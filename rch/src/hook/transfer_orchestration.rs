@@ -465,7 +465,8 @@ pub(super) async fn execute_remote_compilation(
     worker: &SelectedWorker,
     command: &str,
     transfer_config: TransferConfig,
-    env_allowlist: Vec<String>,
+    environment: &rch_common::EnvironmentConfig,
+    execution_storage: &rch_common::execution_storage::ExecutionStorageConfig,
     forwarded_cargo_target_dir: Option<PathBuf>,
     compilation_config: &rch_common::CompilationConfig,
     toolchain: Option<&ToolchainInfo>,
@@ -502,7 +503,8 @@ pub(super) async fn execute_remote_compilation(
         worker,
         command,
         transfer_config,
-        env_allowlist,
+        environment,
+        execution_storage,
         forwarded_cargo_target_dir,
         compilation_config,
         toolchain,
@@ -555,7 +557,8 @@ async fn execute_remote_compilation_inner(
     worker: &SelectedWorker,
     command: &str,
     transfer_config: TransferConfig,
-    env_allowlist: Vec<String>,
+    environment: &rch_common::EnvironmentConfig,
+    execution_storage: &rch_common::execution_storage::ExecutionStorageConfig,
     forwarded_cargo_target_dir: Option<PathBuf>,
     compilation_config: &rch_common::CompilationConfig,
     toolchain: Option<&ToolchainInfo>,
@@ -1000,7 +1003,7 @@ async fn execute_remote_compilation_inner(
     // margin over that cap so a genuine remote group-kill propagates as exit
     // 137 instead of losing the race to a local "SSH command timed out" (#20).
     let mut effective_env_allowlist =
-        cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
+        cargo_target_env_allowlist(&environment.allowlist, forwarded_cargo_target_dir.is_some());
     let build_source_aliases = build_source_before
         .as_ref()
         .map(|_| build_source_commit_env(|key| std::env::var(key).ok()));
@@ -1249,6 +1252,7 @@ async fn execute_remote_compilation_inner(
         .with_compilation_kind(kind)
         .with_remote_path_override(entry.remote_root.clone())
         .with_worker_platform(WorkerPlatform::from_worker(&worker_config))
+        .with_execution_environment(execution_storage.clone(), environment.remote.clone())?
         .with_build_id(build_id)
         .with_pooled_target_prune_idle_hours(pooled_target_prune_idle_hours);
         if let Some(identity) = source_identity {
@@ -1744,9 +1748,11 @@ async fn execute_remote_compilation_inner(
     let alias_bound_command = build_source_aliases
         .as_ref()
         .map(|aliases| bind_build_source_aliases(guarded_command, aliases));
+    let command_to_isolate = alias_bound_command.as_deref().unwrap_or(guarded_command);
     let isolated_command = add_cargo_isolation(
-        alias_bound_command.as_deref().unwrap_or(guarded_command),
+        command_to_isolate,
         &worker_config.id,
+        execution_storage.cache_root().is_some() || environment.remote.contains_key("CARGO_HOME"),
     );
 
     // Stream stdout/stderr to our stderr so the agent sees the output

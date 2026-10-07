@@ -6,6 +6,9 @@
 use crate::error::TransferError;
 use anyhow::{Context, Result};
 use glob::Pattern;
+use rch_common::execution_storage::{
+    ExecutionStorageConfig, JOB_TMP_SCRIPT, TmpMode, validate_remote_environment,
+};
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::rsync_flavor::{ResolvedRsync, RsyncCapabilities, RsyncFlavor, RsyncSource};
 use rch_common::ssh_utils::{
@@ -1798,6 +1801,11 @@ pub struct TransferPipeline {
     color_mode: ColorMode,
     /// Environment variables to forward to workers.
     env_allowlist: Vec<String>,
+    /// Persistent remote defaults and optional worker storage placement.
+    remote_environment: std::collections::BTreeMap<String, String>,
+    execution_storage: ExecutionStorageConfig,
+    /// Unique across controllers and clones stable within this execution attempt.
+    job_tmp_token: String,
     /// Layer 0 configuration-pack env pairs (bd-bqu38): config-resolved
     /// `CARGO_PROFILE_*` assignments forced onto the remote build, bypassing
     /// the ambient-environment allowlist lookup entirely.
@@ -1963,6 +1971,9 @@ impl TransferPipeline {
             ssh_options,
             color_mode: ColorMode::default(),
             env_allowlist: Vec::new(),
+            remote_environment: std::collections::BTreeMap::new(),
+            execution_storage: ExecutionStorageConfig::default(),
+            job_tmp_token: uuid::Uuid::new_v4().to_string(),
             layer0_env: Vec::new(),
             env_overrides: None,
             compilation_kind: None,
@@ -2476,6 +2487,23 @@ impl TransferPipeline {
         self
     }
 
+    /// Configure worker execution without changing transfer or artifact paths.
+    pub fn with_execution_environment(
+        mut self,
+        storage: ExecutionStorageConfig,
+        remote: std::collections::BTreeMap<String, String>,
+    ) -> Result<Self> {
+        storage.validate().map_err(anyhow::Error::msg)?;
+        validate_remote_environment(&remote).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() || !storage.enabled(),
+            "execution.storage requires a POSIX worker; Windows storage placement is not supported"
+        );
+        self.execution_storage = storage;
+        self.remote_environment = remote;
+        Ok(self)
+    }
+
     /// Force Layer 0 configuration-pack env pairs (bd-bqu38).
     ///
     /// These are resolved from the `[layer0]` config knobs by the caller and
@@ -2811,6 +2839,14 @@ impl TransferPipeline {
     /// managed paths sit under `<remote_path>/.rch-*` so they land in the
     /// managed `/data/tmp` build zone and are reclaimable.
     fn managed_remote_env_value(&self, key: &str, remote_path: &str) -> Option<(String, String)> {
+        if let Some((_, value)) = self
+            .execution_storage
+            .cache_env()
+            .into_iter()
+            .find(|(name, _)| name == key)
+        {
+            return Some((value.clone(), value));
+        }
         let go_base = format!("{remote_path}/.rch-go");
         match key {
             // Absolute or host-specific target directories are brittle on workers.
@@ -2822,7 +2858,9 @@ impl TransferPipeline {
             // Temporary directories may point to host-only volatile mounts.
             // Keep temp files project-scoped on the worker for stability.
             "TMPDIR" | "TMP" | "TEMP" => {
-                let temp_dir = format!("{remote_path}/.rch-tmp");
+                let temp_dir = self
+                    .managed_job_tmp_dir()
+                    .unwrap_or_else(|| format!("{remote_path}/.rch-tmp"));
                 Some((temp_dir.clone(), temp_dir))
             }
             // Go build cache, module cache, and GOPATH — pin under the managed
@@ -2842,6 +2880,16 @@ impl TransferPipeline {
             }
             _ => None,
         }
+    }
+
+    fn managed_job_tmp_dir(&self) -> Option<String> {
+        self.execution_storage.tmp_root().map(|root| {
+            format!(
+                "{}/rch-job-{}/tmp",
+                root.trim_end_matches('/'),
+                self.job_tmp_token
+            )
+        })
     }
 
     fn rewrite_remote_env_value(
@@ -2887,7 +2935,13 @@ impl TransferPipeline {
         let mut ensure_dirs = Vec::new();
         let mut restricted_dirs = Vec::new();
 
-        for raw_key in &self.env_allowlist {
+        let mut keys = self.env_allowlist.clone();
+        for key in self.remote_environment.keys() {
+            if !keys.iter().any(|existing| existing.trim() == key) {
+                keys.push(key.clone());
+            }
+        }
+        for raw_key in &keys {
             let key = raw_key.trim();
             if key.is_empty() {
                 continue;
@@ -2901,7 +2955,16 @@ impl TransferPipeline {
                 continue;
             }
 
-            let Some(original_value) = self.env_value(key) else {
+            // Profile defaults do not implicitly forward the controller's environment.
+            let forwarded = self
+                .env_allowlist
+                .iter()
+                .any(|allowed| allowed.trim() == key)
+                .then(|| self.env_value(key))
+                .flatten();
+            let Some(original_value) =
+                forwarded.or_else(|| self.remote_environment.get(key).cloned())
+            else {
                 continue;
             };
 
@@ -2946,7 +3009,20 @@ impl TransferPipeline {
         // rest are injected fresh. This is what forces wrapper/unclassified
         // builds — which may never forward CARGO_TARGET_DIR/GOCACHE/etc. — to
         // still drop artifacts inside the managed `/data/tmp` zone.
-        for &key in FORCED_MANAGED_ENV_KEYS {
+        let mut managed_keys = FORCED_MANAGED_ENV_KEYS
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect::<Vec<_>>();
+        managed_keys.extend(
+            self.execution_storage
+                .cache_env()
+                .into_iter()
+                .map(|(key, _)| key),
+        );
+        if self.managed_job_tmp_dir().is_some() {
+            managed_keys.extend(["TMP".to_owned(), "TEMP".to_owned()]);
+        }
+        for key in &managed_keys {
             if applied.iter().any(|k| k == key) {
                 continue;
             }
@@ -2960,7 +3036,7 @@ impl TransferPipeline {
             if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
                 ensure_dirs.push(ensure_dir.clone());
             }
-            if matches!(key, "TMPDIR" | "TMP" | "TEMP")
+            if matches!(key.as_str(), "TMPDIR" | "TMP" | "TEMP")
                 && !restricted_dirs
                     .iter()
                     .any(|existing| existing == &ensure_dir)
@@ -3471,6 +3547,22 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
+        let managed_execution =
+            self.execution_storage.enabled() || !self.remote_environment.is_empty();
+        // Dependency preparation needs the same cache/proxy/tmp environment and
+        // deadline as the workload. Keep it inside the tracked process group.
+        let toolchain_command = if managed_execution {
+            format!(
+                "sh -c {}",
+                escape(Cow::Owned(format!(
+                    "{}{}",
+                    self.node_modules_bootstrap(),
+                    toolchain_command
+                )))
+            )
+        } else {
+            toolchain_command
+        };
 
         let env_plan = self.build_remote_env_plan(&remote_path);
         if !env_plan.env_prefix.applied.is_empty() {
@@ -3619,16 +3711,37 @@ setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
             String::new()
         };
 
-        format!(
+        let execution = format!(
             "export LC_ALL=C; {}{}touch {} && cd {} && {}{}{}",
             cargo_home_base,
             build_jobs_fragment,
             escaped_remote_path,
             escaped_remote_path,
-            self.node_modules_bootstrap(),
+            if managed_execution {
+                ""
+            } else {
+                self.node_modules_bootstrap()
+            },
             ensure_dirs_command,
             execution_command
-        )
+        );
+        if let Some(tmp_root) = self.execution_storage.tmp_root() {
+            let mode = match self.execution_storage.tmp_mode {
+                TmpMode::Env => "env",
+                TmpMode::PrivateMount => "private_mount",
+            };
+            format!(
+                "sh -c {} rch-execution-storage {} {} {} {} {}",
+                escape(Cow::Borrowed(JOB_TMP_SCRIPT)),
+                escape(Cow::Owned(tmp_root)),
+                self.job_tmp_token,
+                mode,
+                u64::from(self.execution_storage.tmp_retention_hours) * 60,
+                escape(Cow::Owned(execution)),
+            )
+        } else {
+            execution
+        }
     }
 
     /// The `CARGO_BUILD_JOBS` fragment for this pipeline's worker and project,
@@ -10914,6 +11027,7 @@ Number of files transferred: 42
                 let workload = crate::hook::add_cargo_isolation(
                     "printf 'cargo-home=%s\\ntmpdir=%s\\n' \"$CARGO_HOME\" \"$TMPDIR\"; printf 'cache-probe-stderr' >&2",
                     &worker,
+                    false,
                 );
                 let command = pipeline.build_remote_command(&workload, None);
                 let output = std::process::Command::new("sh")
@@ -10952,6 +11066,245 @@ Number of files transferred: 42
         }
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn managed_storage_exec_preserves_output_status_cache_and_target_pool() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let storage = root.path().join("worker 'volume $(not-a-command)");
+        std::fs::create_dir(&source).unwrap();
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_remote_cargo_target_dir_override(
+                root.path().join("native-pool").to_str().unwrap(),
+            )
+            .with_execution_environment(
+                ExecutionStorageConfig {
+                    root: Some(storage.to_str().unwrap().into()),
+                    ..Default::default()
+                },
+                std::collections::BTreeMap::from([(
+                    "RCH_TEST_PROXY".into(),
+                    "https://proxy/'$(literal)".into(),
+                )]),
+            )
+            .unwrap();
+        let probe = r#"printf cargo >/dev/null; test "$CARGO_NET_GIT_FETCH_WITH_CLI" = true || exit 99;
+            printf '%s\n' "$TMPDIR" "$TMP" "$TEMP" "$GOCACHE" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$RCH_TEST_PROXY";
+            printf reusable > "$CARGO_HOME/probe"; printf scratch > "$TMPDIR/probe"; printf problem >&2; exit 42"#;
+        let probe = crate::hook::add_cargo_isolation(probe, &WorkerId::new("cache-worker"), true);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &pipeline.build_remote_command(&probe, None)])
+            .env("RCH_TEST_PROXY", "must-not-forward")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42), "{:?}", output);
+        assert_eq!(output.stderr, b"problem");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = stdout.lines().collect();
+        let tmp = pipeline.managed_job_tmp_dir().unwrap();
+        assert_eq!(&lines[..3], &[tmp.as_str(), tmp.as_str(), tmp.as_str()]);
+        assert_eq!(lines[3], storage.join("cache/go-build").to_str().unwrap());
+        assert_eq!(lines[4], storage.join("cache/cargo-home").to_str().unwrap());
+        assert_eq!(lines[5], root.path().join("native-pool").to_str().unwrap());
+        assert_eq!(lines[6], "https://proxy/'$(literal)");
+        assert!(!Path::new(&tmp).exists());
+        assert_eq!(
+            std::fs::read(storage.join("cache/cargo-home/probe")).unwrap(),
+            b"reusable"
+        );
+        assert!(source.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn managed_storage_unique_jobs_and_allowlisted_precedence() {
+        let _guard = test_guard!();
+        let source = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let make = || {
+            cargo_home_boundary_pipeline(source.path())
+                .with_env_allowlist(vec!["RCH_TEST_PROXY".into(), "GOCACHE".into()])
+                .with_env_overrides(HashMap::from([
+                    ("RCH_TEST_PROXY".into(), "forwarded".into()),
+                    ("GOCACHE".into(), "/controller-only".into()),
+                ]))
+                .with_execution_environment(
+                    ExecutionStorageConfig {
+                        root: Some(storage.path().to_str().unwrap().into()),
+                        ..Default::default()
+                    },
+                    std::collections::BTreeMap::from([("RCH_TEST_PROXY".into(), "default".into())]),
+                )
+                .unwrap()
+        };
+        let first = make();
+        let second = make();
+        assert_ne!(first.managed_job_tmp_dir(), second.managed_job_tmp_dir());
+        assert_eq!(
+            first.clone().managed_job_tmp_dir(),
+            first.managed_job_tmp_dir()
+        );
+        let probe = "printf '%s\\n' \"$RCH_TEST_PROXY\" \"$GOCACHE\"; RCH_TEST_PROXY=authored sh -c 'printf %s \"$RCH_TEST_PROXY\"'";
+        let output = std::process::Command::new("sh")
+            .args(["-c", &first.build_remote_command(probe, None)])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            stdout,
+            format!(
+                "forwarded\n{}/cache/go-build\nauthored",
+                storage.path().display()
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn managed_storage_dependency_prepare_uses_profile_and_scratch() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(source.join("package.json"), "{}").unwrap();
+        let npm = bin.join("npm");
+        std::fs::write(&npm, "#!/bin/sh\ntest -d \"$NPM_CONFIG_CACHE\" && test -d \"$TMPDIR\" || exit 99\nprintf '%s\\n' \"$NPM_CONFIG_REGISTRY\" > prepared\nmkdir -p node_modules\n").unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_compilation_kind(Some(CompilationKind::Tsc))
+            .with_execution_environment(
+                ExecutionStorageConfig {
+                    root: Some(root.path().join("ssd").to_str().unwrap().into()),
+                    ..Default::default()
+                },
+                std::collections::BTreeMap::from([
+                    (
+                        "NPM_CONFIG_REGISTRY".into(),
+                        "https://registry.example".into(),
+                    ),
+                    (
+                        "PATH".into(),
+                        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                    ),
+                ]),
+            )
+            .unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &pipeline.build_remote_command("cat prepared", None)])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(output.stdout, b"https://registry.example\n");
+        assert!(source.join("node_modules").exists());
+        assert!(!Path::new(&pipeline.managed_job_tmp_dir().unwrap()).exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn managed_storage_watchdog_timeout_releases_tmp_without_changing_status() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap();
+        let pipeline = cargo_home_boundary_pipeline(root.path())
+            .with_build_id(Some(91337))
+            .with_compilation_kind(Some(CompilationKind::CargoTest))
+            .with_compilation_config(rch_common::CompilationConfig {
+                test_timeout_sec: 1,
+                external_timeout_enabled: true,
+                remote_build_jobs: RemoteBuildJobs::Off,
+                ..Default::default()
+            })
+            .with_execution_environment(
+                ExecutionStorageConfig {
+                    root: Some(root.path().join("ssd").to_str().unwrap().into()),
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &pipeline.build_remote_command("sleep 20", None)])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(137), "{:?}", output);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&pipeline.deadline_marker));
+        assert!(!Path::new(&pipeline.managed_job_tmp_dir().unwrap()).exists());
+    }
+
+    #[test]
+    fn managed_storage_rejects_unsupported_worker_and_invalid_profile() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/project"),
+            "test".into(),
+            "abc".into(),
+            TransferConfig::default(),
+        );
+        assert!(
+            pipeline
+                .clone()
+                .with_worker_platform(WorkerPlatform::Windows)
+                .with_execution_environment(
+                    ExecutionStorageConfig {
+                        root: Some("/srv/rch".into()),
+                        ..Default::default()
+                    },
+                    Default::default(),
+                )
+                .is_err()
+        );
+        assert!(
+            pipeline
+                .with_execution_environment(
+                    ExecutionStorageConfig::default(),
+                    std::collections::BTreeMap::from([("RCH_CH_BASE".into(), "/wrong".into())]),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn managed_storage_preserves_durable_completion_and_never_replays() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("completion");
+        let pipeline = cargo_home_boundary_pipeline(root.path())
+            .with_recovery_completion(receipt.to_str().unwrap().into(), "same-identity".into())
+            .with_execution_environment(
+                ExecutionStorageConfig {
+                    root: Some(root.path().join("ssd").to_str().unwrap().into()),
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .unwrap();
+        let command = pipeline.durable_execution_command(
+            pipeline.build_remote_command("printf once >> runs; printf result; exit 7", None),
+        );
+        let first = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert_eq!(first.status.code(), Some(7), "{:?}", first);
+        assert_eq!(first.stdout, b"result");
+        assert_eq!(
+            std::fs::read_to_string(&receipt).unwrap(),
+            "same-identity 7\n"
+        );
+        assert!(!Path::new(&pipeline.managed_job_tmp_dir().unwrap()).exists());
+        let replay = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(!replay.status.success());
+        assert_eq!(std::fs::read(root.path().join("runs")).unwrap(), b"once");
+    }
+
     #[cfg(unix)]
     #[test]
     fn cargo_home_boundary_preserves_explicit_home_streams_and_exit() {
@@ -10969,7 +11322,8 @@ Number of files transferred: 42
             shell_words::quote(explicit_home.to_str().unwrap()),
             shell_words::quote(inner)
         );
-        let workload = crate::hook::add_cargo_isolation(&requested, &WorkerId::new("cache-worker"));
+        let workload =
+            crate::hook::add_cargo_isolation(&requested, &WorkerId::new("cache-worker"), false);
         let command = cargo_home_boundary_pipeline(&source).build_remote_command(&workload, None);
         let output = std::process::Command::new("sh")
             .args(["-c", &command])
@@ -11034,7 +11388,7 @@ Number of files transferred: 42
         let retained = tempfile::tempdir().unwrap().keep();
         let pipeline = cargo_home_boundary_pipeline(&retained).with_build_id(Some(1));
         let workload =
-            crate::hook::add_cargo_isolation("cargo build", &WorkerId::new("cache-worker"));
+            crate::hook::add_cargo_isolation("cargo build", &WorkerId::new("cache-worker"), false);
         let command = pipeline.build_remote_command(&workload, None);
         let capture = command.find("export RCH_CH_BASE").unwrap();
         assert!(capture < command.find("touch ").unwrap());
@@ -11042,7 +11396,7 @@ Number of files transferred: 42
         assert!(capture < command.find("setsid sh -c").unwrap());
         let plain = "printf plain";
         assert_eq!(
-            crate::hook::add_cargo_isolation(plain, &WorkerId::new("cache-worker")),
+            crate::hook::add_cargo_isolation(plain, &WorkerId::new("cache-worker"), false),
             plain
         );
         assert!(

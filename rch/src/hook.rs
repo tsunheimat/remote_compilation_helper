@@ -3374,7 +3374,8 @@ pub async fn run_exec(
             &worker,
             &remote_command,
             config.transfer.clone(),
-            config.environment.allowlist.clone(),
+            &config.environment,
+            &config.execution.storage,
             forwarded_cargo_target_dir.clone(),
             &config.compilation,
             toolchain.as_ref(),
@@ -4609,7 +4610,8 @@ async fn handle_selection_response(
         &worker,
         &remote_command,
         config.transfer.clone(),
-        config.environment.allowlist.clone(),
+        &config.environment,
+        &config.execution.storage,
         forwarded_cargo_target_dir,
         &config.compilation,
         toolchain,
@@ -5300,7 +5302,11 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
 }
 
 /// Add per-worker CARGO_HOME isolation to prevent cache lock contention.
-pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
+pub(crate) fn add_cargo_isolation(
+    command: &str,
+    worker_id: &WorkerId,
+    configured_home: bool,
+) -> String {
     // Check if this is a cargo command that could benefit from isolation
     if !command.contains("cargo") {
         return command.to_string();
@@ -5339,7 +5345,12 @@ pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String
     // libgit2 pack path can spin at ~100% CPU for over an hour where git
     // itself finishes in minutes.
     let safe_worker_id = sanitize_cargo_home_token(worker_id.as_str());
-    let cargo_home = rch_common::remote_cargo_cache_expr(&safe_worker_id);
+    // Change placement while preserving native package-cache preparation.
+    let cargo_home = if configured_home {
+        "${CARGO_HOME:?RCH configured CARGO_HOME is missing}".to_owned()
+    } else {
+        rch_common::remote_cargo_cache_expr(&safe_worker_id)
+    };
     let quoted_cargo_home = format!("\"{cargo_home}\"");
     let base_prelude = rch_common::remote_cargo_home_base_prelude();
     let base_var = rch_common::RCH_CARGO_HOME_BASE_VAR;

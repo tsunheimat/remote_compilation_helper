@@ -1627,6 +1627,9 @@ pub struct EnvironmentConfig {
     /// Allowlist of environment variables to forward to remote workers.
     #[serde(default)]
     pub allowlist: Vec<String>,
+    /// Persistent worker-side defaults (for example GOPROXY or NPM_CONFIG_REGISTRY).
+    #[serde(default)]
+    pub remote: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for GeneralConfig {
@@ -3113,12 +3116,16 @@ pub struct ExecutionConfig {
     /// An empty allowlist disables all remote execution (local only).
     #[serde(default = "default_execution_allowlist")]
     pub allowlist: Vec<String>,
+    /// Optional physical placement of worker package caches and job scratch.
+    #[serde(default)]
+    pub storage: crate::execution_storage::ExecutionStorageConfig,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             allowlist: default_execution_allowlist(),
+            storage: crate::execution_storage::ExecutionStorageConfig::default(),
         }
     }
 }
@@ -6244,7 +6251,10 @@ retry_max = 2
     #[test]
     fn test_execution_config_empty_allowlist() {
         let _guard = test_guard!();
-        let config = ExecutionConfig { allowlist: vec![] };
+        let config = ExecutionConfig {
+            allowlist: vec![],
+            ..Default::default()
+        };
         // Empty allowlist should block everything
         assert!(!config.is_allowed("cargo"));
         assert!(!config.is_allowed("gcc"));
@@ -6255,6 +6265,7 @@ retry_max = 2
         let _guard = test_guard!();
         let config = ExecutionConfig {
             allowlist: vec!["cargo".to_string(), "custom_tool".to_string()],
+            ..Default::default()
         };
         assert!(config.is_allowed("cargo"));
         assert!(config.is_allowed("custom_tool"));
@@ -6266,6 +6277,7 @@ retry_max = 2
         let _guard = test_guard!();
         let config = ExecutionConfig {
             allowlist: vec!["cargo".to_string(), "rustc".to_string()],
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: ExecutionConfig = serde_json::from_str(&json).unwrap();

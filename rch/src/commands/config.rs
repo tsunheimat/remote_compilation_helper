@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, environment.remote.<KEY>, execution.storage.root, execution.storage.cache_root, execution.storage.tmp_root, execution.storage.home_root, execution.storage.tmp_mode, execution.storage.tmp_retention_hours, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -154,7 +154,9 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             },
             environment: ConfigEnvironmentSection {
                 allowlist: config.environment.allowlist.clone(),
+                remote_keys: config.environment.remote.keys().cloned().collect(),
             },
+            execution_storage: config.execution.storage.clone(),
             circuit: ConfigCircuitSection {
                 failure_threshold: config.circuit.failure_threshold,
                 success_threshold: config.circuit.success_threshold,
@@ -400,6 +402,28 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         println!("    {},", style.value(&format!("\"{}\"", key)));
     }
     println!("  ]");
+
+    println!("\n{}", style.highlight("[environment.remote]"));
+    for key in config.environment.remote.keys() {
+        println!("  {} = (set)", style.key(key));
+    }
+    println!("\n{}", style.highlight("[execution.storage]"));
+    for entry in collect_value_sources(
+        &config,
+        &loaded
+            .as_ref()
+            .map(|l| l.sources.clone())
+            .unwrap_or_default(),
+    )
+    .iter()
+    .filter(|v| v.key.starts_with("execution.storage."))
+    {
+        println!(
+            "  {} = {}",
+            style.key(entry.key.trim_start_matches("execution.storage.")),
+            format_with_source(&entry.key, &style.value(&entry.value), &value_sources)
+        );
+    }
 
     println!("\n{}", style.highlight("[circuit]"));
     println!(
@@ -1003,6 +1027,31 @@ pub(super) fn collect_value_sources(
         sources,
     );
 
+    if let serde_json::Value::Object(storage) =
+        serde_json::to_value(&config.execution.storage).unwrap_or_default()
+    {
+        for (key, value) in storage {
+            let value = match value {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            push_value_source(
+                &mut values,
+                &format!("execution.storage.{key}"),
+                value,
+                sources,
+            );
+        }
+    }
+    for key in config.environment.remote.keys() {
+        push_value_source(
+            &mut values,
+            &format!("environment.remote.{key}"),
+            "(set)".into(),
+            sources,
+        );
+    }
     values
 }
 
@@ -1176,6 +1225,11 @@ pub(crate) fn default_config_path() -> Result<PathBuf> {
 
 fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext) -> Result<()> {
     apply_config_set(config_path, key, value)?;
+    let value = if key.starts_with("environment.remote.") {
+        "(set)"
+    } else {
+        value
+    };
 
     if ctx.is_json() {
         let _ = ctx.json(&ApiResponse::ok(
@@ -1345,6 +1399,26 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "environment.allowlist" => {
             config.environment.allowlist = parse_string_list(value, key)?;
         }
+        "execution.storage.root" => config.execution.storage.root = Some(value.into()),
+        "execution.storage.cache_root" => config.execution.storage.cache_root = Some(value.into()),
+        "execution.storage.tmp_root" => config.execution.storage.tmp_root = Some(value.into()),
+        "execution.storage.home_root" => config.execution.storage.home_root = Some(value.into()),
+        "execution.storage.tmp_mode" => {
+            config.execution.storage.tmp_mode = match value {
+                "env" => rch_common::execution_storage::TmpMode::Env,
+                "private_mount" => rch_common::execution_storage::TmpMode::PrivateMount,
+                _ => anyhow::bail!("execution.storage.tmp_mode must be env or private_mount"),
+            };
+        }
+        "execution.storage.tmp_retention_hours" => {
+            config.execution.storage.tmp_retention_hours = parse_u32(value, key)?
+        }
+        _ if key.starts_with("environment.remote.") => {
+            config
+                .environment
+                .remote
+                .insert(key["environment.remote.".len()..].into(), value.into());
+        }
         "output.visibility" => {
             let trimmed = value.trim().trim_matches(|c| c == '"');
             let visibility = trimmed
@@ -1426,6 +1500,13 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         .into());
     }
 
+    config
+        .execution
+        .storage
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    rch_common::execution_storage::validate_remote_environment(&config.environment.remote)
+        .map_err(anyhow::Error::msg)?;
     let contents = toml::to_string_pretty(&config)?;
     std::fs::write(config_path, format!("{}\n", contents))
         .with_context(|| format!("Failed to write {:?}", config_path))?;
@@ -1454,6 +1535,38 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
 
     let defaults = RchConfig::default();
     let value = match key {
+        "execution.storage.root" => {
+            config.execution.storage.root = None;
+            String::new()
+        }
+        "execution.storage.cache_root" => {
+            config.execution.storage.cache_root = None;
+            String::new()
+        }
+        "execution.storage.tmp_root" => {
+            config.execution.storage.tmp_root = None;
+            String::new()
+        }
+        "execution.storage.home_root" => {
+            config.execution.storage.home_root = None;
+            String::new()
+        }
+        "execution.storage.tmp_mode" => {
+            config.execution.storage.tmp_mode = Default::default();
+            "env".into()
+        }
+        "execution.storage.tmp_retention_hours" => {
+            config.execution.storage.tmp_retention_hours =
+                defaults.execution.storage.tmp_retention_hours;
+            config.execution.storage.tmp_retention_hours.to_string()
+        }
+        _ if key.starts_with("environment.remote.") => {
+            config
+                .environment
+                .remote
+                .remove(&key["environment.remote.".len()..]);
+            "(unset)".into()
+        }
         "general.role" => {
             config.general.role = defaults.general.role;
             config.general.role.as_str().to_string()
@@ -1608,6 +1721,11 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         .into());
     }
 
+    config
+        .execution
+        .storage
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     let contents = toml::to_string_pretty(&config)?;
     std::fs::write(config_path, format!("{}\n", contents))
         .with_context(|| format!("Failed to write {:?}", config_path))?;
@@ -2893,6 +3011,43 @@ mod tests {
         config_reset_at(&path, "general.role", &plain_context()).unwrap();
         let config: RchConfig = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(config.general.role, rch_common::BoxRole::Hybrid);
+    }
+
+    #[test]
+    fn managed_execution_config_commands_round_trip_and_redact_profile() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        apply_config_set(&path, "execution.storage.root", "/srv/rch").unwrap();
+        apply_config_set(&path, "execution.storage.tmp_retention_hours", "0").unwrap();
+        apply_config_set(
+            &path,
+            "environment.remote.GOPROXY",
+            "https://secret@proxy.example",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let config: RchConfig = toml::from_str(&before).unwrap();
+        assert_eq!(config.execution.storage.root.as_deref(), Some("/srv/rch"));
+        assert_eq!(config.execution.storage.tmp_retention_hours, 0);
+        let values = collect_value_sources(&config, &Default::default());
+        assert_eq!(
+            values
+                .iter()
+                .find(|v| v.key == "environment.remote.GOPROXY")
+                .unwrap()
+                .value,
+            "(set)"
+        );
+        assert!(!format!("{values:?}").contains("secret@"));
+        assert!(apply_config_set(&path, "execution.storage.tmp_root", "/").is_err());
+        assert!(apply_config_set(&path, "environment.remote.CARGO_TARGET_DIR", "/wrong").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        config_reset_at(&path, "execution.storage.root", &plain_context()).unwrap();
+        config_reset_at(&path, "environment.remote.GOPROXY", &plain_context()).unwrap();
+        let config: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(config.execution.storage.root.is_none());
+        assert!(config.environment.remote.is_empty());
     }
 
     /// GH #38 regression: `rch config set path_topology.canonical_root <path>`

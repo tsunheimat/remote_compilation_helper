@@ -38,6 +38,98 @@ Location:
 
 Sections and fields:
 
+### Worker cache, scratch and environment placement
+
+Set these once in the controller's `~/.config/rch/config.toml`; project config
+may override individual keys. They apply to the remote execution path used by
+`rch exec`, `rch exec --job` and the hook. They do not configure standalone
+`rch-wkr execute`, canary self-tests, source transfer staging or the RABS sidecar.
+
+```toml
+[execution.storage]
+root = "/srv/rch"                 # worker path, preferably on the worker SSD
+# cache_root = "/srv/rch/cache"  # overrides root/cache
+# tmp_root = "/srv/rch/tmp/jobs" # overrides root/tmp/jobs
+# home_root = "/srv/rch/home"    # optional; HOME otherwise stays unchanged
+tmp_mode = "env"                 # or "private_mount" on Linux
+tmp_retention_hours = 24         # abandoned-job sweep; 0 disables it
+
+[environment.remote]
+GOPROXY = "https://nexus.example/repository/go-proxy/"
+NPM_CONFIG_REGISTRY = "https://nexus.example/repository/npm-group/"
+PIP_INDEX_URL = "https://nexus.example/repository/pypi-group/simple"
+
+[remediation.pooled_target]
+store_base = "/srv/rch/targets"  # existing Cargo target-pool configuration
+```
+
+With all storage paths unset, native placements remain unchanged. `cache_root` and
+`tmp_root` can also be used independently. Paths are absolute POSIX worker
+paths; no controller-side tilde, variable or shell expansion is performed.
+Configured storage is refused on Windows workers. For a mixed fleet, scope
+this configuration to projects routed to POSIX workers.
+
+| Variable | Under the configured cache root |
+|---|---|
+| `XDG_CACHE_HOME` | `xdg` |
+| `CARGO_HOME` | `cargo-home` |
+| `GOCACHE`, `GOMODCACHE`, `GOPATH` | `go-build`, `go-mod`, `go-path` |
+| `NPM_CONFIG_CACHE`, `BUN_INSTALL_CACHE_DIR` | `npm`, `bun` |
+| `UV_CACHE_DIR`, `PIP_CACHE_DIR` | `uv`, `pip` |
+| `PLAYWRIGHT_BROWSERS_PATH` | `playwright` |
+
+Package caches persist across jobs. Cargo target keys, target-pool reuse and
+artifact retrieval still use RCH's native target policy. A new `CARGO_HOME`
+does not copy the old registry credentials/configuration: provision the new
+directory if those are required. Changing `HOME` is opt-in because it affects
+tool discovery and credentials; explicitly set worker `RUSTUP_HOME` in
+`environment.remote` if rustup toolchains remain under the original home.
+
+Remote environment values are literal defaults. Allowlisted controller values
+override those defaults; RCH-managed cache/tmp/target paths override both.
+Explicit assignments *inside the authored command* retain normal shell
+semantics. This is placement policy, not a security sandbox for arbitrary code.
+`CARGO_TARGET_DIR`, `RCH_CH_BASE` and the recursion-bypass variable cannot be
+set through `environment.remote`. Profile values may contain credentials, so
+`config show/get` reports their names and `(set)` rather than their values.
+Use worker-side credential provisioning instead of committing secrets.
+
+Managed tmp creates a unique `rch-job-<UUID>/tmp` outside the source mirror,
+exports `TMPDIR`, `TMP` and `TEMP`, and inherits a lease into the existing RCH
+watchdog/process group. The worker needs `flock` and `find`. Cleanup after
+success or failure only removes that job directory after its lease is free;
+descendants retaining the inherited lease keep it. A killed supervisor or
+interrupted connection may leave the directory for the next age-and-lock
+sweep. The sweep never kills processes or infers a build's completion. Recovery receipts and result
+directories remain in their original locations.
+
+`private_mount` additionally uses `unshare --mount --propagation private` and
+binds the job scratch directory over `/tmp`. It requires Linux mount namespace
+privileges and the `unshare`/`mount` tools. Missing privileges fail before the
+workload runs; there is no silent downgrade or sudo invocation. Storage paths,
+source mirrors, target pools and worker tools must resolve outside `/tmp`,
+since the private mount hides its original contents. Namespace setup leaves
+process/session identity to RCH's existing watchdog, so cancellation still
+targets the same process group.
+`env` mode does not redirect programs that hardcode `/tmp`.
+
+Source mirrors, cache-warm staging and controller storage retain their existing
+configuration. Package caches are not swept by the job-tmp cleaner. Existing
+disk-pressure telemetry must still observe the volume you use: place the
+worker canonical mirror and these paths on that monitored volume, and use
+the tool's own cache cleanup for persistent package caches. This setting
+does not install a filesystem, impose a quota or guarantee that `/srv/rch`
+is disk-backed.
+
+Inspect or change individual keys with, for example:
+
+```bash
+rch config set execution.storage.root /srv/rch
+rch config set environment.remote.GOPROXY https://nexus.example/repository/go-proxy/
+rch config get execution.storage.root --sources
+rch config validate
+```
+
 ### `[general]`
 - `enabled` (bool, default `true`) — Master on/off switch for the hook.
 - `log_level` (string, default `"info"`) — `trace|debug|info|warn|error`.

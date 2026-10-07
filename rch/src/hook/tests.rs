@@ -4010,7 +4010,7 @@ fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
 
     // Test cargo build command gets isolation
     let cargo_command = "cargo build --release";
-    let isolated = add_cargo_isolation(cargo_command, &worker_id);
+    let isolated = add_cargo_isolation(cargo_command, &worker_id, false);
 
     assert!(isolated.starts_with("sh -c "));
     assert!(!isolated.starts_with("CARGO_HOME="));
@@ -4035,7 +4035,7 @@ fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
     assert!(!isolated.contains("rm "));
 
     // The same worker always maps to the same cache dir (that IS the reuse).
-    let again = add_cargo_isolation(cargo_command, &worker_id);
+    let again = add_cargo_isolation(cargo_command, &worker_id, false);
     assert_eq!(isolated, again);
 }
 
@@ -4443,7 +4443,7 @@ fn test_add_cargo_isolation_skips_non_cargo_commands() {
 
     // Test non-cargo command is unchanged
     let non_cargo_command = "echo hello world";
-    let isolated = add_cargo_isolation(non_cargo_command, &worker_id);
+    let isolated = add_cargo_isolation(non_cargo_command, &worker_id, false);
 
     assert_eq!(isolated, non_cargo_command);
     assert!(!isolated.contains("CARGO_HOME"));
@@ -4457,7 +4457,7 @@ fn test_add_cargo_isolation_handles_complex_cargo_commands() {
     // Test complex cargo command with environment variables and arguments
     let complex_command =
         "cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo";
-    let isolated = add_cargo_isolation(complex_command, &worker_id);
+    let isolated = add_cargo_isolation(complex_command, &worker_id, false);
 
     assert!(isolated.starts_with("sh -c "));
     assert!(
@@ -4478,7 +4478,7 @@ fn test_add_cargo_isolation_handles_complex_cargo_commands() {
 fn test_add_cargo_isolation_survives_timeout_prefix_and_preserves_status() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("timeout-worker");
-    let isolated = add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id);
+    let isolated = add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id, false);
     let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation-wrapper regression command above.
         .arg("-c")
         .arg(format!(
@@ -4512,6 +4512,7 @@ fn test_add_cargo_isolation_repairs_dangling_registry_link() {
     let isolated = add_cargo_isolation(
         "printf cargo >/dev/null; test -d \"$CARGO_HOME/registry\" && touch \"$CARGO_HOME/registry/ok\"",
         &worker_id,
+        false,
     );
     let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation wrapper above.
         .arg("-c")
@@ -6626,7 +6627,8 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         &worker,
         "cargo check",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -6750,7 +6752,8 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &worker,
         "cargo build",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         Some(PathBuf::from(&custom_target_dir)),
         &rch_common::CompilationConfig::default(),
         None,
@@ -6867,7 +6870,8 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         &worker,
         "cargo check",
         transfer_config,
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -6972,7 +6976,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &worker,
         "cargo build",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7000,7 +7005,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &worker,
         "cargo test",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,

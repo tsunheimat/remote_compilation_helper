@@ -35,6 +35,7 @@ pub mod errors;
 pub mod exec_misuse;
 pub mod exec_policy;
 pub mod exec_response;
+pub mod execution_storage;
 pub mod fleet_diff;
 pub mod fleet_provenance;
 pub mod fleet_smoke_profile;
