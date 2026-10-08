@@ -121,20 +121,19 @@ pub fn recover_after_lineage_failure(
         if row.state != "installed" {
             continue; // already recovered in an earlier sweep
         }
-        let os_string: std::ffi::OsString =
-            std::os::unix::ffi::OsStringExt::from_vec(row.installed_path.clone());
-        let path: PathBuf = PathBuf::from(os_string);
-        let outcome = match std::fs::metadata(&path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Already gone: bookkeep, never error.
-                Ok(true)
+        let outcome = decode_installed_path(&row.installed_path).and_then(|path| {
+            match std::fs::metadata(&path) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone: bookkeep, never error.
+                    Ok(true)
+                }
+                Err(_) => Err(()),
+                Ok(_) => match recompute_file_digest(&path) {
+                    Ok(current) if current == row.object => fs_remove(&path),
+                    _ => Err(()),
+                },
             }
-            Err(_) => Err(()),
-            Ok(_) => match recompute_file_digest(&path) {
-                Ok(current) if current == row.object => fs_remove(&path),
-                _ => Err(()),
-            },
-        };
+        });
         match outcome {
             Ok(removed_now) => {
                 store.set_provisional_install_state(
@@ -158,6 +157,23 @@ pub fn recover_after_lineage_failure(
         }
     }
     Ok(summary)
+}
+
+// Preserve Unix path bytes exactly. On other platforms, only UTF-8 journal
+// paths can be decoded safely with the standard library. An undecodable path
+// becomes dirty without touching the filesystem; lossy decoding could delete
+// a different file. This also preserves Windows paths with unpaired surrogates
+// for explicit revalidation rather than guessing their identity.
+fn decode_installed_path(bytes: &[u8]) -> Result<PathBuf, ()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes).map(PathBuf::from).map_err(|_| ())
+    }
 }
 
 fn fs_remove(path: &std::path::Path) -> Result<bool, ()> {
@@ -384,6 +400,91 @@ mod tests {
         let dirty = store.list_provisional_installs_by_state("dirty").unwrap();
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].installed_path, path.as_os_str().as_encoded_bytes());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn m019_unicode_path_is_recovered_verbatim() {
+        let mut store = fixture();
+        let dir = unique_tmp("unicode");
+        let (_, pin_key, path) =
+            pin_with_installing_dependent(&mut store, &dir, "output-\u{03bb}.rmeta", b"installed");
+
+        assert_eq!(
+            decode_installed_path(path.as_os_str().as_encoded_bytes()).unwrap(),
+            path
+        );
+        assert_eq!(
+            recover_after_lineage_failure(&mut store, &[pin_key]).unwrap(),
+            RecoverySummary {
+                removed: 1,
+                marked_dirty: 0
+            }
+        );
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn m019_non_utf8_unix_path_is_recovered_without_lossy_aliasing() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut store = fixture();
+        let dir = unique_tmp("raw-path");
+        let (_, pin_key, original) =
+            pin_with_installing_dependent(&mut store, &dir, "original.rmeta", b"installed");
+        let path = dir.join(std::ffi::OsStr::from_bytes(b"output-\xff.rmeta"));
+        std::fs::rename(&original, &path).unwrap();
+        record_installed_output(&mut store, &pin_key, "worker-b", AttemptId(31), &path, 8).unwrap();
+        let lossy_alias = dir.join("output-\u{fffd}.rmeta");
+        std::fs::write(&lossy_alias, b"installed").unwrap();
+
+        assert_eq!(
+            recover_after_lineage_failure(&mut store, &[pin_key]).unwrap(),
+            RecoverySummary {
+                removed: 2,
+                marked_dirty: 0
+            }
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&lossy_alias).unwrap(), b"installed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn m019_undecodable_path_is_marked_dirty_without_touching_lossy_alias() {
+        let mut store = fixture();
+        let dir = unique_tmp("undecodable-path");
+        let (_, pin_key, path) =
+            pin_with_installing_dependent(&mut store, &dir, "out.rmeta", b"installed");
+        let mut encoded = dir.as_os_str().as_encoded_bytes().to_vec();
+        encoded.extend_from_slice(b"/output-\xff.rmeta");
+        store
+            .insert_provisional_install(&ProvisionalInstallInsert {
+                pin_key: pin_key.clone(),
+                consumer_worker: "worker-b".to_owned(),
+                consumer_attempt: 31,
+                installed_path: encoded.clone(),
+                object: recompute_file_digest(&path).unwrap(),
+                installed_seq: 8,
+            })
+            .unwrap();
+        let lossy_alias = dir.join("output-\u{fffd}.rmeta");
+        std::fs::write(&lossy_alias, b"installed").unwrap();
+
+        assert_eq!(
+            recover_after_lineage_failure(&mut store, &[pin_key]).unwrap(),
+            RecoverySummary {
+                removed: 1,
+                marked_dirty: 1
+            }
+        );
+        assert_eq!(std::fs::read(&lossy_alias).unwrap(), b"installed");
+        let dirty = store.list_provisional_installs_by_state("dirty").unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].installed_path, encoded);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

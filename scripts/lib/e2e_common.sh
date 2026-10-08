@@ -7,12 +7,25 @@
 E2E_SKIP_EXIT=4
 
 e2e_timestamp() {
-    date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
+    local timestamp
+    timestamp="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null)" || timestamp=""
+    if [[ -n "$timestamp" && "$timestamp" != *N* ]]; then
+        printf '%s\n' "$timestamp"
+    else
+        date -u '+%Y-%m-%dT%H:%M:%SZ'
+    fi
 }
 
 e2e_now_ms() {
-    if date +%s%3N >/dev/null 2>&1; then
-        date +%s%3N
+    local milliseconds
+    milliseconds="$(date +%s%3N 2>/dev/null)" || milliseconds=""
+    # BSD date can succeed while leaving an unsupported %N in the output.
+    if [[ "$milliseconds" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$milliseconds"
+        return
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(time.time_ns() // 1_000_000)'
         return
     fi
     local seconds

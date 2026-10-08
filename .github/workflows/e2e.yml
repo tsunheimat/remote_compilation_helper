@@ -1,7 +1,7 @@
 name: e2e
 
-# Runs every scripts/e2e_*.sh as its own matrix job after building the
-# workspace, uploads each run's JSONL + build log, and aggregates a PASS/FAIL
+# Builds the workspace once per OS and runs every scripts/e2e_*.sh through
+# the shared runner, uploads each script's JSONL + build log, and aggregates a PASS/FAIL
 # summary posted as a PR comment (remote_compilation_helper-62u24.15).
 
 on:
@@ -19,33 +19,23 @@ concurrency:
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Bound peak compiler memory while building the full workspace on hosted VMs.
+  CARGO_BUILD_JOBS: 2
 
 jobs:
-  # Auto-discover the e2e scripts so adding scripts/e2e_*.sh needs no workflow edit.
-  discover:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      scripts: ${{ steps.list.outputs.scripts }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: list
-        run: |
-          echo "scripts=$(find scripts -maxdepth 1 -name 'e2e_*.sh' -printf '%f\n' \
-            | sort | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
-
   run:
-    needs: discover
     strategy:
       fail-fast: false
       matrix:
-        script: ${{ fromJson(needs.discover.outputs.scripts) }}
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # This job includes a cold release build before the scenario runs.
-    timeout-minutes: 30
+    # One cold build plus the complete scenario suite; per-scenario budgets
+    # and the runner's non-zero exit on any failure remain unchanged.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: List E2E scenarios
+        run: scripts/run_all_e2e.sh --list
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -54,16 +44,17 @@ jobs:
           cache-on-failure: true
           shared-key: e2e-${{ matrix.os }}
       - name: Build workspace
-        run: cargo build --release --workspace
-      # Run the single matrix script through the SAME runner CI and operators use,
-      # so a local `run_all_e2e.sh --filter=<script>` reproduces this job exactly.
-      # The script's exit code (0 pass / 4 skip / else fail) gates this job.
+        run: |
+          cargo build --release --workspace
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+      # The runner discovers every script, records each exit code, and fails
+      # this job if any scenario fails, while continuing to collect results.
       - name: Run e2e
-        run: scripts/run_all_e2e.sh --filter='${{ matrix.script }}' --out=target/e2e-artifacts
+        run: scripts/run_all_e2e.sh --out=target/e2e-artifacts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: e2e-${{ matrix.script }}-${{ matrix.os }}
+          name: e2e-${{ matrix.os }}
           path: target/e2e-artifacts/
           if-no-files-found: warn
 
