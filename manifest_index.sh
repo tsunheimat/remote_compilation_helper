@@ -9,10 +9,10 @@ set -euo pipefail
 
 manifest_entries() {
   cat <<'MANIFEST_EOF'
-3aca5000f8ba1a9eb649c207681a9078d91eabbda975599d8bd152b632187cd3  .claude/skills/rch/SKILL.md
+a5c1ad85f774beb511cc01eb281efde2fd41083157a1f0dfc98548784157f3fc  .claude/skills/rch/SKILL.md
 e072ca840e44150f17a915fe453f70327fa78f38917c639352d7bde3ad867ac2  .claude/skills/rch/assets/workers-template.toml
-0502242bdbfaed07a4f55afac9ed12588b61def73d09580b05cefac26cdb3e06  .claude/skills/rch/references/COMMANDS.md
-f9ef81f3a01c5d0fb01aaa05dcbb0399ac55664227e8a995d9b387c1f159d938  .claude/skills/rch/references/CONFIGURATION.md
+b01079677fac993511f2a674f1c41122149f46f99bc853e61528c711a08d4ffd  .claude/skills/rch/references/COMMANDS.md
+28d9c2017adf2b663c97a173a41010199972b5f2561ec4a89ddd5642990c108c  .claude/skills/rch/references/CONFIGURATION.md
 44dabc9368f1a1940480012e5c6e2918d50d53e13591ce587ad364f19b8bbb2f  .claude/skills/rch/references/HOOKS.md
 fa21e033180a535de40fe6a46892fb8a3d00849a8fcb1c6db4cc77097ac3ccbf  .claude/skills/rch/references/OPERATIONS.md
 a64aaae56172d825eda9a2b9a02b26ff1aacfd03b1b3d7bfbaa8e46651663987  .claude/skills/rch/references/TROUBLESHOOTING.md
