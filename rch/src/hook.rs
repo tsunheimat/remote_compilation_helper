@@ -3,6 +3,7 @@
 //! Handles incoming hook requests from Claude Code, classifies commands,
 //! and routes compilation commands to remote workers.
 
+pub(crate) use crate::config::configured_incident_ledger;
 use crate::config::load_config;
 use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
 use crate::state::primitives::atomic_write;
@@ -34,13 +35,12 @@ use rch_common::repo_updater_contract::{
 use rch_common::{
     BuildHeartbeatPhase, BuildHeartbeatRequest, Classification, ColorMode, CommandPriority,
     CommandTimingBreakdown, CompilationKind, ControlState, DependencyClosurePlan, HookInput,
-    HookOutput, IncidentEvent, IncidentEventType, IncidentLedger, IncidentLedgerConfig,
-    IncidentReasonCode, IncidentSource, OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
-    RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest,
-    RepoUpdaterOutputFormat, RequestedWorkerFacts, RequestedWorkerOutcome, RequestedWorkerStatus,
-    RequiredRuntime, SelectedMode, SelectedWorker, SelectionDiagnostics, SelectionReason,
-    SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
-    build_dependency_closure_plan_with_policy, build_invocation, classify_command,
+    HookOutput, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource, OutputVisibility,
+    REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract,
+    RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat, RequestedWorkerFacts, RequestedWorkerOutcome,
+    RequestedWorkerStatus, RequiredRuntime, SelectedMode, SelectedWorker, SelectionDiagnostics,
+    SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig,
+    WorkerId, build_dependency_closure_plan_with_policy, build_invocation, classify_command,
     declined_compilation_due_to_structure, default_socket_path, evaluate_requested_worker, mock,
     normalize_project_path_with_policy,
     path_topology::PathTopologyPolicy,
@@ -902,92 +902,6 @@ fn remote_required_refusal_summary(reason: &str) -> String {
     }
 }
 
-/// A config-driven reason to run locally instead of offloading.
-///
-/// Issue #55: `general.enabled`, `general.force_local` and
-/// `execution.allowlist` used to be consulted only by the Claude Code hook.
-/// `rch exec` ignored them, and the cargo shim always execs `rch exec`, so on
-/// a shim-only box (Codex, scripts, CI) `force_local = true` did nothing and on
-/// a hook box the shim offloaded a command the hook had just allowed locally.
-/// One policy, evaluated identically by every interceptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConfigLocalPolicy {
-    /// `general.enabled = false`.
-    Disabled,
-    /// `general.force_local = true`.
-    ForceLocal,
-    /// Both force flags set — validation rejects this; fail safe (local).
-    ConflictingForceFlags,
-    /// The classified command's base is not in `execution.allowlist`.
-    NotAllowlisted(&'static str),
-}
-
-impl ConfigLocalPolicy {
-    const DISABLED_REASON: &'static str = "rch disabled (general.enabled=false)";
-    const FORCE_LOCAL_REASON: &'static str = "force_local";
-    const CONFLICT_REASON: &'static str = "invalid config: force_local+force_remote";
-    const NOT_ALLOWLISTED_SUFFIX: &'static str = "not in execution.allowlist";
-
-    /// Human-readable reason, in the `[RCH] local (<reason>)` vocabulary.
-    pub(crate) fn reason(self) -> String {
-        match self {
-            Self::Disabled => Self::DISABLED_REASON.to_string(),
-            Self::ForceLocal => Self::FORCE_LOCAL_REASON.to_string(),
-            Self::ConflictingForceFlags => Self::CONFLICT_REASON.to_string(),
-            Self::NotAllowlisted(base) => {
-                format!("command '{base}' {}", Self::NOT_ALLOWLISTED_SUFFIX)
-            }
-        }
-    }
-
-    /// Whether this policy is an explicit operator instruction that outranks a
-    /// `RCH_REQUIRE_REMOTE=1` baked into a generic interceptor (the shim).
-    ///
-    /// `RCH_REQUIRE_REMOTE` exists to stop *silent* local fallback. A
-    /// configured, announced `force_local` is neither silent nor a fallback.
-    /// The allowlist is different: it is a capability gate, and under a strict
-    /// remote policy a non-allowlisted command is refused rather than run.
-    pub(crate) fn overrides_require_remote(self) -> bool {
-        !matches!(self, Self::NotAllowlisted(_))
-    }
-
-    /// Whether `reason` was produced by [`Self::reason`]. Policy refusals are
-    /// permanent for the invocation, never retryable.
-    fn is_policy_reason(reason: &str) -> bool {
-        matches!(
-            reason,
-            Self::DISABLED_REASON | Self::FORCE_LOCAL_REASON | Self::CONFLICT_REASON
-        ) || (reason.starts_with("command '") && reason.ends_with(Self::NOT_ALLOWLISTED_SUFFIX))
-    }
-}
-
-/// Evaluate the config-driven local policy for a command of `kind`.
-///
-/// Returns `None` when config permits offload. Explicit job admission
-/// (`rch exec --job`) bypasses the allowlist — there is no allowlist entry for
-/// an arbitrary job — but still honors `enabled` / `force_local`.
-pub(crate) fn config_local_policy(
-    config: &rch_common::RchConfig,
-    kind: Option<CompilationKind>,
-) -> Option<ConfigLocalPolicy> {
-    if !config.general.enabled {
-        return Some(ConfigLocalPolicy::Disabled);
-    }
-    if config.general.force_local && config.general.force_remote {
-        return Some(ConfigLocalPolicy::ConflictingForceFlags);
-    }
-    if config.general.force_local {
-        return Some(ConfigLocalPolicy::ForceLocal);
-    }
-    match kind {
-        Some(CompilationKind::Job) | None => None,
-        Some(kind) => {
-            let base = kind.command_base();
-            (!config.execution.is_allowed(base)).then_some(ConfigLocalPolicy::NotAllowlisted(base))
-        }
-    }
-}
-
 fn exit_with_local_fallback(
     command: &str,
     reporter: &HookReporter,
@@ -1755,15 +1669,6 @@ fn bounded_incident_error(error: &str) -> String {
         Some((cut, _)) => format!("{}…", &redacted[..cut]),
         None => redacted,
     }
-}
-
-/// The incident ledger as `[remediation.incident_ledger]` configures it
-/// (path and retention), or the defaults when config cannot load.
-pub(crate) fn configured_incident_ledger() -> IncidentLedger {
-    let config = crate::config::load_config()
-        .map(|config| IncidentLedgerConfig::from(&config.remediation.incident_ledger))
-        .unwrap_or_default();
-    IncidentLedger::new(config)
 }
 
 /// Append `event` to the durable incident ledger, best-effort. Incident logging
@@ -4287,8 +4192,9 @@ pub(crate) use daemon_ipc::{
 // the test suite, and the numeric `parse_*` helpers stay module-private.
 mod command_parsing;
 pub(crate) use command_parsing::{
-    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name,
-    extract_project_name_with_policy, preferred_workers,
+    ConfigLocalPolicy, cargo_job_count_for_command, config_local_policy, estimate_cores_for_command,
+    extract_project_name, extract_project_name_with_policy, preferred_workers,
+    project_topology_local_reason,
 };
 
 // Human-facing job-output rendering (compile-summary panel, job banner, and the
@@ -5145,26 +5051,6 @@ fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
                 | CompilationKind::CargoZigbuild
         )
     )
-}
-
-/// bd-raobv: why a build started in `cwd` must run locally because the project
-/// lies outside the configured canonical root (the worker mirror cannot place
-/// it), or `None` when topology admits it. The execution path and
-/// `rch diagnose` both call this so their verdicts cannot disagree.
-pub(crate) fn project_topology_local_reason(
-    policy: &PathTopologyPolicy,
-    cwd: &Path,
-) -> Option<String> {
-    normalize_project_path_with_policy(cwd, policy)
-        .err()
-        .map(|error| {
-            format!(
-                "project {} is outside canonical root {} ({error}); set [path_topology] \
-                 canonical_root or RCH_CANONICAL_PROJECT_ROOT to offload it",
-                cwd.display(),
-                policy.canonical_root().display()
-            )
-        })
 }
 
 fn normalize_dependency_root_for_runtime(

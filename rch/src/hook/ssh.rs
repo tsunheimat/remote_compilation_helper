@@ -1474,25 +1474,7 @@ fn build_worker_ownership_detect_cmd(canonical_root: &Path) -> String {
     )
 }
 
-/// bd-kugfc: outcome of one worker's detection-only mirror-ownership
-/// probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MirrorOwnershipProbe {
-    /// Probe intentionally not run (mock mode or Windows worker —
-    /// neither has the Unix canonical/alias mirror-tree semantics).
-    Skipped,
-    /// No root-owned entries under the canonical mirror tree.
-    Healthy,
-    /// Drift detected: N root-owned entries will make rsync-as-ssh-user
-    /// fail exit 23 until repaired.
-    Drift { count: u64 },
-    /// The worker cannot run the count (passwordless sudo unavailable);
-    /// dispatch-time repair fails open silently in this state too.
-    CheckUnavailable,
-    /// SSH transport failure, timeout, or unrecognized output; drift
-    /// state on this worker is unknown.
-    Unprobeable(String),
-}
+pub(crate) use crate::doctor::MirrorOwnershipProbe;
 
 /// Pure classifier for the detect-command output so the parsing
 /// contract stays unit-testable without an SSH fleet.

@@ -4,6 +4,7 @@
 //! platforms we compile a fail-open stub so the CLI can build and the hook
 //! never blocks local execution.
 
+pub(crate) use crate::config::configured_incident_ledger;
 use crate::error::PlatformError;
 use rch_common::{
     CommandPriority, CommandTimingBreakdown, CompilationKind, RequiredRuntime, SelectionResponse,
@@ -19,9 +20,38 @@ use std::path::PathBuf;
 mod command_parsing;
 
 pub(crate) use command_parsing::{
-    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name,
-    extract_project_name_with_policy, preferred_workers,
+    cargo_job_count_for_command, config_local_policy, estimate_cores_for_command, extract_project_name,
+    extract_project_name_with_policy, preferred_workers, project_topology_local_reason,
 };
+
+/// Let the normal non-Unix hook consume stdin and allow local execution.
+pub(crate) fn try_fast_passthrough() -> bool {
+    false
+}
+
+/// Report unsupported ownership probes honestly to the reliability doctor.
+pub(crate) mod ssh {
+    pub(crate) use crate::doctor::MirrorOwnershipProbe;
+
+    pub(crate) async fn probe_worker_mirror_ownership(
+        _worker: &rch_common::WorkerConfig,
+        _canonical_root: &std::path::Path,
+    ) -> MirrorOwnershipProbe {
+        MirrorOwnershipProbe::Unprobeable(
+            "mirror-ownership probing requires the Unix SSH transport".to_owned(),
+        )
+    }
+}
+
+/// Topology mutation requires the Unix ownership-locking SSH transport.
+pub(crate) async fn run_owned_worker_topology_command(
+    _worker: &rch_common::WorkerConfig,
+    _canonical_root: &std::path::Path,
+    _alias_root: &std::path::Path,
+    _command: &str,
+) -> anyhow::Result<std::process::Output> {
+    anyhow::bail!("worker topology mutation requires the Unix ownership-locking SSH transport")
+}
 
 /// Install the fail-open hook-mode panic handler.
 ///
@@ -56,6 +86,7 @@ pub async fn run_exec(
     source_content_receipt: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
+    required_tools: Vec<String>,
     command_parts: Vec<String>,
     _out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
@@ -78,6 +109,9 @@ pub async fn run_exec(
     }
     if !result_dirs.is_empty() {
         anyhow::bail!("--result-dir requires the Unix rsync transport");
+    }
+    if !required_tools.is_empty() {
+        anyhow::bail!("--require-tool requires the Unix worker-selection transport");
     }
     let command = command_parts.join(" ");
     if command.is_empty() {

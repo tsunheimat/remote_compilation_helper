@@ -172,7 +172,9 @@ fn decode_installed_path(bytes: &[u8]) -> Result<PathBuf, ()> {
     }
     #[cfg(not(unix))]
     {
-        std::str::from_utf8(bytes).map(PathBuf::from).map_err(|_| ())
+        std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|_| ())
     }
 }
 

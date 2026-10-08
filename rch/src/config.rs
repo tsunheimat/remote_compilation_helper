@@ -394,6 +394,15 @@ fn load_config_uncached_from_paths(
     Ok(config)
 }
 
+/// The incident ledger as `[remediation.incident_ledger]` configures it
+/// (path and retention), or the defaults when config cannot load.
+pub(crate) fn configured_incident_ledger() -> rch_common::IncidentLedger {
+    let config = load_config()
+        .map(|config| rch_common::IncidentLedgerConfig::from(&config.remediation.incident_ledger))
+        .unwrap_or_default();
+    rch_common::IncidentLedger::new(config)
+}
+
 /// Load configuration from all sources.
 ///
 /// Performance (t15): a source-fingerprint+schema-keyed binary cache lives at
