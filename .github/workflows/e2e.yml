@@ -17,6 +17,9 @@ concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   # Auto-discover the e2e scripts so adding scripts/e2e_*.sh needs no workflow edit.
   discover:
@@ -39,7 +42,8 @@ jobs:
         script: ${{ fromJson(needs.discover.outputs.scripts) }}
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    # This job includes a cold release build before the scenario runs.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
