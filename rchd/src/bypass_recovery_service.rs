@@ -26,9 +26,10 @@
 //! The durable [`BypassRecord`] (backoff, counters, next-probe time, survives
 //! restart) and the in-memory [`crate::workers::WorkerLifecycle`] eligibility
 //! (what selection reads) are two views of the same quarantine. This service is
-//! the single place that advances them together — and [`Self::reconcile_on_start`]
-//! re-derives the lifecycle from the persisted records on daemon startup so a
-//! restart can never silently un-bypass a worker.
+//! the single place that advances them together — and
+//! [`BypassRecoveryService::reconcile_on_start`] re-derives the lifecycle from the
+//! persisted records on daemon startup so a restart can never silently un-bypass
+//! a worker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,9 +258,9 @@ impl SshRecoveryProber {
     }
 }
 
-/// Map exact-path capability [`ProbedFacts`] (+ fresh load + telemetry verdict)
-/// onto the 7-dimension [`RecoveryProbe`]. Pure, so the dimension fidelity is
-/// unit-tested without real SSH.
+/// Map exact-path capability [`ProbedFacts`](rch_common::capability_probe::ProbedFacts)
+/// (+ fresh load + telemetry verdict) onto the 7-dimension [`RecoveryProbe`]. Pure,
+/// so the dimension fidelity is unit-tested without real SSH.
 ///
 /// `worker_binary_ok` requires the exact-path `rch-wkr` to have reported a
 /// version; `toolchain_ok` requires cargo plus every configured target/toolchain;

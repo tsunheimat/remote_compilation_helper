@@ -35,12 +35,13 @@ use rch_common::repo_updater_contract::{
 use rch_common::{
     BuildHeartbeatPhase, BuildHeartbeatRequest, Classification, ColorMode, CommandPriority,
     CommandTimingBreakdown, CompilationKind, ControlState, DependencyClosurePlan, HookInput,
-    HookOutput, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource, OutputVisibility,
-    REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract,
-    RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat, RequestedWorkerFacts, RequestedWorkerOutcome,
-    RequestedWorkerStatus, RequiredRuntime, SelectedMode, SelectedWorker, SelectionDiagnostics,
-    SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig,
-    WorkerId, build_dependency_closure_plan_with_policy, build_invocation, classify_command,
+    HookOutput, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,
+    OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand,
+    RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat,
+    RequestedWorkerFacts, RequestedWorkerOutcome, RequestedWorkerStatus, RequiredRuntime,
+    SelectedMode, SelectedWorker, SelectionDiagnostics, SelectionReason, SelectionResponse,
+    SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
+    build_dependency_closure_plan_with_policy, build_invocation, classify_command,
     declined_compilation_due_to_structure, default_socket_path, evaluate_requested_worker, mock,
     normalize_project_path_with_policy,
     path_topology::PathTopologyPolicy,
@@ -4192,9 +4193,9 @@ pub(crate) use daemon_ipc::{
 // the test suite, and the numeric `parse_*` helpers stay module-private.
 mod command_parsing;
 pub(crate) use command_parsing::{
-    ConfigLocalPolicy, cargo_job_count_for_command, config_local_policy, estimate_cores_for_command,
-    extract_project_name, extract_project_name_with_policy, preferred_workers,
-    project_topology_local_reason,
+    ConfigLocalPolicy, cargo_job_count_for_command, config_local_policy,
+    estimate_cores_for_command, extract_project_name, extract_project_name_with_policy,
+    preferred_workers, project_topology_local_reason,
 };
 
 // Human-facing job-output rendering (compile-summary panel, job banner, and the

@@ -20,8 +20,9 @@ use std::path::PathBuf;
 mod command_parsing;
 
 pub(crate) use command_parsing::{
-    cargo_job_count_for_command, config_local_policy, estimate_cores_for_command, extract_project_name,
-    extract_project_name_with_policy, preferred_workers, project_topology_local_reason,
+    cargo_job_count_for_command, config_local_policy, estimate_cores_for_command,
+    extract_project_name, extract_project_name_with_policy, preferred_workers,
+    project_topology_local_reason,
 };
 
 /// Let the normal non-Unix hook consume stdin and allow local execution.

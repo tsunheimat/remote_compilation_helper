@@ -78,7 +78,8 @@ use ui::{DaemonBanner, MetricsDashboard, WorkerStatusPanel};
     about = "RCH daemon - worker fleet orchestration"
 )]
 struct Cli {
-    /// Socket pin; otherwise use socket environment overrides and config.toml [general].socket_path
+    /// Socket pin; otherwise use socket environment overrides and
+    /// `config.toml [general].socket_path`
     #[arg(short, long, default_value_os_t = crate::config::default_socket_path())]
     socket: PathBuf,
 

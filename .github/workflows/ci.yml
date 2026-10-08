@@ -28,6 +28,8 @@ env:
   # The pinned asupersync Git dependency stalls with Cargo's built-in fetcher
   # on cold runners; use the runner's Git transport for dependency downloads.
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Bound compiler concurrency on hosted runners, as in the E2E workflow.
+  CARGO_BUILD_JOBS: 2
   RUSTUP_TOOLCHAIN: nightly-2026-06-06
 
 jobs:

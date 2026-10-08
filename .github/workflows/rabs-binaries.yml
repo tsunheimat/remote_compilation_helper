@@ -29,6 +29,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   build:
@@ -36,6 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rabs-release-gates
+          cache-on-failure: true
       - name: Install bubblewrap (worker capability + sandbox tests)
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Release build the three spine binaries
