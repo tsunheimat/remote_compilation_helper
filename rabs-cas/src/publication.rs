@@ -3194,6 +3194,10 @@ mod tests {
         }
 
         fn publish(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            // Reopening starts a new domain registry. Declare the static
+            // domains this reader knows, as the coordinator does at boot.
+            store.intern_domain(AUTHORITY_DIGEST_DOMAIN);
+            store.intern_domain(rabs_key::typed_digest::DOMAIN_ACTION_KEY);
             let mut renewed = offer();
             renewed.authority.lease_renewal_seq = LeaseRenewalSeq(2);
             let state = store

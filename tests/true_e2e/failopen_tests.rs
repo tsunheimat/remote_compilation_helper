@@ -1016,19 +1016,37 @@ total_slots = 4
         vec![("phase".to_string(), "shutdown".to_string())],
     );
 
-    let shutdown_result = send_request(&socket_path, "POST /shutdown");
+    // The daemon accepts shutdown only after admission is closed and its
+    // build, queue, and durable client lease snapshot is idle.
+    let admission_response = send_request(&socket_path, "POST /restart-admission")?;
+    let admission: serde_json::Value =
+        serde_json::from_str(&admission_response).map_err(std::io::Error::other)?;
+    harness.assert(
+        admission["admission_closed"] == true
+            && admission["restart_permitted"] == true
+            && admission["active_build_ids"] == serde_json::json!([])
+            && admission["queued_build_ids"] == serde_json::json!([])
+            && admission["client_lease_ids"] == serde_json::json!([])
+            && admission["client_lease_scan_error"].is_null(),
+        &format!("Idle daemon should grant restart admission: {admission_response}"),
+    )?;
+
+    let shutdown_response = send_request(&socket_path, "POST /shutdown")?;
     logger.log_with_context(
         LogLevel::Info,
         LogSource::Custom("failopen".to_string()),
-        "Shutdown request sent",
+        "Shutdown response received",
         vec![
             ("phase".to_string(), "shutdown".to_string()),
-            (
-                "result".to_string(),
-                format!("{:?}", shutdown_result.is_ok()),
-            ),
+            ("response".to_string(), shutdown_response.clone()),
         ],
     );
+    let shutdown: serde_json::Value =
+        serde_json::from_str(&shutdown_response).map_err(std::io::Error::other)?;
+    harness.assert(
+        shutdown["status"] == "shutting_down",
+        &format!("Daemon should accept shutdown: {shutdown_response}"),
+    )?;
 
     // Wait for the managed daemon process to exit. A failed health probe only
     // proves the server stopped accepting requests; it does not prove the old
@@ -1098,6 +1116,7 @@ total_slots = 4
     )?;
 
     // Cleanup
+    let _ = send_request(&socket_path, "POST /restart-admission");
     let _ = send_request(&socket_path, "POST /shutdown");
 
     logger.info("Daemon recovery test passed");

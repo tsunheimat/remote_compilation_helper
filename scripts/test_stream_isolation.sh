@@ -207,19 +207,55 @@ log ""
 # =============================================================================
 log "TEST 6: Piped output detection"
 
-# Check the real pipeline statuses. A missing daemon is an expected status
-# error, but a broken pipe consumer or any other CLI failure still fails.
+# Use a known absent socket and fresh state. Earlier scenarios can record local
+# fallback incidents, which legitimately add a typed error context to status.
+# Keep both native renderings valid without admitting unrelated CLI failures.
+PIPE_FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rch-stream-pipe-XXXXXX")"
+PIPE_FIXTURE_DIR="$(cd "$PIPE_FIXTURE_DIR" && pwd -P)"
+mkdir -p "$PIPE_FIXTURE_DIR/config" "$PIPE_FIXTURE_DIR/state" "$PIPE_FIXTURE_DIR/cache" "$PIPE_FIXTURE_DIR/data"
+PIPE_SOCKET="$PIPE_FIXTURE_DIR/absent.sock"
+PIPE_EXPECTED_ERROR="Daemon socket not found at $PIPE_SOCKET"
+PIPE_CAPTURE_PARENT="$(dirname "${RCH_E2E_LOG:-$PROJECT_ROOT/target/test-logs/test_stream_isolation.jsonl}")"
+mkdir -p "$PIPE_CAPTURE_PARENT"
+PIPE_CAPTURE_DIR="$(mktemp -d "$PIPE_CAPTURE_PARENT/stream-pipe-XXXXXX")"
+PIPE_ENV=(env -u RCH_JSON -u RCH_OUTPUT_FORMAT -u TOON_DEFAULT_FORMAT -u FORCE_COLOR -u RCH_HOOK_MODE
+    "RCH_CONFIG_DIR=$PIPE_FIXTURE_DIR/config" "RCH_SOCKET_PATH=$PIPE_SOCKET"
+    "RCH_STATE_HOME=$PIPE_FIXTURE_DIR/state/rch" "XDG_STATE_HOME=$PIPE_FIXTURE_DIR/state"
+    "XDG_CACHE_HOME=$PIPE_FIXTURE_DIR/cache" "XDG_DATA_HOME=$PIPE_FIXTURE_DIR/data")
+
 set +e
-"$RCH" status 2>"$STDERR_FILE" | tee "$STDOUT_FILE" | wc -l >/dev/null
+"${PIPE_ENV[@]}" "$RCH" status 2>"$PIPE_CAPTURE_DIR/status.stderr" \
+    | tee "$PIPE_CAPTURE_DIR/status.stdout" | wc -l >"$PIPE_CAPTURE_DIR/status.lines"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
-[[ "${pipeline_status[1]}" == 0 && "${pipeline_status[2]}" == 0 ]] \
-    || fail "Piped output consumer failed"
-if [[ "${pipeline_status[0]}" != 0 ]]; then
-    [[ "${pipeline_status[0]}" == 1 && ! -s "$STDOUT_FILE" ]] \
-        && grep -Eq '^Error: Daemon socket not found at /' "$STDERR_FILE" \
-        || fail "Unexpected status failure in the pipe"
+PIPE_JSON_EXIT=0
+"${PIPE_ENV[@]}" "$RCH" status --json >"$PIPE_CAPTURE_DIR/status.json" \
+    2>"$PIPE_CAPTURE_DIR/status-json.stderr" || PIPE_JSON_EXIT=$?
+jq -nc --arg socket "$PIPE_SOCKET" --arg expected "$PIPE_EXPECTED_ERROR" \
+    --argjson status "${pipeline_status[0]}" --argjson tee "${pipeline_status[1]}" \
+    --argjson wc "${pipeline_status[2]}" --argjson json_exit "$PIPE_JSON_EXIT" \
+    '{socket:$socket,expected_error:$expected,pipe_status:[$status,$tee,$wc],json_exit:$json_exit}' \
+    >"$PIPE_CAPTURE_DIR/receipt.json"
+log_json verify "Piped status captures retained" \
+    "$(jq -nc --arg directory "$PIPE_CAPTURE_DIR" '{directory:$directory}')"
+
+[[ "${pipeline_status[0]}" == 1 && "${pipeline_status[1]}" == 0 && "${pipeline_status[2]}" == 0 ]] \
+    || fail "Expected missing-daemon exit 1 and successful pipe consumers"
+[[ ! -s "$PIPE_CAPTURE_DIR/status.stdout" ]] || fail "Missing-daemon status wrote to stdout"
+[[ "$PIPE_JSON_EXIT" == 1 ]] \
+    && jq -se --arg expected "$PIPE_EXPECTED_ERROR" \
+        'length == 1 and (.[0] | .success == false and .error.details == $expected
+            and (.error.code == "RCH-E504" or (.error.code == "RCH-E500"
+                and (.error.context.local_build_warning | type == "string" and length > 0))))' \
+        "$PIPE_CAPTURE_DIR/status.json" >/dev/null \
+    || fail "Piped status did not identify the exact missing fixture socket"
+PIPE_EXPECTED_STDERR="Error: $PIPE_EXPECTED_ERROR"
+if [[ "$(jq -r '.error.code' "$PIPE_CAPTURE_DIR/status.json")" == RCH-E500 ]]; then
+    PIPE_EXPECTED_STDERR="Error: [RCH-E500] Failed to connect to daemon socket: $PIPE_EXPECTED_ERROR: $PIPE_EXPECTED_ERROR"
 fi
+grep -Fxq "$PIPE_EXPECTED_STDERR" "$PIPE_CAPTURE_DIR/status.stderr" \
+    && ! grep -Fq $'\033' "$PIPE_CAPTURE_DIR/status.stderr" \
+    || fail "Expected the native plain missing-socket diagnostic on stderr"
 
 pass "Piped output works correctly"
 log ""

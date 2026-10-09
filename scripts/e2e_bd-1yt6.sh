@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-1yt6.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_bd-1yt6.jsonl}"
 TARGET_DIR="/tmp/rch-bd-1yt6-target"
 
 timestamp() {
@@ -23,11 +23,12 @@ timestamp() {
 log_json() {
     local phase="$1"
     local message="$2"
-    local extra="${3:-{}}"
+    local extra="${3:-}"
+    [[ -n "$extra" ]] || extra='{}'
     local ts
     ts="$(timestamp)"
-    printf '{"ts":"%s","test":"bd-1yt6","phase":"%s","message":"%s",%s}\n' \
-        "$ts" "$phase" "$message" "${extra#\{}" | sed 's/,}$/}/' | tee -a "$LOG_FILE"
+    jq -nc --arg ts "$ts" --arg phase "$phase" --arg message "$message" --argjson extra "$extra" \
+        '{ts:$ts,test:"bd-1yt6",phase:$phase,message:$message} + $extra' | tee -a "$LOG_FILE"
 }
 
 die() {
@@ -54,6 +55,7 @@ main() {
     : > "$LOG_FILE"
     require_cmd rch
     require_cmd cargo
+    require_cmd jq
 
     mkdir -p "${PROJECT_ROOT}/target"
     log_json "setup" "Starting cancellation reliability E2E sweep" "{\"target_dir\":\"${TARGET_DIR}\"}"

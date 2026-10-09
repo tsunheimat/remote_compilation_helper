@@ -167,9 +167,9 @@ run_hook() {
     # Check for RCH interception:
     # - "updatedInput" means RCH ran remotely and replaced the command (transparent interception)
     # - "permissionDecision":"deny" means blocked (legacy, still used for actual denials)
-    if /bin/grep -q '"updatedInput"' "$hook_out"; then
+    if command grep -q '"updatedInput"' "$hook_out"; then
         echo "intercepted"  # RCH handled it remotely
-    elif /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
+    elif command grep -q '"permissionDecision":"deny"' "$hook_out"; then
         echo "deny"  # Blocked
     else
         echo "allow"  # Pass-through to local

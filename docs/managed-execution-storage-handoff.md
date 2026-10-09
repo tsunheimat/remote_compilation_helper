@@ -3,7 +3,9 @@
 Snapshot: 2026-10-09 UTC, local development continuation. Consumer: the draft PR
 reviewer and the user's next local session. The user requested continued
 development and said they will deploy later. Keep PR #2 draft. Deployment and
-live worker/Nexus acceptance remain with the user.
+live worker/Nexus acceptance remain with the user. Windows-specific repair and
+validation are deferred following the user's request to consider skipping
+Windows support; existing Windows jobs have not been disabled.
 
 ## Checkout and validation state
 
@@ -15,6 +17,8 @@ live worker/Nexus acceptance remain with the user.
 - Incoming code commit: `1536190314d72b55aef3b1cd80245b3c93673bb1`
 - Incoming code tree: `50665b2330f0b8c11ba2056cc0a2661f7012e69b`
 - Published development checkpoint: `f207c5bff554361111c56ddc51e7cc260302cb8a`
+- Published main integration: `a67ece95362fe06da6b3cbc8aacf2547a147330c`
+- Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 
 The primary `main` checkout and the published checkpoint worktree were preserved.
@@ -38,6 +42,116 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Current fixture repairs and local evidence
+
+The post-integration changes repair test and logging boundaries; executable
+production Rust remains identical to `a67ece95`. The CAS publication fixture now
+registers the known domains when reopening its store, matching coordinator boot.
+Quarantine tests require the native refusal and unchanged durable snapshot when
+an ordinary serving update attempts to erase quarantine. They retain the
+subsequent blocked-renewal assertion against the unchanged revision.
+
+Real-Cargo conformance now observes both supported build-directory layouts and
+keys the actual environment used for relocated execution. June's original
+fixture passed one case and failed two; both June and August now pass all three.
+The byte-mutation, dependency-key, and unkeyed-environment refusal checks remain.
+The build-script E2E fixture reads Cargo's reported `OUT_DIR`, requires exactly
+one build-script event, and checks the generated file's original content.
+Daemon recovery closes restart admission and checks the idle lease snapshot
+before requesting shutdown; its exit, socket-removal, and restart assertions
+retain their existing budgets.
+
+Shell repairs replace seven platform-specific `grep` paths, collect and encode
+four scenario logs correctly, and verify the exact absent socket in both native
+status-error renderings. Stream checks still require status exit 1, successful
+pipe consumers, empty stdout, and the corresponding plain stderr diagnostic.
+The retry script now executes the hook rewrite, requires new durable remote
+completions, and measures one baseline sync attempt and three transient-case
+attempts: two failures followed by success. Its old selector ran zero tests;
+the corrected selector runs four positive/negative transport cases, followed by
+eight retry-configuration cases. The positive-count guard rejects the old
+zero-test selector with exit 1.
+
+The final JSONL audit also found one malformed quoted-hook event in two copies
+of the same log. The shared logger now uses JSON encoding for strings and helper
+data, preserves failure/skip statuses, and rejects malformed caller data.
+Paired native-function probes preserve quotes, backslashes, newlines, tabs,
+terminal metadata, and failure/skip reasons. Its clock uses the existing
+portable helpers; the old implementation returned a nonnumeric value under a
+BSD-shaped `date` probe, while the repaired helper returns numeric milliseconds.
+
+| Current local check | Result and scope |
+| --- | --- |
+| Workspace/all-target/all-feature check, Clippy with `-D warnings`, formatting | Passed after all five Rust fixture repairs; later changes are Bash/documentation only |
+| Full CAS library, all features | 311 passed, 0 failed, 1 hardware-dependent reflink test ignored |
+| Real-Cargo conformance | 3/3 on both `nightly-2026-06-06` and `nightly-2026-08-31`; Clippy and formatting also passed on both |
+| Feature-gated `true_e2e` | 164 reported passes; 92 explicitly return early without live-worker setup, leaving 72 exercised cases |
+| Frozen 41-script collection | All 41 outer scripts returned success after retained launcher/locale corrections; the subsequent output audit found the retry selector and shared logger defects described above |
+| Aggregate after the shared logger repair | 11 child scripts passed, 0 failed, 2 explicit opt-in skips; all 33 Cargo test invocations selected positive counts |
+| Repaired retry script | Passed with exact 1/3 sync-attempt counts, two new remote completion receipts, force-local admission, and 4 + 8 actual unit cases |
+| Shared logger boundary probes | Passed exact data roundtrips and malformed-data rejection; failure remains exit 1 and skip remains exit 4 |
+| Full workspace test execution and current-patch full CI | Pending; none of the selected checks is an exhaustive workspace or release result |
+
+The frozen collection records 173 actual Cargo calls, including 63 test
+invocations: 62 selected positive counts and the old zero-count retry invocation
+that the later repair replaces. The first 24 binary-only scripts have a shared
+phase binary snapshot; the Cargo-backed scripts have per-case binary receipts.
+Real Cargo builds legitimately changed debug binary bytes during the collection.
+The CLI/daemon versions still identify 2.1.16 at `a67ece95`; each result is bound
+to its source snapshot and recorded binary variant, not one supposedly unchanged
+binary. The genuine release CLI is separately hashed and is not a debug alias.
+
+Retained collection evidence is in `/var/tmp/rch-a67-full41-gmzr5k/`, especially
+`full41-reconciliation.json`, `final-native-binaries.json`, and the two frozen
+source manifests covering 1,390 files. Retry and logger before/after evidence is
+in `/var/tmp/rch-x1ek-final-gUrUDu/report/`. Initial failures remain: the launcher
+omitted the debug binary path and Git trust setting, and its stripped environment
+lacked a Unicode locale. The unchanged icon binary went from 24 passed/6 failed
+to 30 library passes with only `LANG=C.UTF-8` added. The full UI rerun includes
+31 icon matches, 49 context matches, and 10 theme matches. Self-test reports five
+Rust selections but exercises two; three real-worker selections explicitly skip.
+Missing Bun, macOS launchd, real workers, and optional cargo-hakari capability
+checks remain distinct from exercised checks. No operator storage was cleaned.
+
+The final aggregate rerun is retained in
+`/var/tmp/rch-aggregate-logger-final-k8hxuzac/`. It preserves all 13 child logs and
+parses 49 JSONL files containing 11,593 copied records with zero malformed
+records; the quoted hook message decodes to the exact native delegated command.
+Its 120 actual Cargo calls include 33 successful positive-count test invocations
+and 74 non-test `metadata --locked` probes returning 101 on fixture
+lockfile/manifest cases. Those probe statuses are retained separately. Executable
+and test-source hashes matched before/after; documentation is not a runtime input
+to that bounded rerun.
+
+The unchanged UBS scanner's last seven-file supplement passed with 0 critical,
+8 warning, and 34 informational records; bounded added-line review found only
+intentional assertions, a fixture JSON parser, and route literals misread as
+division. The retry-script and shared-logger supplements then passed with zero
+findings, bringing current hash-bound coverage to 100 distinct inputs. These
+supplements do not erase the earlier raw exit 1 or the 20 reviewed baseline
+critical expressions. Remaining warnings are not exhaustively cleared, and no
+all-scope UBS pass is claimed. Scanner commands, authorization, UTC times,
+unchanged scanner/input hashes, and combined coverage manifests are retained
+under `target/managed-storage-validation-20261009/ubs-*-report-approved.*/`.
+
+## Published integration CI (`a67ece95`)
+
+All runs below are terminal. They tested the integration before the fixture
+repairs above, so local repairs do not turn these failed runs into passes.
+
+| Workflow | Observed result |
+| --- | --- |
+| [CI 37912525698](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37912525698) | Check, format, workflow/manifest guards, security, docs, and benchmark jobs passed. June Clippy failed on the inherited range loop; Linux x64 reported 308 CAS passes/3 failures/1 ignore. Both defects are repaired locally above. Linux ARM, both macOS jobs, and coverage reached their unchanged 30-minute limits; their required collection/gates are incomplete. Core E2E and release build were skipped. |
+| [E2E 37912525685](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37912525685) | Ubuntu: 40 outer scripts passed, 1 failed at stream TEST6. The original stderr was not retained, so its exact historical prefix is unproven. macOS failed `bd-1vzb` because `/bin/grep` was absent, then hit the unchanged one-hour limit during `bd-2m7j` after a 31m34s release build. Remaining macOS scripts did not complete. |
+| [Test Release 37912525784](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37912525784) | All five Unix build/version/package/upload jobs passed. Downloaded artifact ZIP digests, original tar checksums, and flat three-binary inventories were independently verified. Windows compilation failed on an inherited unresolved helper import at `rch/src/update/mod.rs:318`; Windows work is deferred. Aggregate verification was skipped. |
+| [RABS 37912525782](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37912525782) | Accepted-hit protocol passed. Release compilation stopped after an explicit runner shutdown and exit 143; the shutdown cause is unknown. Size, replay, worktree, doctor, and overhead gates did not run. |
+| [Rsync transport 37912525705](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37912525705) | Both jobs passed, including real rsync transport checks. |
+
+Full logs, GitHub job metadata, annotations, archive digests, and bounded source
+triage are in `target/managed-storage-integration-validation-20261009/ci-a67ece95362f/`.
+No timeout was increased and no job/assertion was disabled to admit this patch.
+New source publication must receive its own CI record. Keep the PR draft.
 
 ## Integrated storage and archive repairs
 
@@ -384,18 +498,19 @@ not resolve it. An earlier retry behaved similarly. There is no established
 OOM diagnosis and no evidence from the unrun release gates. Preserve logs and
 investigate the host/cancellation event separately from assertion failures.
 
-## Suggested next local session
+## Remaining acceptance
 
-1. Read the instructions and inspect the branch. Keep all existing work.
-2. Fix the small rustdoc and checksum-path defects, then address the runtime
-   policy failures with source-level ownership analysis.
-3. Run targeted feature and policy checks; resolve the watchdog discrepancy on
-   a host with a consistent PID/proc view. Inspect E2E artifacts before reruns.
-4. Repair E2E binary preparation and failure propagation, then reproduce failing
-   scenarios individually. Broaden validation once concrete failures are fixed.
-5. Establish privileged Linux mount success, live SSH, and Nexus behavior in the
-   user's environment before claiming those capabilities verified. Keep draft
-   status until the necessary checks pass at a named revision.
+1. Inspect the current branch and preserve existing work. Read the current PR
+   checks and source-bound receipts before repeating any historical failure.
+2. Complete full workspace/coverage and current-source CI. Preserve the original
+   gates and report timeout, capability skip, runner shutdown, and assertion
+   failure separately. The old rustdoc, checksum, runtime-policy, watchdog,
+   binary-preparation, and failure-propagation defects above are already repaired.
+3. Validate deployment, real SSH, and Nexus behavior in the user's environment
+   when the user is ready. Privileged Linux mounting and native cancellation
+   already passed locally; they do not prove acceptance on an operator's worker.
+4. Leave Windows-specific repair deferred and keep PR #2 draft while required
+   acceptance remains open. Existing Windows build failures remain visible.
 
 Toolchain drift matters: `rust-toolchain.toml` pins `nightly-2026-08-31`, while
 main CI and Test Release explicitly set `RUSTUP_TOOLCHAIN=nightly-2026-06-06`.
@@ -403,7 +518,8 @@ The standalone E2E workflow installs June nightly without that override; RABS
 relies on the checkout's toolchain. Record the actual toolchain for each result.
 Do not silently change pins just to obtain a pass.
 
-Examples for the next local session; none were executed for this handoff:
+Commands from the incoming handoff, retained as historical reproduction
+examples; use the current revision and receipts when choosing a new run:
 
 ```bash
 # Reproduce the main CI policy and docs failures using its explicit toolchain.

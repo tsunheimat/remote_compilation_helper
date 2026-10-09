@@ -354,14 +354,14 @@ check_artifacts_real() {
 
 check_artifacts_mock() {
     local hook_err="$1"
-    /bin/grep -Eq 'Mock artifact retrieval complete: [1-9][0-9]* files, [1-9][0-9]* bytes' "$hook_err" \
+    command grep -Eq 'Mock artifact retrieval complete: [1-9][0-9]* files, [1-9][0-9]* bytes' "$hook_err" \
         && jq -e '.timing.sync_down != null and .timing.sync_down > 0' \
             "${hook_err%.exec.err}.exec.json" >/dev/null
 }
 
 check_artifacts_mock_failure() {
     local hook_err="$1"
-    /bin/grep -Fq 'Mock artifact retrieval failed' "$hook_err"
+    command grep -Fq 'Mock artifact retrieval failed' "$hook_err"
 }
 
 run_scenario() {
