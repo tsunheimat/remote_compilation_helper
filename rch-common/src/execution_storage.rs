@@ -177,7 +177,21 @@ if [ "$mode" = private_mount ]; then
 fi
 cleanup='d=$1; [ ! -L "$d" ] && [ -d "$d" ] && [ -f "$d/.rch-lease" ] && [ ! -L "$d/.rch-lease" ] || exit 1
     [ "$(cat "$d/.rch-owner")" = rch-execution-storage-v1 ] || exit 1
-    flock -xn "$d/.rch-lease" rm -rf -- "$d"'
+    # Open the same lease inode through a temporary link OUTSIDE the job.
+    # NFS may retain an unlinked open dentry as .nfs* until its last FD closes;
+    # holding the original path open would prevent removal of the job itself.
+    retired=$(mktemp "${d%/*}/.rch-reaping-XXXXXXXXXX") || exit 1
+    if ! rm -f -- "$retired" || ! ln -- "$d/.rch-lease" "$retired"; then exit 1; fi
+    exec 9<>"$retired" || { rm -f -- "$retired"; exit 1; }
+    rm -f -- "$retired" || exit 1
+    flock -xn 9 || exit 1
+    # Another cleaner may have removed this job after we opened its lease.
+    # Never use that old inode to authorize cleanup of a reused pathname.
+    [ "$d/.rch-lease" -ef /dev/fd/9 ] || exit 1
+    [ "$(cat "$d/.rch-owner")" = rch-execution-storage-v1 ] || exit 1
+    # Keep the original lease and owner intact until deletion begins, so a
+    # killed cleaner does not strand a live directory without lease evidence.
+    rm -rf -- "$d"'
 if [ "$minutes" -gt 0 ]; then
     find "$base" -mindepth 1 -maxdepth 1 -type d -name 'rch-job-*' -mmin +"$minutes" \
         -exec sh -c "$cleanup" rch-tmp-gc '{}' \; || exit 125

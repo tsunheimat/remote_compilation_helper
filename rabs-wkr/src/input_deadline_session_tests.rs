@@ -1,6 +1,7 @@
 //! Input liveness through the production session driver and a real native
 //! current-thread runtime. The fragmenting byte peer replaces transport only;
 //! the managed shell fixture does not claim TLS or canonical-namespace proof.
+#![cfg(test)]
 #![cfg(target_os = "linux")]
 
 use super::*;

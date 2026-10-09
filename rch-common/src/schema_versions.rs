@@ -29,7 +29,7 @@
 //! - PATCH: serialization-order change or doc-only change affecting
 //!   golden tests
 //!
-//! When you bump, ALSO update [`tests::test_schema_versions_match_snapshot`].
+//! When you bump, ALSO update `tests::test_schema_versions_match_snapshot`.
 //! Reviewers see the snapshot delta and confirm the rationale.
 
 use serde::{Deserialize, Serialize};

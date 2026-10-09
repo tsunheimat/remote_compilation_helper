@@ -5,14 +5,14 @@
 # Verifies:
 # - Custom remote_base can be configured in project config
 # - remote_base is validated (absolute path, no traversal)
-# - Default remote_base is /tmp/rch
+# - Default remote_base is /data/tmp/rch
 # - Output is logged in JSONL format
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-zp4j.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_bd-zp4j.jsonl}"
 
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -50,7 +50,7 @@ check_dependencies() {
 }
 
 build_rch() {
-    local rch_bin="${PROJECT_ROOT}/target/debug/rch"
+    local rch_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch"
     if [[ -x "$rch_bin" ]]; then
         log_json "setup" "Using existing rch binary" "{\"path\":\"$rch_bin\"}" >&2
         echo "$rch_bin"
@@ -75,10 +75,13 @@ EOF
 read_remote_base() {
     local rch_bin="$1"
     local project_dir="$2"
-    (cd "$project_dir" && "$rch_bin" config show --json 2>/dev/null) | jq -r '.data.transfer.remote_base'
+    local stderr_file="${3:-$project_dir/config-show.stderr}"
+    (cd "$project_dir" && "$rch_bin" config show --json 2>"$stderr_file") \
+        | jq -er '.data.transfer.remote_base | select(type == "string" and length > 0)'
 }
 
 main() {
+    mkdir -p "$(dirname "$LOG_FILE")"
     : > "$LOG_FILE"
     check_dependencies
     local rch_bin
@@ -86,6 +89,8 @@ main() {
 
     local tmp_root
     tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/rch-remote-base-XXXXXX")"
+    mkdir -p "$tmp_root/config"
+    export RCH_CONFIG_DIR="$tmp_root/config"
     # Intentionally do not auto-delete temp dirs (avoid destructive rm -rf patterns).
 
     local project_default="$tmp_root/project-default"
@@ -97,11 +102,11 @@ main() {
     log_json "setup" "Created test projects" "{\"root\":\"$tmp_root\"}"
 
     # Test 1: Default remote_base
-    log_json "test" "Default remote_base is /tmp/rch"
+    log_json "test" "Default remote_base is /data/tmp/rch"
     local default_base
     default_base="$(read_remote_base "$rch_bin" "$project_default")"
-    if [[ "$default_base" != "/tmp/rch" ]]; then
-        die "Expected default remote_base /tmp/rch, got: $default_base"
+    if [[ "$default_base" != "/data/tmp/rch" ]]; then
+        die "Expected default remote_base /data/tmp/rch, got: $default_base"
     fi
     log_json "verify" "Default remote_base ok" "{\"remote_base\":\"$default_base\"}"
 
@@ -130,28 +135,38 @@ main() {
     write_project_config "$project_custom" "/var/rch-builds/"
     local normalized_base
     normalized_base="$(read_remote_base "$rch_bin" "$project_custom")"
-    if [[ "$normalized_base" == "/var/rch-builds/" ]]; then
-        die "Expected trailing slash to be removed, got: $normalized_base"
+    if [[ "$normalized_base" != "/var/rch-builds" ]]; then
+        die "Expected normalized remote_base /var/rch-builds, got: $normalized_base"
     fi
     log_json "verify" "Trailing slash normalized" "{\"remote_base\":\"$normalized_base\"}"
 
-    # Test 5: Invalid relative path (should warn and may fall back to default or keep invalid)
+    # Test 5: A rejected relative project path retains the default.
     log_json "test" "Relative path validation"
     write_project_config "$project_invalid" "relative/path"
     local invalid_base
-    # Note: Invalid paths may be rejected by validation. Check stderr for warnings.
-    invalid_base="$(read_remote_base "$rch_bin" "$project_invalid" 2>/dev/null || echo "error")"
-    # The validation may either reject and use default, or warn and use anyway
-    # We just verify it doesn't crash
-    log_json "verify" "Relative path handled" "{\"remote_base\":\"$invalid_base\",\"note\":\"may be rejected or warned\"}"
+    local relative_stderr="$project_invalid/relative.stderr"
+    invalid_base="$(read_remote_base "$rch_bin" "$project_invalid" "$relative_stderr")" \
+        || die "Relative path validation command failed (stderr: $relative_stderr)"
+    [[ "$invalid_base" == "$default_base" ]] \
+        || die "Rejected relative path must retain $default_base, got: $invalid_base (stderr: $relative_stderr)"
+    log_json "verify" "Relative path rejected; default retained" \
+        "{\"remote_base\":\"$invalid_base\",\"stderr_path\":\"$relative_stderr\"}"
 
-    # Test 6: Path traversal rejection
+    # Test 6: A rejected traversal path retains an accepted user-level path.
     log_json "test" "Path traversal rejection"
     write_project_config "$project_invalid" "/tmp/../etc/rch"
+    cat > "$RCH_CONFIG_DIR/config.toml" <<'EOF'
+[transfer]
+remote_base = "/var/rch-user-builds"
+EOF
     local traversal_base
-    traversal_base="$(read_remote_base "$rch_bin" "$project_invalid" 2>/dev/null || echo "error")"
-    # Path traversal should be rejected
-    log_json "verify" "Path traversal handled" "{\"remote_base\":\"$traversal_base\",\"note\":\"should reject path traversal\"}"
+    local traversal_stderr="$project_invalid/traversal.stderr"
+    traversal_base="$(read_remote_base "$rch_bin" "$project_invalid" "$traversal_stderr")" \
+        || die "Traversal validation command failed (stderr: $traversal_stderr)"
+    [[ "$traversal_base" == "/var/rch-user-builds" ]] \
+        || die "Rejected traversal path must retain /var/rch-user-builds, got: $traversal_base (stderr: $traversal_stderr)"
+    log_json "verify" "Traversal rejected; accepted user path retained" \
+        "{\"remote_base\":\"$traversal_base\",\"stderr_path\":\"$traversal_stderr\"}"
 
     log_json "summary" "All bd-zp4j checks passed" '{"result":"pass","tests_run":6}'
 }

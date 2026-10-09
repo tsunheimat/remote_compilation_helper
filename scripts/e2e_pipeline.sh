@@ -24,7 +24,8 @@
 #
 # Notes:
 # - Mock mode uses RCH_MOCK_SSH=1 and does NOT create real artifacts.
-# - For mock runs we validate that the artifact phase executed via hook logs.
+# - The hook rewrite is executed through rch exec; mock runs assert its result,
+#   transfer diagnostics, and daemon ownership without compiling locally.
 #
 
 set -euo pipefail
@@ -45,6 +46,8 @@ VERBOSE="${RCH_E2E_VERBOSE:-0}"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/test_lib.sh"
 init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
+# shellcheck source=lib/e2e_common.sh
+source "$SCRIPT_DIR/lib/e2e_common.sh"
 
 timestamp() { date -u '+%Y-%m-%dT%H:%M:%S.%3NZ'; }
 
@@ -99,13 +102,17 @@ parse_args() {
 
 check_dependencies() {
     log "INFO" "SETUP" "Checking dependencies..."
-    for cmd in cargo rustc; do
+    for cmd in cargo rustc jq; do
         command -v "$cmd" >/dev/null 2>&1 || die "Missing: $cmd"
     done
     log "INFO" "SETUP" "Dependencies OK"
 }
 
 build_binaries() {
+    if [[ -x "$RCH_TARGET_DIR/debug/rch" && -x "$RCH_TARGET_DIR/debug/rchd" ]]; then
+        log "INFO" "BUILD" "Using existing rch + rchd: $RCH_TARGET_DIR/debug"
+        return 0
+    fi
     log "INFO" "BUILD" "Building rch + rchd (debug)..."
     cd "$PROJECT_ROOT"
     cargo build -p rch -p rchd >/dev/null 2>&1 || die "Build failed"
@@ -116,9 +123,47 @@ build_binaries() {
 
 make_test_project() {
     TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rch-e2e-XXXXXX")"
+    TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
     PROJECT_DIR="$TEST_ROOT/project"
     LOG_DIR="$TEST_ROOT/logs"
+    RUNTIME_DIR="$(e2e_runtime_dir)"
     mkdir -p "$PROJECT_DIR/src" "$LOG_DIR"
+    mkdir -p "$TEST_ROOT/config" "$TEST_ROOT/bin" "$TEST_ROOT/cache" "$TEST_ROOT/state"
+    cat >"$TEST_ROOT/config/config.toml" <<EOF
+[path_topology]
+canonical_root = "$TEST_ROOT"
+alias_root = "${TEST_ROOT}__alias"
+
+[output]
+visibility = "verbose"
+first_run_complete = true
+EOF
+    export RCH_CONFIG_DIR="$TEST_ROOT/config"
+    export XDG_CACHE_HOME="$TEST_ROOT/cache"
+    export XDG_STATE_HOME="$TEST_ROOT/state"
+    export XDG_DATA_HOME="$TEST_ROOT/data"
+
+    # Local fallback must be observable without accidentally starting a real
+    # compilation. Metadata still comes from Cargo for the actual fixture tree.
+    export RCH_E2E_REAL_CARGO
+    RCH_E2E_REAL_CARGO="$(command -v cargo)"
+    export RCH_E2E_METADATA_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-}"
+    cat >"$TEST_ROOT/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == +* ]]; then shift; fi
+case "${1:-}" in
+    metadata|locate-project|--version|-V)
+        if [[ -n "${RCH_E2E_METADATA_TOOLCHAIN:-}" ]]; then
+            exec env RUSTUP_TOOLCHAIN="$RCH_E2E_METADATA_TOOLCHAIN" "$RCH_E2E_REAL_CARGO" "$@"
+        fi
+        exec env -u RUSTUP_TOOLCHAIN "$RCH_E2E_REAL_CARGO" "$@"
+        ;;
+esac
+printf 'RCH E2E local Cargo fixture: %s\n' "$*" >&2
+printf '%s\n' "$*" >>"$RCH_E2E_LOCAL_MARKER"
+exit 79
+EOF
+    chmod +x "$TEST_ROOT/bin/cargo"
 
     cat >"$PROJECT_DIR/Cargo.toml" <<'EOF'
 [package]
@@ -134,6 +179,9 @@ fn main() {
     println!("rch e2e ok");
 }
 EOF
+    CARGO_HOME="$TEST_ROOT/cargo-home" "$RCH_E2E_REAL_CARGO" metadata --manifest-path "$PROJECT_DIR/Cargo.toml" \
+        --format-version 1 --no-deps >"$LOG_DIR/fixture-metadata.json" \
+        || die "Fixture Cargo metadata preparation failed"
 
     log "INFO" "SETUP" "Test project: $PROJECT_DIR"
     log "INFO" "SETUP" "Logs: $LOG_DIR"
@@ -185,19 +233,19 @@ EOF
 }
 
 start_daemon() {
-    SOCKET_PATH="$TEST_ROOT/rch.sock"
-    DAEMON_LOG="$LOG_DIR/rchd.log"
+    SOCKET_PATH="$RUNTIME_DIR/${1:-default}.sock"
+    DAEMON_LOG="$LOG_DIR/rchd_${1:-default}.log"
 
     log "INFO" "DAEMON" "Starting rchd (socket: $SOCKET_PATH)"
     if [[ "$MODE" == "mock" ]]; then
-        env RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
+        env RCH_DAEMON_INSTALLS_HOOKS=0 RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
             "$RCH_TARGET_DIR/debug/rchd" \
             --socket "$SOCKET_PATH" \
             --workers-config "$WORKERS_FILE" \
             --foreground \
             >>"$DAEMON_LOG" 2>&1 &
     else
-        "$RCH_TARGET_DIR/debug/rchd" \
+        RCH_DAEMON_INSTALLS_HOOKS=0 "$RCH_TARGET_DIR/debug/rchd" \
             --socket "$SOCKET_PATH" \
             --workers-config "$WORKERS_FILE" \
             --foreground \
@@ -221,89 +269,82 @@ stop_daemon() {
     if [[ -n "${RCHD_PID:-}" ]]; then
         log "INFO" "DAEMON" "Stopping rchd (pid: $RCHD_PID)"
         kill "$RCHD_PID" >/dev/null 2>&1 || true
+        wait "$RCHD_PID" >/dev/null 2>&1 || true
+        RCHD_PID=""
     fi
 }
 
-hook_json() {
-    cat <<'JSON'
-{
-  "tool_name": "Bash",
-  "tool_input": {
-    "command": "cargo build",
-    "description": "rch e2e build"
-  }
-}
-JSON
-}
-
-# Hook JSON with toolchain specification for toolchain sync tests
-hook_json_with_toolchain() {
-    local toolchain="${1:-nightly-2024-01-15}"
-    cat <<JSON
-{
-  "tool_name": "Bash",
-  "tool_input": {
-    "command": "cargo build",
-    "description": "rch e2e build with toolchain",
-    "toolchain": "$toolchain"
-  }
-}
-JSON
-}
-
-run_hook() {
-    local scenario="$1"; shift
-    local hook_out="$LOG_DIR/hook_${scenario}.out"
-    local hook_err="$LOG_DIR/hook_${scenario}.err"
-    local env_args=("$@")
-
-    log "INFO" "HOOK" "Running hook ($scenario)" >&2
-    (
-        cd "$PROJECT_DIR"
-        printf '%s\n' "$(hook_json)" | \
-            env RCH_SOCKET_PATH="$SOCKET_PATH" "${env_args[@]}" \
-            "$RCH_TARGET_DIR/debug/rch" >"$hook_out" 2>"$hook_err"
-    )
-
-    # Check for RCH interception:
-    # - "updatedInput" means RCH ran remotely and replaced the command (transparent interception)
-    # - "permissionDecision":"deny" means blocked (legacy, still used for actual denials)
-    if /bin/grep -q '"updatedInput"' "$hook_out"; then
-        echo "intercepted"  # RCH handled it remotely
-    elif /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"  # Blocked
-    else
-        echo "allow"  # Pass-through to local
+run_pipeline_command() {
+    local scenario="$1" command="$2" expect="$3" fail="$4"
+    shift 4
+    stop_daemon
+    start_daemon "$scenario"
+    local prefix="$LOG_DIR/$scenario" marker="$LOG_DIR/$scenario.local-cargo"
+    local require_remote=1 expected_exit=0 expected_location="remote" expected_outcome="completed"
+    if [[ "$expect" == "allow" ]]; then
+        require_remote=0
+        expected_exit=79
+        expected_location="local"
     fi
-}
+    case "$fail" in
+        artifacts) expected_exit=102 ;;
+        remote-exit) expected_exit=2 ;;
+        exec|worker-down)
+            # Once execution may have started, uncertainty retains ownership
+            # and refuses replay, including local replay.
+            expected_exit=1
+            expected_location="remote"
+            expected_outcome="transport_error"
+            ;;
+    esac
 
-# Run hook with toolchain specification (for toolchain sync tests)
-run_hook_with_toolchain() {
-    local scenario="$1"
-    local toolchain="$2"
-    shift 2
-    local hook_out="$LOG_DIR/hook_${scenario}.out"
-    local hook_err="$LOG_DIR/hook_${scenario}.err"
-    local env_args=("$@")
+    log "INFO" "HOOK" "Executing hook rewrite ($scenario)"
+    e2e_run_delegated "$RCH_TARGET_DIR/debug/rch" "$PROJECT_DIR" "$command" "$prefix" \
+        "PATH=$TEST_ROOT/bin:$RCH_TARGET_DIR/debug:$PATH" \
+        "CARGO_HOME=$TEST_ROOT/cargo-home" \
+        "RCH_CONFIG_DIR=$TEST_ROOT/config" "RCH_E2E_REAL_CARGO=$RCH_E2E_REAL_CARGO" \
+        "RCH_E2E_METADATA_TOOLCHAIN=$RCH_E2E_METADATA_TOOLCHAIN" \
+        "RCH_E2E_LOCAL_MARKER=$marker" "RCH_SOCKET_PATH=$SOCKET_PATH" \
+        "RCH_REQUIRE_REMOTE=$require_remote" "$@" \
+        || die "$scenario did not produce an executable hook rewrite; see $prefix.hook.json"
 
-    log "INFO" "HOOK" "Running hook with toolchain ($scenario, tc=$toolchain)" >&2
-    (
-        cd "$PROJECT_DIR"
-        printf '%s\n' "$(hook_json_with_toolchain "$toolchain")" | \
-            env RCH_SOCKET_PATH="$SOCKET_PATH" "${env_args[@]}" \
-            "$RCH_TARGET_DIR/debug/rch" >"$hook_out" 2>"$hook_err"
-    )
-
-    # Check for RCH interception:
-    # - "updatedInput" means RCH ran remotely and replaced the command (transparent interception)
-    # - "permissionDecision":"deny" means blocked (legacy, still used for actual denials)
-    if /bin/grep -q '"updatedInput"' "$hook_out"; then
-        echo "intercepted"  # RCH handled it remotely
-    elif /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"  # Blocked
-    else
-        echo "allow"  # Pass-through to local
+    if [[ "$E2E_EXEC_EXIT" -ne "$expected_exit" ]] || ! jq -e \
+        --arg location "$expected_location" --arg outcome "$expected_outcome" \
+        --argjson code "$expected_exit" \
+        '.location == $location and .outcome == $outcome and
+         (if $outcome == "completed" then .remote_exit_code == $code else .remote_exit_code == null end)' \
+        "$prefix.exec.json" >/dev/null; then
+        log "FAIL" "SCENARIO" "$scenario expected $expected_location/$expected_outcome exit $expected_exit, got exit $E2E_EXEC_EXIT (see $prefix.exec.json and .err)"
+        return 1
     fi
+    if [[ "$expected_location" == "local" ]]; then
+        [[ -s "$marker" ]] || die "$scenario did not execute the observable local fallback fixture"
+    elif [[ -e "$marker" ]]; then
+        die "$scenario unexpectedly replayed locally"
+    fi
+
+    RCH_SOCKET_PATH="$SOCKET_PATH" "$RCH_TARGET_DIR/debug/rch" status --json \
+        >"$prefix.status.json" 2>"$prefix.status.err" || die "$scenario status query failed"
+    local active_count=0
+    [[ "$fail" != "exec" && "$fail" != "worker-down" ]] || active_count=1
+    jq -e --argjson count "$active_count" \
+        '.success == true and (.data.daemon.active_builds | length) == $count' \
+        "$prefix.status.json" >/dev/null || die "$scenario daemon ownership does not match the execution outcome"
+
+    if [[ "$expected_location" == "remote" && "$expected_outcome" == "completed" ]]; then
+        jq -e --argjson code "$expected_exit" \
+            '.data.daemon.recent_builds[0].exit_code == $code' "$prefix.status.json" >/dev/null \
+            || die "$scenario durable completion did not record exit $expected_exit"
+    fi
+    if [[ "$MODE" == "mock" && -z "$fail" ]]; then
+        check_artifacts_mock "$prefix.exec.err" || die "$scenario artifact retrieval phase missing"
+    elif [[ "$MODE" == "mock" && "$fail" == "artifacts" ]]; then
+        check_artifacts_mock_failure "$prefix.exec.err" || die "$scenario artifact retrieval failure missing"
+        grep -q 'RCH-E309' "$prefix.exec.err" || die "$scenario artifact failure lost its error code"
+    elif [[ "$MODE" == "real" && "$expected_exit" == 0 ]]; then
+        check_artifacts_real || die "$scenario did not retrieve the real binary"
+    fi
+    log "INFO" "SCENARIO" "$scenario OK ($expected_location/$expected_outcome exit $expected_exit)"
 }
 
 check_artifacts_real() {
@@ -313,34 +354,14 @@ check_artifacts_real() {
 
 check_artifacts_mock() {
     local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    /bin/grep -q "Artifacts retrieved" "$hook_err" || /bin/grep -q "Artifacts retrieved" "$hook_out"
+    /bin/grep -Eq 'Mock artifact retrieval complete: [1-9][0-9]* files, [1-9][0-9]* bytes' "$hook_err" \
+        && jq -e '.timing.sync_down != null and .timing.sync_down > 0' \
+            "${hook_err%.exec.err}.exec.json" >/dev/null
 }
 
 check_artifacts_mock_failure() {
     local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    /bin/grep -q "Failed to retrieve artifacts" "$hook_err" || \
-        /bin/grep -q "Failed to retrieve artifacts" "$hook_out"
-}
-
-# Check that toolchain failure was logged with decision path
-check_toolchain_failure_logged() {
-    local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    # Look for toolchain-related log messages
-    /bin/grep -qi "toolchain" "$hook_err" || \
-        /bin/grep -qi "toolchain" "$hook_out" || \
-        /bin/grep -qi "rustup" "$hook_err" || \
-        /bin/grep -qi "rustup" "$hook_out"
-}
-
-# Check that no-rustup fallback was logged
-check_no_rustup_logged() {
-    local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    /bin/grep -qi "rustup not available\|no rustup\|Continuing with default" "$hook_err" || \
-        /bin/grep -qi "rustup not available\|no rustup\|Continuing with default" "$hook_out"
+    /bin/grep -Fq 'Mock artifact retrieval failed' "$hook_err"
 }
 
 run_scenario() {
@@ -366,51 +387,7 @@ run_scenario() {
         *) die "Unknown failure mode: $fail" ;;
     esac
 
-    local result
-    result="$(run_hook "$scenario" "${envs[@]}")"
-
-    if [[ "$result" != "$expect" ]]; then
-        log "FAIL" "SCENARIO" "$scenario expected $expect, got $result"
-        return 1
-    fi
-
-    if [[ "$MODE" == "real" && "$expect" == "intercepted" && "$fail" != "artifacts" ]]; then
-        if check_artifacts_real; then
-            log "INFO" "ARTIFACTS" "$scenario artifacts present"
-        else
-            log "FAIL" "ARTIFACTS" "$scenario artifacts missing"
-            return 1
-        fi
-    fi
-
-    if [[ "$MODE" == "mock" && "$expect" == "intercepted" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" && "$fail" != "remote-exit" && "$fail" != "toolchain-install" && "$fail" != "no-rustup" ]]; then
-        if [[ "$fail" == "artifacts" ]]; then
-            if check_artifacts_mock_failure "$LOG_DIR/hook_${scenario}.err"; then
-                log "INFO" "ARTIFACTS" "$scenario artifact failure logged"
-            else
-                log "FAIL" "ARTIFACTS" "$scenario artifact failure missing"
-                return 1
-            fi
-        else
-            if check_artifacts_mock "$LOG_DIR/hook_${scenario}.err"; then
-                log "INFO" "ARTIFACTS" "$scenario artifact phase logged"
-            else
-                log "FAIL" "ARTIFACTS" "$scenario artifact phase missing"
-                return 1
-            fi
-        fi
-    fi
-
-    # Toolchain-specific checks (allow fallback expected)
-    if [[ "$MODE" == "mock" && "$fail" == "toolchain-install" ]]; then
-        log "INFO" "TOOLCHAIN" "$scenario: toolchain install failure triggered local fallback"
-    fi
-
-    if [[ "$MODE" == "mock" && "$fail" == "no-rustup" ]]; then
-        log "INFO" "TOOLCHAIN" "$scenario: no-rustup triggered local fallback"
-    fi
-
-    log "INFO" "SCENARIO" "$scenario OK"
+    run_pipeline_command "$scenario" "cargo build" "$expect" "$fail" "${envs[@]}"
 }
 
 # Run a scenario with explicit toolchain specification
@@ -432,35 +409,9 @@ run_toolchain_scenario() {
         *) die "Unknown toolchain failure mode: $fail" ;;
     esac
 
-    local result
-    result="$(run_hook_with_toolchain "$scenario" "$toolchain" "${envs[@]}")"
-
-    if [[ "$result" != "$expect" ]]; then
-        log "FAIL" "TOOLCHAIN" "$scenario expected $expect, got $result"
-        return 1
-    fi
-
-    # Verify decision path logging
-    local hook_err="$LOG_DIR/hook_${scenario}.err"
-    local hook_out="$LOG_DIR/hook_${scenario}.out"
-
-    if [[ "$fail" == "toolchain-install" ]]; then
-        if check_toolchain_failure_logged "$hook_err"; then
-            log "INFO" "TOOLCHAIN" "$scenario: toolchain failure properly logged"
-        else
-            log "WARN" "TOOLCHAIN" "$scenario: toolchain failure not explicitly logged (may be hidden)"
-        fi
-    fi
-
-    if [[ "$fail" == "no-rustup" ]]; then
-        if check_no_rustup_logged "$hook_err"; then
-            log "INFO" "TOOLCHAIN" "$scenario: no-rustup properly logged"
-        else
-            log "WARN" "TOOLCHAIN" "$scenario: no-rustup not explicitly logged (may be hidden)"
-        fi
-    fi
-
-    log "INFO" "TOOLCHAIN" "$scenario OK (tc=$toolchain)"
+    run_pipeline_command "$scenario" "cargo +$toolchain build" "$expect" "$fail" "${envs[@]}"
+    grep -qiE 'toolchain|rustup' "$LOG_DIR/$scenario.exec.err" \
+        || die "$scenario lost its toolchain failure diagnostics"
 }
 
 run_e2e() {
@@ -530,8 +481,6 @@ main() {
     build_binaries
     make_test_project
     write_workers_config
-    start_daemon
-
     trap '_test_lib_cleanup; stop_daemon' EXIT
 
     if [[ "$MODE" == "mock" ]]; then

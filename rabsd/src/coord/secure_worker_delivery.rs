@@ -560,6 +560,14 @@ impl<'a, S> RecordPeer<'a, S> {
     }
 
     fn remaining(&self) -> io::Result<Duration> {
+        // Every synchronous transport entry, including cancellation and lease
+        // traffic, reaches this check before driving the borrowed runtime.
+        // Keep the boundary enforced even if a future caller moves into a task.
+        if asupersync::cx::Cx::current().is_some() {
+            return Err(invalid(
+                "worker transport requires a blocking owner outside the runtime",
+            ));
+        }
         if self.failed {
             return Err(invalid("worker connection failed; no retry"));
         }
@@ -2107,6 +2115,38 @@ mod tests {
         ) -> std::task::Poll<io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    #[test]
+    fn native_record_refuses_nested_runtime_before_reading_or_writing() {
+        let runtime = Arc::new(
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(),
+        );
+        let handle = runtime.handle();
+        let borrowed = Arc::clone(&runtime);
+        runtime.block_on(async move {
+            handle
+                .spawn(async move {
+                    assert!(asupersync::cx::Cx::current().is_some());
+                    let mut peer = RecordPeer::new(
+                        &borrowed,
+                        RecordWire::new(b"{}\n".to_vec(), 64),
+                        &request(),
+                    );
+                    for error in [
+                        peer.send(&json!({"kind":"worker-auth"})).unwrap_err(),
+                        peer.receive().unwrap_err(),
+                    ] {
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                        assert!(error.to_string().contains("outside the runtime"));
+                    }
+                    assert_eq!(peer.stream.reads, 0);
+                    assert!(peer.stream.written.is_empty());
+                })
+                .await;
+        });
     }
 
     #[cfg(unix)]

@@ -803,7 +803,7 @@ fn validate_action_destinations(outputs: &[PlannedActionOutput]) -> Result<(), M
 /// Ordering contract: every [`OutputRole::ProvisionalMetadata`] output
 /// is fetched, byte-verified, freshness-stamped while private, and
 /// atomically renamed into place BEFORE any other output begins. Within each
-/// phase the order is deterministic ([`planned_order_key`]). Every installed
+/// phase the order is deterministic (`planned_order_key`). Every installed
 /// file carries the SAME freshness timestamp captured once at call
 /// start, so the bundle is coherent from Cargo's mtime-sensitive
 /// freshness view (risk R6: incoherent hit mtimes cause rebuild storms

@@ -31,7 +31,7 @@
 //! - **The observation.** A network attempt inside a default-deny hermetic
 //!   action is recorded as the observation fact it is
 //!   ([`denied_attempt_observation`]) and classifies
-//!   [`EffectClass::NetworkSensitive`] — never `Hermetic`.
+//!   [`rabs_protocol::volatility::EffectClass::NetworkSensitive`] — never `Hermetic`.
 //!
 //! Attempt DETECTION (the syscall tracer that notices an attempted
 //! connect) is E005/E009 scope; this module fixes the shape of the fact
@@ -1016,8 +1016,8 @@ pub fn boundary_isolation_evidence(boundary: &NamespaceBoundary) -> IsolationEvi
 /// no route — so the fact is recorded with complete coverage of the
 /// network axis. Classification through
 /// [`rabs_protocol::volatility::classify`] is therefore
-/// [`EffectClass::NetworkSensitive`]: one denied attempt makes the action
-/// network-sensitive for shareability purposes, never silently `Hermetic`.
+/// [`rabs_protocol::volatility::EffectClass::NetworkSensitive`]: one denied attempt
+/// makes the action network-sensitive for shareability purposes, never silently `Hermetic`.
 #[must_use]
 pub fn denied_attempt_observation() -> ObservedEffects {
     ObservedEffects {

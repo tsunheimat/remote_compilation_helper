@@ -135,7 +135,10 @@ jobs:
           tar -czf "dist/rch-${TAG}-${{ matrix.target }}.tar.gz" \
             -C "$PWD/target/${{ matrix.target }}/wrapper-release" rch \
             -C "$PWD/target/${{ matrix.target }}/daemon-release" rchd rch-wkr
-          ${{ matrix.checksum_cmd }} "dist/rch-${TAG}-${{ matrix.target }}.tar.gz" > "dist/rch-${TAG}-${{ matrix.target }}.tar.gz.sha256"
+          (
+            cd dist
+            ${{ matrix.checksum_cmd }} "rch-${TAG}-${{ matrix.target }}.tar.gz" > "rch-${TAG}-${{ matrix.target }}.tar.gz.sha256"
+          )
 
       - name: Package (windows)
         if: runner.os == 'Windows'

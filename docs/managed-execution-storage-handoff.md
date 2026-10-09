@@ -1,29 +1,25 @@
 # Managed execution storage: local Codex handoff
 
-Snapshot: 2026-10-09 UTC. Consumer: the user's next local Codex session.
-The feature remains open; this document preserves the implementation and failed
-validation evidence across the session transfer. Replace this snapshot when a
-new validated handoff supersedes it; do not delete files without permission.
+Snapshot: 2026-10-09 UTC, local development continuation. Consumer: the draft PR
+reviewer and the user's next local session. The user requested continued
+development and said they will deploy later. Keep PR #2 draft. Deployment and
+live worker/Nexus acceptance remain with the user.
 
-## Stop state and checkout
-
-The user requested: stop the job, push the work, and hand off to local Codex.
-Development and CI retries are stopped. At handoff, all 31 workflow runs returned
-for this branch were completed; none needed cancellation. No local builds,
-tests, formatting commands, or validation scripts were run after the earlier
-CI-only instruction. The commands below are for the next local session only.
+## Checkout and validation state
 
 - Repository: <https://github.com/tsunheimat/remote_compilation_helper>
 - Branch: `feat/managed-execution-storage`
 - Draft PR: <https://github.com/tsunheimat/remote_compilation_helper/pull/2>
 - Base: `main`, `35375c21719a22c9039c816c143fc09f3aed770b`
-- Last code commit: `1536190314d72b55aef3b1cd80245b3c93673bb1`
-- Code tree: `50665b2330f0b8c11ba2056cc0a2661f7012e69b`
+- Incoming feature head: `7f68c5dc12caffae49d0860bf3c19e72e7c58a65`
+- Incoming code commit: `1536190314d72b55aef3b1cd80245b3c93673bb1`
+- Incoming code tree: `50665b2330f0b8c11ba2056cc0a2661f7012e69b`
+- Local worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
 
-All implementation commits were already pushed and the working tree was clean
-before this document. The handoff commit changes only this document and uses
-`[skip ci]`. Keep PR #2 draft; it is not ready to merge. The final CI results
-below supersede the earlier in-progress PR status text.
+The repairs described below are included with this development snapshot. The
+primary `main` checkout was preserved. Full workspace testing was still running
+when this snapshot was prepared; there is no new all-green CI or merge-readiness
+claim. The incoming CI failures are retained below as historical evidence.
 
 For a fresh local checkout:
 
@@ -36,8 +32,111 @@ git log -8 --oneline
 
 For an existing checkout, inspect its changes before fetching/switching. Preserve
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
-`/data/projects/AGENTS.md` if present locally. The latter, `br`, and UBS were not
-available in the hosted environment. No Beads issues were closed by this handoff.
+`/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
+in this environment. No Beads issues have been closed.
+
+## Local repairs and evidence
+
+The storage cleanup now holds the lease through a temporary hard link outside
+the job directory. This avoids NFS retaining an open `.nfs*` entry inside a job
+being removed. Cleanup still requires the exclusive lease, original inode, and
+owner marker; active descendants retain their scratch. Required worker tools
+and filesystem support are documented in `docs/guides/configuration.md`.
+
+The runtime policy retains the existing owned-thread architecture, as selected
+after the user delegated that decision. The daemon and its joined executor
+threads can own separate runtimes. Synchronous transport entry rejects an active
+Asupersync context before I/O. The static gate scans all 345 RABS source files as
+Rust syntax, excludes explicit test-only bodies, and pins each reviewed entry to
+its function and exact construction/entry counts. Comments and string literals
+are no longer mistaken for calls. Async entries, unreviewed calls, opaque macro
+entries, and stale allowance counts remain failures. This establishes the
+reviewed ownership and no-reentrancy boundaries, not one runtime per process.
+
+Additional reproduced defects were repaired:
+
+- Effective configuration overlays now validate/normalize `remote_base`, retain
+  a valid lower-priority value after a rejected override, and agree with source
+  inspection. Cache schema 5 invalidates the earlier unvalidated merges.
+- Explicit unknown worker probes and failed daemon reloads now return nonzero
+  status with one error response. Successful empty all-worker probes and reloads
+  retain their successful status. Human error diagnostics go to stderr.
+- Mock toolchain preflight uses the same mock transport as health monitoring,
+  executes the real preflight command, and preserves failure classifications.
+- E2E checks execute the hook's actual delegated command, inspect native
+  envelopes and exit codes, verify output bytes/transfer behavior, and require
+  positive executed-test counts for named Cargo selections. A failed fixture
+  directory change now prevents hook/exec invocation in the caller's directory.
+- CI prepares the debug binaries required by `true_e2e` and propagates its
+  failure through `tee`. Unix package checksums name the downloaded archive
+  basename. Rustdoc links and literal markup were repaired without suppressing
+  warnings or changing item visibility.
+
+Local results use `nightly-2026-08-31` (rustc 1.100.0-nightly, `908501772`),
+default debug profiles, and CLI Git dependency transport. Targeted compilation
+used two jobs. Broader compilation uses one job after the shared host's `/tmp`
+tmpfs filled. Isolated mount namespaces bind fresh retained NFS fixtures onto
+`/tmp` and drop back to the normal user for tests; operator files are untouched.
+
+| Check | Result at this snapshot |
+| --- | --- |
+| Workspace, all-target, all-feature check | Passed |
+| Workspace, all-target, all-feature Clippy, `-D warnings` | Passed before subsequent doc-comment-only repairs |
+| Formatting and whitespace checks | Passed |
+| Workspace/all-feature/no-dependency documentation, warnings denied | Passed after all reported markup repairs |
+| RCH `managed_` tests | 35 passed, including the original watchdog status assertion of 137 |
+| Shared execution storage | 6 passed on NFS; the private-mount case also passed separately with privileges and required actual mounted execution |
+| Unchanged full-stderr watchdog regression | Passed with its original assertion |
+| Runtime policy | 6 passed; the incoming gate had one pass and two failures |
+| Native transport reentry refusal | Passed inside an actual runtime context, with zero reads/writes |
+| Remote-base tests | 6 passed |
+| Worker probe CLI filter | 3 passed |
+| Reload CLI matrix | 1 test passed across 12 real CLI/socket cases |
+| Mock preflight | 1 test passed across 6 isolated child-process cases |
+| Self-healing | 9 native cases passed, including cooldown and recovery ownership checks |
+| Pipeline / output / project sync | 13 / 15 / 14 cases passed again after the cwd guard fix, with mock SSH and native local rsync fixtures |
+| Installer | 44 assertions passed across 15 cases; one macOS launchd capability skip; native fixture installs/uninstalls ran in a private `/tmp` namespace |
+| API envelopes / API error codes / error experience / saved-time | All four scripts passed; error experience exercised 90 UI unit tests, saved-time exercised 7 unit tests |
+| Full workspace test collection | In progress, `cargo test --locked --workspace --no-fail-fast` |
+| Feature-gated `true_e2e`, aggregate `e2e_test`, full 41-script runner, release gates | Pending broader execution |
+
+Bun preparation passed its executable-independent cases; four cases requiring
+a working Bun runtime were not run. Installer launchd behavior needs macOS.
+The source-sync and pipeline fixtures do not establish live SSH or Nexus
+acceptance. Local Linux results do not establish Windows/macOS results or parity
+with CI's explicit June nightly.
+
+Logs are retained under `target/managed-storage-validation-20261009/`, including
+failed attempts. The host `/tmp` exhaustion prevented the first API-script
+attempts from opening logs; those attempts are retained and the scripts passed
+after isolated reruns. No operator storage was cleaned to obtain a pass.
+
+### UBS result and bounded triage
+
+The user explicitly authorized cleanup of newly generated UBS scratch. Official
+UBS v5.4.33 at `89d5f354005a0d1a679b56fe31d65d44d184878a` ran unmodified on 51
+changed Rust/Bash files. Its final result is **exit 1**, with 6 critical, 3,817
+warning, and 1,350 informational records. This is not a passing scanner result.
+
+Source triage found that all six critical expressions are unchanged in the
+incoming HEAD: one public trust-scope enum comparison, the managed executable
+selection primitive, two test-only generated GC-script executions, a test-only
+shim executable, and the fixed PowerShell/pwsh selection loop. The reported
+heuristics do not demonstrate vulnerabilities at these reviewed sites. Other
+unchanged warnings were not exhaustively audited.
+
+UBS did find the new delegated-helper cwd bug. Its two warnings disappeared after
+the explicit directory guards were added; negative fixtures verify that neither
+phase runs from a missing initial directory, and execution stops if the directory
+moves after the hook. The same scanner bytes/options found no newly added records
+on rerun. No rule suppression or threshold changes were used.
+
+The retained `ubs-final-report-approved.AAeJdVPLu6/` and
+`ubs-report-approved.3tT9xgpDfi/` directories contain raw reports, source/HEAD
+triage, input hashes, commands, UTC times, and the cleanup authorization record.
+AST/ShellCheck tools were unavailable; Cargo/audit-related UBS phases were
+explicitly not evaluated, and TOML is unsupported. Compiler/lint/test evidence
+above is separate from UBS coverage.
 
 ## Implemented feature and boundaries
 
@@ -89,10 +188,11 @@ Windows recovery retains exact Unix path bytes, supports UTF-8 paths elsewhere,
 and leaves undecodable journal paths dirty without touching a lossy alias. Do
 not replace this with unsafe conversion or silently lossy filesystem access.
 
-## Final GitHub CI evidence at the last code commit
+## Incoming GitHub CI evidence (historical code `15361903`)
 
-These runs finished on 2026-10-08. The handoff is documentation only and has no
-new validation run. A skipped documentation commit must not be called green CI.
+These runs finished on 2026-10-08, before the local repairs above. The incoming
+handoff was documentation only. Neither it nor these old results establish CI
+success for the local continuation.
 
 | Workflow | Final result and evidence |
 | --- | --- |

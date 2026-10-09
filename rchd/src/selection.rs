@@ -18,6 +18,7 @@ use crate::metrics::{
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerPool, WorkerState};
 use rand::RngExt;
+use rch_common::mock::{self, MockConfig, MockSshClient};
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, CompilationKind, RequiredRuntime,
     SelectionConfig, SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
@@ -4143,10 +4144,20 @@ async fn probe_worker_toolchain(
         "rustup run {escaped_toolchain} rustc --version >/dev/null && rustup run {escaped_toolchain} cargo --version >/dev/null"
     );
 
-    // Pooled path: run over the warm shared ControlMaster (no per-probe master
-    // spawn/leak). The pool distinguishes connect failures internally, so map a
-    // pool error onto the same connect-failed reason string for callers.
-    let result = if let Some(pool) = ssh_pool {
+    // Match the health monitor's transport choice while executing the same
+    // preflight command and retaining its failure classifications.
+    let result = if mock::is_mock_enabled() {
+        let mut client = MockSshClient::new(worker_config, MockConfig::from_env());
+        client
+            .connect()
+            .await
+            .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))?;
+        let result = client.execute(&command).await;
+        let _ = client.disconnect().await;
+        result.map_err(|err| format!("toolchain_preflight_command_error:{err}"))
+    } else if let Some(pool) = ssh_pool {
+        // Run over the warm shared ControlMaster (no per-probe master
+        // spawn/leak). The pool distinguishes connect failures internally.
         pool.run_with_timeout(
             &worker_config,
             &command,
@@ -7086,6 +7097,98 @@ mod tests {
             .expect("expected worker to recover after explicit revalidation");
         assert_eq!(selected.config.read().await.id.as_str(), "flapping");
         assert_eq!(second.reason, SelectionReason::Success);
+    }
+
+    #[tokio::test]
+    async fn test_toolchain_preflight_mock_transport() {
+        const CASE_ENV: &str = "RCH_PREFLIGHT_TRANSPORT_TEST_CASE";
+        if let Ok(case) = std::env::var(CASE_ENV) {
+            let worker = make_worker("mock-preflight", 8, 95.0);
+            let ssh_pool = Arc::new(rch_common::SshPool::default());
+            let result =
+                probe_worker_toolchain(&worker, "nightly-2026-04-30", Some(&ssh_pool)).await;
+            match case.as_str() {
+                "success" => assert_eq!(result, Ok(())),
+                "connect" => assert!(
+                    result
+                        .unwrap_err()
+                        .starts_with("toolchain_preflight_connect_failed:")
+                ),
+                "execute" => assert!(
+                    result
+                        .unwrap_err()
+                        .starts_with("toolchain_preflight_command_error:")
+                ),
+                "rustup" => assert_eq!(
+                    result.unwrap_err(),
+                    "toolchain_preflight_command_failed:127:rustup: command not found"
+                ),
+                "install" => assert!(
+                    result
+                        .unwrap_err()
+                        .starts_with("toolchain_preflight_command_failed:1:error: toolchain")
+                ),
+                "nonzero" => assert_eq!(
+                    result.unwrap_err(),
+                    "toolchain_preflight_command_failed:43:missing cargo retry later"
+                ),
+                _ => panic!("Unknown preflight test case: {case}"),
+            }
+            let commands: Vec<_> = mock::global_ssh_invocations_snapshot()
+                .into_iter()
+                .filter_map(|invocation| invocation.command)
+                .collect();
+            if case == "connect" {
+                assert!(commands.is_empty());
+            } else {
+                assert_eq!(
+                    commands,
+                    [
+                        "rustup run nightly-2026-04-30 rustc --version >/dev/null && rustup run nightly-2026-04-30 cargo --version >/dev/null"
+                    ]
+                );
+            }
+            println!("mock preflight case exercised: {case}");
+            return;
+        }
+
+        // MockConfig overrides are process-global. Isolate each injected
+        // outcome from concurrent health tests instead of sharing that state.
+        for (case, variable, value) in [
+            ("success", "RCH_MOCK_SSH_EXIT_CODE", "0"),
+            ("connect", "RCH_MOCK_SSH_FAIL_CONNECT", "1"),
+            ("execute", "RCH_MOCK_SSH_FAIL_EXECUTE", "1"),
+            ("rustup", "RCH_MOCK_NO_RUSTUP", "1"),
+            ("install", "RCH_MOCK_TOOLCHAIN_INSTALL_FAIL", "1"),
+            ("nonzero", "RCH_MOCK_SSH_EXIT_CODE", "43"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "selection::tests::test_toolchain_preflight_mock_transport",
+                    "--nocapture",
+                ])
+                .env_remove("RCH_MOCK_SSH_FAIL_CONNECT")
+                .env_remove("RCH_MOCK_SSH_FAIL_EXECUTE")
+                .env_remove("RCH_MOCK_SSH_FAIL_CONNECT_ATTEMPTS")
+                .env_remove("RCH_MOCK_SSH_FAIL_EXECUTE_ATTEMPTS")
+                .env_remove("RCH_MOCK_NO_RUSTUP")
+                .env_remove("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL")
+                .env("RCH_MOCK_SSH", "1")
+                .env("RCH_MOCK_SSH_EXIT_CODE", "0")
+                .env("RCH_MOCK_SSH_DELAY_MS", "0")
+                .env("RCH_MOCK_SSH_STDERR", "missing cargo\nretry later")
+                .env(CASE_ENV, case)
+                .env(variable, value)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {output:?}");
+            assert!(
+                stdout.contains(&format!("mock preflight case exercised: {case}")),
+                "Child must execute the probe: {stdout}"
+            );
+        }
     }
 
     #[tokio::test]

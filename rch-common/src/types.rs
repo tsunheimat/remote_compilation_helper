@@ -740,7 +740,7 @@ pub struct BuildHeartbeatRequest {
     /// (phase transitions, new output, or richer progress signals).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_counter: Option<u64>,
-    /// Optional progress estimate in [0,100].
+    /// Optional progress estimate in `[0, 100]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_percent: Option<f64>,
 }

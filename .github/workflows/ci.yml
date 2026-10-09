@@ -206,6 +206,10 @@ jobs:
           cache-on-failure: true
       - name: Build release binaries
         run: cargo build --release
+      - name: Build debug binaries for cargo E2E harness
+        # The fail-open tests explicitly launch target/debug/rch and rchd;
+        # the shared harness also uses debug binaries in this test profile.
+        run: cargo build --locked -p rch -p rchd -p rch-wkr --bins
       - name: Run cargo-based E2E tests (feature-gated)
         env:
           RCH_MOCK_SSH: '1'
@@ -213,9 +217,10 @@ jobs:
           RCH_E2E_SKIP_WORKER_CHECK: '1'
           RCH_TEST_LOGGING: '1'
         run: |
+          set -o pipefail
           mkdir -p test-results/cargo-e2e
           # Run E2E tests via cargo test with true-e2e feature
-          cargo test --features true-e2e -p rch --test true_e2e -- --test-threads=1 2>&1 | tee test-results/cargo-e2e/output.log || true
+          cargo test --features true-e2e -p rch --test true_e2e -- --test-threads=1 2>&1 | tee test-results/cargo-e2e/output.log
       - name: Run shell-based E2E tests
         env:
           RCH_MOCK_SSH: '1'

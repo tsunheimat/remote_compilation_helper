@@ -120,7 +120,9 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 4;
+// v5 also invalidates merges produced before remote_base layer validation was
+// restored; those cache entries can contain an unnormalized or rejected path.
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -892,12 +894,24 @@ fn load_config_overlay(base: RchConfig, path: &Path) -> Result<RchConfig> {
     let mut overlay: toml::Value =
         toml::from_str(&content).with_context(|| format!("Failed to parse {:?}", path))?;
     canonicalize_config_aliases(&mut overlay);
+    let previous_remote_base = base.transfer.remote_base.clone();
     let mut merged =
         toml::Value::try_from(base).context("Failed to encode base RCH config as TOML")?;
     merge_toml_overlay(&mut merged, overlay);
-    merged
+    let mut config: RchConfig = merged
         .try_into()
-        .with_context(|| format!("Failed to decode merged config for {:?}", path))
+        .with_context(|| format!("Failed to decode merged config for {:?}", path))?;
+    // Match the validation and source attribution in apply_layer. A rejected
+    // project override must retain the accepted user value, not leak into the
+    // effective config while inspection claims the user value won.
+    match validate_remote_base(&config.transfer.remote_base) {
+        Ok(normalized) => config.transfer.remote_base = normalized,
+        Err(error) => {
+            warn!("Invalid remote_base in {}: {}", path.display(), error);
+            config.transfer.remote_base = previous_remote_base;
+        }
+    }
+    Ok(config)
 }
 
 fn canonicalize_config_aliases(value: &mut toml::Value) {
@@ -4166,6 +4180,63 @@ max_concurrent_workers = 3
         );
 
         info!("PASS: Tilde-based remote_base is expanded");
+    }
+
+    #[test]
+    fn test_overlay_remote_base_normalization_and_sources() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("user.toml");
+        let project = directory.path().join("project.toml");
+        std::fs::write(&user, "[transfer]\nremote_base = '/srv/rch-builds/'\n").unwrap();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), None, Some(&HashMap::new())).unwrap();
+        assert_eq!(loaded.config.transfer.remote_base, "/srv/rch-builds");
+
+        for rejected in ["relative/path", "/tmp/../etc/rch", "/", "/tmp"] {
+            std::fs::write(
+                &project,
+                format!("[transfer]\nremote_base = '{rejected}'\n"),
+            )
+            .unwrap();
+            let loaded = load_config_with_sources_from_paths(
+                Some(&user),
+                Some(&project),
+                Some(&HashMap::new()),
+            )
+            .unwrap();
+            let effective = load_config_uncached_from_paths(Some(&user), Some(&project)).unwrap();
+            assert_eq!(
+                effective.transfer.remote_base, "/srv/rch-builds",
+                "{rejected}"
+            );
+            assert_eq!(
+                loaded.config.transfer.remote_base,
+                effective.transfer.remote_base
+            );
+            assert_eq!(
+                loaded.sources["transfer.remote_base"],
+                ConfigValueSource::UserConfig(user.clone())
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::fs::write(&project, "[transfer]\nremote_base = '~/rch-builds/'\n").unwrap();
+            let loaded = load_config_with_sources_from_paths(
+                Some(&user),
+                Some(&project),
+                Some(&HashMap::new()),
+            )
+            .unwrap();
+            assert!(loaded.config.transfer.remote_base.starts_with('/'));
+            assert!(loaded.config.transfer.remote_base.ends_with("/rch-builds"));
+            assert!(!loaded.config.transfer.remote_base.contains('~'));
+            assert_eq!(
+                loaded.sources["transfer.remote_base"],
+                ConfigValueSource::ProjectConfig(project)
+            );
+        }
     }
 
     #[test]

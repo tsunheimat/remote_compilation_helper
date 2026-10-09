@@ -96,7 +96,8 @@ Use worker-side credential provisioning instead of committing secrets.
 
 Managed tmp creates a unique `rch-job-<UUID>/tmp` outside the source mirror,
 exports `TMPDIR`, `TMP` and `TEMP`, and inherits a lease into the existing RCH
-watchdog/process group. The worker needs `flock` and `find`. Cleanup after
+watchdog/process group. The worker needs `flock`, `find`, `mktemp`, hard-link
+support on the scratch filesystem, and the `/dev/fd` descriptor view. Cleanup after
 success or failure only removes that job directory after its lease is free;
 descendants retaining the inherited lease keep it. A killed supervisor or
 interrupted connection may leave the directory for the next age-and-lock

@@ -7,7 +7,7 @@
 # This is critical for:
 # - Agent JSON parsing
 # - Compiler output capture
-# - Pipeline composition (rch compile 2>/dev/null | jq)
+# - Pipeline composition (rch --json exec -- cargo build | jq)
 #
 # Implements bead: bd-2ans
 
@@ -50,13 +50,16 @@ log ""
 # =============================================================================
 # Build rch (or use existing binary)
 # =============================================================================
-RCH="${PROJECT_ROOT}/target/release/rch"
+RCH="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch"
+if [[ ! -x "$RCH" && -x "${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/release/rch" ]]; then
+    RCH="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/release/rch"
+fi
 
 if [[ -x "$RCH" ]]; then
     log "Using existing binary: $RCH"
 else
     log "Building rch..."
-    if ! cargo build -p rch --release 2>&1 | tail -10; then
+    if ! cargo build -p rch 2>&1 | tail -10; then
         log ""
         log "NOTE: Build failed. This may be due to rich_rust dependency issues."
         log "      To run these tests, either:"
@@ -76,7 +79,7 @@ log ""
 # Create temp files for stdout/stderr capture
 STDOUT_FILE="$(mktemp)"
 STDERR_FILE="$(mktemp)"
-trap '_test_lib_cleanup; rm -f "$STDOUT_FILE" "$STDERR_FILE"' EXIT
+trap '_test_lib_cleanup' EXIT
 
 # =============================================================================
 # TEST 1: rch status --json outputs ONLY to stdout
@@ -94,7 +97,7 @@ if [[ -n "$STDOUT_CONTENT" ]]; then
     fi
 
     # stdout must NOT contain ANSI codes
-    if echo "$STDOUT_CONTENT" | grep -qP '\x1b\['; then
+    if echo "$STDOUT_CONTENT" | grep -Fq $'\033['; then
         log "stdout content: $STDOUT_CONTENT"
         fail "stdout contains ANSI escape codes!"
     fi
@@ -120,7 +123,7 @@ if [[ -n "$STDOUT_CONTENT" ]]; then
         fail "hook stdout is not valid JSON"
     fi
 
-    if echo "$STDOUT_CONTENT" | grep -qP '\x1b\['; then
+    if echo "$STDOUT_CONTENT" | grep -Fq $'\033['; then
         log "hook stdout: $STDOUT_CONTENT"
         fail "hook stdout contains ANSI codes"
     fi
@@ -143,11 +146,11 @@ STDOUT_CONTENT=$(cat "$STDOUT_FILE")
 STDERR_CONTENT=$(cat "$STDERR_FILE")
 
 # Neither stdout nor stderr should have ANSI codes with NO_COLOR
-if echo "$STDOUT_CONTENT" | grep -qP '\x1b\['; then
+if echo "$STDOUT_CONTENT" | grep -Fq $'\033['; then
     fail "stdout has ANSI codes with NO_COLOR=1"
 fi
 
-if echo "$STDERR_CONTENT" | grep -qP '\x1b\['; then
+if echo "$STDERR_CONTENT" | grep -Fq $'\033['; then
     fail "stderr has ANSI codes with NO_COLOR=1"
 fi
 
@@ -169,7 +172,7 @@ if [[ -n "$STDOUT_CONTENT" ]]; then
         fail "workers list --json stdout not valid JSON"
     fi
 
-    if echo "$STDOUT_CONTENT" | grep -qP '\x1b\['; then
+    if echo "$STDOUT_CONTENT" | grep -Fq $'\033['; then
         fail "workers list --json stdout has ANSI codes"
     fi
 fi
@@ -191,7 +194,7 @@ if [[ -n "$STDOUT_CONTENT" ]]; then
         fail "config show --json stdout not valid JSON"
     fi
 
-    if echo "$STDOUT_CONTENT" | grep -qP '\x1b\['; then
+    if echo "$STDOUT_CONTENT" | grep -Fq $'\033['; then
         fail "config show --json stdout has ANSI codes"
     fi
 fi
@@ -204,11 +207,19 @@ log ""
 # =============================================================================
 log "TEST 6: Piped output detection"
 
-# When piped and not a TTY, output should be minimal
-"$RCH" status 2>&1 | {
-    # Just check we can process it through a pipe
-    wc -l > /dev/null
-}
+# Check the real pipeline statuses. A missing daemon is an expected status
+# error, but a broken pipe consumer or any other CLI failure still fails.
+set +e
+"$RCH" status 2>"$STDERR_FILE" | tee "$STDOUT_FILE" | wc -l >/dev/null
+pipeline_status=("${PIPESTATUS[@]}")
+set -e
+[[ "${pipeline_status[1]}" == 0 && "${pipeline_status[2]}" == 0 ]] \
+    || fail "Piped output consumer failed"
+if [[ "${pipeline_status[0]}" != 0 ]]; then
+    [[ "${pipeline_status[0]}" == 1 && ! -s "$STDOUT_FILE" ]] \
+        && grep -Eq '^Error: Daemon socket not found at /' "$STDERR_FILE" \
+        || fail "Unexpected status failure in the pipe"
+fi
 
 pass "Piped output works correctly"
 log ""
@@ -218,25 +229,26 @@ log ""
 # =============================================================================
 log "TEST 7: Multiple JSON commands pipeline"
 
-{
-    "$RCH" status --json 2>/dev/null || echo '{"status":"unknown"}'
-    echo  # Add newline separator
-    "$RCH" workers list --json 2>/dev/null || echo '[]'
-} | {
-    # Each line should be valid JSON
-    LINE_COUNT=0
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            if echo "$line" | jq -e . >/dev/null 2>&1; then
-                ((LINE_COUNT++))
-            fi
-        fi
-    done
-    if [[ $LINE_COUNT -lt 1 ]]; then
-        echo "Expected at least 1 valid JSON line, got $LINE_COUNT"
-        exit 1
+JSON_PIPELINE_FILE="$(mktemp)"
+for command_name in status workers; do
+    command_status=0
+    if [[ "$command_name" == workers ]]; then
+        "$RCH" workers list --json >"$STDOUT_FILE" 2>"$STDERR_FILE" || command_status=$?
+    else
+        "$RCH" status --json >"$STDOUT_FILE" 2>"$STDERR_FILE" || command_status=$?
     fi
-}
+    if [[ "$command_status" == 0 ]]; then
+        jq -e '.api_version and .timestamp and .success == true' "$STDOUT_FILE" >/dev/null \
+            || fail "$command_name did not emit a success envelope"
+    else
+        [[ "$command_name" == status && "$command_status" == 1 ]] \
+            && jq -e '.success == false and (.error.code | startswith("RCH-E"))' "$STDOUT_FILE" >/dev/null \
+            || fail "Unexpected $command_name JSON failure"
+    fi
+    jq -c . "$STDOUT_FILE" >>"$JSON_PIPELINE_FILE"
+done
+cat "$JSON_PIPELINE_FILE" | jq -se 'length == 2 and all(.[]; has("api_version") and has("success"))' >/dev/null \
+    || fail "Expected two complete JSON envelopes in the pipeline"
 
 pass "Multiple JSON commands can be pipelined"
 log ""
@@ -246,8 +258,9 @@ log ""
 # =============================================================================
 log "TEST 8: Error messages to stderr"
 
-# This should produce an error if daemon not running, which should go to stderr
-"$RCH" daemon status > "$STDOUT_FILE" 2> "$STDERR_FILE" || true
+# An unknown configured-worker request is an error independent of daemon state.
+ERROR_EXIT=0
+"$RCH" workers probe __rch_e2e_absent__ > "$STDOUT_FILE" 2> "$STDERR_FILE" || ERROR_EXIT=$?
 
 # stdout should be minimal for non-JSON commands
 STDOUT_SIZE=$(wc -c < "$STDOUT_FILE")
@@ -256,8 +269,12 @@ STDERR_SIZE=$(wc -c < "$STDERR_FILE")
 log "  stdout size: $STDOUT_SIZE bytes"
 log "  stderr size: $STDERR_SIZE bytes"
 
-# Errors should go to stderr, not stdout
-pass "Error output separation verified"
+if [[ "$ERROR_EXIT" == 1 && "$STDOUT_SIZE" -eq 0 && "$STDERR_SIZE" -gt 0 ]] \
+    && grep -q 'RCH-E' "$STDERR_FILE"; then
+    pass "Error output separation verified"
+else
+    fail "Expected error exit 1, an RCH error on stderr, and empty stdout"
+fi
 log ""
 
 # =============================================================================

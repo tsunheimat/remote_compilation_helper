@@ -6,14 +6,15 @@ set -euo pipefail
 # =============================================================================
 #
 # This script validates the mutually reinforcing self-healing behavior:
-# 1. Hook auto-starts daemon when unavailable
+# 1. Hook delegates to rch exec, which recovers an unavailable daemon
 # 2. Daemon auto-installs hooks on startup
 # 3. Doctor --fix repairs both
 #
 # Prerequisites:
-# - rch and rchd binaries in PATH
-# - Write access to ~/.claude/ and /tmp/
-# - No production daemon running (test uses isolated config)
+# - rch/rchd pair in CARGO_TARGET_DIR or PATH (RCH_BIN/RCHD_BIN override)
+# - jq, Python 3, nohup and ps
+# - Write access to /tmp/ (all HOME/config/runtime state is isolated)
+# - macOS: no registered com.rch.daemon launchd service
 #
 # Usage:
 #   ./tests/e2e/test_self_healing.sh [--verbose]
@@ -23,12 +24,28 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_HOME=$(mktemp -d)
-TEST_CONFIG_DIR="${TEST_HOME}/.config/rch"
-TEST_CLAUDE_DIR="${TEST_HOME}/.claude"
-TEST_SOCKET="/tmp/rch-test-$$.sock"
-LOG_FILE="${TEST_HOME}/test.log"
+TEST_ROOT=$(mktemp -d)
+TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
+TEST_RUNTIME_ROOT=$(mktemp -d /tmp/rch-healing.XXXXXX)
+TEST_RUNTIME_ROOT=$(cd "$TEST_RUNTIME_ROOT" && pwd -P)
+LOG_FILE="${TEST_ROOT}/test.log"
+TEST_BIN_DIR=""
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    TEST_BIN_DIR="$CARGO_TARGET_DIR/debug"
+    for profile in debug release; do
+        if [[ -x "$CARGO_TARGET_DIR/$profile/rch" && -x "$CARGO_TARGET_DIR/$profile/rchd" ]]; then
+            TEST_BIN_DIR="$CARGO_TARGET_DIR/$profile"
+            break
+        fi
+    done
+fi
+TEST_RCH_BIN="${RCH_BIN:-${TEST_BIN_DIR:+$TEST_BIN_DIR/rch}}"
+TEST_RCH_BIN="${TEST_RCH_BIN:-$(command -v rch || true)}"
+TEST_RCHD_BIN="${RCHD_BIN:-$(dirname "$TEST_RCH_BIN")/rchd}"
+TEST_NOHUP_BIN=$(command -v nohup || true)
+TEST_PYTHON_BIN="${RCH_E2E_PYTHON_BIN:-$(command -v python3 || true)}"
+TEST_CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+TEST_RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
 
 VERBOSE="${1:-}"
 PASSED=0
@@ -49,7 +66,8 @@ NC='\033[0m' # No Color
 log() {
     local level=$1
     shift
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S.%3N')
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo -e "[$timestamp] [$level] $*" | tee -a "$LOG_FILE"
 }
 
@@ -64,52 +82,234 @@ log_detail() { [[ "$VERBOSE" == "--verbose" ]] && log "DEBUG" "$*" || true; }
 # =============================================================================
 
 setup_test_env() {
-    log_info "Setting up isolated test environment..."
-    log_detail "TEST_HOME=$TEST_HOME"
+    local prerequisite
+    for prerequisite in jq ps; do
+        command -v "$prerequisite" >/dev/null || {
+            log_fail "Missing prerequisite: $prerequisite"
+            return 2
+        }
+    done
+    [[ -x "$TEST_RCH_BIN" && -x "$TEST_RCHD_BIN" && -x "$TEST_NOHUP_BIN" && -x "$TEST_PYTHON_BIN" ]] || {
+        log_fail "Need executable rch, rchd, nohup and python3; fixtures: $TEST_ROOT"
+        return 2
+    }
+    TEST_RCH_BIN=$(cd "$(dirname "$TEST_RCH_BIN")" && pwd -P)/$(basename "$TEST_RCH_BIN")
+    TEST_RCHD_BIN=$(cd "$(dirname "$TEST_RCHD_BIN")" && pwd -P)/$(basename "$TEST_RCHD_BIN")
+    # rch's recovery code prefers its sibling daemon over a PATH override.
+    [[ "$TEST_RCHD_BIN" == "$(dirname "$TEST_RCH_BIN")/rchd" ]] || {
+        log_fail "Use an rch/rchd pair from the same directory"
+        return 2
+    }
+    if [[ $(uname -s) == Darwin ]]; then
+        local services
+        services=$(/bin/launchctl list) || return 2
+        if [[ "$services" == *com.rch.daemon* ]]; then
+            log_fail "Registered com.rch.daemon prevents an isolated standalone test"
+            return 2
+        fi
+    fi
+    log_info "Fixtures and logs are retained at $TEST_ROOT"
+    log_info "Short socket and cooldown paths are retained at $TEST_RUNTIME_ROOT"
+    log_info "Using $TEST_RCH_BIN and $TEST_RCHD_BIN"
+}
 
-    mkdir -p "$TEST_CONFIG_DIR"
-    mkdir -p "$TEST_CLAUDE_DIR"
+setup_case() {
+    TEST_HOME="$CASE_ROOT/home"
+    TEST_CONFIG_DIR="$TEST_HOME/.config/rch"
+    TEST_CLAUDE_DIR="$TEST_HOME/.claude"
+    TEST_RUNTIME_DIR="$TEST_RUNTIME_ROOT/case-$TOTAL"
+    TEST_SOCKET="$TEST_RUNTIME_DIR/rch.sock"
+    TEST_PROJECT="$CASE_ROOT/project"
+    TEST_LAUNCHES="$CASE_ROOT/daemon-pids"
+    TEST_COOLDOWN="$TEST_RUNTIME_DIR/rch/hook_autostart.cooldown"
+    HOOK_ATTEMPT=0
+    EXEC_ATTEMPT=0
+    # Keep pathname sockets within sockaddr_un's platform limit even when
+    # inherited TMPDIR points at a long external build-storage path.
+    [[ ${#TEST_SOCKET} -lt 100 ]] || { log_fail "Fixture socket path is too long: $TEST_SOCKET"; return 2; }
+    mkdir -p "$TEST_CONFIG_DIR" "$TEST_CLAUDE_DIR" "$TEST_RUNTIME_DIR" "$CASE_ROOT/bin" "$TEST_PROJECT/src"
+    cat > "$CASE_ROOT/bin/nohup" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$1" = "$RCH_TEST_DAEMON_BIN" ] || { echo "unexpected nohup command" >&2; exit 2; }
+printf '%s\n' "$$" >> "$RCH_TEST_DAEMON_PIDS"
+exec "$RCH_TEST_NOHUP_BIN" "$@"
+EOF
+    chmod +x "$CASE_ROOT/bin/nohup"
+    cat > "$TEST_PROJECT/Cargo.toml" <<'EOF'
+[package]
+name = "self_healing_fixture"
+version = "0.1.0"
+edition = "2021"
+EOF
+    printf 'fn main() {}\n' > "$TEST_PROJECT/src/main.rs"
+    printf 'workers = []\n' > "$TEST_CONFIG_DIR/workers.toml"
+    CASE_ENV=(env)
+    local variable
+    while IFS= read -r variable; do
+        case "$variable" in
+            RCH_*|TOON_DEFAULT_FORMAT|RUST_LOG|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|NOTIFY_SOCKET)
+                CASE_ENV+=(-u "$variable") ;;
+        esac
+    done < <(compgen -e)
+    CASE_ENV+=(
+        "HOME=$TEST_HOME" "RCH_CONFIG_DIR=$TEST_CONFIG_DIR"
+        "XDG_CONFIG_HOME=$TEST_HOME/.config" "XDG_CACHE_HOME=$TEST_HOME/.cache"
+        "XDG_DATA_HOME=$TEST_HOME/.local/share" "XDG_STATE_HOME=$TEST_HOME/.local/state"
+        "XDG_RUNTIME_DIR=$TEST_RUNTIME_DIR"
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=$TEST_RUNTIME_DIR/no-session-bus"
+        "CARGO_HOME=$TEST_CARGO_HOME" "RUSTUP_HOME=$TEST_RUSTUP_HOME"
+        "CARGO_TARGET_DIR=$TEST_PROJECT/target" "NO_COLOR=1"
+        "PATH=$CASE_ROOT/bin:$(dirname "$TEST_RCH_BIN"):$PATH"
+        "RCH_REQUIRE_REMOTE=1" "RCH_TEST_DAEMON_BIN=$TEST_RCHD_BIN"
+        "RCH_TEST_DAEMON_PIDS=$TEST_LAUNCHES" "RCH_TEST_NOHUP_BIN=$TEST_NOHUP_BIN"
+    )
+    write_case_config true true 30
+}
 
-    # Create minimal config pointing to test socket
-    cat > "${TEST_CONFIG_DIR}/config.toml" <<EOF
+write_case_config() {
+    cat > "$TEST_CONFIG_DIR/config.toml" <<EOF
 [general]
-socket_path = "${TEST_SOCKET}"
+enabled = true
+force_local = false
+socket_path = "$TEST_SOCKET"
+
+[path_topology]
+canonical_root = "$CASE_ROOT"
+alias_root = "${CASE_ROOT}__alias_sentinel"
 
 [self_healing]
-hook_starts_daemon = true
-daemon_installs_hooks = true
+hook_starts_daemon = $1
+daemon_installs_hooks = $2
 auto_start_timeout_secs = 5
-auto_start_cooldown_secs = 5
+auto_start_cooldown_secs = $3
 EOF
-
-    export HOME="$TEST_HOME"
-    export RCH_CONFIG_DIR="$TEST_CONFIG_DIR"
-    export RCH_SOCKET_PATH="$TEST_SOCKET"
-
-    log_info "Test environment ready"
 }
 
-cleanup() {
-    log_info "Cleaning up test environment..."
-
-    # Stop any test daemon
-    if [[ -S "$TEST_SOCKET" ]]; then
-        log_detail "Stopping test daemon..."
-        rch daemon stop 2>/dev/null || true
-    fi
-
-    # Kill any stray rchd processes from this test
-    pkill -f "rchd.*${TEST_SOCKET}" 2>/dev/null || true
-
-    # Remove test directory
-    if [[ -d "$TEST_HOME" && "$TEST_HOME" == /tmp/* ]]; then
-        rm -rf "$TEST_HOME"
-    fi
-
-    log_info "Cleanup complete"
+bounded_run() {
+    "$TEST_PYTHON_BIN" -c '
+import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    print("self-healing command exceeded " + sys.argv[1] + " seconds", file=sys.stderr)
+    sys.exit(124)
+' "$@"
 }
 
-trap cleanup EXIT
+case_rch_for() {
+    local budget=$1
+    shift
+    (cd "$TEST_PROJECT" && bounded_run "$budget" "${CASE_ENV[@]}" "$TEST_RCH_BIN" "$@")
+}
+
+case_rch() {
+    case_rch_for 45 "$@"
+}
+
+daemon_pid() {
+    local report
+    report=$(mktemp "$CASE_ROOT/status.XXXXXX")
+    case_rch --json status > "$report" 2> "$report.stderr" || return 1
+    jq -ers --arg socket "$TEST_SOCKET" '
+        select(length == 1) | .[0]
+        | select(.success and .data.daemon.daemon.socket_path == $socket)
+        | .data.daemon.daemon.pid | select(type == "number" and . > 1)
+    ' "$report"
+}
+
+assert_owned_daemon() {
+    local pid launched
+    pid=$(daemon_pid) || return 1
+    [[ -f "$TEST_LAUNCHES" ]] || return 1
+    while IFS= read -r launched; do
+        [[ "$pid" == "$launched" ]] && return 0
+    done < "$TEST_LAUNCHES"
+    log_fail "Serving PID $pid was not a child launched by this fixture"
+    return 1
+}
+
+owned_daemon_alive() {
+    local command
+    command=$(ps -ww -p "$1" -o command= 2>/dev/null) || return 1
+    [[ "$command" == *"$TEST_RCHD_BIN"* && "$command" == *"$TEST_SOCKET"* ]]
+}
+
+stop_case_daemons() {
+    [[ -f "$TEST_LAUNCHES" ]] || return 0
+    local pid tick
+    while IFS= read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+        if owned_daemon_alive "$pid"; then
+            kill -TERM "$pid" || return 1
+            for ((tick = 0; tick < 100; tick++)); do
+                owned_daemon_alive "$pid" || break
+                sleep 0.1
+            done
+            if owned_daemon_alive "$pid"; then
+                log_fail "Owned daemon $pid did not stop; retained at $CASE_ROOT"
+                return 1
+            fi
+        fi
+    done < "$TEST_LAUNCHES"
+}
+
+finish_case() {
+    local status=$?
+    stop_case_daemons || status=1
+    exit "$status"
+}
+
+assert_no_live_daemon() {
+    local report
+    report=$(mktemp "$CASE_ROOT/daemon-status.XXXXXX")
+    case_rch --json daemon status > "$report"
+    jq -es --arg socket "$TEST_SOCKET" '
+        length == 1 and (.[0] | .success and (.data.running == false) and .data.socket_path == $socket)
+    ' "$report" >/dev/null
+}
+
+start_case_daemon() {
+    case_rch --json daemon start > "$CASE_ROOT/daemon-start.json"
+    jq -es 'length == 1 and (.[0] | .success and .data.success)' "$CASE_ROOT/daemon-start.json" >/dev/null
+    assert_owned_daemon
+}
+
+invoke_hook() {
+    HOOK_ATTEMPT=$((HOOK_ATTEMPT + 1))
+    local prefix="$CASE_ROOT/hook-$HOOK_ATTEMPT"
+    jq -n '{tool_name:"Bash",tool_input:{command:"cargo check"},session_id:"isolated-self-healing"}' > "$prefix.input.json"
+    case_rch_for "${1:-30}" < "$prefix.input.json" > "$prefix.output.json" 2> "$prefix.stderr"
+    DELEGATED_COMMAND=$(jq -ers '
+        select(length == 1) | .[0].hookSpecificOutput.updatedInput.command
+        | select(. == "rch exec -- cargo check")
+    ' "$prefix.output.json")
+}
+
+execute_delegated() {
+    EXEC_ATTEMPT=$((EXEC_ATTEMPT + 1))
+    local prefix="$CASE_ROOT/exec-$EXEC_ATTEMPT"
+    local status=0
+    (cd "$TEST_PROJECT" && bounded_run 30 "${CASE_ENV[@]}" bash -c "$DELEGATED_COMMAND") \
+        > "$prefix.stdout" 2> "$prefix.stderr" || status=$?
+    printf '%s\n' "$status" > "$prefix.status"
+    # The empty fleet must refuse remote-required work, never compile locally.
+    assert_eq 103 "$status" "Empty fleet should return the retryable remote-required refusal"
+    [[ ! -d "$TEST_PROJECT/target" ]]
+}
+
+assert_rch_hook() {
+    jq -e --arg executable "$TEST_RCH_BIN" '
+        [.hooks.PreToolUse[] | .hooks[]?
+            | select(.type == "command" and (.command == "rch" or .command == $executable))]
+        | length == 1
+    ' "$TEST_CLAUDE_DIR/settings.json" >/dev/null
+}
+
+run_case_doctor() {
+    case_rch --json doctor --fix "$@" > "$CASE_ROOT/doctor.json" 2> "$CASE_ROOT/doctor.stderr"
+    jq -es 'length == 1 and (.[0] | .success and .command == "doctor")' "$CASE_ROOT/doctor.json" >/dev/null
+}
 
 assert_eq() {
     local expected=$1
@@ -126,44 +326,6 @@ assert_eq() {
     fi
 }
 
-assert_file_exists() {
-    local file=$1
-    local msg=$2
-
-    if [[ -f "$file" ]]; then
-        return 0
-    else
-        log_fail "File not found: $file ($msg)"
-        return 1
-    fi
-}
-
-assert_socket_exists() {
-    local socket=$1
-    local msg=$2
-
-    if [[ -S "$socket" ]]; then
-        return 0
-    else
-        log_fail "Socket not found: $socket ($msg)"
-        return 1
-    fi
-}
-
-assert_contains() {
-    local haystack=$1
-    local needle=$2
-    local msg=$3
-
-    if [[ "$haystack" == *"$needle"* ]]; then
-        return 0
-    else
-        log_fail "String not found: '$needle' ($msg)"
-        log_detail "  In: $haystack"
-        return 1
-    fi
-}
-
 run_test() {
     local name=$1
     shift
@@ -171,15 +333,30 @@ run_test() {
 
     TOTAL=$((TOTAL + 1))
     log_test "Running: $name"
-
-    if $test_fn; then
+    CASE_ROOT="$TEST_ROOT/case-$TOTAL"
+    mkdir -p "$CASE_ROOT"
+    # A test in an `if` condition disables Bash errexit inside its functions.
+    # Run each case as an ordinary subshell so failed assertions stay fatal.
+    set +e
+    (
+        set -euo pipefail
+        setup_case
+        trap finish_case EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        "$test_fn"
+    ) > "$CASE_ROOT/stdout.log" 2> "$CASE_ROOT/stderr.log"
+    local status=$?
+    set -e
+    if [[ "$status" -eq 0 ]]; then
         PASSED=$((PASSED + 1))
         log_pass "$name"
-        return 0
     else
         FAILED=$((FAILED + 1))
         log_fail "$name"
-        return 1
+    fi
+    if [[ "$status" -ne 0 || "$VERBOSE" == "--verbose" ]]; then
+        cat "$CASE_ROOT/stdout.log" "$CASE_ROOT/stderr.log"
     fi
 }
 
@@ -187,366 +364,129 @@ run_test() {
 # Test Cases
 # =============================================================================
 
-test_hook_auto_starts_daemon() {
-    log_detail "Ensuring daemon is stopped..."
-    rch daemon stop 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    sleep 1
-
-    # Verify daemon not running
-    if [[ -S "$TEST_SOCKET" ]]; then
-        log_fail "Precondition failed: daemon still running"
-        return 1
-    fi
-
-    log_detail "Creating test project..."
-    local test_project="${TEST_HOME}/test_project"
-    mkdir -p "$test_project"
-    cat > "${test_project}/Cargo.toml" <<EOF
-[package]
-name = "test_project"
-version = "0.1.0"
-edition = "2021"
-EOF
-    mkdir -p "${test_project}/src"
-    echo 'fn main() { println!("Hello"); }' > "${test_project}/src/main.rs"
-
-    log_detail "Invoking hook (should auto-start daemon)..."
-    local hook_input='{"event":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo build --release"},"session_id":"test","session_cwd":"'"$test_project"'"}'
-
-    local output
-    output=$(echo "$hook_input" | timeout 30 rch 2>&1) || true
-
-    log_detail "Hook output: $output"
-
-    # Check if daemon was auto-started
-    sleep 2
-    if ! [[ -S "$TEST_SOCKET" ]]; then
-        log_fail "Daemon was not auto-started"
-        return 1
-    fi
-
-    log_detail "Daemon auto-started successfully"
-    return 0
+test_delegated_exec_auto_starts_daemon() {
+    assert_no_live_daemon
+    invoke_hook
+    [[ ! -e "$TEST_LAUNCHES" && ! -S "$TEST_SOCKET" ]]
+    execute_delegated
+    assert_owned_daemon
+    [[ $(wc -l < "$TEST_LAUNCHES" | tr -d ' ') == 1 ]]
+    [[ $(cat "$TEST_COOLDOWN") =~ ^[0-9]+$ ]]
 }
 
 test_daemon_auto_installs_hook() {
-    log_detail "Removing existing hook..."
-    rm -f "${TEST_CLAUDE_DIR}/settings.json"
-
-    log_detail "Stopping daemon..."
-    rch daemon stop 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    sleep 1
-
-    log_detail "Starting daemon (should install hook)..."
-    rch daemon start
-    sleep 2
-
-    # Check if hook was installed
-    if ! assert_file_exists "${TEST_CLAUDE_DIR}/settings.json" "Hook settings file should exist"; then
-        return 1
-    fi
-
-    # Verify hook content
-    local settings
-    settings=$(cat "${TEST_CLAUDE_DIR}/settings.json")
-
-    if ! assert_contains "$settings" '"command": "rch"' "Settings should contain rch hook"; then
-        log_detail "Settings content: $settings"
-        return 1
-    fi
-
-    log_detail "Hook auto-installed successfully"
-    return 0
+    [[ ! -f "$TEST_CLAUDE_DIR/settings.json" ]]
+    start_case_daemon
+    assert_rch_hook
 }
 
 test_daemon_preserves_existing_hooks() {
-    log_detail "Creating settings with existing DCG hook..."
-    mkdir -p "$TEST_CLAUDE_DIR"
-    cat > "${TEST_CLAUDE_DIR}/settings.json" <<EOF
+    cat > "$TEST_CLAUDE_DIR/settings.json" <<'EOF'
 {
+  "permissions": {"allow": ["Read"]},
   "hooks": {
     "PreToolUse": [
       {
-        "command": "dcg",
-        "description": "Destructive Command Guard"
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": "dcg", "timeout": 10}]
       }
     ]
   }
 }
 EOF
-
-    log_detail "Restarting daemon..."
-    rch daemon stop 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    sleep 1
-    rch daemon start
-    sleep 2
-
-    # Verify both hooks present
-    local settings
-    settings=$(cat "${TEST_CLAUDE_DIR}/settings.json")
-
-    if ! assert_contains "$settings" '"command": "dcg"' "DCG hook should be preserved"; then
-        return 1
-    fi
-
-    if ! assert_contains "$settings" '"command": "rch"' "RCH hook should be added"; then
-        return 1
-    fi
-
-    log_detail "Existing hooks preserved successfully"
-    return 0
+    start_case_daemon
+    assert_rch_hook
+    jq -e '
+        .permissions == {"allow":["Read"]}
+        and ([.hooks.PreToolUse[] | .hooks[]? | select(.command == "dcg")]
+            == [{"type":"command","command":"dcg","timeout":10}])
+    ' "$TEST_CLAUDE_DIR/settings.json" >/dev/null
 }
 
 test_doctor_fix_installs_hook() {
-    log_detail "Removing hook..."
-    rm -f "${TEST_CLAUDE_DIR}/settings.json"
-
-    log_detail "Running doctor --fix..."
-    local output
-    output=$(rch doctor --fix 2>&1)
-
-    log_detail "Doctor output: $output"
-
-    if ! assert_file_exists "${TEST_CLAUDE_DIR}/settings.json" "Doctor should install hook"; then
-        return 1
-    fi
-
-    if ! assert_contains "$output" "Fixed" "Doctor should report fix"; then
-        return 1
-    fi
-
-    log_detail "Doctor --fix installed hook successfully"
-    return 0
+    # Attribute installation to doctor, independently of daemon hook repair.
+    write_case_config true false 30
+    run_case_doctor
+    assert_rch_hook
+    jq -e '
+        [.data.checks[] | select(.name == "claude_code_hook")]
+        | length == 1 and .[0].fix_applied and .[0].status == "pass"
+    ' "$CASE_ROOT/doctor.json" >/dev/null
 }
 
 test_doctor_fix_starts_daemon() {
-    log_detail "Stopping daemon..."
-    rch daemon stop 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    sleep 1
-
-    log_detail "Running doctor --fix..."
-    local output
-    output=$(rch doctor --fix 2>&1)
-
-    log_detail "Doctor output: $output"
-
-    sleep 2
-    if ! assert_socket_exists "$TEST_SOCKET" "Doctor should start daemon"; then
-        return 1
-    fi
-
-    log_detail "Doctor --fix started daemon successfully"
-    return 0
+    run_case_doctor
+    assert_owned_daemon
+    jq -e '
+        [.data.checks[] | select(.name == "daemon_socket")]
+        | length == 1 and .[0].fix_applied and .[0].status == "pass"
+    ' "$CASE_ROOT/doctor.json" >/dev/null
 }
 
 test_doctor_dry_run_no_changes() {
-    log_detail "Stopping daemon and removing hook..."
-    rch daemon stop 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    rm -f "${TEST_CLAUDE_DIR}/settings.json"
-    sleep 1
-
-    log_detail "Running doctor --fix --dry-run..."
-    local output
-    output=$(rch doctor --fix --dry-run 2>&1)
-
-    log_detail "Doctor output: $output"
-
-    # Verify no changes made
-    if [[ -f "${TEST_CLAUDE_DIR}/settings.json" ]]; then
-        log_fail "Dry run should not create settings file"
-        return 1
-    fi
-
-    if [[ -S "$TEST_SOCKET" ]]; then
-        log_fail "Dry run should not start daemon"
-        return 1
-    fi
-
-    if ! assert_contains "$output" "Would" "Dry run should say 'Would'"; then
-        return 1
-    fi
-
-    log_detail "Dry run made no changes as expected"
-    return 0
+    run_case_doctor --dry-run
+    [[ ! -f "$TEST_CLAUDE_DIR/settings.json" && ! -e "$TEST_LAUNCHES" && ! -e "$TEST_SOCKET" ]]
+    jq -e '
+        [.data.checks[] | select(.name == "claude_code_hook" or .name == "daemon_socket")]
+        | length == 2 and all(.fix_applied == false and (.fix_message | startswith("Would ")))
+    ' "$CASE_ROOT/doctor.json" >/dev/null
+    assert_no_live_daemon
 }
 
 test_auto_start_cooldown() {
-    log_detail "This test validates cooldown prevents restart spam"
+    write_case_config true true 300
+    invoke_hook 10
+    execute_delegated
+    assert_owned_daemon
+    local timestamp
+    timestamp=$(cat "$TEST_COOLDOWN")
+    [[ "$timestamp" =~ ^[0-9]+$ ]]
+    printf '%s\n' "$timestamp" > "$CASE_ROOT/cooldown-first.timestamp"
+    [[ $(wc -l < "$TEST_LAUNCHES" | tr -d ' ') == 1 ]]
+    stop_case_daemons
+    assert_no_live_daemon
 
-    # Start and immediately stop daemon
-    rch daemon start
-    sleep 1
-    rch daemon stop
-    rm -f "$TEST_SOCKET"
-
-    # Record time
-    local start_time=$(date +%s)
-
-    # Try to trigger auto-start via hook
-    local test_project="${TEST_HOME}/test_project2"
-    mkdir -p "$test_project/src"
-    cat > "${test_project}/Cargo.toml" <<EOF
-[package]
-name = "test_project2"
-version = "0.1.0"
-edition = "2021"
-EOF
-    echo 'fn main() {}' > "${test_project}/src/main.rs"
-
-    local hook_input='{"event":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo build"},"session_id":"test","session_cwd":"'"$test_project"'"}'
-
-    log_detail "First hook invocation..."
-    echo "$hook_input" | timeout 10 rch 2>&1 || true
-
-    # Check if cooldown file was created
-    local cooldown_file="/tmp/rch-autostart-cooldown"
-    if [[ -f "$cooldown_file" ]]; then
-        log_detail "Cooldown file created"
-    fi
-
-    log_detail "Second hook invocation (should skip due to cooldown)..."
-    local output
-    output=$(echo "$hook_input" | timeout 5 rch 2>&1) || true
-
-    # The second invocation should be fast (not waiting for daemon)
-    # because cooldown prevents restart attempt
-    local end_time=$(date +%s)
-    local elapsed=$((end_time - start_time))
-
-    log_detail "Elapsed time: ${elapsed}s"
-
-    # If cooldown works, second invocation should be quick
-    # (This is a heuristic test - timing-based)
-    return 0
+    # Cooldown still observes readiness for the configured startup budget.
+    # Its contract is no new launch, not an immediate return.
+    invoke_hook 5
+    execute_delegated
+    assert_no_live_daemon
+    assert_eq "$timestamp" "$(cat "$TEST_COOLDOWN")" "Cooldown must not record a second launch"
+    [[ $(wc -l < "$TEST_LAUNCHES" | tr -d ' ') == 1 ]]
 }
 
 test_config_disables_self_healing() {
-    log_detail "Creating config with self-healing disabled..."
-    cat > "${TEST_CONFIG_DIR}/config.toml" <<EOF
-socket_path = "${TEST_SOCKET}"
-
-[self_healing]
-hook_starts_daemon = false
-daemon_installs_hooks = false
-EOF
-
-    # Stop daemon and remove hook
-    rch daemon stop 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    rm -f "${TEST_CLAUDE_DIR}/settings.json"
-    sleep 1
-
-    log_detail "Starting daemon (should NOT install hook)..."
-    rch daemon start
-    sleep 2
-
-    # Hook should NOT be installed (disabled in config)
-    if [[ -f "${TEST_CLAUDE_DIR}/settings.json" ]]; then
-        local settings
-        settings=$(cat "${TEST_CLAUDE_DIR}/settings.json")
-        if [[ "$settings" == *'"command": "rch"'* ]]; then
-            log_fail "Hook was installed despite being disabled in config"
-            return 1
-        fi
-    fi
-
-    log_detail "Self-healing correctly disabled by config"
-
-    # Restore default config
-    cat > "${TEST_CONFIG_DIR}/config.toml" <<EOF
-socket_path = "${TEST_SOCKET}"
-
-[self_healing]
-hook_starts_daemon = true
-daemon_installs_hooks = true
-EOF
-
-    return 0
+    write_case_config false false 30
+    invoke_hook
+    execute_delegated
+    assert_no_live_daemon
+    [[ ! -e "$TEST_LAUNCHES" && ! -f "$TEST_CLAUDE_DIR/settings.json" ]]
+    # Disabling recovery does not prohibit an explicit operator startup.
+    start_case_daemon
+    [[ ! -f "$TEST_CLAUDE_DIR/settings.json" ]]
 }
 
 test_full_self_healing_cycle() {
-    log_detail "=== Full Self-Healing Cycle Test ==="
-
-    # Start from completely clean state
-    log_detail "Step 1: Clean state"
-    rch daemon stop 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    rm -f "${TEST_CLAUDE_DIR}/settings.json"
-    rm -rf "${TEST_CLAUDE_DIR}"
-    sleep 1
-
-    # Verify nothing exists
-    if [[ -S "$TEST_SOCKET" ]] || [[ -f "${TEST_CLAUDE_DIR}/settings.json" ]]; then
-        log_fail "Clean state not achieved"
-        return 1
-    fi
-    log_detail "  ✓ Clean state verified"
-
-    # Run doctor --fix (should fix everything)
-    log_detail "Step 2: Run doctor --fix"
-    local output
-    output=$(rch doctor --fix 2>&1)
-    log_detail "Doctor output: $output"
-    sleep 2
-
-    # Verify hook installed
-    if ! [[ -f "${TEST_CLAUDE_DIR}/settings.json" ]]; then
-        log_fail "Hook not installed by doctor --fix"
-        return 1
-    fi
-    log_detail "  ✓ Hook installed"
-
-    # Verify daemon running
-    if ! [[ -S "$TEST_SOCKET" ]]; then
-        log_fail "Daemon not started by doctor --fix"
-        return 1
-    fi
-    log_detail "  ✓ Daemon running"
-
-    # Simulate daemon crash
-    log_detail "Step 3: Simulate daemon crash"
-    pkill -f "rchd.*${TEST_SOCKET}" 2>/dev/null || true
-    rm -f "$TEST_SOCKET"
-    sleep 1
-
-    if [[ -S "$TEST_SOCKET" ]]; then
-        log_fail "Daemon still running after simulated crash"
-        return 1
-    fi
-    log_detail "  ✓ Daemon crashed (simulated)"
-
-    # Trigger build (hook should auto-restart daemon)
-    log_detail "Step 4: Trigger build (should auto-restart daemon)"
-    local test_project="${TEST_HOME}/test_project_cycle"
-    mkdir -p "$test_project/src"
-    cat > "${test_project}/Cargo.toml" <<EOF
-[package]
-name = "cycle_test"
-version = "0.1.0"
-edition = "2021"
-EOF
-    echo 'fn main() { println!("cycle test"); }' > "${test_project}/src/main.rs"
-
-    local hook_input='{"event":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo build --release"},"session_id":"cycle-test","session_cwd":"'"$test_project"'"}'
-
-    output=$(echo "$hook_input" | timeout 30 rch 2>&1) || true
-    log_detail "Hook output: $output"
-    sleep 2
-
-    # Verify daemon auto-restarted
-    if ! [[ -S "$TEST_SOCKET" ]]; then
-        log_fail "Daemon not auto-restarted by hook"
-        return 1
-    fi
-    log_detail "  ✓ Daemon auto-restarted"
-
-    log_detail "=== Full cycle complete ==="
-    return 0
+    run_case_doctor
+    assert_rch_hook
+    assert_owned_daemon
+    local original_pid original_settings tick
+    original_pid=$(daemon_pid)
+    original_settings=$(jq -cS . "$TEST_CLAUDE_DIR/settings.json")
+    owned_daemon_alive "$original_pid"
+    # Kill only the daemon whose PID and configured socket were verified above.
+    kill -KILL "$original_pid"
+    for ((tick = 0; tick < 100; tick++)); do
+        owned_daemon_alive "$original_pid" || break
+        sleep 0.1
+    done
+    assert_no_live_daemon
+    invoke_hook
+    execute_delegated
+    assert_owned_daemon
+    [[ $(daemon_pid) != "$original_pid" ]]
+    [[ $(wc -l < "$TEST_LAUNCHES" | tr -d ' ') == 2 ]]
+    assert_eq "$original_settings" "$(jq -cS . "$TEST_CLAUDE_DIR/settings.json")" "Recovery must preserve installed hook settings"
 }
 
 # =============================================================================
@@ -563,7 +503,7 @@ main() {
     setup_test_env
 
     # Run all tests
-    run_test "Hook auto-starts daemon" test_hook_auto_starts_daemon
+    run_test "Hook delegates and exec auto-starts daemon" test_delegated_exec_auto_starts_daemon
     run_test "Daemon auto-installs hook" test_daemon_auto_installs_hook
     run_test "Daemon preserves existing hooks" test_daemon_preserves_existing_hooks
     run_test "Doctor --fix installs hook" test_doctor_fix_installs_hook
@@ -586,7 +526,7 @@ main() {
 
     if [[ $FAILED -gt 0 ]]; then
         echo -e "${RED}SOME TESTS FAILED${NC}"
-        echo "See $LOG_FILE for details"
+        echo "See $LOG_FILE and $TEST_ROOT/case-* for retained evidence"
         exit 1
     else
         echo -e "${GREEN}ALL TESTS PASSED${NC}"

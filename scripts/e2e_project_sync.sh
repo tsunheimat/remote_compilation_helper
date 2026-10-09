@@ -32,6 +32,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_project_sync.jsonl}"
 
 # shellcheck source=lib/e2e_common.sh
 source "$SCRIPT_DIR/lib/e2e_common.sh"
@@ -54,6 +55,7 @@ TESTS_SKIPPED=0
 # Test directories
 TEST_TMPDIR=""
 FIXTURE_DIR=""
+TEST_DAEMON_PID=""
 
 # =============================================================================
 # Structured Logging (JSONL format per bead spec)
@@ -64,19 +66,25 @@ log_json() {
     local test_name="$2"
     local phase="$3"
     local msg="$4"
-    local data="${5:-{}}"
+    local data="${5:-}"
+    [[ -n "$data" ]] || data='{}'
 
     local ts
     ts="$(e2e_timestamp)"
 
-    printf '{"ts":"%s","level":"%s","test":"%s","phase":"%s","msg":"%s","data":%s}\n' \
-        "$ts" "$level" "$test_name" "$phase" "$msg" "$data"
+    jq -nc --arg ts "$ts" --arg level "$level" --arg test "$test_name" \
+        --arg phase "$phase" --arg msg "$msg" --argjson data "$data" \
+        '{ts:$ts,level:$level,test:$test,phase:$phase,msg:$msg,data:$data}' | tee -a "$LOG_FILE"
 }
 
-log_info() { log_json "INFO" "$1" "$2" "$3" "${4:-{}}"; }
-log_debug() { [[ "$VERBOSE" == "1" ]] && log_json "DEBUG" "$1" "$2" "$3" "${4:-{}}"; }
-log_error() { log_json "ERROR" "$1" "$2" "$3" "${4:-{}}"; }
-log_warn() { log_json "WARN" "$1" "$2" "$3" "${4:-{}}"; }
+log_info() { log_json "INFO" "$1" "$2" "$3" "${4:-}"; }
+log_debug() {
+    if [[ "$VERBOSE" == "1" ]]; then
+        log_json "DEBUG" "$1" "$2" "$3" "${4:-}"
+    fi
+}
+log_error() { log_json "ERROR" "$1" "$2" "$3" "${4:-}"; }
+log_warn() { log_json "WARN" "$1" "$2" "$3" "${4:-}"; }
 
 die() {
     log_error "setup" "fatal" "$1" "{}"
@@ -142,7 +150,7 @@ check_dependencies() {
 
     # Check rsync version for zstd support
     local rsync_version
-    rsync_version=$(rsync --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+    rsync_version=$(rsync --version 2>&1 | sed -n '1p' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 
     log_info "setup" "dependencies" "All dependencies present" \
         "{\"rsync_version\":\"$rsync_version\"}"
@@ -152,6 +160,7 @@ setup_test_fixtures() {
     log_info "setup" "fixtures" "Creating test fixtures" "{}"
 
     TEST_TMPDIR="$(mktemp -d)"
+    TEST_TMPDIR="$(cd "$TEST_TMPDIR" && pwd -P)"
     FIXTURE_DIR="$TEST_TMPDIR/fixtures"
     mkdir -p "$FIXTURE_DIR"
 
@@ -263,9 +272,12 @@ EOF
 }
 
 cleanup() {
+    if [[ -n "$TEST_DAEMON_PID" ]]; then
+        kill "$TEST_DAEMON_PID" 2>/dev/null || true
+        wait "$TEST_DAEMON_PID" 2>/dev/null || true
+    fi
     if [[ -n "$TEST_TMPDIR" && -d "$TEST_TMPDIR" ]]; then
-        rm -rf "$TEST_TMPDIR"
-        log_info "cleanup" "teardown" "Cleaned up test directory" "{}"
+        log_info "cleanup" "teardown" "Retained test fixtures and logs" "{\"root\":\"$TEST_TMPDIR\"}"
     fi
 }
 
@@ -276,9 +288,10 @@ trap cleanup EXIT
 # =============================================================================
 
 build_binaries() {
-    local rch_bin="${PROJECT_ROOT}/target/debug/rch"
+    local rch_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch"
+    local rchd_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rchd"
 
-    if [[ -x "$rch_bin" ]]; then
+    if [[ -x "$rch_bin" && -x "$rchd_bin" ]]; then
         log_info "setup" "build" "Using existing binary" \
             "{\"rch\":\"$rch_bin\"}" >&2
         echo "$rch_bin"
@@ -287,7 +300,7 @@ build_binaries() {
 
     log_info "setup" "build" "Building rch binary" "{}" >&2
 
-    if ! cargo build -p rch --quiet 2>&1; then
+    if ! cargo build -p rch -p rchd --quiet >&2; then
         die "Failed to build rch"
     fi
 
@@ -306,7 +319,7 @@ build_binaries() {
 test_pass() {
     local test_name="$1"
     local msg="$2"
-    local data="${3:-{}}"
+    local data="${3:-}"
     TESTS_PASSED=$((TESTS_PASSED + 1))
     log_info "$test_name" "result" "PASS: $msg" "$data"
 }
@@ -314,7 +327,7 @@ test_pass() {
 test_fail() {
     local test_name="$1"
     local msg="$2"
-    local data="${3:-{}}"
+    local data="${3:-}"
     TESTS_FAILED=$((TESTS_FAILED + 1))
     log_error "$test_name" "result" "FAIL: $msg" "$data"
 }
@@ -322,7 +335,7 @@ test_fail() {
 test_skip() {
     local test_name="$1"
     local msg="$2"
-    local data="${3:-{}}"
+    local data="${3:-}"
     TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
     log_info "$test_name" "result" "SKIP: $msg" "$data"
 }
@@ -378,7 +391,10 @@ run_rsync_with_stats() {
     start_ms="$(e2e_now_ms)"
 
     local output
-    output=$(rsync "${rsync_args[@]}" 2>&1) || true
+    if ! output=$(rsync "${rsync_args[@]}" 2>&1); then
+        printf 'rsync fixture failed: %s\n' "$output" >&2
+        return 1
+    fi
 
     local end_ms
     end_ms="$(e2e_now_ms)"
@@ -639,8 +655,8 @@ test_rsync_delete_detection() {
         return
     fi
 
-    # Delete file locally
-    rm "$source/src/lib.rs"
+    # Remove the source-tree entry while retaining its bytes for inspection.
+    mv "$source/src/lib.rs" "$TEST_TMPDIR/removed-lib.rs"
 
     log_info "$test_name" "sync_start" "Syncing after local delete" \
         "{\"deleted_file\":\"src/lib.rs\"}"
@@ -957,29 +973,53 @@ test_rch_mock_sync() {
 
     local rch_bin="$1"
 
-    # In mock mode, we can verify that the sync infrastructure is invoked correctly
-    # by checking the mock invocation logs
+    local config_dir="$TEST_TMPDIR/config" socket_path runtime_root
+    runtime_root="$(e2e_runtime_dir)"
+    socket_path="$runtime_root/rch.sock"
+    local prefix="$TEST_TMPDIR/mock-sync" rchd_bin="${rch_bin%/*}/rchd"
+    mkdir -p "$config_dir"
+    cat >"$config_dir/config.toml" <<EOF
+[path_topology]
+canonical_root = "$TEST_TMPDIR"
+alias_root = "${TEST_TMPDIR}__alias"
 
-    export RCH_TEST_MODE=1
-    export RCH_MOCK_SSH=1
-    export RCH_MOCK_RSYNC_FILES=25
-    export RCH_MOCK_RSYNC_BYTES=51200
-
-    # Run a compile command which should trigger sync
-    local output
-    output=$("$rch_bin" compile echo "hello" 2>&1) || true
-
-    unset RCH_TEST_MODE RCH_MOCK_SSH RCH_MOCK_RSYNC_FILES RCH_MOCK_RSYNC_BYTES
-
-    log_debug "$test_name" "verify" "Mock output" "{\"output_length\":${#output}}"
-
-    # Check for sync-related output
-    if echo "$output" | grep -qiE "(sync|rsync|transfer)" || [[ -n "$output" ]]; then
-        test_pass "$test_name" "RCH mock sync infrastructure invoked" \
-            "{\"mock_mode\":true}"
+[output]
+visibility = "verbose"
+first_run_complete = true
+EOF
+    cat >"$config_dir/workers.toml" <<'EOF'
+[[workers]]
+id = "mock-sync"
+host = "127.0.0.1"
+user = "test"
+identity_file = "~/.ssh/id_rsa"
+total_slots = 64
+EOF
+    RCH_CONFIG_DIR="$config_dir" RCH_DAEMON_INSTALLS_HOOKS=0 RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
+        "$rchd_bin" --socket "$socket_path" --workers-config "$config_dir/workers.toml" \
+        --foreground >"$prefix.daemon.log" 2>&1 &
+    TEST_DAEMON_PID=$!
+    for _ in {1..50}; do
+        [[ ! -S "$socket_path" ]] || break
+        kill -0 "$TEST_DAEMON_PID" 2>/dev/null || die "Mock daemon exited; see $prefix.daemon.log"
+        sleep 0.1
+    done
+    [[ -S "$socket_path" ]] || die "Mock daemon socket not ready"
+    CARGO_HOME="$TEST_TMPDIR/cargo-home" cargo metadata --manifest-path "$FIXTURE_DIR/basic_rust/Cargo.toml" --format-version 1 --no-deps \
+        >"$prefix.metadata.json" || die "Fixture metadata preparation failed"
+    if e2e_run_delegated "$rch_bin" "$FIXTURE_DIR/basic_rust" "cargo build" "$prefix" \
+        "RCH_CONFIG_DIR=$config_dir" "RCH_SOCKET_PATH=$socket_path" \
+        "CARGO_HOME=$TEST_TMPDIR/cargo-home" \
+        "XDG_CACHE_HOME=$TEST_TMPDIR/cache" "XDG_STATE_HOME=$TEST_TMPDIR/state" \
+        RCH_REQUIRE_REMOTE=1 RCH_MOCK_SSH=1 RCH_MOCK_RSYNC_FILES=25 RCH_MOCK_RSYNC_BYTES=51200 RUST_LOG=info \
+        && [[ "$E2E_EXEC_EXIT" == 0 ]] \
+        && jq -e '.location == "remote" and .outcome == "completed" and .worker_id == "mock-sync" and
+                  .remote_exit_code == 0 and (.timing.sync_up | type) == "number"' "$prefix.exec.json" >/dev/null \
+        && grep -q 'Sync complete: 25 files, 51200 bytes' "$prefix.exec.err"; then
+        test_pass "$test_name" "Hook rewrite executed the remote source-sync path with fixture transfer statistics" \
+            '{"mock_mode":true,"files":25,"bytes":51200}'
     else
-        test_skip "$test_name" "Mock sync output not captured" \
-            "{\"note\":\"This is expected if daemon is not running\"}"
+        test_fail "$test_name" "Delegated remote sync did not complete; see $prefix.exec.json and .err"
     fi
 }
 
@@ -987,28 +1027,45 @@ test_rch_transfer_config_excludes() {
     local test_name="test_rch_transfer_config_excludes"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    log_info "$test_name" "execute" "Verifying default exclude patterns in code" "{}"
+    log_info "$test_name" "execute" "Verifying effective default transfer exclude patterns" "{}"
+    local rch_bin="$1" output
+    output="$(RCH_CONFIG_DIR="$TEST_TMPDIR/config" "$rch_bin" config show --json)" \
+        || die "Cannot inspect effective transfer configuration"
 
-    # Check that the default excludes in code match documented patterns
-    local types_file="$PROJECT_ROOT/rch-common/src/types.rs"
+    printf '%s\n' "$output" >"$TEST_TMPDIR/effective-transfer-config.json"
+    jq -e '.data.transfer.exclude_patterns | type == "array" and length > 0 and all(.[]; type == "string")' \
+        "$TEST_TMPDIR/effective-transfer-config.json" >/dev/null \
+        || die "Effective transfer exclude list is missing or malformed"
+    local effective_excludes=() pattern
+    while IFS= read -r pattern; do
+        effective_excludes+=("$pattern")
+    done < <(jq -r '.data.transfer.exclude_patterns[]' "$TEST_TMPDIR/effective-transfer-config.json")
 
-    local expected_excludes=("target/" "node_modules/" ".git/objects/")
-    local found=0
+    local source="$TEST_TMPDIR/effective-excludes-source"
+    local dest="$TEST_TMPDIR/effective-excludes-dest"
+    mkdir -p "$source" "$dest"
+    cp -r "$FIXTURE_DIR/with_git/." "$source/"
+    mkdir -p "$source/target/debug" "$source/node_modules/fake-package"
+    printf 'excluded target artifact\n' >"$source/target/debug/artifact"
+    printf 'excluded package\n' >"$source/node_modules/fake-package/index.js"
+    local stats
+    stats="$(run_rsync_with_stats "$source" "$dest" "${effective_excludes[@]}")" \
+        || die "Effective-excludes rsync fixture failed"
+    log_info "$test_name" "sync_stats" "Applied native effective exclude list" "$stats"
 
-    for pattern in "${expected_excludes[@]}"; do
-        if grep -q "\"$pattern\"" "$types_file" 2>/dev/null; then
+    local excluded_paths=("target" "node_modules" ".git/objects") found=0
+    for pattern in "${excluded_paths[@]}"; do
+        if [[ ! -e "$dest/$pattern" ]]; then
             found=$((found + 1))
-            log_debug "$test_name" "verify" "Found exclude pattern" \
-                "{\"pattern\":\"$pattern\",\"found\":true}"
         fi
     done
 
-    if [[ "$found" -eq "${#expected_excludes[@]}" ]]; then
-        test_pass "$test_name" "All expected exclude patterns found in code" \
-            "{\"patterns_checked\":${#expected_excludes[@]},\"patterns_found\":$found}"
+    if [[ "$found" -eq "${#excluded_paths[@]}" && -f "$dest/src/main.rs" && -f "$dest/Cargo.toml" ]]; then
+        test_pass "$test_name" "Native effective excludes omit artifacts, dependencies, and Git objects while retaining source" \
+            "{\"excluded_paths_checked\":${#excluded_paths[@]},\"excluded_paths_absent\":$found}"
     else
-        test_fail "$test_name" "Some exclude patterns missing from code" \
-            "{\"patterns_checked\":${#expected_excludes[@]},\"patterns_found\":$found}"
+        test_fail "$test_name" "Native effective exclusions transferred excluded data or lost source files" \
+            "{\"excluded_paths_checked\":${#excluded_paths[@]},\"excluded_paths_absent\":$found}"
     fi
 }
 
@@ -1046,7 +1103,7 @@ run_tests() {
     # RCH-specific tests
     # =========================================================================
     test_rch_mock_sync "$rch_bin"
-    test_rch_transfer_config_excludes
+    test_rch_transfer_config_excludes "$rch_bin"
 }
 
 print_summary() {
@@ -1065,6 +1122,8 @@ print_summary() {
 }
 
 main() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    : >"$LOG_FILE"
     parse_args "$@"
     check_dependencies
     setup_test_fixtures
