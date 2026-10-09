@@ -19,6 +19,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published development checkpoint: `f207c5bff554361111c56ddc51e7cc260302cb8a`
 - Published main integration: `a67ece95362fe06da6b3cbc8aacf2547a147330c`
 - Repair baseline: `4e3d3e3a4f61b2d045019a586cc0c5a918678491`
+- Published runtime repair batch: `45bfad2716b73dde524dc02bc376731a0f1fbf1a`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -45,10 +46,91 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
-## Latest repairs and validation after `4e3d3e3a`
+## Current CI follow-up after `45bfad27`
+
+The complete set of six workflow runs at `45bfad27` is terminal. The current
+follow-up addresses its dependency and filesystem assertion failures and records incomplete
+validation without extending deadlines or dropping test collections.
+
+- The dependency budget correctly rejected the TLS adapter's fourth direct
+  dependency. Its documented policy permits reviewed additions. The adapter's
+  budget is now four, naming Asupersync, protocol, delivery state, and Rustls.
+  The review found 732 locked packages before and after the TLS change, no new
+  versions or transitive packages, and the identical Rustls provider unit in
+  the native failing/passing TLS runs. The pinned Asupersync API exposes no
+  provider initializer. The counter and all other crate limits are unchanged:
+  four is newly admitted for this adapter; five remains rejected. This is a
+  reviewed dependency addition, not a claim that the old gate was defective.
+- macOS ARM rejected both raw filename renames with native `EILSEQ` (OS error
+  92). The two existing tests retain unconditional byte-preserving preflight
+  and decoding, and positive installation/recovery on supporting filesystems.
+  Only that specific macOS error, after a valid-name control on the same volume,
+  admits the refusal assertions. Production must refuse without changing the
+  lossy-name alias, CAS identity, or journal rows. Inode, mode, link count,
+  length, and modification time are also checked. Other I/O errors still fail.
+  Recovery now reopens a file-backed journal before and after both sweeps,
+  declaring the same known object domain as production startup. A filesystem
+  refusal does not fabricate an installed raw-path row or prove dirty recovery.
+- Both E2E workflows build the three application binaries their callers use.
+  Their full test/script collections, debug prerequisites, profiles, compiler
+  pins, and 30/60-minute budgets remain unchanged. The Layer-0 script still
+  builds its own debug `layer0_render` helper. The prior unqualified builds
+  compiled all 16 workspace crates; the macOS release prerequisite alone took
+  44m45s. New-head execution is required before claiming this resolves a timeout.
+- Workspace test output is now retained through a status-preserving `tee` and
+  offered for upload on failure or cancellation. The E2E summary compares
+  outcomes with the same revision's discovered inventory and both OS labels.
+  Replaying the real artifacts now reports 43/82 completed and 39 missing;
+  missing results have no invented exit code or duration. The summary remains
+  informational; the native run jobs still enforce test results.
+- RABS release compilation emits bounded resource observations while its
+  unchanged Cargo command runs. Its own monitor is reaped while preserving the
+  build status. This prepares evidence for another runner shutdown; it does not
+  establish an OOM cause or a release-gate pass.
+
+The three dependency-budget tests and the workspace/all-target/all-feature
+locked check, strict Clippy, and formatting pass. The expanded default-feature
+CAS run completed with 309 passes, one failure, and one ignore: the new reopen
+fixture initially omitted its required domain declaration. After correcting
+that setup, both non-UTF8 tests passed (309 filtered) and all required checks
+passed again. The Linux positive paths are exercised; the new macOS refusal
+branch still needs native CI. No production Rust changed in this follow-up.
+
+Validation binds all 1,390 tracked source hashes/modes and the unchanged host
+profile. Later changes to E2E workflow prerequisites, summary Python, and this
+document have separate YAML/Bash/AST and actual-artifact reporting checks.
+The summary was executed against the verified Linux41/Mac2 artifacts, the
+complete Linux inventory, and an empty collection: respectively 39, zero, and
+82 missing outcomes. These are report checks, not fabricated native tests.
+
+Evidence under the retained validation base below:
+
+- `rch-dependency-budget-validation-n83awndr/report/`: dependency review and three native gate tests.
+- `rch-macos-path-contract-final-to93ngnh/report/`: full default-feature CAS run, including the retained fixture failure.
+- `rch-macos-path-reopen-validation-_rncazd_/report/`: corrected native tests, compiler checks, source proof, and binary hash.
+- `rch-ci-resource-observer-6h62qkw0/`: actual resource sampling and native child statuses 0/7/143 preserved by cleanup.
+- `rch-ci-log-capture-review-rw56bunr/`: real shell-pipeline status/output checks, not Cargo executions.
+- `rch-e2e-completeness-review-_ezhk10x/`: current summary over verified native status artifacts.
+- `rch-ci-head45-monitor-0kN4dR0M/`: all 28 executed-job logs, artifact/source bindings, and release prerequisite caller reviews.
+
+| Terminal CI at `45bfad27` | Observed result |
+| --- | --- |
+| [CI 37961912877](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37961912877) | Check, strict Clippy, docs, format, manifest/workflow/security and benchmark jobs passed. Linux x64 stopped at the adapter dependency budget before worker/daemon suites. macOS ARM had two real `EILSEQ` assertion failures before its 30-minute cancellation. Linux ARM and macOS Intel were still compiling at 30 minutes. Coverage timed out during instrumented compilation; no tests, LCOV, or threshold verdict resulted. |
+| Core CI E2E | 164 reported Cargo test passes; live-worker acceptance is not implied. The shell phase completed three passes and one explicit skip, then timed out during path-dependency fixture setup. The remaining shell collection is incomplete. |
+| [E2E 37961912912](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37961912912) | Linux completed all 41 discovered suites with matching successful archived statuses. macOS completed only API envelope and API error codes, then reached 60 minutes during the third suite's debug prerequisite build. Its other 39 outcomes are missing. The old green summary's 43 passes represent Linux41 plus Mac2, not a complete two-platform run. |
+| [Test Release 37961912948](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37961912948) | All five Unix build/version/package/upload jobs passed. Their archives, checksums, executable members and hashes were independently verified. Windows failed the unresolved non-Unix helper import; repair remains deferred. The aggregate package-verification job was skipped. |
+| [RABS 37961913026](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37961913026) | Accepted-hit protocol passed 34 unit and eight integration cases plus lint. Release compilation received another runner shutdown and exited 143 without a Rust compiler diagnostic. Its later gates did not run; the shutdown cause remains unknown. |
+| [Rsync 37961912900](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37961912900) | Both jobs passed, including 64 selected transfer tests. The source archive matched the exact PR merge and all 1,390 source blobs/modes. |
+
+The separate wrapper-contract workflow is `disabled_fork`, not pending approval
+or missing from pagination; it was not enabled or dispatched. Fresh CI belongs
+to the next published head. Keep the PR draft while the remaining gates,
+including the six large-toolchain worker cases below, remain unresolved.
+
+## Published runtime repair batch (`45bfad27`)
 
 The broader workspace run exposed production and fixture defects beyond the
-earlier checkpoint. The current batch repairs these boundaries:
+earlier checkpoint. This published batch repaired these boundaries:
 
 - RABS creates private staging owners with Unix mode `0700`, matching the
   existing ownership checks. Fixtures now establish the same valid starting
@@ -88,7 +170,7 @@ edits are identified separately from the runtime builds.
 | Validation phase | Actual result and limits |
 | --- | --- |
 | Full workspace before the final residual repairs | 225 top-level test targets: 12,091 reported passes, 16 failures, 31 ignores, zero filtered tests. Eight named capability-dependent early returns are recorded separately. The intentional failing crash-child subprocess is not counted as another top-level target. |
-| Workspace/all-target/all-feature check, Clippy with `-D warnings`, and formatting | Passed after the TLS runtime repair with the locked dependency graph. Subsequent changes are the Beta JSON fixture and this document. |
+| Workspace/all-target/all-feature check, Clippy with `-D warnings`, and formatting | Passed after the TLS runtime repair with the locked dependency graph. Before publishing `45bfad27`, only the Beta JSON fixture and documentation changed afterward. |
 | Entire RCH component after its residual repairs | 3,640 reported passes across 17 target summaries, zero failures/ignores/filtered tests. Two signing cases explicitly returned early for unavailable opt-in/cosign prerequisites. |
 | Native RABS replay, wait, worker TLS, interruption, and resume targets | 44 passed, zero failures/ignores/filtered tests. The passing and failing daemon builds link the identical Rustls unit with both providers enabled. |
 | Feature profile and runtime policy | 4 + 6 passed. Retained unchanged test binaries read the current manifests/source; the policy scanned 352 Rust files. |
@@ -161,17 +243,20 @@ The retained validation base is
 - `beta-native-serial-run-NKwluaf2/`: immutable native outputs, separate corrected observation, exact fixture admission review, and isolated `--cfg` comparison.
 - `rch-beta-fixture-validation-g0groc4f/report/`: strict all-channel comparison after the manual fixture update.
 
-UBS coverage now binds 160 current Rust/Bash inputs. The last one-file TLS scan
-returned exit 0 with 0 critical, 59 warning, and 12 informational records, with
-no finding on an added line. Earlier raw scans remain nonzero, and 26 reviewed
+UBS coverage now binds 162 current Rust/Bash/Python inputs. The final recovery
+and summary scan returned exit 0 with zero critical, 44 warning, and 36
+informational records; its Python module reported zero findings. The expanded
+filesystem tests' assertion and bounded expected-value construction warnings
+were reviewed, not suppressed. Earlier raw scans remain nonzero, and 26 reviewed
 critical records remain in the combined manifest. One is on the existing
 installed-version `Command::new(path)` call moved into the bounded retry loop;
 its trusted path derivation and literal `--version` argument are unchanged.
 The other reviewed expressions are inherited. Warnings are not exhaustively
 cleared, and no all-scope scanner pass is claimed. The official scanner remained
 unchanged; no AST/ShellCheck/Cargo scanner phase or TOML/YAML scan is implied.
+Optional Python package analyzers were disabled; no package installation ran.
 Current combined hashes and bounded triage are in
-`target/managed-storage-validation-20261009/ubs-tls-provider-report-approved.t3ovp5p6/`.
+`target/managed-storage-validation-20261009/ubs-reopen-summary-report-approved.2puzqs72/`.
 
 ## Published baseline CI (`4e3d3e3a`)
 

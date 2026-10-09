@@ -56,7 +56,14 @@ const BUDGETS: &[(&str, usize, &str)] = &[
          corpus and emits the divergence corpus; process effects are \
          its purpose)",
     ),
-    ("rabs-asupersync", 3, "asupersync + protocol (+1 headroom)"),
+    (
+        "rabs-asupersync",
+        4,
+        "asupersync + protocol + rabs-action (delivery exposure frontiers) + \
+         rustls (initialize the pinned Asupersync mutual-TLS verifier's \
+         process provider; the same locked TLS dependency and ring features \
+         already used by Asupersync, with no new transitive packages)",
+    ),
     (
         "rabsd",
         13,

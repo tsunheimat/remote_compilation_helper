@@ -188,13 +188,17 @@ jobs:
       - name: Run tests
         env:
           RCH_MOCK_SSH: '1'
-        run: cargo test ${{ matrix.cargo_args }}
-      - name: Upload test logs on failure
-        if: failure()
+        run: |
+          set -o pipefail
+          mkdir -p target/test-logs
+          cargo test ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log
+      - name: Upload test logs on failure or cancellation
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.name }}
           path: |
+            target/test-logs/workspace-tests.log
             target/debug/deps/*.log
             **/test-output.log
           retention-days: 7
@@ -214,7 +218,9 @@ jobs:
         with:
           cache-on-failure: true
       - name: Build release binaries
-        run: cargo build --release
+        # The Cargo and shell harnesses consume these application binaries.
+        # RABS spine release builds and gates have their own workflow.
+        run: cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
       - name: Build debug binaries for cargo E2E harness
         # The fail-open tests explicitly launch target/debug/rch and rchd;
         # the shared harness also uses debug binaries in this test profile.

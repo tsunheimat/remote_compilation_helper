@@ -1,6 +1,6 @@
 name: e2e
 
-# Builds the workspace once per OS and runs every scripts/e2e_*.sh through
+# Builds the application binaries once per OS and runs every scripts/e2e_*.sh through
 # the shared runner, uploads each script's JSONL + build log, and aggregates a PASS/FAIL
 # summary posted as a PR comment (remote_compilation_helper-62u24.15).
 
@@ -19,7 +19,7 @@ concurrency:
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Bound peak compiler memory while building the full workspace on hosted VMs.
+  # Bound peak compiler memory on hosted VMs.
   CARGO_BUILD_JOBS: 2
 
 jobs:
@@ -43,9 +43,11 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: e2e-${{ matrix.os }}
-      - name: Build workspace
+      - name: Build E2E application binaries
         run: |
-          cargo build --release --workspace
+          # The scenarios consume this trio. Specialized debug helpers, such as
+          # layer0_render, are built by their owning scripts when exercised.
+          cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
           echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
       # The runner discovers every script, records each exit code, and fails
       # this job if any scenario fails, while continuing to collect results.
@@ -70,8 +72,11 @@ jobs:
           path: e2e-artifacts
       - name: Aggregate
         run: |
+          scripts/run_all_e2e.sh --list > expected-e2e-scripts.txt
           python3 scripts/lib/aggregate_e2e.py \
             --artifacts-dir e2e-artifacts \
+            --expected-scripts expected-e2e-scripts.txt \
+            --expected-os linux --expected-os macos \
             --output e2e_summary.md
           cat e2e_summary.md
       - uses: actions/upload-artifact@v4

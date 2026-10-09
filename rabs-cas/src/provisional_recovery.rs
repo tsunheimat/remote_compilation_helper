@@ -430,34 +430,141 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn m019_non_utf8_unix_path_is_recovered_without_lossy_aliasing() {
-        use std::io::Write as _;
+        use crate::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
 
-        let mut store = fixture();
         let dir = unique_tmp("raw-path");
+        let database = dir.join("journal.sqlite");
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&database).unwrap()).unwrap();
         let (_, pin_key, original) =
             pin_with_installing_dependent(&mut store, &dir, "original.rmeta", b"installed");
         let path = dir.join(std::ffi::OsStr::from_bytes(b"output-\xff.rmeta"));
-        std::fs::rename(&original, &path).unwrap_or_else(|error| {
-            let _ = writeln!(
-                std::io::stderr(),
-                "native non-UTF8 recovery fixture rename failed: {error:?}"
-            );
-            panic!("non-UTF8 recovery fixture rename: {error:?}");
-        });
-        record_installed_output(&mut store, &pin_key, "worker-b", AttemptId(31), &path, 8).unwrap();
         let lossy_alias = dir.join("output-\u{fffd}.rmeta");
         std::fs::write(&lossy_alias, b"installed").unwrap();
+        let alias_identity = || {
+            let metadata = std::fs::metadata(&lossy_alias).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.mode(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        };
+        let alias_before = alias_identity();
+        assert_eq!(
+            decode_installed_path(path.as_os_str().as_bytes()).unwrap(),
+            path
+        );
+        assert_ne!(path, lossy_alias);
+        // A valid-name rename on the same volume must work before a native
+        // filename refusal can explain the invalid-name result.
+        let control = dir.join("rename-control.rmeta");
+        std::fs::rename(&original, &control).unwrap();
+        std::fs::rename(&control, &original).unwrap();
+        let before = store
+            .list_provisional_installs_for_pins(std::slice::from_ref(&pin_key))
+            .unwrap();
+        let expected_removed = match std::fs::rename(&original, &path) {
+            Ok(()) => {
+                record_installed_output(&mut store, &pin_key, "worker-b", AttemptId(31), &path, 8)
+                    .unwrap();
+                2
+            }
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                let expected_refusal = Some(rustix::io::Errno::ILSEQ.raw_os_error());
+                #[cfg(not(target_os = "macos"))]
+                let expected_refusal: Option<i32> = None;
+                assert!(
+                    expected_refusal.is_some() && error.raw_os_error() == expected_refusal,
+                    "unexpected native filename refusal: {error:?}"
+                );
+                assert_eq!(std::fs::read(&original).unwrap(), b"installed");
+                assert_eq!(
+                    record_installed_output(
+                        &mut store,
+                        &pin_key,
+                        "worker-b",
+                        AttemptId(31),
+                        &path,
+                        8
+                    ),
+                    Err(ProvisionalInstallError::UnreadablePath {
+                        path: path.as_os_str().as_bytes().to_vec()
+                    })
+                );
+                assert_eq!(
+                    store
+                        .list_provisional_installs_for_pins(std::slice::from_ref(&pin_key))
+                        .unwrap(),
+                    before,
+                    "a refused path must not create or change a journal identity"
+                );
+                1
+            }
+        };
+        let installed = store
+            .list_provisional_installs_for_pins(std::slice::from_ref(&pin_key))
+            .unwrap();
+        assert_eq!(installed.len(), expected_removed);
+        assert_eq!(std::fs::read(&lossy_alias).unwrap(), b"installed");
+        drop(store);
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&database).unwrap()).unwrap();
+        // Fresh readers declare the same static object domain as production
+        // coordinator startup; unknown stored domains still fail closed.
+        store.intern_domain(ATP_OBJECT_CONTENT_DOMAIN);
+        assert_eq!(
+            store
+                .list_provisional_installs_for_pins(std::slice::from_ref(&pin_key))
+                .unwrap(),
+            installed
+        );
 
         assert_eq!(
-            recover_after_lineage_failure(&mut store, &[pin_key]).unwrap(),
+            recover_after_lineage_failure(&mut store, std::slice::from_ref(&pin_key)).unwrap(),
             RecoverySummary {
-                removed: 2,
+                removed: expected_removed,
                 marked_dirty: 0
             }
         );
+        assert!(!original.exists());
         assert!(!path.exists());
         assert_eq!(std::fs::read(&lossy_alias).unwrap(), b"installed");
+        let mut expected_terminal = installed;
+        for row in &mut expected_terminal {
+            row.state = "removed".to_owned();
+        }
+        drop(store);
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&database).unwrap()).unwrap();
+        store.intern_domain(ATP_OBJECT_CONTENT_DOMAIN);
+        assert_eq!(
+            store
+                .list_provisional_installs_for_pins(std::slice::from_ref(&pin_key))
+                .unwrap(),
+            expected_terminal,
+            "terminal state is durable without changing raw paths or object identities"
+        );
+        assert_eq!(
+            recover_after_lineage_failure(&mut store, std::slice::from_ref(&pin_key)).unwrap(),
+            RecoverySummary::default()
+        );
+        assert_eq!(std::fs::read(&lossy_alias).unwrap(), b"installed");
+        assert_eq!(alias_identity(), alias_before);
+        drop(store);
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&database).unwrap()).unwrap();
+        store.intern_domain(ATP_OBJECT_CONTENT_DOMAIN);
+        assert_eq!(
+            store
+                .list_provisional_installs_for_pins(&[pin_key])
+                .unwrap(),
+            expected_terminal,
+            "a repeated sweep must preserve the durable terminal audit rows"
+        );
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
