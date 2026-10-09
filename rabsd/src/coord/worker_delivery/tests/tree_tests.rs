@@ -74,6 +74,8 @@ fn tree_delivery_verifies_every_file_before_ack_and_preserves_exact_request() {
         let destination = owner.path().join("delivery");
         let request = tree_request();
         let original = serde_json::to_vec(&request).unwrap();
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         let (mut peer, expected) = tree_fixture(&destination, 130);
         if lose_ack {
             peer.fail_send = Some("artifact-ack");
@@ -87,7 +89,10 @@ fn tree_delivery_verifies_every_file_before_ack_and_preserves_exact_request() {
                 .len(),
             130
         );
-        assert_eq!(delivered.receipt["request_sha256"], hash(&original));
+        assert_eq!(
+            delivered.receipt["request_sha256"],
+            hash(&serde_json::to_vec(&canonical_request).unwrap())
+        );
         assert_eq!(serde_json::to_vec(&request).unwrap(), original);
         assert_eq!(peer.sent[1], request);
         assert_eq!(

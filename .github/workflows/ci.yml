@@ -172,6 +172,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
+      - name: Install wrapper contract toolchain prerequisites
+        run: |
+          set -euo pipefail
+          for channel in stable beta nightly; do
+            rustup toolchain install "$channel" --profile minimal --no-self-update
+            rustup run "$channel" rustc --version --verbose
+            rustup run "$channel" cargo --version --verbose
+          done
+          rustup toolchain list
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.name }}
@@ -360,6 +369,15 @@ jobs:
         with:
           toolchain: nightly-2026-06-06
           components: llvm-tools-preview
+      - name: Install wrapper contract toolchain prerequisites
+        run: |
+          set -euo pipefail
+          for channel in stable beta nightly; do
+            rustup toolchain install "$channel" --profile minimal --no-self-update
+            rustup run "$channel" rustc --version --verbose
+            rustup run "$channel" cargo --version --verbose
+          done
+          rustup toolchain list
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
         with:

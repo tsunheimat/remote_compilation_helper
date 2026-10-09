@@ -23,11 +23,13 @@ use std::time::{Duration, Instant};
 
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
+use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
 use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome};
 use rabs_cas::test_support::{
-    install_admission_world, install_offer_closure, offer_serving_object, sample_action_key,
-    sample_expected_descriptor,
+    FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
+    install_offer_closure, offer_serving_object, sample_action_key, sample_expected_descriptor,
 };
+use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
 use rabs_protocol::result_identity::ObjectId;
 use rabsd::coord::live::{CoordLive, cluster_id};
 use rabsd::janitor::store::mount_and_reconcile;
@@ -77,6 +79,15 @@ fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8]) {
         let mut store = cas.store().lock().expect("store lock");
         install_admission_world(&mut *store, &authority);
         install_offer_closure(&mut *store, &offer);
+        store
+            .record_decision_receipt(
+                "rabs-live-action-class-v1",
+                &digest_key(&sample_action_key()),
+                0,
+                "rustc-dependency-compile",
+                "synthetic fixture classification",
+            )
+            .expect("fixture class enrollment");
     }
     let outcome = coord
         .commit_offer(&offer, &sample_expected_descriptor())
@@ -85,6 +96,30 @@ fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8]) {
         matches!(outcome, PublicationOutcome::Committed(_)),
         "expected a commit, got {outcome:?}"
     );
+    // These two fixture-seeded comparisons satisfy the real serving policy;
+    // they are not independent compiler verification.
+    for number in 1..=2_u128 {
+        let ids = FixtureAttemptIds {
+            generation: 11 + number,
+            attempt: 20 + number,
+            lease: 30 + number,
+        };
+        install_admission_world_with_ids(
+            &mut *cas.store().lock().expect("store lock"),
+            &authority,
+            ids,
+        );
+        let mut comparison = offer.clone();
+        comparison.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
+        comparison.authority.attempt_id = AttemptId(ids.attempt);
+        comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
+        assert_eq!(
+            coord
+                .commit_offer(&comparison, &sample_expected_descriptor())
+                .expect("commit fixture comparison"),
+            PublicationOutcome::IdempotentEvidenceAppended
+        );
+    }
 }
 
 fn put_manifest(

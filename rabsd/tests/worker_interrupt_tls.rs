@@ -320,12 +320,15 @@ async fn authenticate(stream: &mut SecureWorkerStream, pin: &str, resume: bool) 
     if resume {
         assert!(grant.get("execution_lease").is_none());
     } else {
+        let original_request = request();
+        let mut canonical_request = original_request.clone();
+        canonical_request.sort_all_objects();
         assert_eq!(
             grant["execution_lease"],
             json!({
                 "version":"request-renewal-v1", "session_id":session,
                 "lease_id":challenge["token_id"], "request_id":7,
-                "request_sha256":hash(&serde_json::to_vec(&request()).unwrap()),
+                "request_sha256":hash(&serde_json::to_vec(&canonical_request).unwrap()),
                 "boot_generation":1, "incarnation":"00000000000000000000000000000001",
                 "ttl_ms":30000,
             })

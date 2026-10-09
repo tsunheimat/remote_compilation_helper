@@ -223,9 +223,7 @@ fn pressure() -> rabs_wkr::session::PressureSample {
 }
 
 fn private_root() -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    root
+    crate::private_test_directory()
 }
 
 fn source_request() -> Value {
@@ -816,11 +814,13 @@ fn prelaunch_input_refusal_resolves_durable_admission_and_survives_restart() {
 }
 
 fn execution_selection(journal: &WorkerJournal, request: &Value) -> ExecutionLeaseSelection {
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     let grant = json!({"kind":"session-ok", "session_id":71,
     "execution_lease":{
         "version":REQUEST_EXECUTION_LEASE_VERSION,
         "session_id":71, "lease_id":81, "request_id":REQUEST,
-        "request_sha256":rabs_wkr::session::sha256_hex(&serde_json::to_vec(request).unwrap()),
+        "request_sha256":rabs_wkr::session::sha256_hex(&serde_json::to_vec(&canonical_request).unwrap()),
         "boot_generation":journal.boot_generation().0,
         "incarnation":format!("{:032x}", journal.incarnation().0), "ttl_ms":30_000,
     }});

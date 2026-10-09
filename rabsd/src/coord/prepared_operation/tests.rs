@@ -73,14 +73,18 @@ fn prepared_request(spec: &PreparedOperationSpec) -> Value {
 }
 
 fn delivery_request_digest(request: &Value) -> String {
-    Sha256::digest(serde_json::to_vec(request).unwrap())
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
+    Sha256::digest(serde_json::to_vec(&canonical_request).unwrap())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
 fn operation_request_digest(request: &Value) -> String {
-    let bytes = serde_json::to_vec(request).unwrap();
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
+    let bytes = serde_json::to_vec(&canonical_request).unwrap();
     let mut identity = b"rabs.prepared-operation.request.v1\0".to_vec();
     identity.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     identity.extend_from_slice(&bytes);
@@ -88,6 +92,44 @@ fn operation_request_digest(request: &Value) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[test]
+fn request_identity_has_a_fixed_domain_and_preserves_unknown_values_and_array_order() {
+    let original: Value = serde_json::from_str(
+        r#"{"request_id":3,"kind":"canonical-exec","args":["private.rs","--cfg=fixture"],"extension":{"z":2,"a":[{"y":true,"b":null},7]}}"#,
+    )
+    .unwrap();
+    let reordered: Value = serde_json::from_str(
+        r#"{"extension":{"a":[{"b":null,"y":true},7],"z":2},"args":["private.rs","--cfg=fixture"],"kind":"canonical-exec","request_id":3}"#,
+    )
+    .unwrap();
+    let original_wire = serde_json::to_vec(&original).unwrap();
+    let reordered_wire = serde_json::to_vec(&reordered).unwrap();
+    // Independently calculated from domain + little-endian byte length + the
+    // complete canonical JSON; this is deliberately not the delivery digest.
+    let expected = "e85b9b162a0d1c224084cc34e0dd9133a3bb38ee78ef79a71df618caeceed5e2";
+    assert_eq!(request_digest(&original).unwrap(), expected);
+    assert_eq!(request_digest(&reordered).unwrap(), expected);
+    assert_eq!(
+        delivery_request_digest(&original),
+        "b600d15f2ad66159757d7b356a62f5d28f3e13b06a11c6998179e4c64f12dc2d"
+    );
+    assert_ne!(
+        request_digest(&original).unwrap(),
+        delivery_request_digest(&original)
+    );
+    let mut scalar = original.clone();
+    scalar["extension"]["z"] = json!(3);
+    let mut array = original.clone();
+    array["args"].as_array_mut().unwrap().reverse();
+    let mut extension = original.clone();
+    extension["extension"]["future"] = json!(false);
+    for changed in [&scalar, &array, &extension] {
+        assert_ne!(request_digest(changed).unwrap(), expected);
+    }
+    assert_eq!(serde_json::to_vec(&original).unwrap(), original_wire);
+    assert_eq!(serde_json::to_vec(&reordered).unwrap(), reordered_wire);
 }
 
 fn fail_before_dispatch(claim: OperationClaim) {

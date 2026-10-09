@@ -5,6 +5,8 @@
 //! to a function and exact construction/entry counts, never an entire file.
 //! Async bodies are forbidden even inside a reviewed function. This is a static
 //! gate, not a call-graph proof; worker I/O also refuses an active Cx at runtime.
+//! It runs alongside the A002 dependency-direction and A004 feature-profile
+//! gates; its planted negative fixtures check the runtime detector itself.
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::fs;

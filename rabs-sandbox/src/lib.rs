@@ -57,3 +57,15 @@ pub mod toolchain_transfer;
 pub mod unit_convergence;
 pub mod unit_mappings;
 pub mod upload_policy;
+
+#[cfg(test)]
+pub(crate) fn private_test_directory() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}

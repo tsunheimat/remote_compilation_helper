@@ -2133,6 +2133,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn distinct_non_utf8_destinations_do_not_collide_through_lossy_display() {
+        use std::io::Write as _;
         use std::os::unix::ffi::OsStringExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2161,7 +2162,13 @@ mod tests {
             &[first.clone(), second.clone()],
             MaterializationMode::PrivateCopy,
         )
-        .unwrap();
+        .unwrap_or_else(|error| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "native non-UTF8 materialization failed: {error:?}"
+            );
+            panic!("non-UTF8 materialization: {error:?}");
+        });
         assert_eq!(receipt.installed.len(), 2);
         assert_eq!(fs::read(&first.destination).unwrap(), b"artifact");
         assert_eq!(fs::read(&second.destination).unwrap(), b"artifact");

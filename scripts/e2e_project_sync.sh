@@ -373,7 +373,6 @@ run_rsync_with_stats() {
     local source="$1"
     local dest="$2"
     shift 2
-    local excludes=("$@")
 
     local rsync_args=(
         -av
@@ -381,7 +380,8 @@ run_rsync_with_stats() {
         --stats
     )
 
-    for pattern in "${excludes[@]}"; do
+    local pattern
+    for pattern in "$@"; do
         rsync_args+=(--exclude "$pattern")
     done
 
@@ -390,43 +390,39 @@ run_rsync_with_stats() {
     local start_ms
     start_ms="$(e2e_now_ms)"
 
-    local output
-    if ! output=$(rsync "${rsync_args[@]}" 2>&1); then
-        printf 'rsync fixture failed: %s\n' "$output" >&2
+    local output stats_log
+    stats_log=$(mktemp "$(dirname "$LOG_FILE")/rsync-stats.XXXXXX")
+    if ! LC_ALL=C rsync "${rsync_args[@]}" >"$stats_log" 2>&1; then
+        printf 'rsync fixture failed; retained output: %s\n' "$stats_log" >&2
+        cat "$stats_log" >&2
         return 1
     fi
+    output=$(<"$stats_log")
 
     local end_ms
     end_ms="$(e2e_now_ms)"
     local duration_ms=$((end_ms - start_ms))
 
-    # Parse rsync stats
-    local files_transferred=0
-    local bytes_sent=0
-    local bytes_received=0
-    local speedup="1.0"
-
-    if echo "$output" | grep -q "Number of files transferred"; then
-        files_transferred=$(echo "$output" | grep "Number of files transferred" | grep -oE '[0-9,]+' | tr -d ',')
-    elif echo "$output" | grep -q "Number of regular files transferred"; then
-        files_transferred=$(echo "$output" | grep "Number of regular files transferred" | grep -oE '[0-9,]+' | head -1 | tr -d ',')
+    # Older Apple rsync reports wire bytes only in the final sent/received
+    # summary; newer versions also provide the Total bytes labels.
+    local files_transferred bytes_sent bytes_received speedup
+    files_transferred=$(printf '%s\n' "$output" | awk -F: '/^Number of (regular )?files transferred:/ {gsub(/[[:space:],]/, "", $2); print $2; exit}')
+    bytes_sent=$(printf '%s\n' "$output" | awk -F: '/^Total bytes sent:/ {gsub(/[[:space:],]/, "", $2); print $2; exit}')
+    bytes_received=$(printf '%s\n' "$output" | awk -F: '/^Total bytes received:/ {gsub(/[[:space:],]/, "", $2); print $2; exit}')
+    if [[ -z "$bytes_sent" || -z "$bytes_received" ]]; then
+        bytes_sent=$(printf '%s\n' "$output" | awk '/^sent [0-9,]+ bytes[[:space:]]+received [0-9,]+ bytes/ {gsub(/,/, "", $2); print $2; exit}')
+        bytes_received=$(printf '%s\n' "$output" | awk '/^sent [0-9,]+ bytes[[:space:]]+received [0-9,]+ bytes/ {gsub(/,/, "", $5); print $5; exit}')
     fi
-
-    if echo "$output" | grep -q "Total bytes sent"; then
-        bytes_sent=$(echo "$output" | grep "Total bytes sent" | grep -oE '[0-9,]+' | head -1 | tr -d ',')
-    fi
-
-    if echo "$output" | grep -q "Total bytes received"; then
-        bytes_received=$(echo "$output" | grep "Total bytes received" | grep -oE '[0-9,]+' | head -1 | tr -d ',')
-    fi
-
-    if echo "$output" | grep -q "speedup"; then
-        speedup=$(echo "$output" | grep -oE 'speedup is [0-9.]+' | grep -oE '[0-9.]+' || echo "1.0")
+    speedup=$(printf '%s\n' "$output" | awk '{for (i = 1; i + 2 <= NF; i++) if ($i == "speedup" && $(i + 1) == "is") {gsub(/,/, "", $(i + 2)); print $(i + 2); exit}}')
+    if [[ ! "$files_transferred" =~ ^[0-9]+$ || ! "$bytes_sent" =~ ^[0-9]+$ \
+        || ! "$bytes_received" =~ ^[0-9]+$ || ! "$speedup" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        printf 'Missing or malformed rsync statistics; retained output: %s\n' "$stats_log" >&2
+        return 1
     fi
 
     # Return JSON stats
     printf '{"files_transferred":%s,"bytes_sent":%s,"bytes_received":%s,"duration_ms":%s,"speedup":"%s"}' \
-        "${files_transferred:-0}" "${bytes_sent:-0}" "${bytes_received:-0}" "$duration_ms" "$speedup"
+        "$files_transferred" "$bytes_sent" "$bytes_received" "$duration_ms" "$speedup"
 }
 
 # =============================================================================

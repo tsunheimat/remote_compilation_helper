@@ -5195,6 +5195,7 @@ dependencies = [
  "proc-macro2",
  "rabs-action",
  "rabs-protocol",
+ "rustls",
  "syn 2.0.119",
  "tempfile",
 ]

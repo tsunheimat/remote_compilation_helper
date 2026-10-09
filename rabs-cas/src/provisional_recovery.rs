@@ -430,6 +430,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn m019_non_utf8_unix_path_is_recovered_without_lossy_aliasing() {
+        use std::io::Write as _;
         use std::os::unix::ffi::OsStrExt;
 
         let mut store = fixture();
@@ -437,7 +438,13 @@ mod tests {
         let (_, pin_key, original) =
             pin_with_installing_dependent(&mut store, &dir, "original.rmeta", b"installed");
         let path = dir.join(std::ffi::OsStr::from_bytes(b"output-\xff.rmeta"));
-        std::fs::rename(&original, &path).unwrap();
+        std::fs::rename(&original, &path).unwrap_or_else(|error| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "native non-UTF8 recovery fixture rename failed: {error:?}"
+            );
+            panic!("non-UTF8 recovery fixture rename: {error:?}");
+        });
         record_installed_output(&mut store, &pin_key, "worker-b", AttemptId(31), &path, 8).unwrap();
         let lossy_alias = dir.join("output-\u{fffd}.rmeta");
         std::fs::write(&lossy_alias, b"installed").unwrap();

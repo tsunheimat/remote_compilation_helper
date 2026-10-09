@@ -538,7 +538,8 @@ fn capture_ack(frame: &[u8], attempt: &str, capture: &str) -> Option<CaptureAck>
         .then_some(ack)
 }
 
-fn completion_not_published(detail: &str) -> String {
+fn completion_not_published(key: &str, detail: &str) -> String {
+    log("not-published", &[("key", key), ("detail", detail)]);
     json!({
         "kind": "rustc-completion", "outcome": "not-published", "detail": detail,
         "publication_authorized": false,
@@ -576,6 +577,7 @@ pub(super) async fn complete_on_lane(
     frame: Vec<u8>,
     stream: &mut asupersync::net::unix::UnixStream,
 ) -> String {
+    let key_text = digest_key(attempt.action_key());
     let prepared = match lane.spawn(move || {
         let report = completion_report(&frame, &attempt.attempt_hex())
             .ok_or_else(|| "malformed or unversioned completion".to_owned())?;
@@ -589,20 +591,24 @@ pub(super) async fn complete_on_lane(
     };
     let captured = match prepared {
         Ok(captured) => captured,
-        Err(detail) => return completion_not_published(&detail),
+        Err(detail) => return completion_not_published(&key_text, &detail),
     };
     let attempt_hex = captured.attempt_hex();
     let ack = acknowledge_capture(stream, &attempt_hex, captured.manifest_key()).await;
+    let completion_key = key_text.clone();
     let finished = lane.spawn(move || {
         let Some(ack) = ack else {
             drop(captured);
-            return completion_not_published("output capture was not acknowledged");
+            return completion_not_published(
+                &completion_key,
+                "output capture was not acknowledged",
+            );
         };
         // Recheck against the retained candidate, not values from a new
         // request or a mutable source path. Publication consumes this owner.
         if ack.attempt != captured.attempt_hex() || ack.capture != captured.manifest_key() {
             drop(captured);
-            return completion_not_published("capture identity mismatch");
+            return completion_not_published(&completion_key, "capture identity mismatch");
         }
         let key_text = digest_key(captured.action_key());
         let (outcome, known) = captured.publish();
@@ -628,7 +634,7 @@ pub(super) async fn complete_on_lane(
             })
             .to_string()
         }),
-        Err(error) => completion_not_published(&error.to_string()),
+        Err(error) => completion_not_published(&key_text, &error.to_string()),
     }
 }
 

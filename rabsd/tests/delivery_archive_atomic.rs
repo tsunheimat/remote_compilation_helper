@@ -72,11 +72,13 @@ impl Fixture {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         let receipt = json!({
             "version": 1, "kind": "verified-worker-delivery", "request_id": 7,
             "worker_id": "worker", "boot_generation": 1,
             "incarnation": "00000000000000000000000000000001",
-            "request_sha256": hash(&serde_json::to_vec(&request).unwrap()),
+            "request_sha256": hash(&serde_json::to_vec(&canonical_request).unwrap()),
             "exit_code": 0, "stop_reason": null,
             "stdout_bytes": STDOUT.len(), "stdout_sha256": hash(STDOUT),
             "stderr_bytes": 0, "stderr_sha256": hash(b""),

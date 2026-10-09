@@ -317,18 +317,41 @@ async fn probe_installed_version(
 ) -> Result<String> {
     use crate::transfer::read_bounded_output_stream;
     use std::process::Stdio;
+    use tokio::time::{Instant, sleep_until, timeout_at};
 
-    let mut child = tokio::process::Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("cannot execute installed {name}: {}", path.display()))?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("installed version probe timeout is out of range")?;
+    let mut child = loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("installed {name} version probe timed out after {timeout:?}");
+        }
+        match tokio::process::Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                // A concurrent spawn can temporarily inherit a staging writer
+                // until exec closes it. ETXTBSY means the target did not run;
+                // retry only that refusal, without resetting the probe budget.
+                sleep_until((Instant::now() + std::time::Duration::from_millis(5)).min(deadline))
+                    .await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot execute installed {name}: {}", path.display())
+                });
+            }
+        }
+    };
     let stdout = child.stdout.take().context("version probe lacks stdout")?;
     let stderr = child.stderr.take().context("version probe lacks stderr")?;
-    let captured = tokio::time::timeout(timeout, async {
+    let captured = timeout_at(deadline, async {
         tokio::try_join!(
             read_bounded_output_stream(stdout, 64 * 1024),
             read_bounded_output_stream(stderr, 64 * 1024),
@@ -599,6 +622,91 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn busy_version_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::fs::File) {
+        let directory = tempfile::tempdir().unwrap();
+        let client = installed_fixture(
+            directory.path(),
+            "rch",
+            r#"printf 'run\n' >> "${0%/*}/executions"; printf 'rch 2.1.15\n'"#,
+        );
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&client)
+            .unwrap();
+        let error = std::process::Command::new(&client)
+            .arg("--version")
+            .output()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        assert!(!directory.path().join("executions").exists());
+        (directory, client, writer)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn version_probe_runs_once_after_a_busy_writer_closes() {
+        let (directory, client, writer) = busy_version_fixture();
+        let mut probe = Box::pin(probe_installed_version(
+            &client,
+            "rch",
+            "2.1.15",
+            std::time::Duration::from_secs(1),
+        ));
+        assert!(matches!(
+            futures::poll!(probe.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(!directory.path().join("executions").exists());
+        drop(writer);
+        assert_eq!(probe.await.unwrap(), "2.1.15");
+        assert_eq!(
+            std::fs::read(directory.path().join("executions")).unwrap(),
+            b"run\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn version_probe_refuses_a_busy_writer_within_its_original_budget() {
+        let (directory, client, _writer) = busy_version_fixture();
+        let budget = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            probe_installed_version(&client, "rch", "2.1.15", budget),
+        )
+        .await
+        .expect("busy refusal must not reset the probe deadline")
+        .unwrap_err();
+        assert!(started.elapsed() >= budget);
+        assert!(
+            error.to_string().contains("timed out after 100ms"),
+            "{error:#}"
+        );
+        assert!(!directory.path().join("executions").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_a_busy_version_probe_prevents_later_execution() {
+        let (directory, client, writer) = busy_version_fixture();
+        let mut probe = Box::pin(probe_installed_version(
+            &client,
+            "rch",
+            "2.1.15",
+            std::time::Duration::from_secs(1),
+        ));
+        assert!(matches!(
+            futures::poll!(probe.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(probe);
+        drop(writer);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!directory.path().join("executions").exists());
     }
 
     #[cfg(unix)]

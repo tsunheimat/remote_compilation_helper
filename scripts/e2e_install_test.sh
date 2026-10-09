@@ -247,13 +247,42 @@ run_install_case() {
     fi
     mkdir -p "$home_dir"
 
+    local case_path="$stub_bin:$PATH"
+    if [[ "$systemctl_mode" == "missing" ]]; then
+        # A failing systemctl stub does not hide launchctl on macOS. Keep
+        # native tools available while excluding both manager executables.
+        case_path="$TEST_DIR/no-service-manager-bin"
+        if [[ ! -d "$case_path" ]]; then
+            mkdir -p "$case_path"
+            local path_dir executable name
+            local inherited_path=()
+            IFS=: read -r -a inherited_path <<<"$PATH"
+            for path_dir in "${inherited_path[@]}"; do
+                [[ -d "${path_dir:-.}" ]] || continue
+                path_dir=$(cd "${path_dir:-.}" && pwd -P)
+                for executable in "$path_dir"/*; do
+                    [[ -f "$executable" && -x "$executable" ]] || continue
+                    name="${executable##*/}"
+                    case "$name" in systemctl|launchctl) continue ;; esac
+                    [[ -e "$case_path/$name" ]] || ln -s "$executable" "$case_path/$name"
+                done
+            done
+        fi
+        if PATH="$case_path" command -v systemctl >/dev/null 2>&1 \
+            || PATH="$case_path" command -v launchctl >/dev/null 2>&1; then
+            printf 'Missing-manager fixture still exposes a service manager\n' >&2
+            return 2
+        fi
+    fi
+    printf '%s\n' "$case_path" > "$install_dir/installer.path"
+
     local output
     local status=0
 
     if [[ "$use_script" == "true" ]]; then
         if command -v script >/dev/null 2>&1; then
             local cmd
-            cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 RCH_NO_RC=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$stub_bin:$PATH\""
+            cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 RCH_NO_RC=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$case_path\""
             cmd="$cmd HOME=\"$home_dir\""
             cmd="$cmd \"$PROJECT_ROOT/install.sh\" --offline \"$tarball\" $extra_args"
             if [[ "$(uname -s)" == Darwin ]]; then
@@ -269,7 +298,7 @@ run_install_case() {
         output=$(printf '%s' "$input_data" | \
             SYSTEMCTL_LOG="$systemctl_log" \
             SYSTEMCTL_MODE="$systemctl_mode" \
-            PATH="$stub_bin:$PATH" \
+            PATH="$case_path" \
             HOME="$home_dir" \
             RCH_INSTALL_DIR="$install_dir" \
             RCH_CONFIG_DIR="$config_dir" \

@@ -27,6 +27,8 @@ export PROJECT_ROOT
 VERBOSE="${RCH_E2E_VERBOSE:-0}"
 LOG_FILE="${RCH_E2E_LOG:-${TMPDIR:-/tmp}/rch_e2e_error_codes_$(date +%Y%m%d_%H%M%S).jsonl}"
 LOG_FILE="${LOG_FILE%.jsonl}.diagnostics.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+CAPTURE_DIR=$(mktemp -d "$(dirname "$LOG_FILE")/rch-api-error-codes.XXXXXX")
 
 # Structured JSONL logging
 # shellcheck disable=SC1091
@@ -227,6 +229,7 @@ run_tests() {
     log "INFO" "=========================================="
     log "INFO" "Starting API Error Code E2E Tests"
     log "INFO" "Log file: $LOG_FILE"
+    log "INFO" "Raw stdout and stderr: $CAPTURE_DIR"
     log "INFO" "=========================================="
 
     # =========================================================================
@@ -234,7 +237,8 @@ run_tests() {
     # =========================================================================
     log "INFO" "Test 1: Invalid worker probe error format"
     local output
-    output=$("$rch" workers probe nonexistent-worker --json 2>&1 || true)
+    "$rch" workers probe nonexistent-worker --json >"$CAPTURE_DIR/probe-json.stdout" 2>"$CAPTURE_DIR/probe-json.stderr" || true
+    output=$(<"$CAPTURE_DIR/probe-json.stdout")
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
     test_error_format "probe-invalid-worker" "$output" "RCH-E"
@@ -251,7 +255,8 @@ run_tests() {
     export RCH_SOCKET_PATH="/tmp/nonexistent-rch-socket-$$"
 
     local status_exit=0
-    output=$("$rch" status --json 2>&1) || status_exit=$?
+    "$rch" status --json >"$CAPTURE_DIR/status-json.stdout" 2>"$CAPTURE_DIR/status-json.stderr" || status_exit=$?
+    output=$(<"$CAPTURE_DIR/status-json.stdout")
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
     if [[ "$status_exit" == 1 ]] && echo "$output" | jq -e '.success == false and .error' >/dev/null 2>&1; then
@@ -278,7 +283,8 @@ run_tests() {
     echo 'invalid toml [' > "$invalid_config"
 
     local config_exit=0
-    output=$(RCH_CONFIG_DIR="$invalid_config_dir" "$rch" config show --json 2>&1) || config_exit=$?
+    RCH_CONFIG_DIR="$invalid_config_dir" "$rch" config show --json >"$CAPTURE_DIR/config-json.stdout" 2>"$CAPTURE_DIR/config-json.stderr" || config_exit=$?
+    output=$(<"$CAPTURE_DIR/config-json.stdout")
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
     if [[ "$config_exit" == 1 ]] && echo "$output" | jq -e \
@@ -295,8 +301,8 @@ run_tests() {
     TESTS_RUN=$((TESTS_RUN + 1))
 
     local stdout_file stderr_file
-    stdout_file=$(mktemp)
-    stderr_file=$(mktemp)
+    stdout_file="$CAPTURE_DIR/probe-plain.stdout"
+    stderr_file="$CAPTURE_DIR/probe-plain.stderr"
 
     local probe_exit=0
     "$rch" workers probe nonexistent-worker >"$stdout_file" 2>"$stderr_file" || probe_exit=$?
@@ -315,7 +321,8 @@ run_tests() {
     log "INFO" "Test 5: JSON error parseable by jq"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    output=$("$rch" workers probe nonexistent-worker --json 2>&1 || true)
+    "$rch" workers probe nonexistent-worker --json >"$CAPTURE_DIR/probe-fields.stdout" 2>"$CAPTURE_DIR/probe-fields.stderr" || true
+    output=$(<"$CAPTURE_DIR/probe-fields.stdout")
 
     # Try to extract all standard fields
     local fields_ok=1
@@ -354,7 +361,8 @@ run_tests() {
     log "INFO" "Test 7: NO_COLOR preserves JSON"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    output=$(NO_COLOR=1 "$rch" workers probe nonexistent-worker --json 2>&1 || true)
+    NO_COLOR=1 "$rch" workers probe nonexistent-worker --json >"$CAPTURE_DIR/probe-no-color.stdout" 2>"$CAPTURE_DIR/probe-no-color.stderr" || true
+    output=$(<"$CAPTURE_DIR/probe-no-color.stdout")
 
     if echo "$output" | jq -e '.' >/dev/null 2>&1; then
         log_pass "[no-color] JSON output valid with NO_COLOR"

@@ -2494,6 +2494,12 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
     let writer = retry_selection_test_lease(directory.path().join("lease.json"));
     let previous = writer.snapshot();
     let server_writer = writer.clone();
+    let toolchain = ToolchainInfo::new(
+        "nightly",
+        Some("2026-08-31".into()),
+        "rustc 1.100.0-nightly (908501772 2026-08-30)",
+    );
+    let expected_toolchain = serde_json::to_string(&toolchain).unwrap();
     let status = serde_json::json!({
         "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-endpoint", "socket_path": socket,
             "started_at": "2026-10-07T00:00:00Z", "workers_total": 1, "workers_healthy": 1,
@@ -2536,6 +2542,10 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 assert!(
                     request.contains(&format!("&local_wrapper_id={}", server_writer.wrapper_id()))
                 );
+                assert!(request.contains(&format!(
+                    "&toolchain={}",
+                    urlencoding_encode(&expected_toolchain)
+                )));
                 assert!(!request.contains("&wait=1"));
                 serde_json::to_string(&SelectionResponse {
                     reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
@@ -2558,7 +2568,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             3,
             12,
             "git status",
-            None,
+            Some(&toolchain),
             RequiredRuntime::Rust,
             CommandPriority::Normal,
             &[WorkerId::new("previous-worker")],
@@ -2601,7 +2611,36 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
             reader.read_line(&mut request).await.unwrap();
             writer.write_all(wire_response.as_bytes()).await.unwrap();
             writer.shutdown().await.unwrap();
-            request
+            drop(reader);
+            drop(writer);
+            let mut requests = vec![request];
+            if wire_response.is_empty() {
+                // EOF after dispatch permits only the existing read-only
+                // resume endpoint, never another selection or execution.
+                let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .expect("queued EOF must resume the original selection")
+                    .unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = TokioBufReader::new(reader);
+                let mut resumed = String::new();
+                reader.read_line(&mut resumed).await.unwrap();
+                assert_eq!(
+                    resumed,
+                    requests[0].replacen(
+                        "GET /select-worker?",
+                        "GET /select-worker/resume-queued?",
+                        1,
+                    )
+                );
+                writer
+                    .write_all(b"HTTP/1.0 503 Unavailable\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                writer.shutdown().await.unwrap();
+                requests.push(resumed);
+            }
+            (requests, listener)
         });
         let lease = queued_selection_test_lease(tmp.path().join("lease.json"));
         let wrapper = lease.wrapper_id();
@@ -2628,7 +2667,23 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
         .await
         .unwrap()
         .unwrap_err();
-        let request = server.await.unwrap();
+        let (requests, listener) = server.await.unwrap();
+        assert_eq!(requests.len(), if wire_response.is_empty() { 2 } else { 1 });
+        assert!(requests[0].starts_with("GET /select-worker?"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /select-worker?"))
+                .count(),
+            1,
+            "lost admission must never create a second selection"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let request = &requests[0];
         assert!(request.contains("&wait=1"));
         assert!(request.contains(&format!("local_wrapper_id={wrapper}")));
         assert!(
@@ -2653,6 +2708,7 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
         assert!(!persisted.terminal_acknowledged);
         assert!(persisted.exit_code.is_none());
         assert!(persisted.identity.remote_build_id.is_none());
+        assert!(persisted.recovery.is_none());
     }
 }
 

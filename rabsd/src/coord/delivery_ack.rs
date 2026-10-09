@@ -390,9 +390,11 @@ mod tests {
             }
             fs::write(directory.join("diagnostics/stdout"), b"ok\0\xff").unwrap();
             fs::write(directory.join("diagnostics/stderr"), b"").unwrap();
+            let mut canonical_request = request.clone();
+            canonical_request.sort_all_objects();
             let receipt = json!({"version":1, "kind":"verified-worker-delivery", "request_id":7,
                 "worker_id":"worker", "boot_generation":1, "incarnation":"01".repeat(16),
-                "request_sha256":hash(&serde_json::to_vec(&request).unwrap()),
+                "request_sha256":hash(&serde_json::to_vec(&canonical_request).unwrap()),
                 "exit_code":if artifacts {0} else {1}, "stop_reason":null,
                 "stdout_bytes":4, "stdout_sha256":hash(b"ok\0\xff"), "stderr_bytes":0, "stderr_sha256":hash(b""),
                 "artifact_manifest":manifest, "total_bytes":if artifacts {10} else {4},

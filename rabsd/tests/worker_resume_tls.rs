@@ -519,9 +519,11 @@ async fn serve(
                 let receipt: Value =
                     serde_json::from_slice(&fs::read(destination.join("delivery.json")).unwrap())
                         .unwrap();
+                let mut canonical_request = fixture.request.clone();
+                canonical_request.sort_all_objects();
                 assert_eq!(
                     receipt["request_sha256"],
-                    hash(&serde_json::to_vec(&fixture.request).unwrap())
+                    hash(&serde_json::to_vec(&canonical_request).unwrap())
                 );
                 assert_eq!(receipt["transport_authenticated"], true);
                 assert_eq!(receipt["worker_spki_sha256"], pin);

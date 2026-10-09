@@ -18,8 +18,10 @@ Windows support; existing Windows jobs have not been disabled.
 - Incoming code tree: `50665b2330f0b8c11ba2056cc0a2661f7012e69b`
 - Published development checkpoint: `f207c5bff554361111c56ddc51e7cc260302cb8a`
 - Published main integration: `a67ece95362fe06da6b3cbc8aacf2547a147330c`
+- Repair baseline: `4e3d3e3a4f61b2d045019a586cc0c5a918678491`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
+- Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
 
 The primary `main` checkout and the published checkpoint worktree were preserved.
 The integration brings in 122 main-branch commits, including native source and
@@ -43,10 +45,159 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
-## Current fixture repairs and local evidence
+## Latest repairs and validation after `4e3d3e3a`
 
-The post-integration changes repair test and logging boundaries; executable
-production Rust remains identical to `a67ece95`. The CAS publication fixture now
+The broader workspace run exposed production and fixture defects beyond the
+earlier checkpoint. The current batch repairs these boundaries:
+
+- RABS creates private staging owners with Unix mode `0700`, matching the
+  existing ownership checks. Fixtures now establish the same valid starting
+  state before testing mutation, refusal, and recovery.
+- Parsed JSON request, lease, and completion identities recursively sort object
+  keys before hashing. Their identity no longer depends on whether Cargo enables
+  `serde_json/preserve_order`. Arrays and scalar values remain bound; exact wire
+  and file-byte identities keep their existing representation. Three literal
+  digest-vector tests cover the native identity owners.
+- RCH update and recovery guards explicitly unlock when their logical ownership
+  ends. An unrelated child between fork and exec can no longer prolong the lock
+  through an inherited descriptor. Installed-version probing retries only an
+  actual `ETXTBSY` spawn refusal within one original absolute deadline.
+- Classification-cache tests exercise the exact TTL boundary through the real
+  lookup and eviction path with a controlled clock observation. The public path
+  still reads the monotonic clock under its lock and expires only after the TTL.
+- The RABS TLS adapter initializes Rustls' provider before the pinned Asupersync
+  mutual-TLS verifier consults it. An already installed application provider is
+  retained. This fixes a native startup panic when both Rustls providers are
+  enabled; certificate, peer-key, ALPN, and timeout checks remain enforced.
+- Replay, daemon-wait, stream, recovery, and CAS fixtures now establish the
+  current native protocol state. Shell scenarios use portable timing and
+  timeout helpers, verify current installer/proxy/source-sync behavior, and
+  require actual positive Cargo test counts.
+- CI test and coverage jobs install the three toolchains required by the strict
+  wrapper-contract matrix. Their June compiler pin and existing job budgets
+  remain in force. The Beta fixture changes only the independently observed
+  contract shape described below.
+
+Local execution used August nightly, normal debug profiles, normal libtest
+parallelism, and a single shared Cargo build lane. Fresh ext4 images on the
+retained storage volume supplied private `/tmp` namespaces with a consistent
+PID view. The ordinary test process ran as UID/GID 1000. Each phase binds 1,390
+source hashes and modes before and after execution; later fixture/documentation
+edits are identified separately from the runtime builds.
+
+| Validation phase | Actual result and limits |
+| --- | --- |
+| Full workspace before the final residual repairs | 225 top-level test targets: 12,091 reported passes, 16 failures, 31 ignores, zero filtered tests. Eight named capability-dependent early returns are recorded separately. The intentional failing crash-child subprocess is not counted as another top-level target. |
+| Workspace/all-target/all-feature check, Clippy with `-D warnings`, and formatting | Passed after the TLS runtime repair with the locked dependency graph. Subsequent changes are the Beta JSON fixture and this document. |
+| Entire RCH component after its residual repairs | 3,640 reported passes across 17 target summaries, zero failures/ignores/filtered tests. Two signing cases explicitly returned early for unavailable opt-in/cosign prerequisites. |
+| Native RABS replay, wait, worker TLS, interruption, and resume targets | 44 passed, zero failures/ignores/filtered tests. The passing and failing daemon builds link the identical Rustls unit with both providers enabled. |
+| Feature profile and runtime policy | 4 + 6 passed. Retained unchanged test binaries read the current manifests/source; the policy scanned 352 Rust files. |
+| Controlled native lock and executable-busy schedules | All seven schedules passed, totaling 18 selected test executions. Actual inherited descriptors, unlock/reacquire overlap, and two real `ETXTBSY` returns were observed; syscall results were not injected. |
+| Nine complete repaired shell scripts | All nine returned success. The three real Cargo test selections passed 30 + 42 + 1 cases; self-healing exercised 9/9 cases. Installer passed 44 assertions with one explicit macOS launchd capability skip. |
+| Shell output and command audit | All 32 JSONL/NDJSON files parse: 569 records including retained duplicates. All 21 Cargo calls have complete receipts. Three optional cargo-hakari probes and one missing-lock metadata probe returned 101; none was a test invocation. |
+| Strict wrapper-contract tests after the manual Beta fixture edit | Both existing tests passed unfiltered. Stable 1.98.1, Beta 1.100.0-beta.4, and nightly 1.101.0 all matched; the existing planted flag/framing/environment mutations remained enforced. The retained test harness source and binary were unchanged. |
+
+The nine scripts are API error codes, `bd-szio`, configuration rollout,
+discovery surfaces, installer, Layer-0 pack, placement controls, project sync,
+and self-healing. Layer-0 ran its default three stock/three configured builds
+and checked the actual compiler flags; this is not a performance-win claim.
+Real Cargo legitimately rebuilt the daemon variant during the collection, so
+per-script binary receipts, rather than one supposedly immutable binary, bind
+those results. Existing source, host profile, and output trees were preserved;
+only a previously missing empty `l0-proof` mountpoint was created and retained.
+
+Six large-toolchain RABS worker cases from the full workspace run remain red.
+They span artifact transfer, jobserver bridging, output transfer, process
+context, and worker sessions under the original capture/execution deadlines.
+A separately labeled runtime check with the complete installed June toolchain
+passed 13 of 16 cases but still failed three. One reached real execution and
+returned timeout status 124 after producing output. These are not all pre-exec
+failures, and the evidence does not establish that NFS dominates their cost.
+No hashing barrier, timeout, toolchain pin, or test collection was weakened.
+The selected later passes do not establish a fully passing current workspace.
+
+### Beta contract evidence and admission change
+
+The manual Beta fixture update adds `--force-warn` and
+`unused-externs-silent`, and removes `-C extra-filename` and `-L` from the
+dependency-free primary/build-script profile. Its environment-name set is
+unchanged. The exact two-job C009 stock/native pair executed the actual Beta
+compiler for both classes, retained their normal primary-package refusals, and
+produced identical artifact, dep-info, and application bytes.
+
+A separate one-job native cache cohort exercised commit, independent
+verification, three served dependency hits, and Cargo freshness. Source closure
+changes, a compiler `--cfg` change, and repeated compiler errors passed their
+original negative assertions. The source hashes before/after the `--cfg` change
+are identical, and all three native action keys changed. Raw complete
+`unused_extern` payloads, including the nonempty `unused_extern_names:["side"]`,
+match the real compiler output. Observed `CLONE_THREAD` lineage binds compiler
+writers; replay writers are the actual wrapper processes with matching served
+receipts and no dependency compiler execution.
+
+The original serial runner retains exit 1 because its observer rejected
+whitespace in six reassembled strace write records. A separately retained,
+reviewed offline parser correction accepts only that whitespace and proves the
+complete byte counts, payloads, writer lineage, and receipts from unchanged
+traces. Seven native behavior phases passed; the eighth observation is supported
+by that separate analysis. Earlier parallel probes remain incomplete: an
+observed pre-IPC fallback is consistent with the intended nonblocking breaker
+lock, not proof of a timeout or a required policy repair.
+
+The recorded admission split has 12 cases: the new exact fixture admits the
+observed modern Beta shape and rejects the old Beta shape. Ten altered flag,
+framing, artifact, environment, and hybrid shapes remain rejected by both.
+The comparison code and stable/nightly fixtures were not relaxed or regenerated.
+
+### Evidence locations and scanner limits
+
+The retained validation base is
+`/mnt/hdd-vibe-coding-share/remote-test-local-fallback-claude1/tmp/`:
+
+- `rch-workspace-volume-74eX6rDB/report/`: full 225-target run and capability accounting.
+- `rch-residual-validation-yv7tq8ja/report/`: entire RCH component and the initial native TLS provider failure.
+- `rch-tls-provider-validation-cqiny0di/report/`: final required checks, 44 native cases, and identical Rustls dependency-unit proof.
+- `rch-post-repair-native-Wwu0ZKZL/runs/`: seven native schedules and `nine.4jVfTV8K` complete script collection, including host/source preservation receipts.
+- `beta-native-serial-run-NKwluaf2/`: immutable native outputs, separate corrected observation, exact fixture admission review, and isolated `--cfg` comparison.
+- `rch-beta-fixture-validation-g0groc4f/report/`: strict all-channel comparison after the manual fixture update.
+
+UBS coverage now binds 160 current Rust/Bash inputs. The last one-file TLS scan
+returned exit 0 with 0 critical, 59 warning, and 12 informational records, with
+no finding on an added line. Earlier raw scans remain nonzero, and 26 reviewed
+critical records remain in the combined manifest. One is on the existing
+installed-version `Command::new(path)` call moved into the bounded retry loop;
+its trusted path derivation and literal `--version` argument are unchanged.
+The other reviewed expressions are inherited. Warnings are not exhaustively
+cleared, and no all-scope scanner pass is claimed. The official scanner remained
+unchanged; no AST/ShellCheck/Cargo scanner phase or TOML/YAML scan is implied.
+Current combined hashes and bounded triage are in
+`target/managed-storage-validation-20261009/ubs-tls-provider-report-approved.t3ovp5p6/`.
+
+## Published baseline CI (`4e3d3e3a`)
+
+These terminal results predate the batch above. Fresh CI belongs to its own
+published head; local selected passes do not turn these runs green.
+
+| Workflow | Observed result |
+| --- | --- |
+| [CI 37926280812](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37926280812) | Check, Clippy, docs, format, workflow/manifest/security and benchmark jobs passed. Linux x64 stopped at two missing CAS domain declarations, repaired in this batch. macOS ARM reported two non-UTF8 path failures before its 30-minute limit; their exact native error remains open and direct-stderr diagnostics are added. Linux ARM, macOS Intel, coverage and the core E2E job also reached their existing limits. No LCOV report was produced. |
+| [E2E 37926280750](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37926280750) | Ubuntu passed all 41 outer scripts. macOS passed 34 and failed seven; their portability/behavior repairs are in this batch. Both inner collections passed 11 cases with two explicit opt-in skips. Native macOS acceptance still requires fresh CI. |
+| [Test Release 37926280696](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37926280696) | Four Unix jobs passed. macOS Intel completed packaging/upload but its final job was cancelled at one hour. All five Unix packages independently passed archive/checksum/inventory verification. Windows failed at the inherited non-Unix helper import and remains deferred; aggregate verification was skipped. |
+| [RABS 37926280978](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37926280978) | Accepted-hit protocol passed 34 unit and 8 integration cases plus lint. Release compilation received a runner shutdown signal and exited 143; cause remains unknown. Size, replay, worktree, doctor and overhead gates did not run. |
+| [Rsync 37926280842](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37926280842) | Both jobs passed. The source archive was independently bound to the exact PR merge and all 1,390 published files. |
+
+The core CI `true_e2e` step separately reported 164 passes, including 92 named
+early returns without live-worker prerequisites and 72 exercised cases. The
+failed overall job is not a complete E2E pass. Full baseline logs, annotations,
+verified artifacts, and source analysis remain in the integration worktree's
+`target/managed-storage-integration-validation-20261009/ci-4e3d3e3a4f61/`.
+Keep the PR draft while the remaining gates are unresolved. Deployment and live
+SSH/Nexus acceptance remain with the user.
+
+## Historical fixture checkpoint (`4e3d3e3a`)
+
+At this earlier checkpoint, post-integration changes repaired test and logging
+boundaries; executable production Rust was identical to `a67ece95`. The CAS publication fixture now
 registers the known domains when reopening its store, matching coordinator boot.
 Quarantine tests require the native refusal and unchanged durable snapshot when
 an ordinary serving update attempts to erase quarantine. They retain the
@@ -81,7 +232,7 @@ terminal metadata, and failure/skip reasons. Its clock uses the existing
 portable helpers; the old implementation returned a nonnumeric value under a
 BSD-shaped `date` probe, while the repaired helper returns numeric milliseconds.
 
-| Current local check | Result and scope |
+| Earlier checkpoint local check | Result and scope |
 | --- | --- |
 | Workspace/all-target/all-feature check, Clippy with `-D warnings`, formatting | Passed after all five Rust fixture repairs; later changes are Bash/documentation only |
 | Full CAS library, all features | 311 passed, 0 failed, 1 hardware-dependent reflink test ignored |
@@ -91,7 +242,7 @@ BSD-shaped `date` probe, while the repaired helper returns numeric milliseconds.
 | Aggregate after the shared logger repair | 11 child scripts passed, 0 failed, 2 explicit opt-in skips; all 33 Cargo test invocations selected positive counts |
 | Repaired retry script | Passed with exact 1/3 sync-attempt counts, two new remote completion receipts, force-local admission, and 4 + 8 actual unit cases |
 | Shared logger boundary probes | Passed exact data roundtrips and malformed-data rejection; failure remains exit 1 and skip remains exit 4 |
-| Full workspace test execution and current-patch full CI | Pending; none of the selected checks is an exhaustive workspace or release result |
+| Full workspace test execution and checkpoint CI | Pending when this checkpoint was published; later terminal results are recorded above |
 
 The frozen collection records 173 actual Cargo calls, including 63 test
 invocations: 62 selected positive counts and the old zero-count retry invocation
@@ -119,8 +270,8 @@ The final aggregate rerun is retained in
 parses 49 JSONL files containing 11,593 copied records with zero malformed
 records; the quoted hook message decodes to the exact native delegated command.
 Its 120 actual Cargo calls include 33 successful positive-count test invocations
-and 74 non-test `metadata --locked` probes returning 101 on fixture
-lockfile/manifest cases. Those probe statuses are retained separately. Executable
+and 74 non-test metadata probes returning 101 on fixture lockfile/manifest cases:
+73 used `--locked` and one used `--no-deps`. Those probe statuses are retained separately. Executable
 and test-source hashes matched before/after; documentation is not a runtime input
 to that bounded rerun.
 

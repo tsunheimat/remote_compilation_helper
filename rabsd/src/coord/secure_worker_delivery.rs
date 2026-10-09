@@ -1232,6 +1232,8 @@ mod tests {
             selected["request_id"] = json!(request_id);
             selected["extension"] = json!({"preserve":["opaque", 17]});
             let original_bytes = serde_json::to_vec(&selected).unwrap();
+            let mut canonical_request = selected.clone();
+            canonical_request.sort_all_objects();
             let (inner, admission) = with_admission(Script {
                 replies: VecDeque::from([hello(), response()]),
                 ..Script::default()
@@ -1255,7 +1257,7 @@ mod tests {
                 peer.inner.sent[1]["execution_lease"],
                 json!({
                     "version":"request-renewal-v1", "session_id":10, "lease_id":30,
-                    "request_id":request_id, "request_sha256":hex(&Sha256::digest(&original_bytes)),
+                    "request_id":request_id, "request_sha256":hex(&Sha256::digest(serde_json::to_vec(&canonical_request).unwrap())),
                     "boot_generation":1, "incarnation":"00000000000000000000000000000001",
                     "ttl_ms":30000,
                 })
@@ -1688,12 +1690,14 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         for (advertised, warm) in [(false, false), (true, false), (true, true)] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_util::private_tempdir();
             let (upload, request, mut script) = toolchain_fixture(root.path(), warm);
             if advertised {
                 script.replies[0]["toolchain_reuses"] = json!([TOOLCHAIN_REUSE_VERSION]);
             }
             let original = serde_json::to_vec(&request).unwrap();
+            let mut canonical_request = request.clone();
+            canonical_request.sort_all_objects();
             let mut peer = source_admission(script, &request)
                 .with_source(&upload)
                 .unwrap();
@@ -1715,7 +1719,9 @@ mod tests {
             }
             assert_eq!(
                 sent[1]["execution_lease"]["request_sha256"],
-                hex(&Sha256::digest(&original))
+                hex(&Sha256::digest(
+                    serde_json::to_vec(&canonical_request).unwrap()
+                ))
             );
             assert_eq!(sent[5]["kind"], "source-seal");
             assert_eq!(sent[6]["kind"], "toolchain-begin");
@@ -1755,7 +1761,7 @@ mod tests {
         use rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION;
 
         for case in 0..7 {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_util::private_tempdir();
             let (upload, request, mut script) = toolchain_fixture(root.path(), true);
             if case != 0 {
                 script.replies[0]["toolchain_reuses"] = json!([TOOLCHAIN_REUSE_VERSION]);
@@ -1823,9 +1829,13 @@ mod tests {
         assert_eq!(sent[1]["kind"], "session-ok");
         assert_eq!(sent[1]["source_transfer"], "source-files-v1");
         assert_eq!(sent[1]["publication"], "disabled");
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         assert_eq!(
             sent[1]["execution_lease"]["request_sha256"],
-            hex(&Sha256::digest(serde_json::to_vec(&request).unwrap()))
+            hex(&Sha256::digest(
+                serde_json::to_vec(&canonical_request).unwrap()
+            ))
         );
         assert_eq!(sent[2]["kind"], "source-begin");
         for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
@@ -2319,7 +2329,7 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_util::private_tempdir();
         let (upload, request, mut script) = toolchain_fixture(root.path(), true);
         script.replies[0]["toolchain_reuses"] =
             json!([rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION,]);

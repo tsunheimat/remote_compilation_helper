@@ -328,7 +328,7 @@ impl Fixture {
     }
     fn daemon(&self) -> Process {
         let mut command = self.command();
-        command.args(["--run-for-ms", "60000"]);
+        // Normal daemon mode installs the SIGTERM listener used by shutdown().
         let mut process = Process::start(&self.root, "daemon", &mut command);
         process.ready(&self.socket);
         process

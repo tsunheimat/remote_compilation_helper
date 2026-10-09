@@ -14,12 +14,23 @@ use std::path::{Path, PathBuf};
 const GATED_RECORD: &str = "rch-update-gate-v1";
 const MAX_RECORD_BYTES: u64 = 4096;
 
+struct UpdateGate(File);
+
+impl Drop for UpdateGate {
+    fn drop(&mut self) {
+        // A concurrent process spawn can retain this open-file description
+        // until exec closes CLOEXEC descriptors. Its copy must not extend
+        // ownership after the acquiring guard has finished.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Exclusive ownership of an update, including rollback and daemon restart.
 pub struct UpdateLock {
     path: PathBuf,
     body: String,
-    // Closed only after Drop has finished cleaning up our sentinel.
-    _gate: File,
+    // Unlocked only after Drop has finished cleaning up our sentinel.
+    _gate: UpdateGate,
 }
 
 impl UpdateLock {
@@ -103,8 +114,8 @@ impl Drop for UpdateLock {
         if read_record(&self.path).ok().flatten().as_deref() == Some(self.body.as_str()) {
             let _ = fs::remove_file(&self.path);
         }
-        // Do not unlink the gate. Closing our File releases kernel ownership,
-        // also on process death when this destructor does not run.
+        // The gate field unlocks only after this cleanup. Keep its persistent
+        // inode; kernel ownership also ends when every handle has closed.
     }
 }
 
@@ -121,7 +132,7 @@ fn lock_error(operation: &str, error: io::Error) -> UpdateError {
 
 /// No caller may remove or replace this file. As with the other local
 /// ownership journals, its parent directory must be operator-controlled.
-fn open_gate(path: &Path, create: bool) -> Result<Option<File>, UpdateError> {
+fn open_gate(path: &Path, create: bool) -> Result<Option<UpdateGate>, UpdateError> {
     let path = path.with_extension("gate");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
@@ -151,7 +162,7 @@ fn open_gate(path: &Path, create: bool) -> Result<Option<File>, UpdateError> {
         Err(error) => return Err(lock_error("open update gate", error)),
     };
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(UpdateGate(file))),
         Err(TryLockError::WouldBlock) => Err(UpdateError::LockHeld),
         Err(TryLockError::Error(error)) => Err(lock_error("lock update gate", error)),
     }
@@ -256,6 +267,38 @@ mod tests {
         assert!(path.with_extension("gate").is_file());
         assert!(!UpdateLock::is_locked_at(&path));
         drop(UpdateLock::acquire_at(&path).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_gate_unlocks_with_an_inherited_handle_open() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_directory, path) = fixture();
+        let owner = open_gate(&path, true).unwrap().unwrap();
+        // try_clone shares the open-file description, as a child does between
+        // fork and exec. Closing only the original leaves its flock held.
+        let inherited = owner.0.try_clone().unwrap();
+        let inode = inherited.metadata().unwrap().ino();
+        assert!(matches!(
+            UpdateLock::acquire_at(&path),
+            Err(UpdateError::LockHeld)
+        ));
+        drop(owner);
+        assert!(!path.exists());
+        assert_eq!(
+            fs::metadata(path.with_extension("gate")).unwrap().ino(),
+            inode
+        );
+        let next = UpdateLock::acquire_at(&path).unwrap();
+        drop(inherited);
+        assert!(UpdateLock::is_locked_at(&path));
+        assert!(matches!(
+            UpdateLock::acquire_at(&path),
+            Err(UpdateError::LockHeld)
+        ));
+        drop(next);
+        assert!(!UpdateLock::is_locked_at(&path));
     }
 
     #[test]

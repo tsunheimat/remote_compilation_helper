@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -112,7 +113,10 @@ struct ReceiverPeer {
 impl ReceiverPeer {
     fn new(fixture: &Fixture) -> Self {
         Self {
-            owner: tempfile::tempdir().unwrap(),
+            owner: tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap(),
             receiver: None,
             files: fixture.files.clone(),
             missing: None,

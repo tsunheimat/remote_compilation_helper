@@ -11,7 +11,7 @@ set -euo pipefail
 # 3. Doctor --fix repairs both
 #
 # Prerequisites:
-# - rch/rchd pair in CARGO_TARGET_DIR or PATH (RCH_BIN/RCHD_BIN override)
+# - rch/rchd pair in CARGO_TARGET_DIR, repository target, or PATH (RCH_BIN/RCHD_BIN override)
 # - jq, Python 3, nohup and ps
 # - Write access to /tmp/ (all HOME/config/runtime state is isolated)
 # - macOS: no registered com.rch.daemon launchd service
@@ -29,16 +29,15 @@ TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
 TEST_RUNTIME_ROOT=$(mktemp -d /tmp/rch-healing.XXXXXX)
 TEST_RUNTIME_ROOT=$(cd "$TEST_RUNTIME_ROOT" && pwd -P)
 LOG_FILE="${TEST_ROOT}/test.log"
+TEST_PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+TEST_TARGET_DIR="${CARGO_TARGET_DIR:-$TEST_PROJECT_ROOT/target}"
 TEST_BIN_DIR=""
-if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-    TEST_BIN_DIR="$CARGO_TARGET_DIR/debug"
-    for profile in debug release; do
-        if [[ -x "$CARGO_TARGET_DIR/$profile/rch" && -x "$CARGO_TARGET_DIR/$profile/rchd" ]]; then
-            TEST_BIN_DIR="$CARGO_TARGET_DIR/$profile"
-            break
-        fi
-    done
-fi
+for profile in debug release; do
+    if [[ -x "$TEST_TARGET_DIR/$profile/rch" && -x "$TEST_TARGET_DIR/$profile/rchd" ]]; then
+        TEST_BIN_DIR="$TEST_TARGET_DIR/$profile"
+        break
+    fi
+done
 TEST_RCH_BIN="${RCH_BIN:-${TEST_BIN_DIR:+$TEST_BIN_DIR/rch}}"
 TEST_RCH_BIN="${TEST_RCH_BIN:-$(command -v rch || true)}"
 TEST_RCHD_BIN="${RCHD_BIN:-$(dirname "$TEST_RCH_BIN")/rchd}"

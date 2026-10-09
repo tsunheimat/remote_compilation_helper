@@ -141,9 +141,11 @@ impl Peer {
             serde_json::from_slice(&fs::read(self.destination.join("delivery.json")).unwrap())
                 .unwrap();
         assert_eq!(marker["publication_authorized"], false);
+        let mut canonical_request = self.request.clone();
+        canonical_request.sort_all_objects();
         assert_eq!(
             marker["request_sha256"],
-            hash(&serde_json::to_vec(&self.request).unwrap())
+            hash(&serde_json::to_vec(&canonical_request).unwrap())
         );
     }
 
