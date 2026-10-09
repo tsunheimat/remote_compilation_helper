@@ -21,6 +21,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Repair baseline: `4e3d3e3a4f61b2d045019a586cc0c5a918678491`
 - Published runtime repair batch: `45bfad2716b73dde524dc02bc376731a0f1fbf1a`
 - Published CI repair baseline: `e061220552d3d5465107b6f22e1e07f61469cf30`
+- Published profiling/toolchain repairs: `1c56ce1d9c5565acc295d622fa1e1d0933e10594`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -47,12 +48,91 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
-## Current repair batch after `e0612205`
+## Current repair batch after `1c56ce1d`
 
-The six workflows at `e0612205` are terminal. This batch repairs the observed
-profiling, nested-build, shell-status, and test-preparation boundaries. Keep the
-PR draft: fresh CI, the six large-toolchain worker cases below, and operator
-deployment acceptance remain open.
+All six workflows at `1c56ce1d` are terminal. The current batch addresses the
+remaining wrapper-fixture environment leak, development hashing cost, and
+portable hook checks. The PR remains draft; full current CI, coverage, native
+macOS confirmation, and operator deployment acceptance remain open.
+
+- C009's recorded and live flags matched in Linux CI, but the live environment
+  contained the workflow's `CARGO_HTTP_TIMEOUT` and `CARGO_NET_RETRY`. The fixture
+  now removes those two caller inputs before invoking stock Cargo. Raw capture
+  still observes both names if Cargo emits them; two explicit negatives cover
+  that distinction. No golden or parser filter changed. Before the repair,
+  clean launches passed all three channels, while the actual CI settings failed.
+  After the repair, clean, CI-network, and CI-plus-coverage launches each pass
+  both tests across stable, Beta, and nightly; the planted unknown Cargo key
+  still fails every channel.
+- Profiling a real full-toolchain worker case attributed 72.35% of sampled CPU
+  events to SHA-256 code and its instantiated intrinsics. An ordinary-debug
+  baseline/candidate/candidate/baseline comparison retained the complete 1.39 GB
+  installed August toolchain and the original 60-second control. Baselines
+  timed out at 61.77 and 62.23 seconds; candidates completed the unchanged real
+  compiler/output assertions at 25.36 and 22.23 seconds. This is maintenance
+  evidence, not an external-incumbent performance win. The subsequent five-target
+  diagnostic cohort passed all 16 cases, without skips or filtered tests.
+- The adopted Cargo development profile optimizes only `sha2:0.11.0`. The
+  diagnostic unit graphs differed only in that dependency's optimization level
+  among 306 units; debug information, assertions, overflow checks, application
+  profiles, and all source/toolchain hash barriers remained unchanged. Release
+  profiles are unchanged. Ordinary Cargo without a CLI profile override produces
+  that same unit graph, and all 16 cases pass again with no skips or filters.
+- The macOS shell suite recorded a hook non-interference failure before its
+  later cancellation. Its inner log was outside the uploaded artifact, so the
+  exact native diagnostic is unavailable. Compatibility controls reproduce two
+  concrete defects: BSD-style date output breaks arithmetic, and unsupported
+  `grep -P` silently admits ANSI output. The repair uses fixed-string matching
+  that also rejects grep errors, and one monotonic timer around each complete
+  hook process. The 50 samples and 10 ms mean limit remain enforced; individual
+  samples are retained and printed. Native macOS acceptance still needs CI.
+- The outer E2E runner places inner suite logs in its artifact directory as they
+  are written. A controlled failure retained its nonempty inner log before the
+  outer runner exited and produced a failed status. Cancellation still leaves
+  unfinished cases missing; it never manufactures passes or skips.
+
+The hook-gate admission comparison is explicit: a valid hook with unsupported
+date nanoseconds changes from failure to pass; ANSI output under a grep without
+`-P`, and a grep I/O error, change from false passes to failures. A 20 ms injected
+delay fails both timing implementations, and the real Linux hook passes both.
+The new clock measures process launch, input delivery, and completion without
+including separate clock-process launches. These are fixture controls and a
+Linux native check, not a macOS result or a claimed product speedup.
+
+The required locked workspace/all-target check, Clippy with warnings denied,
+and formatting all passed. The only source change during those checks was
+making the shell timing sample file unique per invocation; the final shell
+source passed the portability/negative controls and Bash syntax checking.
+No Rust source or Cargo profile changed during this validation cohort.
+The final four-file UBS scan returned exit zero, zero critical findings, and no
+added-line findings. Its 13 warnings and 35 informational records are retained.
+Current input hashes cover 174 files; the 26 earlier reviewed critical records
+remain, so this is not an all-scope scanner pass. No scanner Cargo/AST/ShellCheck
+phase is claimed.
+
+| Terminal CI at `1c56ce1d` | Observed result |
+| --- | --- |
+| [CI 37992072427](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37992072427) | Check, strict Clippy, docs, format, workflow/manifest/security, and benchmark jobs passed. Linux x64 failed C009 on the two network environment keys. Linux ARM and coverage each completed 200 cases in 12 harnesses before cancellation during `rabs-cas`; both macOS jobs were still compiling. GitHub annotations identify the existing 30-minute job limits. No full workspace or 65% coverage verdict was produced. |
+| Core CI E2E | 164 reported native passes, with 92 archived capability-skip records. Shell execution completed three passes and one skip, then hit the 30-minute job limit during path-fixture compilation. |
+| [E2E 37992072457](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37992072457) | Linux completed all 41 discovered scripts. macOS completed 39, recorded the inner hook failure above, and hit its existing 60-minute limit during the nested reliability suite. Its outer `e2e_test.sh` result and final UI script are missing. The aggregate correctly reports 80/82 completed; its green reporting job is not suite acceptance. |
+| [Test Release 37992072428](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37992072428) | All five Unix build/version/package/upload jobs passed. Each ZIP digest, embedded archive checksum, exact three executables, and executable modes were verified. Windows failed the deferred non-Unix helper import; aggregate verification was skipped. |
+| [RABS 37992072425](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37992072425) | Both jobs passed. Accepted-hit delivery: 34 unit and eight integration cases. Release gates: replay seven, real compiler dependencies two, worktrees one, doctor two, overhead one. Wrapper size was 443,456 bytes; enforced p95 was 5,593 microseconds under the unchanged 10 ms limit. Build observations retained at least 4,203,968 KiB available memory and reported zero OOM kills; this does not diagnose earlier exit-143 runs. |
+| [Rsync 37992072434](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37992072434) | Both jobs passed, including 64 native transfer cases. All 1,390 archived Git blobs and modes match the named head, binding the CI merge source to this revision. |
+
+Dependabot automerge was skipped. Evidence under the retained validation base:
+
+- `rch-ci-head1c-monitor-3ezt2vx9/`: raw logs, timeout annotations, exact collections, source binding, and verified artifacts.
+- `rch-contract-ci-network-pfbeh4o4/`: three-channel clean/CI/coverage/unknown-input controls.
+- `rch-large-toolchain-profile-get_9rna/`: raw CPU profile, binary identities, unit graphs, retained baselines, and all 16 diagnostic cases.
+- `rch-hook-portability-Ga23SHJB/`: original/final gate controls, actual Linux binary checks, raw timings, and outer-runner failure propagation.
+- Active-worktree `target/managed-storage-validation-20261009/ubs-final-timing-report-approved.pefw5dm2/`: final scanner report, command, authorization, source hashes, and retained earlier critical records.
+
+## Profiling and toolchain repairs at `1c56ce1d`
+
+The six workflows at `e0612205` were terminal before this batch repaired the
+profiling, nested-build, shell-status, and test-preparation boundaries. At that
+checkpoint, fresh CI, six large-toolchain worker cases, and operator deployment
+acceptance remained open. The section above supersedes that validation state.
 
 - An instrumented compiler guard wrote its default profile into an immutable
   package directory. The native June reproduction captured the actual files
@@ -289,7 +369,8 @@ per-script binary receipts, rather than one supposedly immutable binary, bind
 those results. Existing source, host profile, and output trees were preserved;
 only a previously missing empty `l0-proof` mountpoint was created and retained.
 
-Six large-toolchain RABS worker cases from the full workspace run remain red.
+Six large-toolchain RABS worker cases were red in that full workspace run with
+fully unoptimized development dependencies.
 They span artifact transfer, jobserver bridging, output transfer, process
 context, and worker sessions under the original capture/execution deadlines.
 A separately labeled runtime check with the complete installed June toolchain
@@ -297,7 +378,8 @@ passed 13 of 16 cases but still failed three. One reached real execution and
 returned timeout status 124 after producing output. These are not all pre-exec
 failures, and the evidence does not establish that NFS dominates their cost.
 No hashing barrier, timeout, toolchain pin, or test collection was weakened.
-The selected later passes do not establish a fully passing current workspace.
+These failures remain the baseline for the later development-profile repair
+above. Its full 16-case cohort is still not a full-workspace pass.
 
 ### Beta contract evidence and admission change
 

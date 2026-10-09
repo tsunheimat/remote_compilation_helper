@@ -180,6 +180,8 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         // Keep unknown output keys observable instead of filtering the capture.
         .env_remove("CARGO_BUILD_JOBS")
         .env_remove("CARGO_NET_GIT_FETCH_WITH_CLI")
+        .env_remove("CARGO_HTTP_TIMEOUT")
+        .env_remove("CARGO_NET_RETRY")
         .env_remove("CARGO_TERM_COLOR")
         .env_remove("CARGO_BUILD_SBOM")
         .env_remove("CARGO_UNSTABLE_SBOM")
@@ -297,6 +299,8 @@ fn raw_capture_preserves_contract_drift() {
         env.replace("CARGO_MAKEFLAGS\n", ""),
         format!("{env}CARGO_SBOM_PATH\n"),
         format!("{env}CARGO_LLVM_COV\n"),
+        format!("{env}CARGO_HTTP_TIMEOUT\n"),
+        format!("{env}CARGO_NET_RETRY\n"),
     ] {
         assert_ne!(baseline, parse_contract(log, &changed));
     }

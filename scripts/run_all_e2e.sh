@@ -120,6 +120,7 @@ for script in "${SELECTED[@]}"; do
     (
         cd "$PROJECT_ROOT"
         RCH_E2E_LOG="$log_jsonl" RCH_E2E_VERBOSE="${RCH_E2E_VERBOSE:-0}" \
+            E2E_LOG_DIR="${E2E_LOG_DIR:-$OUT_DIR/${slug}.cases}" \
             bash "scripts/${script}"
     ) >"$build_log" 2>&1
     exit_code=$?
