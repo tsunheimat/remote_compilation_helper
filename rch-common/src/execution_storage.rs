@@ -160,19 +160,22 @@ pub fn validate_remote_environment(
 /// process or deletes a directory whose lease is still held. A killed supervisor
 /// leaves an orphan for the next age-and-lock sweep, not a guessed completion.
 /// Args: tmp parent, unique job token, mode, retention minutes, execution script.
+/// `private_mount_deferred` runs the same storage preflight but lets the caller
+/// enter the mount namespace inside its native process-control wrapper.
 pub const JOB_TMP_SCRIPT: &str = r#"
 set -u
 base=$1; token=$2; mode=$3; minutes=$4; workload=$5
 case "$token" in ''|*[!a-zA-Z0-9-]*) exit 125;; esac
 command -v flock >/dev/null 2>&1 || { printf '%s\n' 'RCH managed tmp requires flock on the worker' >&2; exit 125; }
-if [ "$mode" = private_mount ]; then
+case "$mode" in env|private_mount|private_mount_deferred) ;; *) exit 125;; esac
+if [ "$mode" != env ]; then
     [ "$(uname -s)" = Linux ] && command -v unshare >/dev/null 2>&1 && command -v mount >/dev/null 2>&1 || {
         printf '%s\n' 'RCH private_mount requires Linux, unshare and mount' >&2; exit 125;
     }
 fi
 (umask 077; mkdir -p -- "$base") || exit 125
 base=$(CDPATH= cd -- "$base" && pwd -P) || exit 125
-if [ "$mode" = private_mount ]; then
+if [ "$mode" != env ]; then
     case "$base" in /tmp|/tmp/*) printf '%s\n' 'RCH private tmp root resolves inside /tmp' >&2; exit 125;; esac
 fi
 cleanup='d=$1; [ ! -L "$d" ] && [ -d "$d" ] && [ -f "$d/.rch-lease" ] && [ ! -L "$d/.rch-lease" ] || exit 1

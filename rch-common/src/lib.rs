@@ -58,6 +58,7 @@ pub mod patterns;
 mod patterns_security_test;
 pub mod placement;
 pub mod pooled_target_key;
+pub mod process_identity;
 pub mod proof_handoff;
 pub mod proof_intent;
 pub mod proof_policy;

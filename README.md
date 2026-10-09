@@ -48,6 +48,7 @@ RCH currently recognizes and can offload:
 |---|---|
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
+| Go | `go build -o <file>`, ordinary `go test`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
@@ -59,6 +60,34 @@ with Bun/Node). Nix outputs stay in the worker's `/nix/store` behind a `result`
 symlink, so these run as streaming, exit-status-only commands (no artifacts are
 copied back — the flake source is synced out, the build runs, the result stays
 remote).
+
+Go builds support an explicit, project-relative **file** output, for example
+`go build -o bin/app ./cmd/app` or `go build -o 'products/app [dev]*?' main.go`.
+The output is returned to that exact path, including when `CARGO_TARGET_DIR` is
+set. Common build flags such as `-p`, `-tags`, `-trimpath`, and `-race` are
+supported, as are linker stripping flags (`-ldflags '-s -w'`) and `-X` variable
+definitions. Builds require the durable Unix execution path and a local Go
+installation. Both endpoints must report empty effective `GOFLAGS` and the
+dispatcher's native `GOOS`/`GOARCH`. The caller's selected Go version, CGO
+configuration, experiments, and architecture tuning settings are captured
+before upload and must match the worker exactly before compilation starts.
+Ordinary builds with CGO enabled remain supported when those settings match.
+
+The worker compiles into a fresh private file outside the source root, preserving
+wildcard `go:embed` inputs. Only after successful compilation produces a regular
+file does it create output parents and an adjacent stage for atomic replacement
+of the previous worker file. Retrieval then stages and validates that file before
+replacing the local output. A missing download cannot be satisfied by an old
+local binary, and durable recovery resumes collection without rerunning Go.
+Directory outputs, symlinks or symlinked output parents, cross compilation,
+native-library modes such as `c-shared`/`c-archive`, and low-level flags that can
+create extra files are outside this output contract. Implicit forms such as
+`go build`, `go build .`, and `go build ./...` stay local because their output
+names depend on which packages they select. Go test options that write binaries,
+profiles, or fuzz corpora (`-c`, `-o`, `-coverprofile`, `-cpuprofile`, `-trace`,
+`-fuzz`, and related flags, including `-test.*` forms after `-args`) also stay
+local. Strict remote mode refuses
+unsupported forms instead of executing them locally.
 
 RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 
@@ -496,6 +525,9 @@ remote_speedup_threshold = 1.2
 build_slots = 4
 test_slots = 8
 check_slots = 2
+# Optional additional build-disk headroom for each remote job (GiB).
+# Include expected output growth and a safety margin. Zero disables it.
+# disk_headroom_gib = 80
 build_timeout_sec = 300
 test_timeout_sec = 1800
 bun_timeout_sec = 600
@@ -572,6 +604,40 @@ and reports that the configured deadline expired. It does not retry on a larger
 worker or fall back locally. Machine-mode `rch exec` reports
 `outcome: "deadline_exceeded"`. This classification requires evidence from the
 launcher; exit 137 or elapsed time alone does not establish a timeout.
+
+For projects with large build outputs, set `compilation.disk_headroom_gib` in
+`.rch/config.toml`. A value of `80` requires 80 GiB of additional space on the
+worker's reported build filesystem. Selection requires a successful disk probe
+within 90 seconds and subtracts budgets already held by active builds in this
+daemon. Budgets survive daemon restart and remain held until the owning build
+completes. Releasing a budget does not prove its output files freed any space:
+the next budgeted admission requires a disk probe started after that completion.
+A probe already in flight cannot reuse the earlier free-space reading. Retries,
+queue recovery, and `rch diagnose` use the same requirement.
+Smaller CPU-slot estimates and cache affinity cannot bypass it. Older daemons
+reject the distinct budgeted selection endpoint rather than ignoring the
+requirement.
+
+This is admission accounting for the worker's reported canonical/alias build
+roots, not a filesystem quota or a measurement of arbitrary custom target
+mounts. Other dispatchers, undeclared jobs, and external writes are outside its
+accounting. The full budget stays reserved even after a disk sample reflects
+some of the build's output, so admission deliberately errs toward leaving extra
+space. The default is `0`, retaining ordinary disk-pressure admission.
+
+Without a declaration, the daemon still learns each project's footprint. For
+every remote build that had a worker to itself (no other build from this
+daemon overlapped there), it records how far the worker's free build-disk
+space fell between the admission probe and the lowest probe seen while the
+build ran. Footprints are kept per project and command class (`cargo test` is
+learned separately from `cargo check`), for 30 days, in
+`history.footprints.json` beside the build history. When some candidate
+worker has room for the largest recent footprint plus 10% (at least 5 GiB),
+after declared budgets and the remaining growth of builds already running
+there, selection only considers those workers. If none has room, selection is
+unchanged. Learned footprints are evidence, not a budget, so they never refuse
+a build. Other dispatchers' builds can inflate a measurement and cache cleanup
+can shrink one; declare `disk_headroom_gib` when you need a hard requirement.
 
 Unix artifact downloads estimate the files matched by the retrieval filters
 before transferring them. Their default total retry budget grows with that size

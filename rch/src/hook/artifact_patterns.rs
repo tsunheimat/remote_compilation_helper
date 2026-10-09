@@ -38,8 +38,8 @@
 //! into `hook::tests`. `CARGO_TARGET_CACHE_EXCLUDES` is used only within this
 //! module and stays private.
 
-mod cargo_bins;
-mod direct_compiler;
+pub(super) mod cargo_bins;
+pub(super) mod direct_compiler;
 
 use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};
 use super::*;
@@ -83,19 +83,22 @@ pub(super) fn get_artifact_patterns(
         return patterns;
     }
     if kind == Some(CompilationKind::CargoBuild)
-        && command.is_some_and(rch_common::patterns::is_cargo_package_verification)
+        && let Some(packaging) = command.and_then(rch_common::patterns::cargo_package_verification)
     {
         // Cargo's own verifier builds the extracted archive and checks source
-        // mutations. `cargo package` leaves the archive in package/, workspace
-        // publication keeps verified archives in its temporary registry, and
-        // `cargo publish -p X` writes its only archive to package/tmp-crate/
-        // (bd-3kskq: without it every publish dry run returned zero archives).
+        // mutations. `cargo package` returns only final archives in package/;
+        // its tmp-crate copy is verification scratch, not another output.
+        // Publication can keep its only verified archive in tmp-registry/ or
+        // tmp-crate/ (bd-3kskq), so retain those locations for publish dry-runs.
         // Return only archives, never the index or extracted sources.
-        return vec![
-            "target/package/*.crate".to_string(),
-            "target/package/tmp-registry/*.crate".to_string(),
-            "target/package/tmp-crate/*.crate".to_string(),
-        ];
+        let mut patterns = vec!["target/package/*.crate".to_string()];
+        if packaging == rch_common::patterns::CargoPackageVerification::PublishDryRun {
+            patterns.extend([
+                "target/package/tmp-registry/*.crate".to_string(),
+                "target/package/tmp-crate/*.crate".to_string(),
+            ]);
+        }
+        return patterns;
     }
     if let Some(patterns) = cargo_bins::patterns(kind, command) {
         return patterns;
@@ -128,11 +131,9 @@ pub(super) fn get_artifact_patterns(
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
         Some(CompilationKind::NixBuild) => Vec::new(),
-        // Go and TypeScript kinds are stream-only by construction: the classifier
-        // only accepts the non-emitting forms (`go build` without `-o`, `go test`,
-        // `go vet`, `tsc --noEmit`), so there is no output file to bring home and
-        // the exit status is the payload. Emitting forms are declined in
-        // classify_go/classify_tsc and run locally. Falling through to the
+        // Explicit Go builds were selected by direct_compiler above. Other Go
+        // and TS commands stream their results; unsupported emitting forms
+        // are declined by their classifiers. Falling through to the
         // `_ => default_rust_artifact_patterns()` catch-all would sync back
         // `target/**` — the wrong tree entirely.
         Some(CompilationKind::GoBuild)
@@ -437,6 +438,7 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         // Zig cross-build produces a real binary under target/<triple>/ that the
         // caller needs locally, so a failed sync-back is a build failure.
         | Some(CompilationKind::CargoZigbuild)
+        | Some(CompilationKind::GoBuild)
         | Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
         | Some(CompilationKind::Clang)
@@ -458,9 +460,7 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         // Jobs are arbitrary admitted commands: no artifact contract exists in
         // this phase, so a sync-back miss can never fail a job.
         | Some(CompilationKind::Job)
-        // Go/TS: only non-emitting forms are ever offloaded (see classify_go /
-        // classify_tsc), so there is no required local artifact.
-        | Some(CompilationKind::GoBuild)
+        // Go tests/vet and TS typechecks have no selected local artifact.
         | Some(CompilationKind::GoTest)
         | Some(CompilationKind::GoVet)
         | Some(CompilationKind::Tsc) => false,

@@ -10,16 +10,20 @@ live worker/Nexus acceptance remain with the user.
 - Repository: <https://github.com/tsunheimat/remote_compilation_helper>
 - Branch: `feat/managed-execution-storage`
 - Draft PR: <https://github.com/tsunheimat/remote_compilation_helper/pull/2>
-- Base: `main`, `35375c21719a22c9039c816c143fc09f3aed770b`
+- Integrated base: `main`, `67b5d4b9b8aa179d5d9d74bc0d8d01a05e209210`
 - Incoming feature head: `7f68c5dc12caffae49d0860bf3c19e72e7c58a65`
 - Incoming code commit: `1536190314d72b55aef3b1cd80245b3c93673bb1`
 - Incoming code tree: `50665b2330f0b8c11ba2056cc0a2661f7012e69b`
-- Local worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
+- Published development checkpoint: `f207c5bff554361111c56ddc51e7cc260302cb8a`
+- Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 
-The repairs described below are included with this development snapshot. The
-primary `main` checkout was preserved. Full workspace testing was still running
-when this snapshot was prepared; there is no new all-green CI or merge-readiness
-claim. The incoming CI failures are retained below as historical evidence.
+The primary `main` checkout and the published checkpoint worktree were preserved.
+The integration brings in 122 main-branch commits, including native source and
+execution recovery changes. Their process identity, source ownership, pooled
+targets, and completion-receipt paths remain in place. The old full-workspace
+build was stopped with exit 143 during compilation, before any tests ran, so
+remaining validation could target the integrated source. It is not a full-suite
+pass. The incoming CI failures and checkpoint results below remain historical.
 
 For a fresh local checkout:
 
@@ -35,7 +39,90 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
-## Local repairs and evidence
+## Integrated storage and archive repairs
+
+Private `/tmp` now wraps only the workload. The native watchdog publishes its
+process record in the worker's normal namespace, where daemon cancellation and
+orphan discovery can see it. The scratch lease and cleanup remain outside the
+tracked process group. Canonical source, target, and managed storage paths that
+would be hidden by `/tmp` are rejected, including symlink aliases. Failed setup
+also prevents the entire watchdog launch. A tmp-only private profile rejects a
+native or explicit Cargo cache hidden by `/tmp` before using its contents.
+
+A native before/after probe used the actual production shell scripts and real
+mount namespaces. Before the repair, parent-side cancellation returned the
+missing-record result while the private workload was running. Afterward it found
+the live record, cancelled the job with status 137, and cleaned scratch. The
+deadline path also retained status 137 and cleaned scratch. All four compiled
+private-storage regressions then passed with mount privileges, requiring actual
+mounted execution; ordinary-user runs exercise privilege refusal separately.
+
+Main's package-output policy also selected Cargo's temporary verification copy
+beside the final archive. `cargo package` now selects the final archive only;
+publish dry-runs retain their existing temporary archive locations. Both use
+the same conservative command parser. The real-Cargo success case retains its
+single-archive and byte-identity assertions. Its failed-verification fixture now
+proves the exact broken source and excluded input in a bounded final or temporary
+archive, and requires exit 101 with Cargo's verification diagnostic. Both June
+and August Cargo produced the temporary failed archive in local probes.
+
+Integrated validation logs are under
+`target/managed-storage-integration-validation-20261009/`. The first run's NFS
+bind mount reported UID 0 for files created by UID 1000, causing Git ownership
+and sticky-directory unlink failures. The same compiled tests passed unchanged
+in a fresh local-disk `/tmp` namespace. No operator files were removed. Six
+non-compiling source/manifest/workflow guards passed, including all six release
+asset gate self-tests. June and August formatting checks passed. Broader
+workspace, cross-platform, and release execution remains distinct from the
+targeted results below.
+
+| Integrated check | Result |
+| --- | --- |
+| Workspace/all-target/all-feature check and Clippy with warnings denied | Passed after the runtime changes; two subsequent rustdoc-only corrections do not change executable code |
+| Workspace/all-feature/no-dependency rustdoc, warnings denied | Passed after correcting the test-only producer link and `/proc/<getpid>` markup |
+| RCH `managed_` selection | 45 passed, including real Cargo archive success/failure checks and original watchdog status assertions |
+| Privileged private-storage selection | 4 passed with actual mounting, native cancellation, deadlines, hidden-path and cache checks; overlaps the ordinary selection |
+| Package-output policy / shared parser / shared rejection matrices | 3 / 1 / 2 passed |
+| Native Cargo isolation | 5 passed |
+| Shared execution storage | 6 passed |
+| Runtime policy / native reentry refusal | 6 passed across 352 source files; 1 native-context test passed with zero I/O |
+| Mock toolchain preflight | 1 test passed across 6 isolated child-process cases |
+| Worker probe / reload CLI | 3 passed; 1 reload test passed across 12 real CLI/socket cases |
+| Integrated debug binaries | `rch`, `rchd`, and `rch-wkr` built successfully as 2.1.16 |
+| `bd-2ga8` daemon ownership and output scenarios | Native owned-child cleanup passed; all 11 scenarios passed, including 8 actual delegated remote completions and byte checks |
+| Pipeline / output preservation / project sync on integrated binaries | 13 / 15 / 14 passed; source/helper and binary SHA manifests stayed unchanged |
+| Full workspace tests, feature-gated `true_e2e`, complete 41-script suite, release gates | Not established by these selected checks; broader validation remains pending |
+
+`bd-2ga8` previously lost its daemon PID through command substitution and
+accepted obsolete-command usage errors as successful executions. It now retains
+the actual daemon child, stops and waits for that child, preserves diagnostics,
+and requires real delegated execution with a new matching daemon completion.
+Native error scenarios validate typed errors and exact nonzero statuses.
+
+The pre-merge debug binaries report `f207c5bf` in their Git stamp. Retained
+source/binary SHA manifests bind these local tests to the integrated working
+tree; they are not release artifacts or proof of a later published revision.
+
+The final integrated UBS scan used the unchanged v5.4.33 scanner on 85 Rust/Bash
+files, from 08:58:01.052481688 to 08:59:43.309100481 UTC on 2026-10-09. It returned
+**exit 1**, with 19 critical, 10,569 warning and 5,234 informational records.
+Input and scanner hashes matched before/after. All 19 critical source expressions
+also exist in base `67b5d4b9`; none is on a feature-added line. Bounded review
+found non-secret comparisons, intentional executable selections, test commands,
+and a test receipt literal. Warnings and informational records were not
+exhaustively cleared. This is not a passing UBS result. The exact command,
+source hashes, triage and the user's scratch-cleanup authorization are retained
+under `target/managed-storage-validation-20261009/ubs-final-integrated-report-approved.4FImGd0tNp/`.
+After the two doc repairs and daemon-fixture repair, a three-file supplement
+passed with exit 0 (0 critical, 281 warning, 103 informational records), replacing
+the changed file's prior findings and bringing coverage to 87 distinct inputs.
+The final `bd-2ga8` delegation update then passed a one-file scan with zero
+findings; the other 86 input hashes still matched. Combined current criticals
+remain 19, all baseline expressions. Neither supplemental pass erases the main
+scan's exit 1. The final audit and combined input hashes are in
+`target/managed-storage-validation-20261009/ubs-bd2ga8-final-report-approved.0WJ6wIhzB1/`.
+
+## Published checkpoint repairs and evidence (`f207c5bf`)
 
 The storage cleanup now holds the lease through a temporary hard link outside
 the job directory. This avoids NFS retaining an open `.nfs*` entry inside a job
@@ -78,7 +165,7 @@ used two jobs. Broader compilation uses one job after the shared host's `/tmp`
 tmpfs filled. Isolated mount namespaces bind fresh retained NFS fixtures onto
 `/tmp` and drop back to the normal user for tests; operator files are untouched.
 
-| Check | Result at this snapshot |
+| Check | Result at the published checkpoint, before main integration |
 | --- | --- |
 | Workspace, all-target, all-feature check | Passed |
 | Workspace, all-target, all-feature Clippy, `-D warnings` | Passed before subsequent doc-comment-only repairs |
@@ -97,7 +184,7 @@ tmpfs filled. Isolated mount namespaces bind fresh retained NFS fixtures onto
 | Pipeline / output / project sync | 13 / 15 / 14 cases passed again after the cwd guard fix, with mock SSH and native local rsync fixtures |
 | Installer | 44 assertions passed across 15 cases; one macOS launchd capability skip; native fixture installs/uninstalls ran in a private `/tmp` namespace |
 | API envelopes / API error codes / error experience / saved-time | All four scripts passed; error experience exercised 90 UI unit tests, saved-time exercised 7 unit tests |
-| Full workspace test collection | In progress, `cargo test --locked --workspace --no-fail-fast` |
+| Full workspace test collection | Interrupted during compilation with exit 143; no tests ran |
 | Feature-gated `true_e2e`, aggregate `e2e_test`, full 41-script runner, release gates | Pending broader execution |
 
 Bun preparation passed its executable-independent cases; four cases requiring
@@ -115,7 +202,7 @@ after isolated reruns. No operator storage was cleaned to obtain a pass.
 
 The user explicitly authorized cleanup of newly generated UBS scratch. Official
 UBS v5.4.33 at `89d5f354005a0d1a679b56fe31d65d44d184878a` ran unmodified on 51
-changed Rust/Bash files. Its final result is **exit 1**, with 6 critical, 3,817
+changed Rust/Bash files. Its checkpoint result is **exit 1**, with 6 critical, 3,817
 warning, and 1,350 informational records. This is not a passing scanner result.
 
 Source triage found that all six critical expressions are unchanged in the

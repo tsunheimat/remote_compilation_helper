@@ -109,9 +109,16 @@ binds the job scratch directory over `/tmp`. It requires Linux mount namespace
 privileges and the `unshare`/`mount` tools. Missing privileges fail before the
 workload runs; there is no silent downgrade or sudo invocation. Storage paths,
 source mirrors, target pools and worker tools must resolve outside `/tmp`,
-since the private mount hides its original contents. Namespace setup leaves
-process/session identity to RCH's existing watchdog, so cancellation still
-targets the same process group.
+since the private mount hides its original contents. RCH checks the physical
+source, target and managed storage paths before starting the workload, including
+symlink aliases. Only the workload enters the namespace; the native watchdog
+and its `/tmp/rch-run` process record remain in the worker's normal namespace
+for cancellation and orphan recovery. Cancellation still targets the same
+process group.
+If only `tmp_root` is configured, the existing native Cargo cache must also
+resolve outside `/tmp`. RCH refuses a hidden native or explicit `CARGO_HOME`
+before Cargo runs; configure `cache_root` or a persistent
+`environment.remote.CARGO_HOME` when the worker's native cache base is `/tmp`.
 `env` mode does not redirect programs that hardcode `/tmp`.
 
 Source mirrors, cache-warm staging and controller storage retain their existing
