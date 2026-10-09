@@ -164,7 +164,7 @@ run_disk_pressure() {
   log "running disk pressure policy unit tests"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rchd -- disk_pressure --nocapture
+    e2e_cargo_test -p rchd --bin rchd -- disk_pressure --nocapture
   )
 }
 
@@ -188,7 +188,7 @@ run_reliability_harness() {
   log "running reliability harness foundation tests"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch-common -- e2e::tests --nocapture
+    e2e_cargo_test -p rch-common --lib -- e2e::tests --nocapture
   )
 }
 
@@ -200,7 +200,7 @@ run_reliability_logging() {
   log "running reliability logging schema contract tests"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch-common -- logging::tests --nocapture
+    e2e_cargo_test -p rch-common --lib -- logging::tests --nocapture
   )
 }
 
@@ -217,7 +217,7 @@ run_topology_fixtures() {
   log "worker accepted valid topology and rejected wrong/missing aliases; evidence: $topology_dir"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch-common -- multi_repo_fixture_ --nocapture
+    e2e_cargo_test -p rch-common --lib -- multi_repo_fixture_ --nocapture
   )
 }
 
@@ -433,7 +433,7 @@ run_nightly_topology_deep() {
   log "running nightly deep topology canonicalization tests"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch-common -- path_topology::tests --nocapture
+    e2e_cargo_test -p rch-common --lib -- path_topology::tests --nocapture
   )
 }
 
@@ -441,8 +441,8 @@ run_nightly_contract_schema_deep() {
   log "running nightly schema deep validation"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch-common -- repo_updater_contract::tests --nocapture || exit 1
-    e2e_cargo_test -p rch-common -- process_triage::tests --nocapture || exit 1
+    e2e_cargo_test -p rch-common --lib -- repo_updater_contract::tests --nocapture || exit 1
+    e2e_cargo_test -p rch-common --lib -- process_triage::tests --nocapture || exit 1
   )
 }
 

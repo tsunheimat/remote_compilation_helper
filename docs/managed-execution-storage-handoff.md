@@ -20,6 +20,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published main integration: `a67ece95362fe06da6b3cbc8aacf2547a147330c`
 - Repair baseline: `4e3d3e3a4f61b2d045019a586cc0c5a918678491`
 - Published runtime repair batch: `45bfad2716b73dde524dc02bc376731a0f1fbf1a`
+- Published CI repair baseline: `e061220552d3d5465107b6f22e1e07f61469cf30`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -46,7 +47,107 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
-## Current CI follow-up after `45bfad27`
+## Current repair batch after `e0612205`
+
+The six workflows at `e0612205` are terminal. This batch repairs the observed
+profiling, nested-build, shell-status, and test-preparation boundaries. Keep the
+PR draft: fresh CI, the six large-toolchain worker cases below, and operator
+deployment acceptance remain open.
+
+- An instrumented compiler guard wrote its default profile into an immutable
+  package directory. The native June reproduction captured the actual files
+  and identified both wrapper and guard processes as writers. The guard now
+  retains the wrapper's profiling destination separately from the admitted
+  compiler environment. The compiler receives a profiling variable only when
+  explicitly admitted. The dependency fixtures preserve the wrapper's profile
+  destination outside their inputs. Input mutation checks remain enforced.
+  Running the strengthened test with the retained old wrapper fails on the
+  leaked file; its explicit-profile positive control still passes.
+- Five test helpers now remove their parent test package's Cargo metadata
+  before asking real Cargo to build `rabsd`. A five-invocation Cargo control
+  established that the inherited metadata invalidated Ring's fingerprint while
+  producing identical output bytes. After the repair, all five helpers reuse
+  the prepared daemon without recompiling Ring, Rustls, Asupersync, or RABS.
+  Source freshness checks, compiler flags, and configured storage remain intact.
+- The strict stable/Beta/nightly wrapper contract excludes four known
+  cargo-llvm-cov launcher variables. Raw-capture negatives still reject an
+  unknown Cargo variable and preserve observed flag, environment, and framing
+  drift. The signal fixture explicitly waits for its killed child, so Bash's
+  exec optimization cannot replace the shell's required numeric status 137.
+- Unit-only E2E filters select their actual library or binary targets. Native
+  test inventories and Cargo unit graphs establish unchanged selected cases
+  and dependency features. Filters with integration matches remain broad.
+  `e2e_bd-1yt6.sh` honors the configured Cargo target directory instead of
+  forcing another cold build. Every existing assertion and scenario remains.
+- Core shell E2E and the coverage-summary pipeline propagate failures through
+  `tee`. Coverage executes the full workspace once, then generates the other
+  formats and checks the unchanged 65% line threshold from that execution.
+  RABS release compilation uses one Cargo job after recorded severe memory
+  pressure with two; the observations did not establish a kernel OOM cause.
+
+CI, E2E, release, and test-release now explicitly use the existing repository
+pin, `nightly-2026-08-31`. The June workflow pin was introduced in `69a7ac24` to
+match the fleet; `282e13f5` later moved the fleet/repository to August without
+updating those workflows. This is a deliberate compiler-coverage change,
+announced during development. It does not establish June compatibility. Native
+June coverage still fails the live multi-worktree test after the profile repair:
+the classic shared dependency directory changes its candidate set during
+compilation. A retained explicit-layout experiment also failed key reuse and
+was reverted. Neither assertion nor dependency fence was relaxed. The same
+unchanged multi-worktree assertions pass with August's default Cargo layout.
+All affected platforms require fresh CI under the aligned pin.
+
+Local validation uses the repository's August toolchain and normal debug
+profiles except where instrumentation is explicitly identified. Cohorts overlap
+and must not be summed into a full-workspace pass:
+
+| Current batch validation | Observed result |
+| --- | --- |
+| Workspace/all-target/all-feature locked check, strict Clippy, formatting | Passed after the final Rust edits. |
+| Entire wrapper package after the guard repair | 87 passed across 16 targets; no failures, ignores, or filtered cases. |
+| Five changed daemon-build helper targets after metadata repair | All 16 cases passed; no dependency/daemon recompilation inside their setup. |
+| Instrumented supervisor on August | All nine cases passed, with profiles outside immutable inputs and explicit admitted-profile preservation. This is not a full coverage report. |
+| Instrumented June dependency and supervisor targets | Two dependency cases and nine supervisor cases passed; the separate June multi-worktree failure remains recorded. |
+| Replay fixture | All 40 existing cases passed with actual Dash and actual Bash. Native macOS confirmation remains required. |
+| Strict wrapper contract | Both tests passed on all three channels with known coverage markers; the planted unknown variable still fails. |
+| Four complete changed E2E scripts | Path fixtures: 45 passes including nightly topology; repo-updater: 29; reliability: 676 outcomes across 25 smoke families; cancellation: seven. No live worker acceptance is implied. |
+| Changed nightly Cargo selectors through the existing E2E helper | Topology 20, repo-updater 29, and process-triage nine passed. The full nightly script and its unchanged Criterion benchmark were not run. |
+
+UBS input hashes now cover 172 distinct current files. The two latest raw scans
+returned zero critical findings; the five-helper delta has no added-line
+findings. The earlier 26 reviewed critical records remain in the combined
+report, so this is not an all-scope scanner pass. The official scanner is
+unchanged and only its own newly generated scratch cleanup was authorized.
+The retained reports record that authorization, exact commands, timestamps,
+source integrity, and the unrun Cargo/AST scanner phases.
+
+Evidence under the retained validation base below:
+
+- `rch-ci-heade061-monitor-f2WKfYaN/`: terminal CI metadata, logs, verified source and artifact bindings.
+- `rch-coverage-native-reproduction-g0c1tey3/report/`: June causal reproduction, old-wrapper control, repair trials, full wrapper run, final helper checks, August instrumentation, and four complete scripts.
+- `rch-nested-cargo-metadata-7s933i9s/`: five actual Cargo invocations, dirty-fingerprint reason, and identical Ring output hashes.
+- `rch-shell-target-collection-nywa8rri/`: native case inventories and unchanged selected Cargo dependency graphs.
+- `rch-replay-fixture-validation-gflro1vr/report/` and `rch-coverage-contract-validation-hwry8mqk/report/`: complete shell and strict-channel controls.
+- `rch-workflow-pin-alignment-_md5gvuf/`: parsed workflow review; only compiler selection, four reporting run fields, and RABS build concurrency changed.
+
+The latest UBS reports are in the active worktree's
+`target/managed-storage-validation-20261009/`, under
+`ubs-coverage-e2e-report-approved.1pfvqm85/` and
+`ubs-cargo-helper-report-approved.dqkt243l/`.
+
+| Terminal CI at `e0612205` | Observed result |
+| --- | --- |
+| [CI 37970947675](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37970947675) | Check, strict Clippy, docs, format, workflow/manifest/security and benchmark jobs passed. macOS Intel reached the real shell-status assertion failure. Linux x64 reached nested daemon compilation before its 30-minute cancellation; the ARM jobs were incomplete. Coverage stopped at the live multi-worktree assertion; no LCOV or 65% verdict was produced. |
+| Core CI E2E | 164 reported harness passes, with 92 archived capability-skip records. Shell execution completed three passes and one skip, then timed out during path-fixture compilation; eight later suites did not run. |
+| [E2E 37970947587](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37970947587) | Linux completed all 41 discovered suites. macOS completed five and timed out compiling the sixth. The report records 46/82 completed and 36 missing outcomes; inner capability skips remain visible. |
+| [Test Release 37970947695](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37970947695) | All five Unix build/version/package/upload jobs passed; their archives and checksums were independently verified. Windows failed the deferred non-Unix helper import; aggregate verification was skipped. |
+| [RABS 37970947586](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37970947586) | Accepted-hit protocol passed 34 unit and eight integration cases. Release compilation exited 143 after severe observed RAM/swap pressure; OOM counters remained zero. Later release gates did not run. |
+| [Rsync 37970947605](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/37970947605) | Both jobs passed, including 64 native transfer cases; source/artifact bindings were verified. |
+
+Dependabot automerge was skipped. These are results for the preceding head,
+not acceptance of the current compiler selection or repair batch.
+
+## Historical CI follow-up after `45bfad27`
 
 The complete set of six workflow runs at `45bfad27` is terminal. The current
 follow-up addresses its dependency and filesystem assertion failures and records incomplete
@@ -748,17 +849,16 @@ investigate the host/cancellation event separately from assertion failures.
 4. Leave Windows-specific repair deferred and keep PR #2 draft while required
    acceptance remains open. Existing Windows build failures remain visible.
 
-Toolchain drift matters: `rust-toolchain.toml` pins `nightly-2026-08-31`, while
-main CI and Test Release explicitly set `RUSTUP_TOOLCHAIN=nightly-2026-06-06`.
-The standalone E2E workflow installs June nightly without that override; RABS
-relies on the checkout's toolchain. Record the actual toolchain for each result.
-Do not silently change pins just to obtain a pass.
+The current CI/E2E/release configuration follows `rust-toolchain.toml` at
+`nightly-2026-08-31`. Earlier June results remain historical; the alignment and
+the unresolved June failures are documented above. Record the actual toolchain
+for each result, and do not silently change pins just to obtain a pass.
 
 Commands from the incoming handoff, retained as historical reproduction
 examples; use the current revision and receipts when choosing a new run:
 
 ```bash
-# Reproduce the main CI policy and docs failures using its explicit toolchain.
+# Reproduce historical June policy/docs results, not the current CI selection.
 CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_BUILD_JOBS=2 cargo +nightly-2026-06-06 test --locked -p rabs-asupersync --test nested_runtime_prohibition -- --nocapture
 CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_BUILD_JOBS=2 RUSTDOCFLAGS='-D warnings' cargo +nightly-2026-06-06 doc --locked --no-deps --all-features --workspace
 

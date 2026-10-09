@@ -441,13 +441,11 @@ mod tests {
             "a SIGKILLed replay is observed as signaled, never 137"
         );
 
-        // A recording that NESTS a shell inside StockPath's own `sh -c`
-        // surfaces POSIX's 128+N convention instead: dash never re-raises,
-        // so the outer shell exits normally with code 137 and that IS the
-        // faithful observation of what ran (bd-xbux4 root cause — not a
-        // worker regression; verified identical on local + all workers).
+        // Keep the outer shell alive to observe the child's status. Some
+        // shells replace themselves with a final command, which would expose
+        // the child's signal directly instead of a normal parent exit.
         let nested = [record_line(
-            "sh -c 'kill -9 $$'",
+            "sh -c 'kill -9 $$'; child_status=$?; exit \"$child_status\"",
             NormalizedOutcome::Signaled(9),
         )];
         let nested_refs: Vec<&str> = nested.iter().map(String::as_str).collect();
@@ -457,7 +455,7 @@ mod tests {
         assert_eq!(
             nested_observation.outcome,
             Some(NormalizedOutcome::Exited(137)),
-            "nested shells convert child SIGKILL into exit 128+N by POSIX"
+            "the outer shell explicitly exits with the killed child's status"
         );
     }
 

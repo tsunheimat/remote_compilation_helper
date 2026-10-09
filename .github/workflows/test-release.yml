@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 2
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  RUSTUP_TOOLCHAIN: nightly-2026-06-06
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
 
 jobs:
   build:
@@ -58,7 +58,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2

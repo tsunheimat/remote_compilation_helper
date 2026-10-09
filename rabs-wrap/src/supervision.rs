@@ -20,7 +20,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-const GUARD_ARGUMENT: &str = "--rabs-internal-compiler-guard-v1";
+const GUARD_ARGUMENT: &str = "--rabs-internal-compiler-guard-v2";
 const POLL: Duration = Duration::from_millis(20);
 const KILL_BUDGET: Duration = Duration::from_secs(2);
 
@@ -179,12 +179,19 @@ pub(super) fn spawn(
         std::process::exit(1);
     }
     kill_program()?;
-    Command::new("/proc/self/exe")
+    let compiler_has_profile = env.iter().any(|(key, _)| key == "LLVM_PROFILE_FILE");
+    let mut guard = Command::new("/proc/self/exe");
+    guard
         .arg(GUARD_ARGUMENT)
         .arg(owner.pid.to_string())
         .arg(owner.start.to_string())
         .arg(owner.caller_pid.to_string())
         .arg(owner.caller_start.to_string())
+        .arg(if compiler_has_profile {
+            "compiler"
+        } else {
+            "guard"
+        })
         .arg("--")
         .arg(compiler)
         .args(args)
@@ -193,8 +200,14 @@ pub(super) fn spawn(
         .process_group(0)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // The guard is this instrumented executable too. Its own profile must not
+    // land in the compiler's source directory when the admitted environment
+    // omits profiling. This does not add a variable to the compiler environment.
+    if !compiler_has_profile && let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        guard.env("LLVM_PROFILE_FILE", profile);
+    }
+    guard.spawn()
 }
 
 fn kill_program() -> io::Result<&'static str> {
@@ -240,6 +253,11 @@ pub(super) fn run_if_guard() {
                 .and_then(|s| s.to_str()?.parse().ok())
                 .ok_or_else(invalid)?,
         };
+        let compiler_has_profile = match args.next().as_deref() {
+            Some(value) if value == OsStr::new("compiler") => true,
+            Some(value) if value == OsStr::new("guard") => false,
+            _ => return Err(invalid()),
+        };
         if args.next().as_deref() != Some(OsStr::new("--")) {
             return Err(invalid());
         }
@@ -265,7 +283,12 @@ pub(super) fn run_if_guard() {
             ));
         }
         let kill = kill_program()?;
-        let child = Command::new(compiler).args(args).process_group(0).spawn()?;
+        let mut compiler = Command::new(compiler);
+        compiler.args(args).process_group(0);
+        if !compiler_has_profile {
+            compiler.env_remove("LLVM_PROFILE_FILE");
+        }
+        let child = compiler.spawn()?;
         let mut owned = OwnedCompiler {
             child,
             kill,

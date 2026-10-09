@@ -37,7 +37,7 @@ run_fixture_tests() {
   log "running deterministic multi-repo fixture unit tests"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch-common multi_repo_fixture_ -- --nocapture
+    e2e_cargo_test -p rch-common --lib multi_repo_fixture_ -- --nocapture
   )
 }
 
@@ -45,9 +45,9 @@ run_topology_smoke_tests() {
   log "running topology smoke tests (bootstrap + preflight gating)"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch topology_bootstrap_ -- --nocapture
-    e2e_cargo_test -p rchd topology_preflight_ -- --nocapture
-    e2e_cargo_test -p rch-wkr probe_projects_topology_ -- --nocapture
+    e2e_cargo_test -p rch --bin rch topology_bootstrap_ -- --nocapture
+    e2e_cargo_test -p rchd --bin rchd topology_preflight_ -- --nocapture
+    e2e_cargo_test -p rch-wkr --bin rch-wkr probe_projects_topology_ -- --nocapture
   )
 }
 
@@ -55,7 +55,7 @@ run_topology_nightly_tests() {
   log "running topology nightly tests (deep canonicalization edge coverage)"
   (
     cd "$PROJECT_ROOT"
-    e2e_cargo_test -p rch-common path_topology::tests:: -- --nocapture
+    e2e_cargo_test -p rch-common --lib path_topology::tests:: -- --nocapture
   )
 }
 

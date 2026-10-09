@@ -21,6 +21,7 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   # Bound peak compiler memory on hosted VMs.
   CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
 
 jobs:
   run:
@@ -38,7 +39,7 @@ jobs:
         run: scripts/run_all_e2e.sh --list
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true

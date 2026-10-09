@@ -21,10 +21,20 @@ fn wrap() -> &'static str {
 fn rabsd_bin() -> std::path::PathBuf {
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
+        let mut build = Command::new(env!("CARGO"));
+        build.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
+        // Parent test metadata invalidates build-script fingerprints (e.g. Ring).
+        // Cargo supplies the correct package metadata for each child build.
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| {
+                name.starts_with("CARGO_PKG_")
+                    || name.starts_with("CARGO_BIN_EXE_")
+                    || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH")
+            }) {
+                build.env_remove(name);
+            }
+        }
+        let status = build.status().expect("build rabsd");
         assert!(status.success(), "rabsd build failed");
     });
     std::path::Path::new(wrap()).with_file_name("rabsd")

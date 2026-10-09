@@ -99,12 +99,13 @@ impl Fixture {
     }
 
     fn daemon(&self) -> std::thread::JoinHandle<Option<Value>> {
-        self.daemon_paused(None)
+        self.daemon_paused(None, None)
     }
 
     fn daemon_paused(
         &self,
         pause: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        compiler_profile: Option<PathBuf>,
     ) -> std::thread::JoinHandle<Option<Value>> {
         let listener = UnixListener::bind(&self.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -139,10 +140,17 @@ impl Fixture {
                 arrived.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(10)).unwrap();
             }
+            let mut env = vec![
+                json!(["PATH", "/usr/bin:/bin"]),
+                json!(["EXACT", "admitted value"]),
+            ];
+            if let Some(profile) = compiler_profile {
+                env.push(json!(["LLVM_PROFILE_FILE", profile.to_str().unwrap()]));
+            }
             let reply = json!({"kind":"rustc-decision", "decision":"execute",
                 "action_key":"fixture", "attempt":"supervised-attempt",
                 "capture_protocol":1, "compiler_skip_authorized":false,
-                "env":[["PATH","/usr/bin:/bin"],["EXACT","admitted value"]]});
+                "env":env});
             writeln!(writer, "{reply}").unwrap();
             line.clear();
             match reader.read_line(&mut line) {
@@ -213,13 +221,21 @@ impl Fixture {
 #[test]
 fn supervised_execution_preserves_stdin_environment_streams_and_exit_code() {
     let fixture = Fixture::new(
-        "IFS= read -r line\nprintf '%s:%s:%s' \"$EXACT\" \"$line\" \"${NOT_ADMITTED-unset}\"\nprintf 'diagnostic\\n' >&2\nexit 7",
+        "IFS= read -r line\nprintf '%s:%s:%s:%s' \"$EXACT\" \"$line\" \"${NOT_ADMITTED-unset}\" \"${LLVM_PROFILE_FILE-unset}\"\nprintf 'diagnostic\\n' >&2\nexit 7",
     );
+    let profiles = tempfile::tempdir().unwrap();
+    let profile = std::env::var_os("LLVM_PROFILE_FILE").unwrap_or_else(|| {
+        profiles
+            .path()
+            .join("wrapper-%p-%m.profraw")
+            .into_os_string()
+    });
     let daemon = fixture.daemon();
     let stdout_path = fixture.root.path().join("stdout");
     let stderr_path = fixture.root.path().join("stderr");
     let mut command = fixture.command();
     command
+        .env("LLVM_PROFILE_FILE", profile)
         .stdin(Stdio::piped())
         .stdout(std::fs::File::create(&stdout_path).unwrap())
         .stderr(std::fs::File::create(&stderr_path).unwrap());
@@ -234,7 +250,7 @@ fn supervised_execution_preserves_stdin_environment_streams_and_exit_code() {
     assert_eq!(wait(&mut child).code(), Some(7));
     assert_eq!(
         std::fs::read(stdout_path).unwrap(),
-        b"admitted value:input bytes:unset"
+        b"admitted value:input bytes:unset:unset"
     );
     assert_eq!(std::fs::read(stderr_path).unwrap(), b"diagnostic\n");
     let completion = daemon.join().unwrap().unwrap();
@@ -242,6 +258,38 @@ fn supervised_execution_preserves_stdin_environment_streams_and_exit_code() {
     assert_eq!(completion["exit_code"], 7);
     assert!(completion["signal"].is_null());
     assert_eq!(completion["stderr_hex"], "646961676e6f737469630a");
+    assert!(
+        std::fs::read_dir(fixture.root.path())
+            .unwrap()
+            .all(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "profraw")
+            }),
+        "the instrumented guard must not write profiling data into compiler inputs"
+    );
+}
+
+#[test]
+fn explicitly_admitted_compiler_profile_is_preserved() {
+    let fixture = Fixture::new("printf '%s' \"$LLVM_PROFILE_FILE\" > admitted-profile\nexit 0");
+    let profiles = tempfile::tempdir().unwrap();
+    let profile = profiles.path().join("admitted-%p-%m.profraw");
+    let daemon = fixture.daemon_paused(None, Some(profile.clone()));
+    let mut command = fixture.command();
+    command.env(
+        "LLVM_PROFILE_FILE",
+        profiles.path().join("wrapper-%p-%m.profraw"),
+    );
+    let mut child = Owned(command.spawn().unwrap());
+    assert_eq!(wait(&mut child).code(), Some(0));
+    assert_eq!(
+        std::fs::read(fixture.root.path().join("admitted-profile")).unwrap(),
+        profile.as_os_str().as_encoded_bytes()
+    );
+    assert_eq!(daemon.join().unwrap().unwrap()["exit_code"], 0);
 }
 
 #[test]
@@ -308,11 +356,12 @@ fn forged_guard_owner_never_starts_a_compiler() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rabs-wrap"));
     command
         .args([
-            "--rabs-internal-compiler-guard-v1",
+            "--rabs-internal-compiler-guard-v2",
             "1",
             "1",
             "1",
             "1",
+            "guard",
             "--",
         ])
         .arg(&fixture.compiler)
@@ -346,7 +395,7 @@ fn parent_lost_during_the_decision_cannot_start_an_orphaned_compiler() {
     let fixture = Fixture::new("printf 'must not run' > forbidden\nexit 0");
     let (arrived, ready) = mpsc::channel();
     let (release, released) = mpsc::channel();
-    let daemon = fixture.daemon_paused(Some((arrived, released)));
+    let daemon = fixture.daemon_paused(Some((arrived, released)), None);
     let mut caller = Owned(fixture.caller().spawn().unwrap());
     ready.recv_timeout(Duration::from_secs(10)).unwrap();
     let wrapper = fixture.pid("wrapper.pid");

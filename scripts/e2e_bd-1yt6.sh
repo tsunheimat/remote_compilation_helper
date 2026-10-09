@@ -14,7 +14,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_bd-1yt6.jsonl}"
-TARGET_DIR="/tmp/rch-bd-1yt6-target"
+# The cases isolate their runtime fixtures; reuse the caller's Cargo build
+# cache instead of cold-building the repository in an unrelated target tree.
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
 
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -64,13 +66,13 @@ main() {
 
     # Unit/daemon integration slices for cancellation lifecycle and status surfaces.
     run_case "cancel_inflight_metadata" \
-        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd test_cancel_inflight_build_records_metadata -- --nocapture
+        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd --bin rchd test_cancel_inflight_build_records_metadata -- --nocapture
     run_case "cancel_post_completion_race" \
-        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd test_cancel_after_completion_returns_error_post_completion_race -- --nocapture
+        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd --bin rchd test_cancel_after_completion_returns_error_post_completion_race -- --nocapture
     run_case "cancel_repeated_deterministic" \
-        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd test_repeated_cancel_after_completion_is_deterministic -- --nocapture
+        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd --bin rchd test_repeated_cancel_after_completion_is_deterministic -- --nocapture
     run_case "status_cancellation_issues" \
-        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd test_handle_status_emits_cancellation_cleanup_issue -- --nocapture
+        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" cargo test -p rchd --bin rchd test_handle_status_emits_cancellation_cleanup_issue -- --nocapture
 
     # Integration reliability scenarios: jitter/unreachable/partial transfer states.
     run_case "worker_network_jitter_reconnect" \

@@ -187,6 +187,13 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         .env_remove("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO")
         .env_remove("CARGO_PROFILE_DEV_DEBUG")
         .env_remove("CARGO_PROFILE_TEST_DEBUG")
+        // Coverage configures this harness, not the stock channel probe.
+        // Remove its explicit launcher inputs before Cargo; the capture must
+        // still detect every unexpected key produced by Cargo or the wrapper.
+        .env_remove("CARGO_LLVM_COV")
+        .env_remove("CARGO_LLVM_COV_SHOW_ENV")
+        .env_remove("CARGO_LLVM_COV_TARGET_DIR")
+        .env_remove("CARGO_LLVM_COV_BUILD_DIR")
         .env_remove("RUSTUP_TOOLCHAIN")
         .env("RUSTUP_AUTO_INSTALL", "0")
         .env("RUSTC_WRAPPER", source.path().join("log-rustc.sh"))
@@ -289,6 +296,7 @@ fn raw_capture_preserves_contract_drift() {
         format!("{env}CARGO_RABS_CONTRACT_PROBE\n"),
         env.replace("CARGO_MAKEFLAGS\n", ""),
         format!("{env}CARGO_SBOM_PATH\n"),
+        format!("{env}CARGO_LLVM_COV\n"),
     ] {
         assert_ne!(baseline, parse_contract(log, &changed));
     }

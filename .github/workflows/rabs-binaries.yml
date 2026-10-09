@@ -59,6 +59,10 @@ jobs:
   build:
     name: release build + gates
     runs-on: ubuntu-latest
+    env:
+      # Two concurrent release rustc processes nearly exhausted RAM and swap
+      # before a shutdown. Serialize compilation; retain every gate.
+      CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
