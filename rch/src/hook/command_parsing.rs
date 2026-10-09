@@ -9,10 +9,10 @@
 //! are `pub(super)` for the test suite. The numeric `parse_*` helpers stay
 //! module-private.
 //!
-//! Also hosts two more pure helpers that both the Unix hook and the non-Unix
-//! stub need verbatim: project identity extraction (canonical path + short
-//! blake3 suffix) and preferred-worker selection (`RCH_WORKER(S)` merged with
-//! project `.rch/config.toml` `[routing] preferred_workers`).
+//! Also hosts config and topology policy evaluation, project identity
+//! extraction (canonical path + short blake3 suffix), and preferred-worker
+//! selection (`RCH_WORKER(S)` merged with project `.rch/config.toml`
+//! `[routing] preferred_workers`), shared by both hook backends.
 //!
 //! NOTHING in this module may depend on daemon/socket/SSH state or on a
 //! specific parent module: it is included verbatim (`#[path]`) by the
@@ -24,6 +24,106 @@ use rch_common::normalize_project_path_with_policy;
 use rch_common::path_topology::PathTopologyPolicy;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
+
+/// A config-driven reason to run locally instead of offloading.
+///
+/// Issue #55: every interceptor and `rch diagnose` evaluates the same
+/// enabled, force-local, and execution-allowlist policy on every platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigLocalPolicy {
+    /// `general.enabled = false`.
+    Disabled,
+    /// `general.force_local = true`.
+    ForceLocal,
+    /// Both force flags set — validation rejects this; fail safe (local).
+    ConflictingForceFlags,
+    /// The classified command's base is not in `execution.allowlist`.
+    NotAllowlisted(&'static str),
+}
+
+impl ConfigLocalPolicy {
+    const DISABLED_REASON: &'static str = "rch disabled (general.enabled=false)";
+    const FORCE_LOCAL_REASON: &'static str = "force_local";
+    const CONFLICT_REASON: &'static str = "invalid config: force_local+force_remote";
+    const NOT_ALLOWLISTED_SUFFIX: &'static str = "not in execution.allowlist";
+
+    /// Human-readable reason, in the `[RCH] local (<reason>)` vocabulary.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::Disabled => Self::DISABLED_REASON.to_string(),
+            Self::ForceLocal => Self::FORCE_LOCAL_REASON.to_string(),
+            Self::ConflictingForceFlags => Self::CONFLICT_REASON.to_string(),
+            Self::NotAllowlisted(base) => {
+                format!("command '{base}' {}", Self::NOT_ALLOWLISTED_SUFFIX)
+            }
+        }
+    }
+
+    /// Whether this policy is an explicit operator instruction that outranks a
+    /// `RCH_REQUIRE_REMOTE=1` baked into a generic interceptor (the shim).
+    ///
+    /// `RCH_REQUIRE_REMOTE` exists to stop *silent* local fallback. A
+    /// configured, announced `force_local` is neither silent nor a fallback.
+    /// The allowlist is different: it is a capability gate, and under a strict
+    /// remote policy a non-allowlisted command is refused rather than run.
+    pub(crate) fn overrides_require_remote(self) -> bool {
+        !matches!(self, Self::NotAllowlisted(_))
+    }
+
+    /// Whether `reason` was produced by [`Self::reason`]. Policy refusals are
+    /// permanent for the invocation, never retryable.
+    pub(super) fn is_policy_reason(reason: &str) -> bool {
+        matches!(
+            reason,
+            Self::DISABLED_REASON | Self::FORCE_LOCAL_REASON | Self::CONFLICT_REASON
+        ) || (reason.starts_with("command '") && reason.ends_with(Self::NOT_ALLOWLISTED_SUFFIX))
+    }
+}
+
+/// Evaluate the config-driven local policy for a command of `kind`.
+///
+/// Returns `None` when config permits offload. Explicit job admission
+/// (`rch exec --job`) bypasses the allowlist — there is no allowlist entry for
+/// an arbitrary job — but still honors `enabled` / `force_local`.
+pub(crate) fn config_local_policy(
+    config: &rch_common::RchConfig,
+    kind: Option<CompilationKind>,
+) -> Option<ConfigLocalPolicy> {
+    if !config.general.enabled {
+        return Some(ConfigLocalPolicy::Disabled);
+    }
+    if config.general.force_local && config.general.force_remote {
+        return Some(ConfigLocalPolicy::ConflictingForceFlags);
+    }
+    if config.general.force_local {
+        return Some(ConfigLocalPolicy::ForceLocal);
+    }
+    match kind {
+        Some(CompilationKind::Job) | None => None,
+        Some(kind) => {
+            let base = kind.command_base();
+            (!config.execution.is_allowed(base)).then_some(ConfigLocalPolicy::NotAllowlisted(base))
+        }
+    }
+}
+
+/// Why a project cannot be placed under the configured worker mirror root.
+/// Shared by execution and `rch diagnose` so their verdicts cannot disagree.
+pub(crate) fn project_topology_local_reason(
+    policy: &PathTopologyPolicy,
+    cwd: &Path,
+) -> Option<String> {
+    normalize_project_path_with_policy(cwd, policy)
+        .err()
+        .map(|error| {
+            format!(
+                "project {} is outside canonical root {} ({error}); set [path_topology] \
+                 canonical_root or RCH_CANONICAL_PROJECT_ROOT to offload it",
+                cwd.display(),
+                policy.canonical_root().display()
+            )
+        })
+}
 
 fn parse_u32(value: &str) -> Option<u32> {
     value

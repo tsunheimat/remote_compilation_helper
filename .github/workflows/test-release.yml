@@ -15,7 +15,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 2
-  RUSTUP_TOOLCHAIN: nightly-2026-06-06
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
 
 jobs:
   build:
@@ -37,7 +38,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             checksum_cmd: sha256sum
           - name: macos-x86_64
-            runs-on: macos-13
+            runs-on: macos-15-intel
             target: x86_64-apple-darwin
             checksum_cmd: shasum -a 256
           - name: macos-aarch64
@@ -49,14 +50,15 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 30
+    # Cold macOS split-profile builds can exceed 30 minutes before smoke tests.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -80,9 +82,12 @@ jobs:
 
       - name: Build (A021 split profiles) (windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           cargo build --profile wrapper-release --locked --no-default-features --target ${{ matrix.target }} -p rch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --profile daemon-release --locked --no-default-features --target ${{ matrix.target }} -p rch-wkr
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify binaries exist (unix)
         if: runner.os != 'Windows'
@@ -110,7 +115,16 @@ jobs:
         shell: pwsh
         run: |
           & "target/${{ matrix.target }}/wrapper-release/rch.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "target/${{ matrix.target }}/daemon-release/rch-wkr.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test provisional install recovery (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo test --locked --target ${{ matrix.target }} -p rabs-cas --lib provisional_recovery::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -121,7 +135,10 @@ jobs:
           tar -czf "dist/rch-${TAG}-${{ matrix.target }}.tar.gz" \
             -C "$PWD/target/${{ matrix.target }}/wrapper-release" rch \
             -C "$PWD/target/${{ matrix.target }}/daemon-release" rchd rch-wkr
-          ${{ matrix.checksum_cmd }} "dist/rch-${TAG}-${{ matrix.target }}.tar.gz" > "dist/rch-${TAG}-${{ matrix.target }}.tar.gz.sha256"
+          (
+            cd dist
+            ${{ matrix.checksum_cmd }} "rch-${TAG}-${{ matrix.target }}.tar.gz" > "rch-${TAG}-${{ matrix.target }}.tar.gz.sha256"
+          )
 
       - name: Package (windows)
         if: runner.os == 'Windows'

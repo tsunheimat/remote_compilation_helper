@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
-use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome};
+use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome, authority_digest};
 use rabs_cas::serving_state::ServeDecision;
 use rabs_cas::test_support::{
     divergent_offer_with_manifest_bytes, install_admission_world, install_admission_world_with_ids,
@@ -121,10 +121,18 @@ fn matching_comparison(
     };
     install_admission_world_with_ids(&mut *cas.store().lock().unwrap(), &authority, ids);
     let mut comparison = original.clone();
+    comparison
+        .authority
+        .action_generation
+        .created_under_authority_digest = authority_digest(&authority);
     comparison.authority.coordinator = authority;
     comparison.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
     comparison.authority.attempt_id = AttemptId(ids.attempt);
     comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
+    // Restart reconciliation removes the synthetic evidence locations because
+    // they have no real backing files. Seed this newly admitted fixture offer's
+    // closure again; the manifest and served artifact retain their real CAS bytes.
+    install_offer_closure(&mut *cas.store().lock().unwrap(), &comparison);
     comparison
 }
 

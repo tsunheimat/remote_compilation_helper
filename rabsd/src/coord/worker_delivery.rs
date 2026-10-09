@@ -1096,9 +1096,11 @@ pub fn receive_operation(
         for parent in destination.ancestors().skip(1) {
             File::open(parent)?.sync_all()?;
         }
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         let mut receipt = json!({"version":1,"kind":"verified-worker-delivery","request_id":id,
             "worker_id":expected_worker,"boot_generation":hello["boot_generation"],"incarnation":incarnation,
-            "request_sha256":hash(&serde_json::to_vec(request)?),"exit_code":exit_code,"stop_reason":stop,
+            "request_sha256":hash(&serde_json::to_vec(&canonical_request)?),"exit_code":exit_code,"stop_reason":stop,
             "stdout_bytes":stdout.len,"stdout_sha256":stdout.sha256,
             "stderr_bytes":stderr.len,"stderr_sha256":stderr.sha256,
             "artifact_manifest":result["artifact_manifest"],"total_bytes":total,
@@ -1785,13 +1787,15 @@ mod tests {
         assert_eq!(peer.sent[3]["kind"], "source-seal");
         assert_eq!(peer.sent[4], request);
         assert!(peer.sent[4].get("workspace_backing").is_none());
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         assert_eq!(
             std::fs::read(destination.join("artifacts/a")).unwrap(),
             b"A\0\xffB"
         );
         assert_eq!(
             delivery.receipt["request_sha256"],
-            hash(&serde_json::to_vec(&request).unwrap())
+            hash(&serde_json::to_vec(&canonical_request).unwrap())
         );
         assert_eq!(delivery.receipt["publication_authorized"], false);
     }
@@ -1912,6 +1916,8 @@ mod tests {
         let mut request = request();
         request["command_context"] = explicit_context();
         let original = serde_json::to_vec(&request).unwrap();
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         let mut peer = AdmissionPeer {
             inner: fixture(&destination),
             reject: false,
@@ -1923,7 +1929,10 @@ mod tests {
         assert!(peer.admitted);
         assert_eq!(serde_json::to_vec(&peer.inner.sent[1]).unwrap(), original);
         assert_eq!(serde_json::to_vec(&request).unwrap(), original);
-        assert_eq!(delivery.receipt["request_sha256"], hash(&original));
+        assert_eq!(
+            delivery.receipt["request_sha256"],
+            hash(&serde_json::to_vec(&canonical_request).unwrap())
+        );
         assert_eq!(delivery.receipt["transport_authenticated"], true);
         assert_eq!(delivery.receipt["publication_authorized"], false);
         assert!(
@@ -2055,9 +2064,11 @@ mod tests {
             if supported {
                 let delivery = result.unwrap();
                 assert_eq!(peer.sent[4], request);
+                let mut canonical_request = request.clone();
+                canonical_request.sort_all_objects();
                 assert_eq!(
                     delivery.receipt["request_sha256"],
-                    hash(&serde_json::to_vec(&request).unwrap())
+                    hash(&serde_json::to_vec(&canonical_request).unwrap())
                 );
             } else {
                 let failure = result.unwrap_err();
@@ -2203,9 +2214,11 @@ mod tests {
                 assert!(delivery.acknowledgments_confirmed);
                 assert_eq!(peer.sent[4], request);
                 assert_eq!(peer.sent[4]["command_context"], explicit_context());
+                let mut canonical_request = request.clone();
+                canonical_request.sort_all_objects();
                 assert_eq!(
                     delivery.receipt["request_sha256"],
-                    hash(&serde_json::to_vec(&request).unwrap())
+                    hash(&serde_json::to_vec(&canonical_request).unwrap())
                 );
             } else {
                 assert!(!result.unwrap_err().execution_may_have_run);

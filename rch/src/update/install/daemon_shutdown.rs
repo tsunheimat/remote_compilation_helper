@@ -483,6 +483,9 @@ mod tests {
                 let mut command = String::new();
                 stream.read_to_string(&mut command).await.unwrap();
                 let value = match command.as_str() {
+                    // The startup deadline can abandon a connection after
+                    // connect and before writing. No daemon mutation arrived.
+                    "" => continue,
                     STATUS => &status,
                     ADMISSION_STATUS => &admission,
                     other => panic!("readiness must not mutate daemon state: {other}"),

@@ -353,10 +353,14 @@ impl SourceTransferState {
             } else {
                 None
             };
-            let directory = tempfile::Builder::new()
-                .prefix("rabs-source-")
-                .tempdir()
-                .map_err(|error| error.to_string())?;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("rabs-source-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let directory = builder.tempdir().map_err(|error| error.to_string())?;
             let mut receiver =
                 SourceReceiver::create(&directory.path().join("workspace"), manifest)
                     .map_err(|error| error.to_string())?;
@@ -693,7 +697,7 @@ mod tests {
     #[test]
     fn cold_upload_then_reopened_cache_reuses_private_bytes_but_still_requires_seal() {
         use std::os::unix::fs::MetadataExt;
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::private_test_directory();
         let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK + 7).map(|i| (i % 251) as u8).collect();
         let manifest = projection(&[("src/lib.rs", &bytes, false), ("empty", b"", false)]);
         let mut cold = cached_state(cache.path());
@@ -742,7 +746,7 @@ mod tests {
     #[test]
     fn edited_files_miss_while_renamed_bytes_reuse_with_request_specific_modes() {
         use std::os::unix::fs::PermissionsExt;
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::private_test_directory();
         let first = projection(&[("a", b"unchanged", false), ("b", b"before", false)]);
         let mut cold = cached_state(cache.path());
         cold.handle(&begin(&first, 1), true, false).unwrap();
@@ -785,7 +789,7 @@ mod tests {
     #[test]
     fn corrupt_cached_content_requires_upload_and_can_be_repaired_without_reexecution() {
         use std::os::unix::fs::PermissionsExt;
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::private_test_directory();
         let manifest = projection(&[("lib.rs", b"good", false)]);
         let mut state = cached_state(cache.path());
         state.handle(&begin(&manifest, 1), true, false).unwrap();
@@ -816,7 +820,7 @@ mod tests {
 
     #[test]
     fn reuse_selection_is_explicit_immutable_and_does_not_renew_expired_ownership() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::private_test_directory();
         let manifest = manifest();
         let mut state = cached_state(cache.path());
         let mut start = begin(&manifest, 7);
@@ -848,7 +852,7 @@ mod tests {
 
     #[test]
     fn cache_storage_failure_is_optional_but_changed_execution_source_is_fenced() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::private_test_directory();
         let manifest = projection(&[("lib.rs", b"good", false)]);
         let mut state = cached_state(cache.path());
         state.handle(&begin(&manifest, 1), true, false).unwrap();
@@ -868,7 +872,7 @@ mod tests {
             b"preserve"
         );
 
-        let clean_cache = tempfile::tempdir().unwrap();
+        let clean_cache = crate::private_test_directory();
         let mut changed = cached_state(clean_cache.path());
         changed.handle(&begin(&manifest, 2), true, false).unwrap();
         upload(&mut changed, &manifest, 2, "lib.rs", b"good");
@@ -1185,7 +1189,7 @@ mod tests {
 
     #[test]
     fn cached_bytes_do_not_authorize_extra_inputs_or_a_changed_private_copy() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::private_test_directory();
         let manifest = projection(&[("lib.rs", b"good", false)]);
         let mut cold = cached_state(cache.path());
         cold.handle(&begin(&manifest, 1), true, false).unwrap();

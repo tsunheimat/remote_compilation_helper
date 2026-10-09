@@ -102,8 +102,10 @@ if [[ -n "$STDOUT_CONTENT" ]]; then
     fi
 
     # Verify stdout contains NO ANSI escape codes
-    if echo "$STDOUT_CONTENT" | grep -qP '\x1b\['; then
+    if LC_ALL=C grep -qF $'\033[' "$STDOUT_FILE"; then
         fail "stdout contains ANSI escape codes!"
+    elif [[ $? -ne 1 ]]; then
+        fail "Could not inspect stdout for ANSI escape codes"
     fi
 else
     log "  stdout: (empty - allow)"
@@ -156,8 +158,10 @@ for cmd in "echo hello" "ls -la" "pwd"; do
     INPUT="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$cmd\"}}"
     echo "$INPUT" | "$RCH" > "$STDOUT_FILE" 2>/dev/null
 
-    if grep -qP '\x1b\[' "$STDOUT_FILE"; then
+    if LC_ALL=C grep -qF $'\033[' "$STDOUT_FILE"; then
         fail "stdout contains ANSI codes for command: $cmd"
+    elif [[ $? -ne 1 ]]; then
+        fail "Could not inspect stdout for ANSI codes for command: $cmd"
     fi
 done
 
@@ -170,20 +174,33 @@ log ""
 log "TEST 4: Hook Classification Timing"
 
 ITERATIONS=50
-TIMING_LOG="$(mktemp)"
+TIMING_LOG="$(mktemp "${TEST_LOG%.log}.timing-ns.XXXXXX")"
 
-for i in $(seq 1 $ITERATIONS); do
-    START=$(date +%s%N)
-    echo '{"tool_name":"Bash","tool_input":{"command":"echo test"}}' | "$RCH" >/dev/null 2>&1
-    END=$(date +%s%N)
-    echo $((END - START)) >> "$TIMING_LOG"
-done
+# macOS date does not supply %N. Measure complete hook processes from one
+# monotonic clock so launching the clock itself is outside each sample.
+command -v python3 >/dev/null 2>&1 || fail "python3 is required for hook timing"
+python3 - "$RCH" "$ITERATIONS" "$TIMING_LOG" <<'PY'
+import subprocess
+import sys
+import time
+
+hook_input = b'{"tool_name":"Bash","tool_input":{"command":"echo test"}}\n'
+with open(sys.argv[3], "w", encoding="utf-8") as samples:
+    for _ in range(int(sys.argv[2])):
+        start = time.perf_counter_ns()
+        subprocess.run(
+            [sys.argv[1]], input=hook_input, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=True,
+        )
+        samples.write(f"{time.perf_counter_ns() - start}\n")
+PY
 
 AVG_NS=$(awk '{ sum += $1 } END { print int(sum/NR) }' "$TIMING_LOG")
 AVG_MS=$(echo "scale=2; $AVG_NS / 1000000" | bc)
-rm -f "$TIMING_LOG"
 
 log "  Average hook time: ${AVG_MS}ms over $ITERATIONS iterations"
+log "  Timing samples: $TIMING_LOG"
+log "  Hook timing samples (ns): $(tr '\n' ' ' < "$TIMING_LOG")"
 
 # Threshold: 10ms (generous for CI variance, real target is <1ms)
 if (( AVG_NS > 10000000 )); then

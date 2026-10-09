@@ -1331,18 +1331,21 @@ mod tests {
         );
         assert_eq!(store.differential_snapshot().unwrap(), before);
 
-        // Even a newer record that omits ALL references cannot make
-        // the durable quarantine disappear from the renewal gate.
-        store
-            .put_serving_record(
+        // Even a newer record that omits ALL references must be refused:
+        // only explicit repair may remove the durable quarantine.
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            store.put_serving_record(
                 &active,
                 &action_key,
                 "servable",
                 4,
                 &validity(1_080_000, Some(DEFAULT_REVALIDATION_TTL_MICROS), 0, 1),
                 &[],
-            )
-            .unwrap();
+            ),
+            Err(StoreError::QuarantineRequiresRepair)
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
         let before = store.differential_snapshot().unwrap();
         assert_eq!(
             apply_revalidation(
@@ -1350,7 +1353,7 @@ mod tests {
                 &active,
                 &action_key,
                 &action_typed,
-                4,
+                3,
                 24,
                 11,
                 "exit=1|diag=d1",

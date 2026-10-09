@@ -27,7 +27,7 @@ run_contract_unit_tests() {
   log "running rch-common repo_updater contract unit tests"
   (
     cd "$PROJECT_ROOT"
-    cargo test -p rch-common repo_updater_contract_ -- --nocapture
+    cargo test -p rch-common --lib repo_updater_contract_ -- --nocapture
   )
 }
 

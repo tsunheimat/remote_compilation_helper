@@ -21,10 +21,26 @@ LOG_FILE="$TEST_DIR/e2e_install.log"
 source "$SCRIPT_DIR/test_lib.sh"
 init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
 
+# Installer fixtures delegate configuration reads to the checkout's real CLI;
+# a version-only stub cannot answer the installer's machine-role precondition.
+RCH_E2E_CONFIG_READER="${RCH_E2E_CONFIG_READER:-}"
+if [[ -z "$RCH_E2E_CONFIG_READER" ]]; then
+    for candidate in "${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch" \
+        "${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/release/rch"; do
+        if [[ -x "$candidate" ]]; then
+            RCH_E2E_CONFIG_READER="$candidate"
+            break
+        fi
+    done
+fi
+[[ -x "$RCH_E2E_CONFIG_READER" ]] || test_fail "Build rch before running installer scenarios"
+export RCH_E2E_CONFIG_READER
+
 # Test counters
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
+TESTS_SKIPPED=0
 
 # ============================================================================
 # Utilities
@@ -45,14 +61,18 @@ fail() {
     log "FAIL: $1"
 }
 
+skip() {
+    TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+    log "SKIP: $1"
+}
+
 start_test() {
     TESTS_RUN=$((TESTS_RUN + 1))
     log "Test $TESTS_RUN: $1"
 }
 
 cleanup() {
-    log "Cleaning up test directory: $TEST_DIR"
-    rm -rf "$TEST_DIR"
+    log "Retaining installer test directory: $TEST_DIR"
 }
 
 trap '_test_lib_cleanup; cleanup' EXIT
@@ -137,6 +157,14 @@ EOF
     chmod +x "$bin_dir/launchctl"
 }
 
+# Direct installer scenarios receive the same service isolation as the prompt
+# scenarios. The PATH change is confined to this script's fixture process.
+INSTALLER_SERVICE_STUBS="$TEST_DIR/service-stubs"
+create_systemd_stubs "$INSTALLER_SERVICE_STUBS"
+create_launchd_stubs "$INSTALLER_SERVICE_STUBS"
+export PATH="$INSTALLER_SERVICE_STUBS:$PATH"
+export RCH_RUNTIME_DIR="$TEST_DIR/runtime"
+
 create_prompt_tarball() {
     local name="$1"
     local pkg_dir="$TEST_DIR/${name}_pkg"
@@ -146,13 +174,16 @@ create_prompt_tarball() {
 
     # STUB CONTRACT: these fixtures must never be mistakable for the real
     # binaries. Every invocation announces itself on stderr, and anything
-    # other than --version FAILS with exit 97. In particular `doctor` must
+    # other than --version or the delegated role read FAILS with exit 97. `doctor` must
     # never fake success: a stub that answered "All checks passed" while
     # silently no-oping real commands masked a broken PATH for five days
     # (2026-07-11..16 incident).
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
 echo "rch TEST STUB (e2e_install_test.sh fixture) — NOT the real rch" >&2
+if [[ "$*" == "--color never config get general.role" ]]; then
+    exec "$RCH_E2E_CONFIG_READER" "$@"
+fi
 case "$1" in
     --version) echo "rch 0.1.0-test" ;;
     *)
@@ -216,16 +247,49 @@ run_install_case() {
     fi
     mkdir -p "$home_dir"
 
+    local case_path="$stub_bin:$PATH"
+    if [[ "$systemctl_mode" == "missing" ]]; then
+        # A failing systemctl stub does not hide launchctl on macOS. Keep
+        # native tools available while excluding both manager executables.
+        case_path="$TEST_DIR/no-service-manager-bin"
+        if [[ ! -d "$case_path" ]]; then
+            mkdir -p "$case_path"
+            local path_dir executable name
+            local inherited_path=()
+            IFS=: read -r -a inherited_path <<<"$PATH"
+            for path_dir in "${inherited_path[@]}"; do
+                [[ -d "${path_dir:-.}" ]] || continue
+                path_dir=$(cd "${path_dir:-.}" && pwd -P)
+                for executable in "$path_dir"/*; do
+                    [[ -f "$executable" && -x "$executable" ]] || continue
+                    name="${executable##*/}"
+                    case "$name" in systemctl|launchctl) continue ;; esac
+                    [[ -e "$case_path/$name" ]] || ln -s "$executable" "$case_path/$name"
+                done
+            done
+        fi
+        if PATH="$case_path" command -v systemctl >/dev/null 2>&1 \
+            || PATH="$case_path" command -v launchctl >/dev/null 2>&1; then
+            printf 'Missing-manager fixture still exposes a service manager\n' >&2
+            return 2
+        fi
+    fi
+    printf '%s\n' "$case_path" > "$install_dir/installer.path"
+
     local output
     local status=0
 
     if [[ "$use_script" == "true" ]]; then
         if command -v script >/dev/null 2>&1; then
             local cmd
-            cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 RCH_NO_RC=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$stub_bin:$PATH\""
+            cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 RCH_NO_RC=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$case_path\""
             cmd="$cmd HOME=\"$home_dir\""
             cmd="$cmd \"$PROJECT_ROOT/install.sh\" --offline \"$tarball\" $extra_args"
-            output=$(printf '%s' "$input_data" | script -q /dev/null -c "$cmd" 2>&1) || status=$?
+            if [[ "$(uname -s)" == Darwin ]]; then
+                output=$(printf '%s' "$input_data" | script -q /dev/null /bin/bash -c "$cmd" 2>&1) || status=$?
+            else
+                output=$(printf '%s' "$input_data" | SHELL=/bin/bash script -eq /dev/null -c "$cmd" 2>&1) || status=$?
+            fi
         else
             log "SKIP: script command not available for interactive prompt test"
             return 2
@@ -234,7 +298,7 @@ run_install_case() {
         output=$(printf '%s' "$input_data" | \
             SYSTEMCTL_LOG="$systemctl_log" \
             SYSTEMCTL_MODE="$systemctl_mode" \
-            PATH="$stub_bin:$PATH" \
+            PATH="$case_path" \
             HOME="$home_dir" \
             RCH_INSTALL_DIR="$install_dir" \
             RCH_CONFIG_DIR="$config_dir" \
@@ -245,6 +309,8 @@ run_install_case() {
             "$PROJECT_ROOT/install.sh" --offline "$tarball" $extra_args 2>&1) || status=$?
     fi
 
+    printf '%s\n' "$output" > "$install_dir/installer.log"
+    printf '%s\n' "$status" > "$install_dir/installer.exit"
     echo "$output"
     return "$status"
 }
@@ -256,8 +322,12 @@ run_install_case() {
 test_help() {
     start_test "Help output"
 
-    local output
-    output=$("$PROJECT_ROOT/install.sh" --help 2>&1) || true
+    local output status=0
+    output=$("$PROJECT_ROOT/install.sh" --help 2>&1) || status=$?
+    if [[ "$status" != 0 ]]; then
+        fail "Installer help exited $status"
+        return
+    fi
 
     if [[ "$output" == *"RCH Installer"* ]]; then
         pass "Help shows installer name"
@@ -312,7 +382,7 @@ test_verify_only() {
              NO_GUM=1 \
              "$PROJECT_ROOT/install.sh" --verify-only 2>&1) || status=$?
 
-    if [[ $status -ne 0 ]]; then
+    if [[ $status -eq 1 && "$output" == *"not found"* ]]; then
         pass "Verify-only fails correctly when not installed"
     else
         fail "Verify-only should fail when binaries not present"
@@ -337,6 +407,9 @@ test_offline_install() {
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
 echo "rch TEST STUB (offline-install fixture) — NOT the real rch" >&2
+if [[ "$*" == "--color never config get general.role" ]]; then
+    exec "$RCH_E2E_CONFIG_READER" "$@"
+fi
 case "$1" in
     --version) echo "rch 0.1.0-test" ;;
     *)
@@ -368,8 +441,7 @@ EOF
     # tester's real shell rc — see run_install_case).
     local offline_home="$TEST_DIR/offline_home"
     mkdir -p "$offline_home"
-    local output
-    local status=0
+    local output status=0
     output=$(HOME="$offline_home" \
              RCH_INSTALL_DIR="$install_dir" \
              RCH_CONFIG_DIR="$config_dir" \
@@ -379,6 +451,10 @@ EOF
              NO_GUM=1 \
              "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-test.tar.gz" --yes 2>&1) || status=$?
 
+    if [[ "$status" -ne 0 ]]; then
+        log "Installer output: $output"
+        fail "Offline installer exited $status"
+    fi
     if [[ -x "$install_dir/rch" ]]; then
         pass "rch binary installed from tarball"
     else
@@ -406,6 +482,11 @@ EOF
 test_uninstall() {
     start_test "Uninstall"
 
+    if [[ -e /tmp/rch.sock || -L /tmp/rch.sock ]]; then
+        fail "Refusing native uninstall while its hardcoded /tmp/rch.sock path exists; run in an isolated fixture namespace"
+        return
+    fi
+
     local install_dir="$TEST_DIR/uninstall_test/bin"
     local config_dir="$TEST_DIR/uninstall_test/config"
 
@@ -424,14 +505,18 @@ test_uninstall() {
     # real shell rc — see run_install_case).
     local uninstall_home="$TEST_DIR/uninstall_home"
     mkdir -p "$uninstall_home"
-    local output
+    local output status=0
     output=$(HOME="$uninstall_home" \
              RCH_INSTALL_DIR="$install_dir" \
              RCH_CONFIG_DIR="$config_dir" \
              RCH_NO_HOOK=1 \
              RCH_NO_RC=1 \
              NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --uninstall --yes 2>&1) || true
+             "$PROJECT_ROOT/install.sh" --uninstall --yes 2>&1) || status=$?
+    if [[ "$status" != 0 ]]; then
+        log "Installer output: $output"
+        fail "Native uninstall exited $status"
+    fi
 
     if [[ ! -f "$install_dir/rch" ]]; then
         pass "rch binary removed"
@@ -471,23 +556,41 @@ test_worker_mode() {
 
     mkdir -p "$install_dir" "$config_dir"
 
-    # Worker mode with verify-only should check toolchain
-    local output
-    output=$(RCH_INSTALL_DIR="$install_dir" \
-             RCH_CONFIG_DIR="$config_dir" \
-             RCH_NO_HOOK=1 \
-             NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --worker --verify-only 2>&1) || true
+    local tarball stub_bin="$TEST_DIR/worker_toolchain_stubs" tool
+    tarball="$(create_prompt_tarball "worker_mode")"
+    mkdir -p "$stub_bin"
+    for tool in rustup gcc rsync zstd; do
+        cat >"$stub_bin/$tool" <<'EOF'
+#!/usr/bin/env bash
+tool_name="${0##*/}"
+printf '%s TEST STUB (installer worker prerequisites)\n' "$tool_name" >&2
+case "$*" in
+    --version) printf '%s 0.0.0-test\n' "$tool_name" ;;
+    'toolchain list')
+        [[ "$tool_name" == rustup ]] || exit 97
+        printf 'nightly-test\n'
+        ;;
+    'run nightly rustc --version')
+        [[ "$tool_name" == rustup ]] || exit 97
+        printf 'rustc 0.0.0-test\n'
+        ;;
+    *) exit 97 ;;
+esac
+EOF
+        chmod +x "$stub_bin/$tool"
+    done
 
-    # Check that toolchain verification was attempted
-    if [[ "$output" == *"rustup"* ]] || \
-       [[ "$output" == *"gcc"* ]] || \
-       [[ "$output" == *"rsync"* ]] || \
-       [[ "$output" == *"zstd"* ]]; then
-        pass "Worker mode checks toolchain requirements"
+    local output status=0
+    output="$(run_install_case "$install_dir" "$config_dir" "$tarball" \
+        "--worker --no-service --yes" "" false "$stub_bin" "" ok)" || status=$?
+    if [[ "$status" == 0 && -x "$install_dir/rch-wkr" \
+        && "$output" == *"Worker toolchain verification passed"* \
+        && "$output" == *"rustup:"* && "$output" == *"gcc:"* \
+        && "$output" == *"rsync:"* && "$output" == *"zstd:"* ]]; then
+        pass "Native worker install checked all explicit toolchain fixtures"
     else
-        log "  Note: Worker mode verification output may vary"
-        pass "Worker mode (output varies)"
+        log "Installer output: $output"
+        fail "Worker installation did not complete its prerequisite checks (exit=$status)"
     fi
 }
 
@@ -528,6 +631,9 @@ test_easy_mode() {
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
 echo "rch TEST STUB (easy-mode fixture) — NOT the real rch" >&2
+if [[ "$*" == "--color never config get general.role" ]]; then
+    exec "$RCH_E2E_CONFIG_READER" "$@"
+fi
 case "$1" in
     --version) echo "rch 0.1.0-test" ;;
     doctor) echo "RCH Doctor [TEST STUB]: SIMULATED result — all checks passed (no real checks ran)"; exit 0 ;;
@@ -552,32 +658,36 @@ esac
 EOF
     chmod +x "$pkg_dir/rchd"
 
-    tar -czf "$TEST_DIR/rch-easymode.tar.gz" -C "$pkg_dir" rch rchd
+    cp "$pkg_dir/rchd" "$pkg_dir/rch-wkr"
+    tar -czf "$TEST_DIR/rch-easymode.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
 
     # Run with easy mode
-    local output
-    output=$(RCH_INSTALL_DIR="$install_dir" \
+    local output status=0
+    local easy_home="$TEST_DIR/easymode_home"
+    mkdir -p "$easy_home"
+    output=$(HOME="$easy_home" RCH_INSTALL_DIR="$install_dir" \
              RCH_CONFIG_DIR="$config_dir" \
              RCH_NO_HOOK=1 \
+             RCH_NO_RC=1 \
              NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-easymode.tar.gz" --easy-mode --yes 2>&1) || true
+             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-easymode.tar.gz" --easy-mode --yes 2>&1) || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        log "Installer output: $output"
+        fail "Easy-mode installer exited $status"
+    fi
 
     # Easy mode should run doctor
-    if [[ "$output" == *"doctor"* ]] || \
-       [[ "$output" == *"diagnostic"* ]] || \
-       "$install_dir/rch" doctor 2>&1 | grep -qi "passed"; then
+    if [[ "$output" == *"RCH Doctor [TEST STUB]: SIMULATED result"* ]]; then
         pass "Easy mode includes doctor check"
     else
-        log "  Note: Doctor output may vary"
-        pass "Easy mode (output varies)"
+        fail "Easy mode did not invoke its explicit doctor fixture"
     fi
 
     # Easy mode should detect agents
-    if [[ "$output" == *"agent"* ]] || [[ "$output" == *"Agent"* ]]; then
+    if [[ "$output" == *"Detecting AI coding agents"* ]]; then
         pass "Easy mode includes agent detection"
     else
-        log "  Note: Agent detection output may vary"
-        pass "Easy mode agent detection (output varies)"
+        fail "Easy mode did not run agent detection"
     fi
 }
 
@@ -664,24 +774,41 @@ test_proxy_config() {
 test_lock_file() {
     start_test "Lock file mechanism"
 
-    local lock_file="/tmp/rch-install.lock"
-
-    # Remove any existing lock
-    rm -f "$lock_file"
-
-    # Create a lock with a non-existent PID
-    echo "99999999" > "$lock_file"
-
-    # Should detect stale lock and proceed
-    local output
-    output=$("$PROJECT_ROOT/install.sh" --help 2>&1) || true
-
-    rm -f "$lock_file"
-
-    if [[ $? -eq 0 ]]; then
-        pass "Handles stale lock file"
+    local case_dir="$TEST_DIR/stale_lock"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    local lock_file="$case_dir/installer.lock"
+    printf '99999999\n' >"$case_dir/lock.expected"
+    if ! (set -o noclobber; cat "$case_dir/lock.expected" >"$lock_file") 2>/dev/null; then
+        fail "Refusing to replace a preexisting installer lock at $lock_file"
+        return
+    fi
+    ln "$lock_file" "$case_dir/lock.owned"
+    if [[ ! -O "$lock_file" || -L "$lock_file" || ! "$lock_file" -ef "$case_dir/lock.owned" ]] \
+        || ! cmp -s "$lock_file" "$case_dir/lock.expected"; then
+        fail "Installer lock fixture ownership or contents changed; refusing to run"
+        return
+    fi
+    log "Native lock-function test owns $lock_file; retained identity: $case_dir/lock.owned"
+    local output status=0
+    output="$(RCH_INSTALLER_LIB=1 bash -c '
+        source "$1"
+        LOCK_FILE="$2"
+        [[ -O "$LOCK_FILE" && ! -L "$LOCK_FILE" && "$LOCK_FILE" -ef "$3" ]] || exit 91
+        cmp -s "$LOCK_FILE" "$4" || exit 92
+        acquire_lock
+        [[ "$(cat "$LOCK_FILE")" == "$$" ]] || exit 93
+        cp "$LOCK_FILE" "$5"
+        cleanup_lock
+        [[ ! -e "$LOCK_FILE" ]] || exit 94
+        printf "native stale-lock acquire and cleanup passed\\n"
+    ' bash "$PROJECT_ROOT/install.sh" "$lock_file" "$case_dir/lock.owned" \
+        "$case_dir/lock.expected" "$case_dir/lock.active" 2>&1)" || status=$?
+    printf '%s\n' "$output" >"$case_dir/lock-test.log"
+    if [[ "$status" == 0 && -f "$case_dir/lock.active" && ! -e "$lock_file" ]]; then
+        pass "Native lock functions replaced the stale fixture with their PID and released it"
     else
-        fail "Should handle stale lock file"
+        log "Installer output: $output"
+        fail "Native stale-lock function validation failed (exit=$status)"
     fi
 }
 
@@ -704,6 +831,9 @@ test_config_generation() {
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
 echo "rch TEST STUB (config fixture) — NOT the real rch" >&2
+if [[ "$*" == "--color never config get general.role" ]]; then
+    exec "$RCH_E2E_CONFIG_READER" "$@"
+fi
 case "$1" in
     --version) echo "rch 0.1.0-test" ;;
     *)
@@ -722,7 +852,7 @@ EOF
     # shell rc — see run_install_case).
     local config_home="$TEST_DIR/config_home"
     mkdir -p "$config_home"
-    local output
+    local output status=0
     output=$(HOME="$config_home" \
              RCH_INSTALL_DIR="$install_dir" \
              RCH_CONFIG_DIR="$config_dir" \
@@ -730,7 +860,11 @@ EOF
              RCH_NO_HOOK=1 \
              RCH_NO_RC=1 \
              NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-config.tar.gz" --yes 2>&1) || true
+             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-config.tar.gz" --yes 2>&1) || status=$?
+    if [[ "$status" != 0 ]]; then
+        log "Installer output: $output"
+        fail "Config-generation installer exited $status"
+    fi
 
     if [[ -f "$config_dir/daemon.toml" ]]; then
         pass "daemon.toml generated"
@@ -956,8 +1090,7 @@ test_launchd_unit_generation() {
     start_test "Launchd unit generation"
 
     if [[ "$(uname -s)" != "Darwin" ]]; then
-        log "  SKIP: launchd tests require macOS"
-        pass "Launchd test skipped on non-macOS"
+        skip "Launchd tests require macOS"
         return
     fi
 
@@ -1102,8 +1235,7 @@ test_launchd_unit_generation() {
             pass "Declining prompt avoids launchctl calls"
         fi
     else
-        log "  SKIP: script command not available for interactive decline test"
-        pass "Decline prompt test skipped (script missing)"
+        skip "Interactive decline test requires script"
     fi
 }
 
@@ -1139,11 +1271,19 @@ fi
 # Summary
 # ============================================================================
 
+while IFS= read -r -d '' status_file; do
+    installer_status="$(cat "$status_file")"
+    if [[ "$installer_status" != 0 ]]; then
+        fail "Installer exited $installer_status; see ${status_file%/*}/installer.log"
+    fi
+done < <(find "$TEST_DIR" -type f -name installer.exit -print0)
+
 log ""
 log "=== Test Summary ==="
-log "Total tests: $TESTS_RUN"
-log "Passed: $TESTS_PASSED"
-log "Failed: $TESTS_FAILED"
+log "Cases: $TESTS_RUN"
+log "Assertions passed: $TESTS_PASSED"
+log "Assertions failed: $TESTS_FAILED"
+log "Capability skips: $TESTS_SKIPPED"
 log ""
 log "Full log at: $LOG_FILE"
 

@@ -347,7 +347,6 @@ pub fn derive_gc_roots(pooled: &PooledTargetConfig, cli_roots: &[String]) -> GcR
     for cli in cli_roots {
         push(cli, GcRootSource::CommandLine);
     }
-    drop(push);
 
     roots.push(GcRoot {
         path: WORKER_TEMP_BASE_PLACEHOLDER.to_string(),

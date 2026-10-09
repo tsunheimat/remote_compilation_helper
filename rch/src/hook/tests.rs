@@ -2494,6 +2494,12 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
     let writer = retry_selection_test_lease(directory.path().join("lease.json"));
     let previous = writer.snapshot();
     let server_writer = writer.clone();
+    let toolchain = ToolchainInfo::new(
+        "nightly",
+        Some("2026-08-31".into()),
+        "rustc 1.100.0-nightly (908501772 2026-08-30)",
+    );
+    let expected_toolchain = serde_json::to_string(&toolchain).unwrap();
     let status = serde_json::json!({
         "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-endpoint", "socket_path": socket,
             "started_at": "2026-10-07T00:00:00Z", "workers_total": 1, "workers_healthy": 1,
@@ -2536,6 +2542,10 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 assert!(
                     request.contains(&format!("&local_wrapper_id={}", server_writer.wrapper_id()))
                 );
+                assert!(request.contains(&format!(
+                    "&toolchain={}",
+                    urlencoding_encode(&expected_toolchain)
+                )));
                 assert!(!request.contains("&wait=1"));
                 serde_json::to_string(&SelectionResponse {
                     reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
@@ -2558,7 +2568,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             3,
             12,
             "git status",
-            None,
+            Some(&toolchain),
             RequiredRuntime::Rust,
             CommandPriority::Normal,
             &[WorkerId::new("previous-worker")],
@@ -2601,7 +2611,36 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
             reader.read_line(&mut request).await.unwrap();
             writer.write_all(wire_response.as_bytes()).await.unwrap();
             writer.shutdown().await.unwrap();
-            request
+            drop(reader);
+            drop(writer);
+            let mut requests = vec![request];
+            if wire_response.is_empty() {
+                // EOF after dispatch permits only the existing read-only
+                // resume endpoint, never another selection or execution.
+                let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .expect("queued EOF must resume the original selection")
+                    .unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = TokioBufReader::new(reader);
+                let mut resumed = String::new();
+                reader.read_line(&mut resumed).await.unwrap();
+                assert_eq!(
+                    resumed,
+                    requests[0].replacen(
+                        "GET /select-worker?",
+                        "GET /select-worker/resume-queued?",
+                        1,
+                    )
+                );
+                writer
+                    .write_all(b"HTTP/1.0 503 Unavailable\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                writer.shutdown().await.unwrap();
+                requests.push(resumed);
+            }
+            (requests, listener)
         });
         let lease = queued_selection_test_lease(tmp.path().join("lease.json"));
         let wrapper = lease.wrapper_id();
@@ -2628,7 +2667,23 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
         .await
         .unwrap()
         .unwrap_err();
-        let request = server.await.unwrap();
+        let (requests, listener) = server.await.unwrap();
+        assert_eq!(requests.len(), if wire_response.is_empty() { 2 } else { 1 });
+        assert!(requests[0].starts_with("GET /select-worker?"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /select-worker?"))
+                .count(),
+            1,
+            "lost admission must never create a second selection"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let request = &requests[0];
         assert!(request.contains("&wait=1"));
         assert!(request.contains(&format!("local_wrapper_id={wrapper}")));
         assert!(
@@ -2653,6 +2708,7 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
         assert!(!persisted.terminal_acknowledged);
         assert!(persisted.exit_code.is_none());
         assert!(persisted.identity.remote_build_id.is_none());
+        assert!(persisted.recovery.is_none());
     }
 }
 
@@ -4582,7 +4638,7 @@ fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
 
     // Test cargo build command gets isolation
     let cargo_command = "cargo build --release";
-    let isolated = add_cargo_isolation(cargo_command, &worker_id);
+    let isolated = add_cargo_isolation(cargo_command, &worker_id, false, false);
 
     assert!(isolated.starts_with("sh -c "));
     assert!(!isolated.starts_with("CARGO_HOME="));
@@ -4607,7 +4663,7 @@ fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
     assert!(!isolated.contains("rm "));
 
     // The same worker always maps to the same cache dir (that IS the reuse).
-    let again = add_cargo_isolation(cargo_command, &worker_id);
+    let again = add_cargo_isolation(cargo_command, &worker_id, false, false);
     assert_eq!(isolated, again);
 }
 
@@ -5015,7 +5071,7 @@ fn test_add_cargo_isolation_skips_non_cargo_commands() {
 
     // Test non-cargo command is unchanged
     let non_cargo_command = "echo hello world";
-    let isolated = add_cargo_isolation(non_cargo_command, &worker_id);
+    let isolated = add_cargo_isolation(non_cargo_command, &worker_id, false, false);
 
     assert_eq!(isolated, non_cargo_command);
     assert!(!isolated.contains("CARGO_HOME"));
@@ -5029,7 +5085,7 @@ fn test_add_cargo_isolation_handles_complex_cargo_commands() {
     // Test complex cargo command with environment variables and arguments
     let complex_command =
         "cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo";
-    let isolated = add_cargo_isolation(complex_command, &worker_id);
+    let isolated = add_cargo_isolation(complex_command, &worker_id, false, false);
 
     assert!(isolated.starts_with("sh -c "));
     assert!(
@@ -5050,7 +5106,8 @@ fn test_add_cargo_isolation_handles_complex_cargo_commands() {
 fn test_add_cargo_isolation_survives_timeout_prefix_and_preserves_status() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("timeout-worker");
-    let isolated = add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id);
+    let isolated =
+        add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id, false, false);
     let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation-wrapper regression command above.
         .arg("-c")
         .arg(format!(
@@ -5084,6 +5141,8 @@ fn test_add_cargo_isolation_repairs_dangling_registry_link() {
     let isolated = add_cargo_isolation(
         "printf cargo >/dev/null; test -d \"$CARGO_HOME/registry\" && touch \"$CARGO_HOME/registry/ok\"",
         &worker_id,
+        false,
+        false,
     );
     let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation wrapper above.
         .arg("-c")
@@ -7198,7 +7257,8 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         &worker,
         "cargo check",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7322,7 +7382,8 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &worker,
         "cargo build",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         Some(PathBuf::from(&custom_target_dir)),
         &rch_common::CompilationConfig::default(),
         None,
@@ -7439,7 +7500,8 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         &worker,
         "cargo check",
         transfer_config,
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7544,7 +7606,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &worker,
         "cargo build",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -7572,7 +7635,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &worker,
         "cargo test",
         TransferConfig::default(),
-        Vec::new(),
+        &rch_common::EnvironmentConfig::default(),
+        &rch_common::execution_storage::ExecutionStorageConfig::default(),
         None,
         &rch_common::CompilationConfig::default(),
         None,
@@ -8301,31 +8365,34 @@ fn test_artifact_patterns_for_test_commands() {
 #[test]
 fn test_cargo_package_verification_artifacts_are_exact_archives() {
     let _guard = test_guard!();
-    for command in [
-        "cargo package --workspace --locked",
-        "cargo package --workspace --target-dir /data/tmp/package-verification",
-        "cargo +nightly publish --dry-run -p asupersync",
-        "env CARGO_INCREMENTAL=0 cargo publish -n --workspace",
+    for (command, expected_archive_locations) in [
+        ("cargo package --workspace --locked", 1),
+        (
+            "cargo package --workspace --target-dir /data/tmp/package-verification",
+            1,
+        ),
+        ("cargo +nightly publish --dry-run -p asupersync", 3),
+        ("env CARGO_INCREMENTAL=0 cargo publish -n --workspace", 3),
     ] {
         let kind = classify_command(command).kind;
         assert_eq!(kind, Some(CompilationKind::CargoBuild), "{command}");
         assert_eq!(
             get_artifact_patterns(kind, Some(command)),
-            vec![
+            [
                 "target/package/*.crate".to_string(),
                 "target/package/tmp-registry/*.crate".to_string(),
                 "target/package/tmp-crate/*.crate".to_string(),
-            ],
+            ][..expected_archive_locations],
             "return archives without registry indexes or extracted sources"
         );
         let custom = get_custom_target_artifact_patterns(kind, Some(command));
         assert_eq!(
             expected_output_glob_list(&custom),
-            vec![
+            [
                 "package/*.crate",
                 "package/tmp-registry/*.crate",
                 "package/tmp-crate/*.crate"
-            ]
+            ][..expected_archive_locations]
         );
         assert!(get_project_artifact_patterns(kind, Some(command), true).is_empty());
         for archive in [

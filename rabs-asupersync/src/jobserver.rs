@@ -66,8 +66,8 @@ pub enum AcquireError {
     /// Pipe-level failure.
     Io(std::io::Error),
     /// No token within the budget; the in-flight read is parked in
-    /// [`AcquireError::Timeout.0`] and its byte returns to the pool when
-    /// satisfied (call [`parked_reclaim`] or drop the error after
+    /// the first field of [`AcquireError::Timeout`] and its byte returns to
+    /// the pool when satisfied (call [`parked_reclaim`] or drop the error after
     /// spawning your own drainer). A timed-out acquire never loses a
     /// token as long as the parked read is eventually reclaimed.
     Timeout(ParkedRead),

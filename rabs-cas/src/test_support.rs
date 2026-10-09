@@ -3,8 +3,8 @@
 //! ships in a normal build.
 //!
 //! `publication::process_offer` is the real atomic commit+pin+quarantine
-//! engine, but constructing a valid [`OfferPreparedActionResult`] and the
-//! "ready" store it commits into requires a deep stack of authority /
+//! engine, but constructing a valid [`crate::publication::OfferPreparedActionResult`]
+//! and the "ready" store it commits into requires a deep stack of authority /
 //! manifest / evidence / lease / object rows. Those builders existed only
 //! as `#[cfg(test)]` privates inside `publication.rs`, so a live test in
 //! `rabsd` could not drive a commit at all. This module exposes the same

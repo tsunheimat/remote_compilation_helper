@@ -18,11 +18,13 @@ and skipping any unparseable line.
 Usage:
     aggregate_e2e.py --artifacts-dir <dir> [--output e2e_summary.md]
                      [--baseline-dir <dir>]
+                     [--expected-scripts <list> --expected-os <os> ...]
 
 When ``--baseline-dir`` is given (e.g. artifacts from the merge base), any script
 whose status regressed (pass -> fail) is highlighted. The aggregator never exits
 non-zero on test failures: CI gates on the per-script run jobs, not on this
-summary step.
+summary step. CI supplies the same revision's discovered script list and both
+OS labels so canceled or absent run jobs leave explicit missing outcomes.
 """
 
 from __future__ import annotations
@@ -124,8 +126,16 @@ def _emoji(status: str) -> str:
     return {"pass": "✅", "fail": "❌", "skip": "⏭️"}.get(status, "❓")
 
 
-def _render(statuses, scenarios, perf, baseline) -> tuple[str, dict]:
-    totals = {"pass": 0, "fail": 0, "skip": 0}
+def _render(statuses, scenarios, perf, baseline, expected=None) -> tuple[str, dict]:
+    observed = set(statuses)
+    statuses = dict(statuses)
+    if expected is not None:
+        for script, os_label in expected:
+            statuses.setdefault(
+                f"{script}@{os_label}",
+                {"script": script, "os": os_label, "status": "missing"},
+            )
+    totals = {"pass": 0, "fail": 0, "skip": 0, "missing": 0}
     for rec in statuses.values():
         totals[rec.get("status", "fail")] = totals.get(rec.get("status", "fail"), 0) + 1
 
@@ -134,8 +144,22 @@ def _render(statuses, scenarios, perf, baseline) -> tuple[str, dict]:
     lines.append("")
     lines.append(
         f"**{totals['pass']} passed · {totals['fail']} failed · {totals['skip']} skipped** "
-        f"({len(statuses)} job(s))"
+        f"({len(observed)} completed script/OS outcomes)"
     )
+    if expected is None:
+        lines.append("Collection completeness was not assessed: no expected inventory was supplied.")
+    else:
+        expected_keys = {f"{script}@{os_label}" for script, os_label in expected}
+        completed = len(expected_keys & observed)
+        lines.append(f"Expected collection: **{completed}/{len(expected_keys)} completed**.")
+        if totals["missing"]:
+            lines.append(
+                f"**INCOMPLETE: {totals['missing']} expected outcomes are missing.** "
+                "Missing outcomes are neither passes nor skips."
+            )
+        unexpected = observed - expected_keys
+        if unexpected:
+            lines.append("Unexpected outcomes outside the inventory: " + ", ".join(sorted(unexpected)))
     lines.append("")
 
     # Per-script/os result table.
@@ -147,7 +171,8 @@ def _render(statuses, scenarios, perf, baseline) -> tuple[str, dict]:
         status = rec.get("status", "fail")
         script = rec.get("script", key)
         os_label = rec.get("os", "?")
-        dur = rec.get("duration_ms", 0)
+        dur = rec.get("duration_ms")
+        duration = f"{int(dur)}ms" if dur is not None else "—"
         regressed = ""
         if baseline:
             base = baseline.get(key)
@@ -156,7 +181,7 @@ def _render(statuses, scenarios, perf, baseline) -> tuple[str, dict]:
                 regressions.append(f"{script} ({os_label})")
         lines.append(
             f"| `{script}` | {os_label} | {_emoji(status)} {status}{regressed} "
-            f"| {rec.get('exit_code', '?')} | {int(dur)}ms |"
+            f"| {rec.get('exit_code', '—')} | {duration} |"
         )
     lines.append("")
 
@@ -202,7 +227,20 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--artifacts-dir", required=True, type=Path)
     parser.add_argument("--output", default="e2e_summary.md", type=Path)
     parser.add_argument("--baseline-dir", type=Path, default=None)
+    parser.add_argument("--expected-scripts", type=Path)
+    parser.add_argument("--expected-os", action="append", default=[])
     args = parser.parse_args(argv)
+    if bool(args.expected_scripts) != bool(args.expected_os):
+        parser.error("--expected-scripts and --expected-os must be supplied together")
+
+    expected = None
+    if args.expected_scripts:
+        scripts = args.expected_scripts.read_text(encoding="utf-8").splitlines()
+        if not scripts or any(not script for script in scripts) or len(scripts) != len(set(scripts)):
+            parser.error("expected script inventory must be nonempty and contain unique names")
+        if len(args.expected_os) != len(set(args.expected_os)):
+            parser.error("expected OS labels must be unique")
+        expected = {(script, os_label) for script in scripts for os_label in args.expected_os}
 
     if not args.artifacts_dir.is_dir():
         print(f"artifacts dir not found: {args.artifacts_dir}", file=sys.stderr)
@@ -212,12 +250,13 @@ def main(argv: list[str]) -> int:
     scenarios, perf = _scan_jsonl(args.artifacts_dir)
     baseline = _load_statuses(args.baseline_dir) if args.baseline_dir else {}
 
-    markdown, totals = _render(statuses, scenarios, perf, baseline)
+    markdown, totals = _render(statuses, scenarios, perf, baseline, expected)
     args.output.write_text(markdown, encoding="utf-8")
 
     # Echo a one-line summary for the CI log.
     print(
-        f"e2e: {totals['pass']} pass, {totals['fail']} fail, {totals['skip']} skip "
+        f"e2e: {totals['pass']} pass, {totals['fail']} fail, {totals['skip']} skip, "
+        f"{totals['missing']} missing "
         f"-> {args.output}"
     )
     # The aggregator is informational; CI gates on the per-script run jobs.

@@ -149,7 +149,7 @@ $a=[uint64](($p | Measure-Object -Property AllocatedBaseSize -Sum).Sum); \
 $u=[uint64](($p | Measure-Object -Property CurrentUsage -Sum).Sum); \
 \"$c $($o.TotalVisibleMemorySize) $($o.FreePhysicalMemory) $a $u $(@(Get-Process).Count)\"";
 
-/// Parsed output of [`WINDOWS_CIM_SAMPLE_SCRIPT`].
+/// Parsed output of the Windows CIM sampling script.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowsSystemSample {
     pub cpu_load_percent: f64,

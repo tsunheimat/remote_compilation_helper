@@ -41,10 +41,20 @@ fn wrap() -> &'static str {
 fn rabsd_bin() -> PathBuf {
     static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
+        let mut build = Command::new(env!("CARGO"));
+        build.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
+        // Parent test metadata invalidates build-script fingerprints (e.g. Ring).
+        // Cargo supplies the correct package metadata for each child build.
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| {
+                name.starts_with("CARGO_PKG_")
+                    || name.starts_with("CARGO_BIN_EXE_")
+                    || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH")
+            }) {
+                build.env_remove(name);
+            }
+        }
+        let status = build.status().expect("build rabsd");
         assert!(status.success(), "rabsd build failed");
     });
     Path::new(wrap()).with_file_name("rabsd")
@@ -220,14 +230,18 @@ impl World {
             env.retain(|(present, _)| present != key);
             env.push(((*key).to_owned(), (*value).to_owned()));
         }
-        Command::new(wrap())
+        let mut command = Command::new(wrap());
+        command
             .arg(&self.rustc)
             .args(self.args(name, out, externs))
             .current_dir(self.package(name))
-            .env_clear()
-            .envs(env)
-            .output()
-            .expect("run rabs-wrap")
+            .env_clear();
+        // Profiling the wrapper must not create files in the dependency's
+        // immutable source tree. The daemon still constructs the compiler env.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command.envs(env).output().expect("run rabs-wrap")
     }
 
     /// Stock rustc, no wrapper, same argv: the oracle for served bytes.

@@ -508,7 +508,11 @@ fn completion_report(frame: &[u8], attempt: &str) -> Option<CompletionReport> {
     if value.kind != "rustc-complete"
         || value.capture_protocol != 1
         || value.attempt != attempt
-        || value.stdout_hex.len().saturating_add(value.stderr_hex.len()) > 2 * MAX_TRANSCRIPT_BYTES
+        || value
+            .stdout_hex
+            .len()
+            .saturating_add(value.stderr_hex.len())
+            > 2 * MAX_TRANSCRIPT_BYTES
     {
         return None;
     }
@@ -534,7 +538,8 @@ fn capture_ack(frame: &[u8], attempt: &str, capture: &str) -> Option<CaptureAck>
         .then_some(ack)
 }
 
-fn completion_not_published(detail: &str) -> String {
+fn completion_not_published(key: &str, detail: &str) -> String {
+    log("not-published", &[("key", key), ("detail", detail)]);
     json!({
         "kind": "rustc-completion", "outcome": "not-published", "detail": detail,
         "publication_authorized": false,
@@ -572,6 +577,7 @@ pub(super) async fn complete_on_lane(
     frame: Vec<u8>,
     stream: &mut asupersync::net::unix::UnixStream,
 ) -> String {
+    let key_text = digest_key(attempt.action_key());
     let prepared = match lane.spawn(move || {
         let report = completion_report(&frame, &attempt.attempt_hex())
             .ok_or_else(|| "malformed or unversioned completion".to_owned())?;
@@ -585,20 +591,24 @@ pub(super) async fn complete_on_lane(
     };
     let captured = match prepared {
         Ok(captured) => captured,
-        Err(detail) => return completion_not_published(&detail),
+        Err(detail) => return completion_not_published(&key_text, &detail),
     };
     let attempt_hex = captured.attempt_hex();
     let ack = acknowledge_capture(stream, &attempt_hex, captured.manifest_key()).await;
+    let completion_key = key_text.clone();
     let finished = lane.spawn(move || {
         let Some(ack) = ack else {
             drop(captured);
-            return completion_not_published("output capture was not acknowledged");
+            return completion_not_published(
+                &completion_key,
+                "output capture was not acknowledged",
+            );
         };
         // Recheck against the retained candidate, not values from a new
         // request or a mutable source path. Publication consumes this owner.
         if ack.attempt != captured.attempt_hex() || ack.capture != captured.manifest_key() {
             drop(captured);
-            return completion_not_published("capture identity mismatch");
+            return completion_not_published(&completion_key, "capture identity mismatch");
         }
         let key_text = digest_key(captured.action_key());
         let (outcome, known) = captured.publish();
@@ -611,7 +621,8 @@ pub(super) async fn complete_on_lane(
             _ => String::new(),
         };
         log(outcome.label(), &[("key", &key_text), ("detail", &detail)]);
-        json!({"kind": "rustc-completion", "outcome": outcome.label(), "detail": detail}).to_string()
+        json!({"kind": "rustc-completion", "outcome": outcome.label(), "detail": detail})
+            .to_string()
     });
     match finished {
         // A panic here may follow a committed pointer. Do not report a
@@ -623,7 +634,7 @@ pub(super) async fn complete_on_lane(
             })
             .to_string()
         }),
-        Err(error) => completion_not_published(&error.to_string()),
+        Err(error) => completion_not_published(&key_text, &error.to_string()),
     }
 }
 
@@ -646,7 +657,10 @@ mod completion_capture_tests {
         );
         assert!(completion_report(encoded.as_bytes(), "another-attempt").is_none());
         let mut old_wrapper = report.clone();
-        old_wrapper.as_object_mut().unwrap().remove("capture_protocol");
+        old_wrapper
+            .as_object_mut()
+            .unwrap()
+            .remove("capture_protocol");
         assert!(completion_report(old_wrapper.to_string().as_bytes(), "attempt-a").is_none());
         for (field, bad) in [
             ("capture_protocol", json!(2)),
@@ -824,22 +838,41 @@ mod tests {
         let toolchain = root.join("toolchain");
         let compiler = toolchain.join("bin/rustc");
         for directory in [
-            package.clone(), generated.clone(), output.clone(), toolchain.join("bin"),
+            package.clone(),
+            generated.clone(),
+            output.clone(),
+            toolchain.join("bin"),
             toolchain.join("lib/rustlib/x86_64-unknown-linux-gnu/lib"),
         ] {
             std::fs::create_dir_all(directory).unwrap();
         }
-        std::fs::write(package.join("lib.rs"), b"pub const LABEL: &str = env!(\"BUILD_LABEL\");\n").unwrap();
-        std::fs::write(generated.parent().unwrap().join("root-output"), generated.to_str().unwrap()).unwrap();
-        std::fs::write(generated.parent().unwrap().join("output"), b"cargo::rustc-env=BUILD_LABEL=pinned\n").unwrap();
+        std::fs::write(
+            package.join("lib.rs"),
+            b"pub const LABEL: &str = env!(\"BUILD_LABEL\");\n",
+        )
+        .unwrap();
+        std::fs::write(
+            generated.parent().unwrap().join("root-output"),
+            generated.to_str().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            generated.parent().unwrap().join("output"),
+            b"cargo::rustc-env=BUILD_LABEL=pinned\n",
+        )
+        .unwrap();
         // Only identity probes are scripted. No fake compile or publication is
         // credited here: the assertion exercises the real live admission path.
-        std::fs::write(&compiler, concat!(
-            "#!/bin/sh\ncase \"$1\" in\n",
-            "-vV) printf 'rustc fixture\\nhost: x86_64-unknown-linux-gnu\\n';;\n",
-            "--print) bin=${0%/*}; printf '%s\\n' \"${bin%/*}\";;\n",
-            "*) exit 99;;\nesac\n",
-        )).unwrap();
+        std::fs::write(
+            &compiler,
+            concat!(
+                "#!/bin/sh\ncase \"$1\" in\n",
+                "-vV) printf 'rustc fixture\\nhost: x86_64-unknown-linux-gnu\\n';;\n",
+                "--print) bin=${0%/*}; printf '%s\\n' \"${bin%/*}\";;\n",
+                "*) exit 99;;\nesac\n",
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut request = json!({
             "kind":"rustc-request",
@@ -854,7 +887,9 @@ mod tests {
         });
         let cas = Arc::new(crate::janitor::store::mount_and_reconcile(&root.join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(cas));
-        coord.acquire_boot_authority("build-script-environment-fixture").unwrap();
+        coord
+            .acquire_boot_authority("build-script-environment-fixture")
+            .unwrap();
         coord.mark_up();
         let live = LiveEdge::new(LiveDependencyLane::new(coord));
         let env = constructed_environment(&parse_request(&request).unwrap().env);
@@ -872,8 +907,17 @@ mod tests {
         let Decided::Execute { reply, attempt } = decide(&live, &request) else {
             panic!("a captured custom rustc-env must reach live execution admission");
         };
-        assert!(attempt.execution_env().contains(&("BUILD_LABEL".into(), "pinned".into())));
-        assert!(!attempt.execution_env().iter().any(|(name, _)| name == "UNDECLARED"));
+        assert!(
+            attempt
+                .execution_env()
+                .contains(&("BUILD_LABEL".into(), "pinned".into()))
+        );
+        assert!(
+            !attempt
+                .execution_env()
+                .iter()
+                .any(|(name, _)| name == "UNDECLARED")
+        );
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["compiler_skip_authorized"], false);
         drop(attempt);
@@ -884,7 +928,12 @@ mod tests {
         };
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["decision"], "pass-through");
-        assert!(reply["reason"].as_str().unwrap().contains("LIVE_DEP_REFUSED_ENV"));
+        assert!(
+            reply["reason"]
+                .as_str()
+                .unwrap()
+                .contains("LIVE_DEP_REFUSED_ENV")
+        );
         assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
     }
 }

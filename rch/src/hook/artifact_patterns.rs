@@ -83,19 +83,22 @@ pub(super) fn get_artifact_patterns(
         return patterns;
     }
     if kind == Some(CompilationKind::CargoBuild)
-        && command.is_some_and(rch_common::patterns::is_cargo_package_verification)
+        && let Some(packaging) = command.and_then(rch_common::patterns::cargo_package_verification)
     {
         // Cargo's own verifier builds the extracted archive and checks source
-        // mutations. `cargo package` leaves the archive in package/, workspace
-        // publication keeps verified archives in its temporary registry, and
-        // `cargo publish -p X` writes its only archive to package/tmp-crate/
-        // (bd-3kskq: without it every publish dry run returned zero archives).
+        // mutations. `cargo package` returns only final archives in package/;
+        // its tmp-crate copy is verification scratch, not another output.
+        // Publication can keep its only verified archive in tmp-registry/ or
+        // tmp-crate/ (bd-3kskq), so retain those locations for publish dry-runs.
         // Return only archives, never the index or extracted sources.
-        return vec![
-            "target/package/*.crate".to_string(),
-            "target/package/tmp-registry/*.crate".to_string(),
-            "target/package/tmp-crate/*.crate".to_string(),
-        ];
+        let mut patterns = vec!["target/package/*.crate".to_string()];
+        if packaging == rch_common::patterns::CargoPackageVerification::PublishDryRun {
+            patterns.extend([
+                "target/package/tmp-registry/*.crate".to_string(),
+                "target/package/tmp-crate/*.crate".to_string(),
+            ]);
+        }
+        return patterns;
     }
     if let Some(patterns) = cargo_bins::patterns(kind, command) {
         return patterns;

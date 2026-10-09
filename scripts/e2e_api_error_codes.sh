@@ -25,7 +25,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PROJECT_ROOT
 VERBOSE="${RCH_E2E_VERBOSE:-0}"
-LOG_FILE="/tmp/rch_e2e_error_codes_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${RCH_E2E_LOG:-${TMPDIR:-/tmp}/rch_e2e_error_codes_$(date +%Y%m%d_%H%M%S).jsonl}"
+LOG_FILE="${LOG_FILE%.jsonl}.diagnostics.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+CAPTURE_DIR=$(mktemp -d "$(dirname "$LOG_FILE")/rch-api-error-codes.XXXXXX")
 
 # Structured JSONL logging
 # shellcheck disable=SC1091
@@ -98,26 +101,32 @@ check_dependencies() {
 }
 
 build_binaries() {
-    log "INFO" "Building rch (release)..."
+    local target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+    RCH_BIN="$target_dir/debug/rch"
+    if [[ ! -x "$RCH_BIN" && -x "$target_dir/release/rch" ]]; then
+        RCH_BIN="$target_dir/release/rch"
+    fi
+    if [[ -x "$RCH_BIN" ]]; then
+        log "INFO" "Using existing rch: $RCH_BIN"
+        return 0
+    fi
+    log "INFO" "Building rch (debug)..."
     cd "$PROJECT_ROOT"
-    if ! cargo build -p rch --release 2>&1 | tee -a "$LOG_FILE" | tail -3; then
+    if ! cargo build -p rch 2>&1 | tee -a "$LOG_FILE" | tail -3; then
         die "Build failed"
     fi
-    [[ -x "$PROJECT_ROOT/target/release/rch" ]] || die "Binary missing: rch"
+    [[ -x "$RCH_BIN" ]] || die "Binary missing: rch"
     log "INFO" "Build OK"
 }
 
-# Test helper: run command and check for RCH-Exxx format in error
+# Test helper: check the captured JSON response without evaluating its contents.
 test_error_format() {
     local test_name="$1"
-    local cmd="$2"
+    local output="$2"
     local expected_pattern="${3:-RCH-E}"
 
     TESTS_RUN=$((TESTS_RUN + 1))
-    log "TEST" "[$test_name] Running: $cmd"
-
-    local output
-    output=$(eval "$cmd" 2>&1 || true)
+    log "TEST" "[$test_name] Checking captured error response"
 
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
@@ -215,11 +224,12 @@ test_remediation_present() {
 }
 
 run_tests() {
-    local rch="$PROJECT_ROOT/target/release/rch"
+    local rch="$RCH_BIN"
 
     log "INFO" "=========================================="
     log "INFO" "Starting API Error Code E2E Tests"
     log "INFO" "Log file: $LOG_FILE"
+    log "INFO" "Raw stdout and stderr: $CAPTURE_DIR"
     log "INFO" "=========================================="
 
     # =========================================================================
@@ -227,10 +237,11 @@ run_tests() {
     # =========================================================================
     log "INFO" "Test 1: Invalid worker probe error format"
     local output
-    output=$("$rch" workers probe nonexistent-worker --json 2>&1 || true)
+    "$rch" workers probe nonexistent-worker --json >"$CAPTURE_DIR/probe-json.stdout" 2>"$CAPTURE_DIR/probe-json.stderr" || true
+    output=$(<"$CAPTURE_DIR/probe-json.stdout")
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
-    test_error_format "probe-invalid-worker" "echo '$output' | cat" "RCH-E"
+    test_error_format "probe-invalid-worker" "$output" "RCH-E"
     test_error_structure "probe-structure" "$output"
     test_error_category "probe-category" "$output"
     test_remediation_present "probe-remediation" "$output"
@@ -240,26 +251,26 @@ run_tests() {
     # =========================================================================
     log "INFO" "Test 2: Daemon not running error"
     # Temporarily unset socket path to ensure daemon not found
-    local orig_socket="${RCH_DAEMON_SOCKET:-}"
-    export RCH_DAEMON_SOCKET="/tmp/nonexistent-rch-socket-$$"
+    local orig_socket="${RCH_SOCKET_PATH:-}"
+    export RCH_SOCKET_PATH="/tmp/nonexistent-rch-socket-$$"
 
-    output=$("$rch" status --json 2>&1 || true)
+    local status_exit=0
+    "$rch" status --json >"$CAPTURE_DIR/status-json.stdout" 2>"$CAPTURE_DIR/status-json.stderr" || status_exit=$?
+    output=$(<"$CAPTURE_DIR/status-json.stdout")
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
-    # Check if we got a JSON error (daemon might actually be running)
-    if echo "$output" | jq -e '.error' >/dev/null 2>&1; then
-        test_error_format "daemon-not-running" "echo '$output' | cat" "RCH-E"
+    if [[ "$status_exit" == 1 ]] && echo "$output" | jq -e '.success == false and .error' >/dev/null 2>&1; then
+        test_error_format "daemon-not-running" "$output" "RCH-E"
         test_error_structure "daemon-structure" "$output"
     else
-        # Daemon might be running, skip this test
-        log "INFO" "[daemon-not-running] Skipped - daemon may be running"
+        log_fail "[daemon-not-running] Expected exit 1 and error envelope for the deliberately absent socket"
     fi
 
     # Restore socket path
     if [[ -n "$orig_socket" ]]; then
-        export RCH_DAEMON_SOCKET="$orig_socket"
+        export RCH_SOCKET_PATH="$orig_socket"
     else
-        unset RCH_DAEMON_SOCKET
+        unset RCH_SOCKET_PATH
     fi
 
     # =========================================================================
@@ -271,16 +282,16 @@ run_tests() {
     invalid_config="$invalid_config_dir/config.toml"
     echo 'invalid toml [' > "$invalid_config"
 
-    output=$(RCH_CONFIG_DIR="$invalid_config_dir" "$rch" status --json 2>&1 || true)
-    rm -f "$invalid_config"
-    rmdir "$invalid_config_dir"
+    local config_exit=0
+    RCH_CONFIG_DIR="$invalid_config_dir" "$rch" config show --json >"$CAPTURE_DIR/config-json.stdout" 2>"$CAPTURE_DIR/config-json.stderr" || config_exit=$?
+    output=$(<"$CAPTURE_DIR/config-json.stdout")
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
-    # Config errors should have RCH-E format if triggered
-    if echo "$output" | jq -e '.error' >/dev/null 2>&1; then
-        test_error_format "config-invalid" "echo '$output' | cat" "RCH-E"
+    if [[ "$config_exit" == 1 ]] && echo "$output" | jq -e \
+        --arg path "$invalid_config" '.success == false and .error.category == "config" and (.error.details | contains($path))' >/dev/null 2>&1; then
+        test_error_format "config-invalid" "$output" "RCH-E"
     else
-        log "INFO" "[config-invalid] No config error triggered (may have fallback)"
+        log_fail "[config-invalid] Expected exit 1 and configuration error identifying the malformed file"
     fi
 
     # =========================================================================
@@ -290,26 +301,19 @@ run_tests() {
     TESTS_RUN=$((TESTS_RUN + 1))
 
     local stdout_file stderr_file
-    stdout_file=$(mktemp)
-    stderr_file=$(mktemp)
+    stdout_file="$CAPTURE_DIR/probe-plain.stdout"
+    stderr_file="$CAPTURE_DIR/probe-plain.stderr"
 
-    "$rch" workers probe nonexistent-worker >"$stdout_file" 2>"$stderr_file" || true
+    local probe_exit=0
+    "$rch" workers probe nonexistent-worker >"$stdout_file" 2>"$stderr_file" || probe_exit=$?
 
-    # For --json mode, errors go to stdout
-    # For non-json mode, errors should go to stderr
-    # Check stderr has error content or stdout has JSON error
-    local has_error=0
-    if [[ -s "$stderr_file" ]] || grep -q '"error"' "$stdout_file" 2>/dev/null; then
-        has_error=1
-    fi
-
-    if [[ "$has_error" == "1" ]]; then
+    if [[ "$probe_exit" == 1 && -s "$stderr_file" && ! -s "$stdout_file" ]] \
+        && grep -q 'RCH-E' "$stderr_file"; then
         log_pass "[stream-separation] Error output correctly routed"
     else
-        log_fail "[stream-separation] No error output found"
+        log_fail "[stream-separation] Expected exit 1, coded error on stderr, and empty stdout"
     fi
 
-    rm -f "$stdout_file" "$stderr_file"
 
     # =========================================================================
     # Test 5: JSON error format is parseable
@@ -317,12 +321,13 @@ run_tests() {
     log "INFO" "Test 5: JSON error parseable by jq"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    output=$("$rch" workers probe nonexistent-worker --json 2>&1 || true)
+    "$rch" workers probe nonexistent-worker --json >"$CAPTURE_DIR/probe-fields.stdout" 2>"$CAPTURE_DIR/probe-fields.stderr" || true
+    output=$(<"$CAPTURE_DIR/probe-fields.stdout")
 
     # Try to extract all standard fields
     local fields_ok=1
     for field in api_version timestamp success; do
-        if ! echo "$output" | jq -e ".$field" >/dev/null 2>&1; then
+        if ! echo "$output" | jq -e "has(\"$field\")" >/dev/null 2>&1; then
             log "WARN" "Missing top-level field: $field"
             fields_ok=0
         fi
@@ -341,18 +346,13 @@ run_tests() {
     TESTS_RUN=$((TESTS_RUN + 1))
 
     # This is validated by unit tests, but we verify they pass
-    if cargo test -p rch-common --lib -- api:: --quiet 2>&1 | grep -q "test result: ok"; then
+    local test_output test_exit=0
+    test_output=$(cargo test -p rch-common --lib -- api:: --quiet 2>&1) || test_exit=$?
+    if [[ "$test_exit" == 0 ]] && echo "$test_output" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
         log_pass "[unit-tests] API unit tests pass"
     else
-        # Run tests and capture full output for debugging
-        local test_output
-        test_output=$(cargo test -p rch-common --lib -- api:: 2>&1 || true)
-        if echo "$test_output" | grep -q "passed"; then
-            log_pass "[unit-tests] API unit tests pass"
-        else
-            log_fail "[unit-tests] Some API unit tests failed"
-            [[ "$VERBOSE" == "1" ]] && log "DEBUG" "$test_output"
-        fi
+        log_fail "[unit-tests] API unit tests failed or selected no tests (exit $test_exit)"
+        [[ "$VERBOSE" == "1" ]] && log "DEBUG" "$test_output"
     fi
 
     # =========================================================================
@@ -361,7 +361,8 @@ run_tests() {
     log "INFO" "Test 7: NO_COLOR preserves JSON"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    output=$(NO_COLOR=1 "$rch" workers probe nonexistent-worker --json 2>&1 || true)
+    NO_COLOR=1 "$rch" workers probe nonexistent-worker --json >"$CAPTURE_DIR/probe-no-color.stdout" 2>"$CAPTURE_DIR/probe-no-color.stderr" || true
+    output=$(<"$CAPTURE_DIR/probe-no-color.stdout")
 
     if echo "$output" | jq -e '.' >/dev/null 2>&1; then
         log_pass "[no-color] JSON output valid with NO_COLOR"

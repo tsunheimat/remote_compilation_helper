@@ -132,7 +132,7 @@ enum Commands {
         #[arg(long, default_value = "none")]
         runtime: PrepareRuntime,
 
-        /// Directory for install logs (default: <project>/.rch_prepare_logs/).
+        /// Directory for install logs (default: `<project>/.rch_prepare_logs/`).
         #[arg(long)]
         log_dir: Option<String>,
     },

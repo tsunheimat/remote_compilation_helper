@@ -227,6 +227,7 @@ pub struct ConfigShowResponse {
     pub compilation: ConfigCompilationSection,
     pub transfer: ConfigTransferSection,
     pub environment: ConfigEnvironmentSection,
+    pub execution_storage: rch_common::execution_storage::ExecutionStorageConfig,
     pub circuit: ConfigCircuitSection,
     pub output: ConfigOutputSection,
     pub self_healing: ConfigSelfHealingSection,
@@ -327,6 +328,8 @@ pub fn is_default_verify_size(val: &u64) -> bool {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigEnvironmentSection {
     pub allowlist: Vec<String>,
+    /// Key names only: registry/proxy defaults may contain credentials.
+    pub remote_keys: Vec<String>,
 }
 
 /// Circuit breaker configuration section.

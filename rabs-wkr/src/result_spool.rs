@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn sealed_binary_result_reopens_with_exact_artifacts_and_recipient() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let (_journal, target, fingerprint) = target(root.path(), 1);
         let mut original = completion(1, true);
         let manifest = original.artifacts.as_ref().unwrap().manifest();
@@ -708,7 +708,7 @@ mod tests {
             Some(StopReason::SessionLost),
             Some(StopReason::LeaseExpired),
         ] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::private_test_directory();
             let (_journal, target, fingerprint) = target(root.path(), 1);
             let mut original = completion(1, false);
             original.stop_reason = stop;
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn lease_expiry_cannot_seal_success_or_partial_artifacts() {
         for with_artifacts in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::private_test_directory();
             let (_journal, target, _) = target(root.path(), 1);
             let mut original = completion(1, with_artifacts);
             original.stop_reason = Some(StopReason::LeaseExpired);
@@ -745,7 +745,7 @@ mod tests {
     #[test]
     fn corruption_and_foreign_entries_never_become_recovered_results() {
         for case in 0..5 {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::private_test_directory();
             let (_journal, target, fingerprint) = target(root.path(), 1);
             let digest = target.seal(&mut completion(1, true)).unwrap();
             let spool = root.path().join(DIRECTORY);
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn missing_capture_and_residual_writers_are_refused_before_spool_creation() {
         for case in 0..3 {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::private_test_directory();
             let (_journal, target, _) = target(root.path(), 1);
             let mut original = completion(1, false);
             match case {
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn acceptance_cleanup_is_repeatable_and_cannot_follow_unknown_paths() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let (_journal, target, _) = target(root.path(), 1);
         let digest = target.seal(&mut completion(1, true)).unwrap();
         let unknown = root.path().join(DIRECTORY).join("foreign");
@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn execution_owner_seals_before_completion_and_reports_persistence_failure() {
         for fail in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::private_test_directory();
             let (_journal, target, fingerprint) = target(root.path(), 1);
             if fail {
                 fs::create_dir(root.path().join(DIRECTORY)).unwrap();
@@ -858,7 +858,7 @@ mod tests {
     fn tree_results_rehydrate_every_file_beyond_the_exact_declaration_limit() {
         use rabs_sandbox::artifact_tree::TREE_FILES_VERSION;
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = WorkerJournal::open(root.path(), "worker", "coord").unwrap();
         let request = json!({"kind":"canonical-exec", "request_id":23, "program":"cargo",
             "artifacts":{"unit":"build", "files":["debug/app"], "tree":TREE_FILES_VERSION}});

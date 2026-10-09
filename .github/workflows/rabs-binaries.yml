@@ -28,6 +28,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   # Exercise the accepted-hit delivery frontier independently of the slower
@@ -57,12 +59,69 @@ jobs:
   build:
     name: release build + gates
     runs-on: ubuntu-latest
+    env:
+      # Two concurrent release rustc processes nearly exhausted RAM and swap
+      # before a shutdown. Serialize compilation; retain every gate.
+      CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rabs-release-gates
+          cache-on-failure: true
       - name: Install bubblewrap (worker capability + sandbox tests)
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Release build the three spine binaries
-        run: cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A runner shutdown can prevent even an always() follow-up step.
+          # Emit resource observations during the unchanged build command.
+          python3 -u - <<'PY' &
+          import datetime
+          import json
+          import pathlib
+          import time
+
+          def read(path):
+              try:
+                  return pathlib.Path(path).read_text()
+              except OSError:
+                  return None
+
+          while True:
+              meminfo = read('/proc/meminfo') or ''
+              memory = {line.split(':', 1)[0]: line.split(':', 1)[1].strip()
+                        for line in meminfo.splitlines()
+                        if line.startswith(('MemTotal:', 'MemAvailable:', 'SwapTotal:', 'SwapFree:'))}
+              processes = []
+              for entry in pathlib.Path('/proc').iterdir():
+                  if not entry.name.isdecimal():
+                      continue
+                  fields = dict(line.split(':', 1) for line in (read(entry / 'status') or '').splitlines()
+                                if ':' in line)
+                  rss = int(fields.get('VmRSS', '0 kB').split()[0])
+                  if rss:
+                      processes.append({'pid': int(entry.name), 'name': fields.get('Name', '').strip(),
+                                        'rss_kib': rss, 'threads': fields.get('Threads', '').strip()})
+              cgroup = read('/proc/self/cgroup') or ''
+              relative = next((line.split('::', 1)[1] for line in cgroup.splitlines()
+                               if line.startswith('0::')), '/')
+              cgroup_root = pathlib.Path('/sys/fs/cgroup') / relative.lstrip('/')
+              print('RABS runner resources ' + json.dumps({
+                  'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  'memory': memory, 'self_cgroup': cgroup,
+                  'cgroup': {name: read(cgroup_root / name) for name in
+                             ('memory.current', 'memory.max', 'memory.peak', 'memory.events', 'cpu.max')},
+                  'host_oom_kill': next((line for line in (read('/proc/vmstat') or '').splitlines()
+                                         if line.startswith('oom_kill ')), None),
+                  'largest_processes': sorted(processes, key=lambda row: row['rss_kib'], reverse=True)[:8]
+              }), flush=True)
+              time.sleep(30)
+          PY
+          rabs_sampler_pid=$!
+          trap 'rabs_build_status=$?; trap - EXIT; kill "$rabs_sampler_pid" 2>/dev/null || true; wait "$rabs_sampler_pid" 2>/dev/null || true; exit "$rabs_build_status"' EXIT
+          cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
       - name: Binary size budget (rabs-wrap < 2 MiB, A021)
         run: |
           size=$(stat -c%s target/release/rabs-wrap)

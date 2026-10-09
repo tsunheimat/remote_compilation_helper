@@ -25,7 +25,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PROJECT_ROOT
 VERBOSE="${RCH_E2E_VERBOSE:-0}"
-LOG_FILE="/tmp/rch_e2e_envelope_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${RCH_E2E_LOG:-${TMPDIR:-/tmp}/rch_e2e_envelope_$(date +%Y%m%d_%H%M%S).jsonl}"
+LOG_FILE="${LOG_FILE%.jsonl}.diagnostics.log"
 
 # Structured JSONL logging
 # shellcheck disable=SC1091
@@ -98,12 +99,21 @@ check_dependencies() {
 }
 
 build_binaries() {
-    log "INFO" "Building rch (release)..."
+    local target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+    RCH_BIN="$target_dir/debug/rch"
+    if [[ ! -x "$RCH_BIN" && -x "$target_dir/release/rch" ]]; then
+        RCH_BIN="$target_dir/release/rch"
+    fi
+    if [[ -x "$RCH_BIN" ]]; then
+        log "INFO" "Using existing rch: $RCH_BIN"
+        return 0
+    fi
+    log "INFO" "Building rch (debug)..."
     cd "$PROJECT_ROOT"
-    if ! cargo build -p rch --release 2>&1 | tee -a "$LOG_FILE" | tail -3; then
+    if ! cargo build -p rch 2>&1 | tee -a "$LOG_FILE" | tail -3; then
         die "Build failed"
     fi
-    [[ -x "$PROJECT_ROOT/target/release/rch" ]] || die "Binary missing: rch"
+    [[ -x "$RCH_BIN" ]] || die "Binary missing: rch"
     log "INFO" "Build OK"
 }
 
@@ -124,7 +134,7 @@ test_success_envelope() {
     local missing_fields=()
 
     for field in "${required_fields[@]}"; do
-        if ! echo "$json_output" | jq -e ".$field" >/dev/null 2>&1; then
+        if ! echo "$json_output" | jq -e "has(\"$field\")" >/dev/null 2>&1; then
             missing_fields+=("$field")
         fi
     done
@@ -159,7 +169,7 @@ test_error_envelope() {
     local missing_fields=()
 
     for field in "${required_fields[@]}"; do
-        if ! echo "$json_output" | jq -e ".$field" >/dev/null 2>&1; then
+        if ! echo "$json_output" | jq -e "has(\"$field\")" >/dev/null 2>&1; then
             missing_fields+=("$field")
         fi
     done
@@ -296,7 +306,7 @@ test_command_field() {
 # =============================================================================
 
 run_tests() {
-    local rch="$PROJECT_ROOT/target/release/rch"
+    local rch="$RCH_BIN"
 
     log "INFO" "=========================================="
     log "INFO" "Starting API Envelope E2E Tests"
@@ -407,15 +417,13 @@ run_tests() {
     log "INFO" "Test 6: ApiResponse unit tests"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    local test_output
-    test_output=$(cargo test -p rch-common --lib -- api::response::tests 2>&1 || true)
+    local test_output test_exit=0
+    test_output=$(cargo test -p rch-common --lib -- api::response::tests 2>&1) || test_exit=$?
 
-    if echo "$test_output" | grep -q "test result: ok"; then
-        log_pass "[unit-tests] ApiResponse unit tests pass"
-    elif echo "$test_output" | grep -q "passed"; then
+    if [[ "$test_exit" == 0 ]] && echo "$test_output" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
         log_pass "[unit-tests] ApiResponse unit tests pass"
     else
-        log_fail "[unit-tests] Some ApiResponse unit tests failed"
+        log_fail "[unit-tests] ApiResponse unit tests failed or selected no tests (exit $test_exit)"
         [[ "$VERBOSE" == "1" ]] && log "DEBUG" "$test_output"
     fi
 

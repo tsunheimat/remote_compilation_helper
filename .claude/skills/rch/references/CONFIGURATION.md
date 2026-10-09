@@ -311,7 +311,8 @@ Worker-side: `RCH_WORKER_ID` (falls back to `HOSTNAME`), `RCH_WKR_CANONICAL_ROOT
 Validation-only names (appear in `rch --help`/validators but are **not read as
 overrides**): `RCH_DAEMON_TIMEOUT_MS`, `RCH_SSH_KEY`, `RCH_TRANSFER_ZSTD_LEVEL`.
 Non-existent: `RCH_DISABLED`, `RCH_BYPASS`, `RCH_FORCE_LOCAL`, `RCH_DAEMON_SOCKET`,
-`RCH_LOG`, `RCH_DRY_RUN`, `RCH_NO_COLOR`.
+`RCH_LOG`, `RCH_NO_COLOR`. For a preview without execution, use
+`rch diagnose --dry-run "<cmd>"`.
 
 Boolean parsing: loader accepts `1|true|yes|on` / `0|false|no|off|""`; the
 placement resolver additionally accepts `enabled|disabled`.

@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn inventory_admits_only_closed_internal_hardlinks() {
         use std::io::Read;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory().unwrap();
         std::fs::create_dir(root.path().join("deps")).unwrap();
         std::fs::write(root.path().join("deps/app-hash"), b"binary\0\xff").unwrap();
         std::fs::hard_link(root.path().join("deps/app-hash"), root.path().join("app")).unwrap();
@@ -408,14 +408,14 @@ mod tests {
     fn missing_oversized_cancelled_and_nonregular_trees_refuse() {
         use std::os::unix::{fs::symlink, net::UnixListener};
         let required = BTreeSet::from(["app".to_owned()]);
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory().unwrap();
         assert!(TreeInventory::scan(root.path(), &required, 10, &|| false).is_err());
         std::fs::write(root.path().join("app"), b"12345").unwrap();
         assert!(TreeInventory::scan(root.path(), &required, 4, &|| false).is_err());
         assert!(TreeInventory::scan(root.path(), &required, 10, &|| true).is_err());
         let _socket = UnixListener::bind(root.path().join("socket")).unwrap();
         assert!(TreeInventory::scan(root.path(), &required, 10, &|| false).is_err());
-        let links = tempfile::tempdir().unwrap();
+        let links = crate::private_test_directory().unwrap();
         symlink(root.path().join("app"), links.path().join("app")).unwrap();
         assert!(TreeInventory::scan(links.path(), &required, 10, &|| false).is_err());
     }
@@ -425,7 +425,7 @@ mod tests {
     fn mutation_replacement_and_new_entries_invalidate_inventory() {
         let required = BTreeSet::from(["app".to_owned()]);
         for case in 0..3 {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::private_test_directory().unwrap();
             std::fs::write(root.path().join("app"), b"first").unwrap();
             let inventory = TreeInventory::scan(root.path(), &required, 100, &|| false).unwrap();
             let file = inventory.open_file("app").unwrap();

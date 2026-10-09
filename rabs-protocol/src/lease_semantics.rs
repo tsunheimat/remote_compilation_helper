@@ -91,7 +91,9 @@ pub struct RequestExecutionLeaseIdentity {
     /// Durable canonical execution request ID. Zero is valid in the existing
     /// canonical request protocol and remains an exact correlation identity.
     pub request_id: u64,
-    /// SHA-256 of the complete original request's agreed encoding.
+    /// SHA-256 of compact JSON for the complete request with recursively sorted
+    /// object keys. Array order and scalar values are binding; the wire request
+    /// itself is unchanged.
     pub request_sha256: [u8; 32],
     /// Worker durable boot generation named by the authenticated hello.
     pub boot_generation: u64,

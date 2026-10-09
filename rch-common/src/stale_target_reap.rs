@@ -33,7 +33,7 @@
 //! dimensions. Beyond the idle window, pooled targets and the durable
 //! `rch-cargo-cache-*` caches must clear two LIVENESS GATES before anything
 //! removes them: no open file descriptor (or cwd) anywhere under the dir, and
-//! no live process whose command line names it. See [`gate_snapshot_fragment`]
+//! no live process whose command line names it. See `gate_snapshot_fragment`
 //! and [`evaluate_gc_candidate`]. A gate that cannot be evaluated counts as
 //! "in use": an error must never make a directory eligible for deletion.
 //!
@@ -642,7 +642,7 @@ pub const MIN_POOLED_IDLE_MINUTES: u64 = 24 * 60;
 /// Build the worker-wide sweep script shared by the daemon's periodic reaper
 /// (`rchd::stale_target_reap`) and the on-demand `rch gc` — one builder so the
 /// two can never drift (bead 6dj11). Applies [`reap_loop_body`] to every
-/// candidate from [`candidate_discovery_preamble`] and always prints a final
+/// candidate from `candidate_discovery_preamble` and always prints a final
 /// `RCH_WORKER_REAP_METRICS removed=<n> freed_kb=<kb>` line.
 ///
 /// `pooled_idle_minutes` adds a SECOND pass over the pooled
@@ -897,7 +897,7 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
 /// `RCH_TARGET_ENTRY <newest_mtime_unix> <kb> <handles> <procs> <path>`
 ///
 /// `<handles>` and `<procs>` are the two liveness gates (`free`, `held`, or
-/// `unknown`); see [`gate_snapshot_fragment`]. `unknown` is the fail-closed
+/// `unknown`); see `gate_snapshot_fragment`. `unknown` is the fail-closed
 /// answer and makes a warm-cache dir ineligible.
 ///
 /// `newest_mtime_unix` is the newest mtime of the dir or any descendant (the
@@ -1509,7 +1509,7 @@ pub const ABANDONED_GC_CLAIM_MIN_MINUTES: u64 = 6 * 60;
 /// `__gc_source_end` (ssh timeout, kill, OOM, reboot) leaves its `fc-*.claim`
 /// behind, and it fences every build of that tree from then on. The claim is
 /// kept on purpose after a KILL, because the `rm` child may still be deleting
-/// (see [`source_claim_gate_fragment`]), so a free metadata lock does not
+/// (see `source_claim_gate_fragment`), so a free metadata lock does not
 /// prove the deletion is over. A claim counts as abandoned only when, under
 /// the registry's metadata lock, all of these hold:
 /// - it is at least `min_age_minutes` old;

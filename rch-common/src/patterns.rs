@@ -2447,15 +2447,30 @@ fn classify_go(cmd: &str) -> Classification {
 /// declined: a token that merely occurs inside an option value must never
 /// authorize offloading a real `cargo publish` invocation.
 pub fn is_cargo_package_verification(command: &str) -> bool {
+    cargo_package_verification(command).is_some()
+}
+
+/// The verified packaging operation, whose archive locations differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoPackageVerification {
+    /// Final archives are published directly below `target/package`.
+    Package,
+    /// Dry-run publication can retain its only archive in a temporary registry or crate directory.
+    PublishDryRun,
+}
+
+/// Parse the packaging operation with the same conservative authority checks
+/// used by command classification. Option values cannot name the operation.
+pub fn cargo_package_verification(command: &str) -> Option<CargoPackageVerification> {
     let normalized = normalize_command(command);
     let cmd = normalized.as_ref();
     if check_structure(cmd).is_some() || cmd.contains(['\'', '"', '\\', '$', '`']) {
-        return false;
+        return None;
     }
 
     let mut tokens = cmd.split_whitespace();
     if tokens.next() != Some("cargo") {
-        return false;
+        return None;
     }
 
     let mut subcommand = None;
@@ -2493,7 +2508,7 @@ pub fn is_cargo_package_verification(command: &str) -> bool {
         }
         if VALUE_FLAGS.contains(&token) {
             if tokens.next().is_none_or(|value| value.starts_with('-')) {
-                return false;
+                return None;
             }
             continue;
         }
@@ -2529,11 +2544,15 @@ pub fn is_cargo_package_verification(command: &str) -> bool {
             | "-q" => {}
             // Includes --no-verify, --list/-l, --help/-h and --. Reject unknown
             // value-taking flags rather than mistaking their value for -n.
-            _ => return false,
+            _ => return None,
         }
     }
 
-    matches!(subcommand, Some("package")) || (subcommand == Some("publish") && dry_run)
+    match subcommand {
+        Some("package") => Some(CargoPackageVerification::Package),
+        Some("publish") if dry_run => Some(CargoPackageVerification::PublishDryRun),
+        _ => None,
+    }
 }
 
 /// Recognize the explicit cargo-xwin build entry points, without treating a
@@ -6238,6 +6257,34 @@ mod regression_classification {
                 classify_command_detailed(command).classification,
                 classification,
                 "diagnosis must agree with execution for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_package_archive_locations_follow_the_operation_not_option_values() {
+        for (command, operation) in [
+            (
+                "cargo --config publish package --offline",
+                CargoPackageVerification::Package,
+            ),
+            (
+                "cargo +nightly package --workspace --locked",
+                CargoPackageVerification::Package,
+            ),
+            (
+                "cargo --config package publish --dry-run",
+                CargoPackageVerification::PublishDryRun,
+            ),
+            (
+                "env CARGO_INCREMENTAL=0 cargo publish -n --workspace",
+                CargoPackageVerification::PublishDryRun,
+            ),
+        ] {
+            assert_eq!(
+                cargo_package_verification(command),
+                Some(operation),
+                "{command}"
             );
         }
     }

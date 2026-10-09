@@ -41,8 +41,8 @@ struct CachedClassification {
 
 impl CachedClassification {
     /// Check if this cached entry has expired.
-    fn is_expired(&self) -> bool {
-        self.inserted_at.elapsed() > self.ttl
+    fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.inserted_at) > self.ttl
     }
 }
 
@@ -107,6 +107,17 @@ impl ClassificationCache {
     /// cache directly are responsible. Trimming inside `get` would be a
     /// double-trim against [`classify_cached`] which already trims once.
     pub fn get(&self, command: &str) -> Option<Classification> {
+        self.get_with_clock(command, Instant::now)
+    }
+
+    // Read the clock at the lookup, under the cache lock, as on the public path.
+    // Explicit observations let expiry tests cover exact boundaries without
+    // depending on how long the test thread remains scheduled.
+    fn get_with_clock(
+        &self,
+        command: &str,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<Classification> {
         if !self.config.enabled {
             return None;
         }
@@ -118,7 +129,7 @@ impl ClassificationCache {
 
         // Check if entry exists and is not expired
         if let Some(entry) = cache.get(key) {
-            if entry.is_expired() {
+            if entry.is_expired(now()) {
                 // Remove expired entry
                 cache.pop(key);
                 if let Ok(mut misses) = self.misses.lock() {
@@ -341,22 +352,36 @@ mod tests {
     fn test_cache_ttl_expiration() {
         let config = CacheConfig {
             max_entries: 100,
-            ttl: Duration::from_millis(50), // Very short TTL for testing
+            ttl: Duration::from_millis(50),
             enabled: true,
         };
+        let ttl = config.ttl;
         let cache = ClassificationCache::new(config);
 
         let class = make_classification(true);
         cache.put("cargo build", class);
 
-        // Should be cached immediately
-        assert!(cache.get("cargo build").is_some());
-
-        // Wait for expiration
-        std::thread::sleep(Duration::from_millis(60));
-
-        // Should be expired now
-        assert!(cache.get("cargo build").is_none());
+        let inserted_at = cache
+            .cache
+            .lock()
+            .unwrap()
+            .get("cargo build")
+            .unwrap()
+            .inserted_at;
+        for offset in [Duration::ZERO, ttl - Duration::from_nanos(1), ttl] {
+            let cached = cache
+                .get_with_clock("cargo build", || inserted_at + offset)
+                .expect("the exact TTL boundary remains live");
+            assert!(cached.is_compilation);
+        }
+        let expired_at = inserted_at + ttl + Duration::from_nanos(1);
+        assert!(cache.get_with_clock("cargo build", || expired_at).is_none());
+        let expired = cache.stats();
+        assert_eq!(expired.hits, 3);
+        assert_eq!(expired.misses, 1);
+        assert_eq!(expired.len, 0, "expiry removes the cached entry");
+        assert!(cache.get_with_clock("cargo build", || expired_at).is_none());
+        assert_eq!(cache.stats().misses, 2);
     }
 
     #[test]
@@ -813,20 +838,31 @@ mod tests {
 
     #[test]
     fn test_cached_classification_is_expired() {
+        let inserted_at = Instant::now();
         let entry = CachedClassification {
             classification: make_classification(true),
-            inserted_at: Instant::now(),
+            inserted_at,
             ttl: Duration::from_millis(10),
         };
 
-        // Should not be expired immediately
-        assert!(!entry.is_expired());
-
-        // Wait for expiration
-        std::thread::sleep(Duration::from_millis(15));
-
-        // Should be expired now
-        assert!(entry.is_expired());
+        for (offset, expired) in [
+            (Duration::ZERO, false),
+            (entry.ttl - Duration::from_nanos(1), false),
+            (entry.ttl, false),
+            (entry.ttl + Duration::from_nanos(1), true),
+        ] {
+            assert_eq!(
+                entry.is_expired(inserted_at + offset),
+                expired,
+                "{offset:?}"
+            );
+        }
+        let zero_ttl = CachedClassification {
+            ttl: Duration::ZERO,
+            ..entry
+        };
+        assert!(!zero_ttl.is_expired(inserted_at));
+        assert!(zero_ttl.is_expired(inserted_at + Duration::from_nanos(1)));
     }
 
     #[test]

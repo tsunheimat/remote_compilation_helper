@@ -5,8 +5,8 @@
 #
 # Runs every scripts/e2e_*.sh with the SAME env and artifact layout CI uses, so
 # an operator can reproduce a CI e2e failure locally. CI invokes this script
-# (one matrix job per e2e script via --filter) so there is exactly one code path
-# for running an e2e, local or remote.
+# (one job per OS, with optional --filter for a single script) so there is one
+# code path for running an e2e, local or remote.
 #
 # Artifact layout (one set per script, in --out):
 #   e2e_<slug>.jsonl       structured JSONL log (via RCH_E2E_LOG)
@@ -62,8 +62,13 @@ done
 OS_LABEL="$(printf '%s' "${RUNNER_OS:-$(uname -s)}" | tr '[:upper:]' '[:lower:]')"
 TEST_LOGS_DIR="$PROJECT_ROOT/target/test-logs"
 
-# Discover e2e scripts (sorted, deterministic).
-mapfile -t ALL_SCRIPTS < <(find "$PROJECT_ROOT/scripts" -maxdepth 1 -name 'e2e_*.sh' -printf '%f\n' | sort)
+# Bash expands the glob in sorted order. Avoid GNU find's -printf and mapfile
+# so discovery also works with the system tools on macOS.
+ALL_SCRIPTS=()
+for script in "$PROJECT_ROOT"/scripts/e2e_*.sh; do
+    [[ -f "$script" ]] || continue
+    ALL_SCRIPTS+=("${script##*/}")
+done
 
 # Apply the filter (glob match on basename).
 SELECTED=()
@@ -115,6 +120,7 @@ for script in "${SELECTED[@]}"; do
     (
         cd "$PROJECT_ROOT"
         RCH_E2E_LOG="$log_jsonl" RCH_E2E_VERBOSE="${RCH_E2E_VERBOSE:-0}" \
+            E2E_LOG_DIR="${E2E_LOG_DIR:-$OUT_DIR/${slug}.cases}" \
             bash "scripts/${script}"
     ) >"$build_log" 2>&1
     exit_code=$?

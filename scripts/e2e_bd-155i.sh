@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-155i.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_bd-155i.jsonl}"
 
 # shellcheck source=lib/e2e_common.sh
 source "$SCRIPT_DIR/lib/e2e_common.sh"
@@ -22,6 +22,9 @@ run_start_ms="$(e2e_now_ms)"
 
 daemon_pid=""
 tmp_root=""
+rch_bin=""
+rchd_bin=""
+socket_path=""
 
 log_json() {
     local phase="$1"
@@ -68,13 +71,12 @@ check_dependencies() {
 }
 
 build_binaries() {
-    local rch_bin="${PROJECT_ROOT}/target/debug/rch"
-    local rchd_bin="${PROJECT_ROOT}/target/debug/rchd"
+    rch_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch"
+    rchd_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rchd"
 
     if [[ -x "$rch_bin" && -x "$rchd_bin" ]]; then
         log_json "setup" "Using existing rch/rchd binaries" "local" "cargo build" 0 0 "pass"
         record_pass
-        echo "$rch_bin;$rchd_bin"
         return
     fi
 
@@ -88,13 +90,17 @@ build_binaries() {
         return 1
     fi
 
-    echo "$rch_bin;$rchd_bin"
 }
 
 start_daemon() {
     tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/rch-bd-155i-XXXXXX")"
     local workers_toml="$tmp_root/workers.toml"
-    local socket_path="$tmp_root/rch.sock"
+    local runtime_root
+    runtime_root="$(e2e_runtime_dir)"
+    socket_path="$runtime_root/rch.sock"
+    export RCH_CONFIG_DIR="$tmp_root" RCH_SOCKET_PATH="$socket_path"
+    export XDG_CACHE_HOME="$tmp_root/cache" XDG_STATE_HOME="$tmp_root/state"
+    export XDG_DATA_HOME="$tmp_root/data"
 
     cat > "$workers_toml" <<'WORKERS'
 [[workers]]
@@ -106,7 +112,9 @@ total_slots = 4
 WORKERS
 
     log_json "setup" "Starting daemon (mock ssh)" "local" "rchd --socket" 0 0 "start"
-    RCH_LOG_LEVEL=error RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
+    RCH_CONFIG_DIR="$tmp_root" RCH_DAEMON_INSTALLS_HOOKS=0 \
+        XDG_CACHE_HOME="$tmp_root/cache" XDG_STATE_HOME="$tmp_root/state" \
+        RCH_LOG_LEVEL=error RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
         "$rchd_bin" --socket "$socket_path" --workers-config "$workers_toml" --foreground \
         >"$tmp_root/rchd.log" 2>&1 &
     daemon_pid=$!
@@ -115,7 +123,6 @@ WORKERS
         if [[ -S "$socket_path" ]]; then
             log_json "setup" "Daemon socket ready" "local" "$socket_path" 0 0 "pass"
             record_pass
-            echo "$socket_path"
             return
         fi
         sleep 0.1
@@ -135,7 +142,7 @@ run_capabilities_check() {
     start_ms="$(e2e_now_ms)"
 
     local output
-    if ! output=$(RCH_DAEMON_SOCKET="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
+    if ! output=$(RCH_CONFIG_DIR="$tmp_root" RCH_SOCKET_PATH="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
         "$rch_bin" workers capabilities --refresh --command "bun test" --json 2>/dev/null); then
         local duration_ms
         duration_ms=$(( $(e2e_now_ms) - start_ms ))
@@ -148,13 +155,13 @@ run_capabilities_check() {
     duration_ms=$(( $(e2e_now_ms) - start_ms ))
     log_json "exec" "Capabilities command completed" "local" "$cap_cmd" 0 "$duration_ms" "pass"
 
-    if ! echo "$output" | jq -e '.result.local' >/dev/null 2>&1; then
+    if ! echo "$output" | jq -e '.data.local' >/dev/null 2>&1; then
         log_json "verify" "Missing local capabilities field" "local" "$cap_cmd" 0 0 "fail" "local missing"
         record_fail
         return 1
     fi
 
-    if ! echo "$output" | jq -r '.result.warnings[]?' | grep -q "required runtime bun"; then
+    if ! echo "$output" | jq -r '.data.warnings[]?' | grep -q "required runtime bun"; then
         log_json "verify" "Missing required runtime warning" "local" "$cap_cmd" 0 0 "fail" "warning missing"
         record_fail
         return 1
@@ -172,15 +179,11 @@ main() {
         return 1
     fi
 
-    local bins
-    if ! bins="$(build_binaries)"; then
+    if ! build_binaries; then
         return 1
     fi
-    rch_bin="${bins%;*}"
-    rchd_bin="${bins#*;}"
 
-    local socket_path
-    if ! socket_path="$(start_daemon)"; then
+    if ! start_daemon; then
         return 1
     fi
 

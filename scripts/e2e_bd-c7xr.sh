@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-c7xr.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_bd-c7xr.jsonl}"
 
 # shellcheck source=lib/e2e_common.sh
 source "$SCRIPT_DIR/lib/e2e_common.sh"
@@ -57,9 +57,6 @@ cleanup() {
         kill "$daemon_pid" >/dev/null 2>&1 || true
         wait "$daemon_pid" >/dev/null 2>&1 || true
     fi
-    if [[ -n "$tmp_root" && -d "$tmp_root" ]]; then
-        rm -rf "$tmp_root"
-    fi
 }
 trap cleanup EXIT
 
@@ -77,8 +74,8 @@ check_dependencies() {
 }
 
 build_binaries() {
-    local rch="${PROJECT_ROOT}/target/debug/rch"
-    local rchd="${PROJECT_ROOT}/target/debug/rchd"
+    local rch="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch"
+    local rchd="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rchd"
 
     if [[ -x "$rch" && -x "$rchd" ]]; then
         log_json "setup" "Using existing rch/rchd binaries" "local" "cargo build" 0 0 "pass"
@@ -104,7 +101,12 @@ build_binaries() {
 start_daemon() {
     tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/rch-bd-c7xr-XXXXXX")"
     workers_toml="$tmp_root/workers.toml"
-    socket_path="$tmp_root/rch.sock"
+    local runtime_root
+    runtime_root="$(e2e_runtime_dir)"
+    socket_path="$runtime_root/rch.sock"
+    export RCH_CONFIG_DIR="$tmp_root" RCH_SOCKET_PATH="$socket_path"
+    export XDG_CACHE_HOME="$tmp_root/cache" XDG_STATE_HOME="$tmp_root/state"
+    export XDG_DATA_HOME="$tmp_root/data"
 
     # Initial config with one worker
     cat > "$workers_toml" <<'WORKERS'
@@ -118,7 +120,9 @@ enabled = true
 WORKERS
 
     log_json "setup" "Starting daemon with hot-reload enabled" "local" "rchd --socket" 0 0 "start"
-    RCH_LOG_LEVEL=error RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
+    RCH_CONFIG_DIR="$tmp_root" RCH_DAEMON_INSTALLS_HOOKS=0 \
+        XDG_CACHE_HOME="$tmp_root/cache" XDG_STATE_HOME="$tmp_root/state" \
+        RCH_LOG_LEVEL=info RUST_LOG=info RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
         "$rchd_bin" --socket "$socket_path" --workers-config "$workers_toml" --foreground \
         >"$tmp_root/rchd.log" 2>&1 &
     daemon_pid=$!
@@ -139,13 +143,13 @@ WORKERS
 
 get_worker_count() {
     local output
-    output=$(RCH_DAEMON_SOCKET="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
-        "$rch_bin" workers list --json 2>/dev/null || echo '{}')
-    echo "$output" | jq -r '.result.workers | length' 2>/dev/null || echo "0"
+    output=$(RCH_CONFIG_DIR="$tmp_root" RCH_SOCKET_PATH="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
+        "$rch_bin" status --json 2>/dev/null) || return 1
+    echo "$output" | jq -er '.data.daemon.workers | arrays | length'
 }
 
 test_initial_worker_count() {
-    log_json "verify" "Checking initial worker count" "local" "rch workers list" 0 0 "start"
+    log_json "verify" "Checking initial worker count" "local" "rch status" 0 0 "start"
     local count
     count=$(get_worker_count)
 
@@ -187,7 +191,7 @@ WORKERS
     start_ms="$(e2e_now_ms)"
 
     local output
-    if ! output=$(RCH_DAEMON_SOCKET="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
+    if ! output=$(RCH_CONFIG_DIR="$tmp_root" RCH_SOCKET_PATH="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
         "$rch_bin" daemon reload --json 2>/dev/null); then
         local duration_ms
         duration_ms=$(( $(e2e_now_ms) - start_ms ))
@@ -201,7 +205,7 @@ WORKERS
 
     # Check reload response
     local added
-    added=$(echo "$output" | jq -r '.result.added // 0' 2>/dev/null || echo "0")
+    added=$(echo "$output" | jq -er '.data.added')
 
     if [[ "$added" == "1" ]]; then
         log_json "execute" "Reload added worker" "local" "added=$added" 0 "$duration_ms" "pass"
@@ -228,11 +232,6 @@ WORKERS
 }
 
 test_sighup_reload() {
-    # Note: SIGHUP handling in background processes from shell scripts can be
-    # environment-dependent. The daemon's SIGHUP handler works correctly when
-    # run interactively or via systemd, but may behave differently in CI/test
-    # environments due to process group handling.
-
     log_json "execute" "Adding third worker to config" "local" "modify workers.toml" 0 0 "start"
 
     # Add a third worker
@@ -264,29 +263,33 @@ WORKERS
 
     # Check if daemon is still running before sending SIGHUP
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
-        log_json "verify" "SIGHUP test skipped - daemon not running" "local" "skip" 0 0 "skip" "daemon stopped"
-        # Don't count as failure - this is an environment limitation
-        return 0
+        log_json "verify" "Daemon exited before SIGHUP reload" "local" "kill -0" 0 0 "fail" "daemon stopped"
+        record_fail
+        return 1
     fi
 
     log_json "execute" "Sending SIGHUP to daemon" "local" "kill -HUP $daemon_pid" 0 0 "start"
-    kill -HUP "$daemon_pid" 2>/dev/null || true
+    if ! kill -HUP "$daemon_pid" 2>/dev/null; then
+        log_json "verify" "Failed to send SIGHUP" "local" "kill -HUP" 0 0 "fail" "signal delivery failed"
+        record_fail
+        return 1
+    fi
 
     # Wait for reload to complete
     sleep 1.0
 
     # Check if daemon still running after SIGHUP
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
-        log_json "verify" "SIGHUP caused daemon to exit (environment-specific)" "local" "skip" 0 0 "skip" "daemon terminated by SIGHUP"
-        # Restart daemon for remaining tests
-        start_daemon || return 1
-        return 0
+        log_json "verify" "SIGHUP caused daemon to exit" "local" "kill -0" 0 0 "fail" "daemon terminated by SIGHUP"
+        record_fail
+        return 1
     fi
 
     local count
     count=$(get_worker_count)
 
-    if [[ "$count" == "3" ]]; then
+    if [[ "$count" == "3" ]] \
+        && grep -Fq 'SIGHUP received, triggering configuration reload' "$tmp_root/rchd.log"; then
         log_json "verify" "SIGHUP reload added worker" "local" "count=$count" 0 0 "pass"
         record_pass
         return 0
@@ -312,8 +315,17 @@ INVALID
     log_json "execute" "Triggering reload with invalid config" "local" "rch daemon reload" 0 0 "start"
 
     # Reload should fail but daemon keeps running with old config
-    RCH_DAEMON_SOCKET="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
-        "$rch_bin" daemon reload --json 2>/dev/null || true
+    local reload_exit=0
+    RCH_CONFIG_DIR="$tmp_root" RCH_SOCKET_PATH="$socket_path" RCH_TEST_MODE=1 RCH_MOCK_SSH=1 \
+        "$rch_bin" daemon reload --json >"$tmp_root/invalid-reload.json" \
+        2>"$tmp_root/invalid-reload.stderr" || reload_exit=$?
+    if [[ "$reload_exit" != 1 ]] || ! jq -e \
+        '.success == false and (.error.code | startswith("RCH-E"))' \
+        "$tmp_root/invalid-reload.json" >/dev/null; then
+        log_json "verify" "Invalid config reload did not return its expected error" "local" "rch daemon reload" 0 0 "fail" "unexpected reload exit or envelope"
+        record_fail
+        return 1
+    fi
 
     sleep 0.5
 
@@ -358,6 +370,22 @@ host = "127.0.0.1"
 user = "test"
 identity_file = "~/.ssh/id_rsa"
 total_slots = 4
+enabled = true
+
+[[workers]]
+id = "worker-2"
+host = "127.0.0.2"
+user = "test"
+identity_file = "~/.ssh/id_rsa"
+total_slots = 8
+enabled = true
+
+[[workers]]
+id = "worker-3"
+host = "127.0.0.3"
+user = "test"
+identity_file = "~/.ssh/id_rsa"
+total_slots = 2
 enabled = true
 
 [[workers]]

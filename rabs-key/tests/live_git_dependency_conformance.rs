@@ -5,7 +5,7 @@
 //! rabs-wrap's separate live-dependency end-to-end suite.
 #![cfg(target_os = "linux")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use rabs_key::live_dependency::{
@@ -252,10 +252,10 @@ fn try_actual_key(
             }
         })
         .collect();
-    let script_output = plan
-        .generated_root
-        .as_ref()
-        .map(|root| std::fs::read(Path::new(root).parent().unwrap().join("run/stdout")).unwrap());
+    let script_output = plan.generated_root.as_ref().map(|root| {
+        let (stdout, _) = build_script_records(Path::new(root));
+        std::fs::read(stdout).unwrap()
+    });
     live_dependency_key(
         plan,
         toolchain,
@@ -271,6 +271,18 @@ fn actual_key(
     toolchain: &ToolchainFacts,
 ) -> rabs_key::live_dependency::LiveDependencyKey {
     try_actual_key(plan, toolchain).unwrap()
+}
+
+// Observe the two native Cargo layouts also accepted by live_facts.
+// Both must bind the exact OUT_DIR and build-script stdout record.
+fn build_script_records(generated: &Path) -> (PathBuf, PathBuf) {
+    let unit = generated.parent().unwrap();
+    let run = unit.join("run");
+    if run.is_dir() {
+        (run.join("stdout"), run.join("root-output"))
+    } else {
+        (unit.join("output"), unit.join("root-output"))
+    }
 }
 
 #[test]
@@ -371,9 +383,11 @@ fn main() {
     let recorded = Recorded::load(&record.join("generated_fixture"));
     let plan = recorded.plan(host);
     let generated = Path::new(plan.generated_root.as_ref().expect("real OUT_DIR"));
-    let script_record = std::fs::read(generated.parent().unwrap().join("run/stdout")).unwrap();
+    let (stdout, root_output) = build_script_records(generated);
+    eprintln!("Cargo build-script stdout record: {:?}", stdout.file_name());
+    let script_record = std::fs::read(stdout).unwrap();
     assert_eq!(
-        std::fs::read(generated.parent().unwrap().join("run/root-output")).unwrap(),
+        std::fs::read(root_output).unwrap(),
         generated.to_str().unwrap().as_bytes()
     );
     assert!(String::from_utf8_lossy(&script_record).contains("cargo::rustc-cfg=generated_input"));
@@ -385,7 +399,7 @@ fn main() {
     let toolchain = real_toolchain(&plan);
     let baseline = actual_key(&plan, &toolchain);
     let repeat_out = root.join("repeat-out");
-    let repeat = recorded.execute_at(&plan, &repeat_out);
+    let (repeat, repeat_env) = recorded.execute_at(&plan, &repeat_out);
     let mut repeat_argv = recorded.argv.clone();
     for arg in &mut repeat_argv {
         *arg = arg.replace(&plan.out_dir, repeat_out.to_str().unwrap());
@@ -394,7 +408,7 @@ fn main() {
         LiveRustcRequest {
             argv: &repeat_argv,
             cwd: &plan.cwd,
-            env: &plan.execution_env,
+            env: &repeat_env,
         },
         host,
     )
@@ -590,8 +604,7 @@ fn actual_cargo_dependency_chain_reuses_complete_keys_across_target_directories(
         }));
     }
     let toolchain = real_toolchain(&builds[0][0].1);
-    for index in 0..2 {
-        let (request_a, a) = &builds[0][index];
+    for (index, (request_a, a)) in builds[0].iter().enumerate() {
         let (request_b, b) = &builds[1][index];
         assert_eq!(
             actual_key(a, &toolchain),
@@ -623,13 +636,27 @@ fn actual_cargo_dependency_chain_reuses_complete_keys_across_target_directories(
         }
     }
     let middle = &builds[0][1].1;
-    assert!(
-        middle
-            .dependency_dirs
-            .iter()
-            .any(|directory| directory != &middle.out_dir),
-        "fixture must exercise Cargo's sibling per-unit dependency directory"
-    );
+    if Path::new(&middle.out_dir) == root.join("first/target/debug/deps") {
+        // Classic Cargo shares one dependency directory between both units.
+        assert_eq!(middle.dependency_dirs, vec![middle.out_dir.clone()]);
+        eprintln!("Cargo dependency directory layout: classic deps");
+    } else {
+        assert!(
+            Path::new(&middle.out_dir)
+                .starts_with(root.join("first/target/debug/build/chain_middle"))
+                && Path::new(&middle.out_dir).file_name().unwrap() == "out",
+            "unrecognized Cargo dependency directory layout: {}",
+            middle.out_dir
+        );
+        assert!(
+            middle
+                .dependency_dirs
+                .iter()
+                .any(|directory| directory != &middle.out_dir),
+            "fixture must exercise Cargo's sibling per-unit dependency directory"
+        );
+        eprintln!("Cargo dependency directory layout: per-unit sibling");
+    }
     let original = actual_key(middle, &toolchain).action_key;
     let direct = middle
         .externs
@@ -727,7 +754,11 @@ impl Recorded {
         })
     }
 
-    fn execute_at(&self, plan: &DependencyActionPlan, out: &Path) -> Output {
+    fn execute_at(
+        &self,
+        plan: &DependencyActionPlan,
+        out: &Path,
+    ) -> (Output, Vec<(String, String)>) {
         use std::io::Write;
         std::fs::create_dir_all(out).unwrap();
         // Cargo's recorded descriptors belonged to the completed Cargo
@@ -745,7 +776,21 @@ impl Recorded {
         jobserver.write_all(b"+").unwrap();
         let jobserver_flags = format!("-j --jobserver-auth=fifo:{}", fifo.display());
         let out = out.to_str().unwrap();
-        checked(
+        let execution_env: Vec<_> = plan
+            .execution_env
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    if matches!(name.as_str(), "CARGO_MAKEFLAGS" | "MAKEFLAGS" | "MFLAGS") {
+                        jobserver_flags.clone()
+                    } else {
+                        value.replace(&plan.out_dir, out)
+                    },
+                )
+            })
+            .collect();
+        let output = checked(
             Command::new(&self.argv[0])
                 .args(
                     self.argv[1..]
@@ -754,17 +799,9 @@ impl Recorded {
                 )
                 .current_dir(&plan.cwd)
                 .env_clear()
-                .envs(plan.execution_env.iter().map(|(name, value)| {
-                    (
-                        name,
-                        if matches!(name.as_str(), "CARGO_MAKEFLAGS" | "MAKEFLAGS" | "MFLAGS") {
-                            jobserver_flags.clone()
-                        } else {
-                            value.replace(&plan.out_dir, out)
-                        },
-                    )
-                })),
-        )
+                .envs(execution_env.iter().map(|(name, value)| (name, value))),
+        );
+        (output, execution_env)
     }
 }
 

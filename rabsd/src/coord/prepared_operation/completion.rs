@@ -63,9 +63,10 @@ pub struct PreparedCompletion {
     pub operation_id: String,
     /// Domain-separated durable job request fingerprint (same as job status).
     pub request_sha256: String,
-    /// SHA-256 of original request JSON (same as the delivery receipt).
+    /// SHA-256 of compact request JSON with recursively sorted object keys
+    /// (same as the delivery receipt). Array order and scalar values are binding.
     pub delivery_request_sha256: String,
-    /// SHA-256 of the receipt's compact JSON value, not its pretty-printing.
+    /// SHA-256 of compact receipt JSON with recursively sorted object keys.
     pub receipt_sha256: String,
     pub request_id: u64,
     pub worker: String,
@@ -133,6 +134,8 @@ impl PreparedOperationStore {
                     .to_owned(),
             })
         };
+        let mut canonical_receipt = receipt.clone();
+        canonical_receipt.sort_all_objects();
         let completion = PreparedCompletion {
             version: 1,
             operation_id: id.to_owned(),
@@ -141,7 +144,7 @@ impl PreparedOperationStore {
                 .as_str()
                 .ok_or_else(|| invalid("missing delivery request fingerprint"))?
                 .to_owned(),
-            receipt_sha256: hash(&serde_json::to_vec(receipt)?),
+            receipt_sha256: hash(&serde_json::to_vec(&canonical_receipt)?),
             request_id: record.request["request_id"]
                 .as_u64()
                 .ok_or_else(|| invalid("missing request id"))?,
@@ -232,8 +235,10 @@ impl PreparedCompletion {
         ordinary_directory(&self.delivery, false)?;
         let bytes = read_bounded(&self.delivery.join("delivery.json"), MAX_FRAME_BYTES, true)?;
         let receipt: Value = serde_json::from_slice(&bytes)?;
+        let mut canonical_receipt = receipt.clone();
+        canonical_receipt.sort_all_objects();
         require(
-            hash(&serde_json::to_vec(&receipt)?) == self.receipt_sha256
+            hash(&serde_json::to_vec(&canonical_receipt)?) == self.receipt_sha256
                 && receipt["kind"] == "verified-worker-delivery"
                 && receipt["request_id"].as_u64() == Some(self.request_id)
                 && receipt["request_sha256"].as_str()
@@ -615,11 +620,13 @@ mod tests {
             let fixture = Fixture::new();
             fixture.complete(exit, stop);
             let proof = fixture.proof();
+            let mut canonical_request = fixture.request.clone();
+            canonical_request.sort_all_objects();
             assert_eq!(proof.exit_code, exit);
             assert_eq!(proof.request_sha256, fixture.digest);
             assert_eq!(
                 proof.delivery_request_sha256,
-                hash(&serde_json::to_vec(&fixture.request).unwrap())
+                hash(&serde_json::to_vec(&canonical_request).unwrap())
             );
             assert_ne!(
                 proof.request_sha256, proof.delivery_request_sha256,
@@ -882,7 +889,7 @@ mod tests {
             assert!(!status.succeeded && !status.outputs_installed);
             assert_eq!(
                 status.state,
-                if stop.is_some() {
+                if stop == Some("cancelled") {
                     OperationState::Cancelled
                 } else {
                     OperationState::Completed

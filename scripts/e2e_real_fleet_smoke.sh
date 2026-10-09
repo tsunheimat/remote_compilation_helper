@@ -85,7 +85,7 @@ PY
 command -v python3 >/dev/null 2>&1 || { echo "python3 unavailable; skipping" >&2; exit "$E2E_SKIP_EXIT"; }
 
 RCH_BIN=""
-for cand in "$PROJECT_ROOT/target/release/rch" "$PROJECT_ROOT/target/debug/rch"; do
+for cand in "$TARGET_DIR/debug/rch" "$TARGET_DIR/release/rch"; do
     [[ -x "$cand" ]] && { RCH_BIN="$cand"; break; }
 done
 [[ -z "$RCH_BIN" ]] && command -v rch >/dev/null 2>&1 && RCH_BIN="$(command -v rch)"
@@ -101,13 +101,13 @@ mkdir -p "$BASE"
 # every SmokeProfileEvent carrying the required fields + the right bead) AND that
 # the named scenario's planned status matches the fleet shape's expectation (an
 # invariant of daemon reachability, so it actually distinguishes the two shapes).
-# Echoes "ok" or a stable error token. Args: <expect_scenario> <expect_status>.
+# Echoes "ok" or a stable error token. Args: <expect_scenario> <expect_status> <json>.
 validate_smoke_json() {
-    python3 - "$BEAD_ID" "$1" "$2" <<'PY'
+    python3 - "$BEAD_ID" "$1" "$2" "$3" <<'PY'
 import json, sys
 bead, want_scenario, want_status = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(sys.argv[4])
 except Exception:
     print("__BADJSON__"); sys.exit(0)
 if not isinstance(d, dict) or "run_id" not in d or d.get("bead_id") != bead:
@@ -140,19 +140,19 @@ PY
 
 run_smoke_scenario() {
     local scenario="$1" cfg_dir="$2" expect_scenario="$3" expect_status="$4"
-    local out verdict
+    local out verdict command_exit=0
     # Isolate the smoke JSONL trace (written via dirs::cache_dir()) into the
     # per-scenario temp dir so the e2e stays hermetic and does not pollute (or
     # accumulate in) the runner's real ~/.cache/rch.
     out="$(env -u RCH_OUTPUT_FORMAT NO_COLOR=1 RCH_CONFIG_DIR="$cfg_dir" \
         XDG_CACHE_HOME="$cfg_dir/cache" \
-        "$RCH_BIN" self-test --smoke --dry-run --json 2>/dev/null || true)"
-    if [[ -z "$out" ]]; then
-        emit "$scenario" "smoke_plan" "skip" "no_output" \
-            "no output in hermetic env (fail-open); logic covered by unit tests"
-        return 0
+        "$RCH_BIN" self-test --smoke --dry-run --json 2>"$cfg_dir/smoke.stderr")" || command_exit=$?
+    if [[ "$command_exit" != 0 || -z "$out" ]]; then
+        emit "$scenario" "smoke_plan" "fail" "missing_native_plan" \
+            "expected exit 0 and a native dry-run plan; got exit=$command_exit; stderr=$cfg_dir/smoke.stderr"
+        return 1
     fi
-    verdict="$(printf '%s' "$out" | validate_smoke_json "$expect_scenario" "$expect_status")"
+    verdict="$(validate_smoke_json "$expect_scenario" "$expect_status" "$out")"
     case "$verdict" in
         ok)
             emit "$scenario" "smoke_plan" "pass" "" \

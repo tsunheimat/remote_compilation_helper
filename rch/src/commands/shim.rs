@@ -54,8 +54,8 @@ use crate::ui::theme::StatusIndicator;
 /// hardcoding `$HOME/.cargo/bin/cargo` (the rustup proxy). On a host whose
 /// active toolchain cargo was renamed to `cargo-rch-real` (rch toolchain
 /// wrapping, or a rustup update over it), that proxy cannot dispatch — rustup
-/// answers "the 'cargo' binary ... is not applicable to the '<toolchain>'
-/// toolchain" — so `RCH_SHIM_LOCAL_IDE=1`, the escape hatch for exactly that
+/// answers `"the 'cargo' binary ... is not applicable to the '<toolchain>'
+/// toolchain"` — so `RCH_SHIM_LOCAL_IDE=1`, the escape hatch for exactly that
 /// moment, died instead (2026-08-30 fleet rollout of 943b8e29 on a
 /// nightly-default dispatcher). Resolution order, first executable wins:
 /// `$RCH_REAL_CARGO` → `$RCH_SHIM_REAL_CARGO` (toolchain wrapper handoff) →
@@ -105,7 +105,7 @@ fn cargo_clippy_shim_path() -> Result<PathBuf> {
 /// then compile locally no matter how correctly `cargo` is shimmed.
 ///
 /// Two entry shapes must be told apart:
-///   * `cargo clippy ...` → cargo execs `cargo-clippy clippy ...` (argv[1] is
+///   * `cargo clippy ...` → cargo execs `cargo-clippy clippy ...` (`argv[1]` is
 ///     the literal subcommand). That outer `cargo` was already intercepted, so
 ///     re-entering `rch` here would double-offload; pass it straight through.
 ///   * `cargo-clippy ...` → invoked directly by a script. This is the leak, and

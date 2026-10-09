@@ -803,7 +803,7 @@ fn validate_action_destinations(outputs: &[PlannedActionOutput]) -> Result<(), M
 /// Ordering contract: every [`OutputRole::ProvisionalMetadata`] output
 /// is fetched, byte-verified, freshness-stamped while private, and
 /// atomically renamed into place BEFORE any other output begins. Within each
-/// phase the order is deterministic ([`planned_order_key`]). Every installed
+/// phase the order is deterministic (`planned_order_key`). Every installed
 /// file carries the SAME freshness timestamp captured once at call
 /// start, so the bundle is coherent from Cargo's mtime-sensitive
 /// freshness view (risk R6: incoherent hit mtimes cause rebuild storms
@@ -2133,38 +2133,150 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn distinct_non_utf8_destinations_do_not_collide_through_lossy_display() {
-        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _layout, object) = store_with_object(dir.path(), b"artifact");
+        let locations = store.object_locations(&object).unwrap();
+        let source = PathBuf::from(&locations[0].0);
+        let output_dir = dir.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let lossy_alias = output_dir.join("out-\u{fffd}");
+        fs::write(&lossy_alias, b"user-owned alias").unwrap();
+        let identity = |path: &Path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.mode(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        };
+        let alias_before = identity(&lossy_alias);
+        let source_before = identity(&source);
         let first = PlannedActionOutput {
             role: OutputRole::Materializable,
             virtual_path: RawBytes::from("first"),
-            object,
-            destination: dir
-                .path()
-                .join(std::ffi::OsString::from_vec(b"out-\xff".to_vec())),
+            object: object.clone(),
+            destination: output_dir.join(std::ffi::OsString::from_vec(b"out-\xff".to_vec())),
         };
         let second = PlannedActionOutput {
             virtual_path: RawBytes::from("second"),
-            destination: dir
-                .path()
-                .join(std::ffi::OsString::from_vec(b"out-\xfe".to_vec())),
+            destination: output_dir.join(std::ffi::OsString::from_vec(b"out-\xfe".to_vec())),
             ..first.clone()
         };
         assert_eq!(
             first.destination.to_string_lossy(),
             second.destination.to_string_lossy()
         );
-        let receipt = materialize_action_outputs(
+        // Lexical preflight must preserve both names on every Unix host,
+        // including filesystems which refuse either name at the rename step.
+        assert_ne!(first.destination, second.destination);
+        validate_action_destinations(&[first.clone(), second.clone()]).unwrap();
+        let control = PlannedActionOutput {
+            virtual_path: RawBytes::from("control"),
+            destination: output_dir.join("control"),
+            ..first.clone()
+        };
+        let control_receipt = materialize_action_outputs(
             &mut store,
-            &[first.clone(), second.clone()],
+            std::slice::from_ref(&control),
             MaterializationMode::PrivateCopy,
         )
         .unwrap();
-        assert_eq!(receipt.installed.len(), 2);
-        assert_eq!(fs::read(&first.destination).unwrap(), b"artifact");
-        assert_eq!(fs::read(&second.destination).unwrap(), b"artifact");
+        assert_eq!(control_receipt.installed.len(), 1);
+        assert_eq!(fs::read(&control.destination).unwrap(), b"artifact");
+
+        // Probe the exact destination bytes on the same filesystem. Only the
+        // native macOS EILSEQ observed in CI admits the refusal assertions;
+        // permission, space, and unrelated I/O errors still fail this test.
+        #[cfg(target_os = "macos")]
+        let expected_refusal = Some(rustix::io::Errno::ILSEQ.raw_os_error());
+        #[cfg(not(target_os = "macos"))]
+        let expected_refusal: Option<i32> = None;
+        let probe = output_dir.join("rename-probe");
+        fs::write(&probe, b"rename probe").unwrap();
+        let refusals: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|out| match fs::rename(&probe, &out.destination) {
+                Ok(()) => {
+                    fs::rename(&out.destination, &probe).unwrap();
+                    None
+                }
+                Err(error) => {
+                    assert!(
+                        expected_refusal.is_some() && error.raw_os_error() == expected_refusal,
+                        "unexpected native filename refusal: {error:?}"
+                    );
+                    assert_eq!(fs::read(&probe).unwrap(), b"rename probe");
+                    Some(error.to_string())
+                }
+            })
+            .collect();
+        let names = || {
+            fs::read_dir(&output_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let mut expected_names = std::collections::BTreeSet::from([
+            b"control".to_vec(),
+            b"rename-probe".to_vec(),
+            "out-\u{fffd}".as_bytes().to_vec(),
+        ]);
+        assert_eq!(
+            names(),
+            expected_names,
+            "control must not leave staging files"
+        );
+        match (&refusals[0], &refusals[1]) {
+            (None, None) => {
+                let receipt = materialize_action_outputs(
+                    &mut store,
+                    &[first.clone(), second.clone()],
+                    MaterializationMode::PrivateCopy,
+                )
+                .unwrap();
+                assert_eq!(receipt.installed.len(), 2);
+                for out in [&first, &second] {
+                    assert_eq!(fs::read(&out.destination).unwrap(), b"artifact");
+                    expected_names.insert(out.destination.file_name().unwrap().as_bytes().to_vec());
+                }
+            }
+            (Some(first_error), Some(second_error)) => {
+                for (out, expected_error) in [(&first, first_error), (&second, second_error)] {
+                    let failure = materialize_action_outputs(
+                        &mut store,
+                        std::slice::from_ref(out),
+                        MaterializationMode::PrivateCopy,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        MaterializeError::Io {
+                            step: "rename-into-place",
+                            error: expected_error.clone(),
+                        }
+                    );
+                    assert!(failure.installed.is_empty());
+                }
+            }
+            _ => panic!("the two invalid UTF-8 names have different native support"),
+        }
+        assert_eq!(
+            names(),
+            expected_names,
+            "no unreported output or staging file"
+        );
+        assert_eq!(fs::read(&lossy_alias).unwrap(), b"user-owned alias");
+        assert_eq!(fs::read(&source).unwrap(), b"artifact");
+        assert_eq!(identity(&lossy_alias), alias_before);
+        assert_eq!(identity(&source), source_before);
+        assert_eq!(store.object_locations(&object).unwrap(), locations);
     }
 
     #[test]

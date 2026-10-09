@@ -356,11 +356,13 @@ fn upload<F: Future>(mut driver: Pin<&mut F>, peer: &Wire, identity: ToolchainId
 }
 
 fn selection(journal: &WorkerJournal, request: &Value) -> ExecutionLeaseSelection {
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     let frame = json!({"kind":"session-ok", "session_id":SESSION,
     "execution_lease":{
         "version":REQUEST_EXECUTION_LEASE_VERSION,
         "session_id":SESSION, "lease_id":LEASE, "request_id":request["request_id"],
-        "request_sha256":rabs_wkr::session::sha256_hex(&serde_json::to_vec(request).unwrap()),
+        "request_sha256":rabs_wkr::session::sha256_hex(&serde_json::to_vec(&canonical_request).unwrap()),
         "boot_generation":journal.boot_generation().0,
         "incarnation":format!("{:032x}", journal.incarnation().0),
         "ttl_ms":30_000,
@@ -512,7 +514,7 @@ fn launch(
 #[test]
 fn unnegotiated_and_partial_toolchains_never_reach_durable_admission() {
     for enabled in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let identity = fixture(root.path());
         let original = request(identity);
         let report = report();
@@ -574,7 +576,7 @@ fn unnegotiated_and_partial_toolchains_never_reach_durable_admission() {
 
 #[test]
 fn pipelined_toolchain_chunks_preserve_order_while_ping_bypasses_filesystem_work() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::private_test_directory();
     let identity = fixture(root.path());
     let report = report();
     let mut journal = WorkerJournal::open(root.path(), &report.worker_id, "coordinator").unwrap();
@@ -653,7 +655,7 @@ fn pipelined_toolchain_chunks_preserve_order_while_ping_bypasses_filesystem_work
 #[test]
 fn uploaded_executable_runs_private_bytes_and_journals_the_exact_original_request() {
     for request_id in [REQUEST, 0] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let identity = fixture(root.path());
         let mut original = request(identity);
         original["request_id"] = json!(request_id);
@@ -772,7 +774,7 @@ fn uploaded_executable_runs_private_bytes_and_journals_the_exact_original_reques
 
 #[test]
 fn sealed_toolchain_refuses_foreign_original_identity_without_consuming_the_owner() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::private_test_directory();
     let identity = fixture(root.path());
     let original = request(identity);
     let report = report();
@@ -843,7 +845,7 @@ fn sealed_toolchain_refuses_foreign_original_identity_without_consuming_the_owne
 
 #[test]
 fn disconnect_retains_the_uploaded_toolchain_until_the_real_child_is_drained() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::private_test_directory();
     let identity = fixture(root.path());
     let original = request(identity);
     let report = report();
@@ -902,7 +904,7 @@ fn disconnect_retains_the_uploaded_toolchain_until_the_real_child_is_drained() {
 #[test]
 fn cancel_before_seal_and_after_seal_blocks_later_execution_and_reupload() {
     for sealed in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let identity = fixture(root.path());
         let original = request(identity);
         let report = report();
@@ -1001,7 +1003,7 @@ fn cancelling_a_pending_real_seal_discards_any_late_filesystem_success() {
 
 #[test]
 fn a_blocked_seal_reply_does_not_admit_pipelined_execution_after_cancel() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::private_test_directory();
     let identity = fixture(root.path());
     let original = request(identity);
     let report = report();

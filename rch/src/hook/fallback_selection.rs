@@ -4,7 +4,7 @@
 //! missing worker system dependency, a missing toolchain, or a generic pipeline
 //! error), the hook should NOT immediately revert the heavy compile to the local
 //! orchestrator — that floods the box that coordinates the whole fleet
-//! ([[rch_local_fallback_floods_trj_oom_crate]]). Instead it retries the build on
+//! (`rch_local_fallback_floods_trj_oom_crate`). Instead it retries the build on
 //! a *different, higher-capacity* worker, using the memory-pressure / slot
 //! telemetry the daemon already tracks (surfaced via `GET /status`). Local
 //! execution is a genuine last resort, gated by `compilation.allow_local_fallback`.

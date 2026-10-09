@@ -386,7 +386,7 @@ mod delivery_tests {
     }
 
     struct Peer {
-        replies: VecDeque<Value>,
+        replies: VecDeque<io::Result<Value>>,
         sent: Vec<Value>,
         result: Value,
         stdout: Vec<u8>,
@@ -428,7 +428,7 @@ mod delivery_tests {
                 hello["request_high_water"] = json!(7);
             }
             Self {
-                replies: VecDeque::from([hello]),
+                replies: VecDeque::from([Ok(hello)]),
                 sent: Vec::new(),
                 result,
                 stdout,
@@ -451,11 +451,11 @@ mod delivery_tests {
                 Some("session-ok") => {}
                 Some("canonical-exec") => {
                     assert_eq!(frame, &request());
-                    self.replies.push_back(self.result.clone());
+                    self.replies.push_back(Ok(self.result.clone()));
                 }
                 Some("result-resume") => {
                     assert_eq!(frame, &DeliveryMode::Resume.frame(&request()));
-                    self.replies.push_back(self.result.clone());
+                    self.replies.push_back(Ok(self.result.clone()));
                 }
                 Some("output-read" | "artifact-read") => {
                     assert_eq!(frame["request_id"], 7);
@@ -466,10 +466,13 @@ mod delivery_tests {
                         .unwrap();
                     let offset = frame["offset"].as_u64().unwrap();
                     if artifact && self.fail_artifact_at.is_some_and(|limit| offset >= limit) {
-                        return Err(io::Error::new(
+                        // Deliver the already queued first chunk before the
+                        // interrupted response to this pipelined request.
+                        self.replies.push_back(Err(io::Error::new(
                             io::ErrorKind::ConnectionReset,
                             "injected interrupted artifact",
-                        ));
+                        )));
+                        return Ok(());
                     }
                     let bytes: &[u8] = match (artifact, name) {
                         (true, "a") => &self.artifact,
@@ -490,14 +493,16 @@ mod delivery_tests {
                             self.result["artifact_manifest"]["manifest_sha256"].clone();
                         reply["executable"] = json!(false);
                     }
-                    self.replies.push_back(reply);
+                    self.replies.push_back(Ok(reply));
                 }
                 Some("output-ack" | "artifact-ack") => {
                     let receipt: Value =
                         serde_json::from_slice(&fs::read(self.destination.join("delivery.json"))?)?;
+                    let mut canonical_request = request();
+                    canonical_request.sort_all_objects();
                     assert_eq!(
                         receipt["request_sha256"],
-                        hash(&serde_json::to_vec(&request()).unwrap())
+                        hash(&serde_json::to_vec(&canonical_request).unwrap())
                     );
                     assert_eq!(
                         fs::read(self.destination.join("diagnostics/stdout"))?,
@@ -508,8 +513,8 @@ mod delivery_tests {
                         self.artifact
                     );
                     assert_eq!(receipt["publication_authorized"], false);
-                    self.replies.push_back(json!({"kind":if frame["kind"] == "output-ack" {
-                        "output-acknowledged"} else {"artifact-acknowledged"}, "request_id":7, "already_released":false}));
+                    self.replies.push_back(Ok(json!({"kind":if frame["kind"] == "output-ack" {
+                        "output-acknowledged"} else {"artifact-acknowledged"}, "request_id":7, "already_released":false})));
                 }
                 _ => panic!(
                     "resume must not upload sources, retry execution or invent protocol messages"
@@ -521,7 +526,7 @@ mod delivery_tests {
             self.receive_count += 1;
             self.replies
                 .pop_front()
-                .ok_or_else(|| invalid("missing fixture reply"))
+                .unwrap_or_else(|| Err(invalid("missing fixture reply")))
         }
     }
 

@@ -120,7 +120,9 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 3;
+// v5 also invalidates merges produced before remote_base layer validation was
+// restored; those cache entries can contain an unnormalized or rejected path.
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -394,6 +396,15 @@ fn load_config_uncached_from_paths(
     Ok(config)
 }
 
+/// The incident ledger as `[remediation.incident_ledger]` configures it
+/// (path and retention), or the defaults when config cannot load.
+pub(crate) fn configured_incident_ledger() -> rch_common::IncidentLedger {
+    let config = load_config()
+        .map(|config| rch_common::IncidentLedgerConfig::from(&config.remediation.incident_ledger))
+        .unwrap_or_default();
+    rch_common::IncidentLedger::new(config)
+}
+
 /// Load configuration from all sources.
 ///
 /// Performance (t15): a source-fingerprint+schema-keyed binary cache lives at
@@ -652,6 +663,8 @@ struct PartialRchConfig {
     #[serde(default)]
     environment: PartialEnvironmentConfig,
     #[serde(default)]
+    execution: PartialExecutionConfig,
+    #[serde(default)]
     circuit: PartialCircuitConfig,
     #[serde(default)]
     output: PartialOutputConfig,
@@ -753,6 +766,13 @@ struct PartialTransferConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialEnvironmentConfig {
     allowlist: Option<Vec<String>>,
+    remote: Option<std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialExecutionConfig {
+    #[serde(default)]
+    storage: toml::Table,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -875,12 +895,24 @@ fn load_config_overlay(base: RchConfig, path: &Path) -> Result<RchConfig> {
     let mut overlay: toml::Value =
         toml::from_str(&content).with_context(|| format!("Failed to parse {:?}", path))?;
     canonicalize_config_aliases(&mut overlay);
+    let previous_remote_base = base.transfer.remote_base.clone();
     let mut merged =
         toml::Value::try_from(base).context("Failed to encode base RCH config as TOML")?;
     merge_toml_overlay(&mut merged, overlay);
-    merged
+    let mut config: RchConfig = merged
         .try_into()
-        .with_context(|| format!("Failed to decode merged config for {:?}", path))
+        .with_context(|| format!("Failed to decode merged config for {:?}", path))?;
+    // Match the validation and source attribution in apply_layer. A rejected
+    // project override must retain the accepted user value, not leak into the
+    // effective config while inspection claims the user value won.
+    match validate_remote_base(&config.transfer.remote_base) {
+        Ok(normalized) => config.transfer.remote_base = normalized,
+        Err(error) => {
+            warn!("Invalid remote_base in {}: {}", path.display(), error);
+            config.transfer.remote_base = previous_remote_base;
+        }
+    }
+    Ok(config)
 }
 
 fn canonicalize_config_aliases(value: &mut toml::Value) {
@@ -1047,6 +1079,15 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
                 trimmed
             ));
         }
+    }
+
+    if let Err(error) = config.execution.storage.validate() {
+        validation.error(error);
+    }
+    if let Err(error) =
+        rch_common::execution_storage::validate_remote_environment(&config.environment.remote)
+    {
+        validation.error(error);
     }
 
     if config.general.socket_path.trim().is_empty() {
@@ -1363,6 +1404,12 @@ fn default_sources_map() -> ConfigSourceMap {
         "transfer.source_sync_silence_timeout_secs",
         "transfer.rsync_bin",
         "environment.allowlist",
+        "execution.storage.root",
+        "execution.storage.cache_root",
+        "execution.storage.tmp_root",
+        "execution.storage.home_root",
+        "execution.storage.tmp_mode",
+        "execution.storage.tmp_retention_hours",
         "circuit.failure_threshold",
         "circuit.success_threshold",
         "circuit.error_rate_threshold",
@@ -1598,6 +1645,19 @@ fn apply_layer(
     if let Some(allowlist) = layer.environment.allowlist.as_ref() {
         config.environment.allowlist = allowlist.clone();
         set_source(sources, "environment.allowlist", source.clone());
+    }
+    if let Some(remote) = &layer.environment.remote {
+        config.environment.remote.extend(remote.clone());
+        for key in remote.keys() {
+            set_source(
+                sources,
+                &format!("environment.remote.{key}"),
+                source.clone(),
+            );
+        }
+    }
+    for key in layer.execution.storage.keys() {
+        set_source(sources, &format!("execution.storage.{key}"), source.clone());
     }
 
     if let Some(failure_threshold) = layer.circuit.failure_threshold {
@@ -2837,6 +2897,18 @@ exclude_patterns = [
 # to worker-scoped paths under the remote project root for reliability.
 allowlist = ["RUSTFLAGS", "CARGO_TARGET_DIR"]
 
+# Optional persistent remote defaults (values are literal, not shell expressions).
+# [environment.remote]
+# GOPROXY = "https://nexus.example/repository/go-proxy/"
+# NPM_CONFIG_REGISTRY = "https://nexus.example/repository/npm-group/"
+
+# Optional worker SSD placement. Source mirrors and Cargo target pools keep
+# their existing settings. HOME changes only when home_root is explicitly set.
+# [execution.storage]
+# root = "/srv/rch"
+# tmp_mode = "env" # or "private_mount" on Linux with mount privileges
+# tmp_retention_hours = 24
+
 [output]
 # Hook output visibility: none, summary, verbose
 visibility = "none"
@@ -3726,6 +3798,81 @@ min_local_time_ms = 2000
     }
 
     #[test]
+    fn managed_execution_config_merges_and_reports_sources() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &user,
+            r#"
+[execution.storage]
+root = "/srv/rch"
+tmp_mode = "private_mount"
+tmp_retention_hours = 48
+[environment.remote]
+GOPROXY = "https://proxy.example"
+NPM_CONFIG_REGISTRY = "https://registry.example"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"
+[execution.storage]
+tmp_mode = "env"
+tmp_retention_hours = 0
+[environment.remote]
+GOPROXY = "direct"
+"#,
+        )
+        .unwrap();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&HashMap::new()))
+                .unwrap();
+        assert_eq!(
+            loaded.config.execution.storage.root.as_deref(),
+            Some("/srv/rch")
+        );
+        assert_eq!(
+            loaded.config.execution.storage.tmp_mode,
+            rch_common::execution_storage::TmpMode::Env
+        );
+        assert_eq!(loaded.config.execution.storage.tmp_retention_hours, 0);
+        assert_eq!(loaded.config.environment.remote["GOPROXY"], "direct");
+        assert_eq!(
+            loaded.config.environment.remote["NPM_CONFIG_REGISTRY"],
+            "https://registry.example"
+        );
+        assert_eq!(
+            loaded.sources["execution.storage.root"],
+            ConfigValueSource::UserConfig(user)
+        );
+        assert_eq!(
+            loaded.sources["environment.remote.GOPROXY"],
+            ConfigValueSource::ProjectConfig(project)
+        );
+    }
+
+    #[test]
+    fn managed_execution_config_rejects_unsafe_values() {
+        let _guard = test_guard!();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for config in [
+            "[execution.storage]\nroot = '../tmp'",
+            "[execution.storage]\ntmp_mode = 'private_mount'",
+            "[environment.remote]\n'BAD=KEY' = 'oops'",
+            "[environment.remote]\nCARGO_TARGET_DIR = '/wrong'",
+        ] {
+            std::fs::write(file.path(), config).unwrap();
+            assert!(
+                !validate_rch_config_file(file.path()).errors.is_empty(),
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
     fn test_uncached_config_loader_can_reset_user_values_to_defaults() {
         let _guard = test_guard!();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4109,6 +4256,63 @@ max_concurrent_workers = 3
         );
 
         info!("PASS: Tilde-based remote_base is expanded");
+    }
+
+    #[test]
+    fn test_overlay_remote_base_normalization_and_sources() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("user.toml");
+        let project = directory.path().join("project.toml");
+        std::fs::write(&user, "[transfer]\nremote_base = '/srv/rch-builds/'\n").unwrap();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), None, Some(&HashMap::new())).unwrap();
+        assert_eq!(loaded.config.transfer.remote_base, "/srv/rch-builds");
+
+        for rejected in ["relative/path", "/tmp/../etc/rch", "/", "/tmp"] {
+            std::fs::write(
+                &project,
+                format!("[transfer]\nremote_base = '{rejected}'\n"),
+            )
+            .unwrap();
+            let loaded = load_config_with_sources_from_paths(
+                Some(&user),
+                Some(&project),
+                Some(&HashMap::new()),
+            )
+            .unwrap();
+            let effective = load_config_uncached_from_paths(Some(&user), Some(&project)).unwrap();
+            assert_eq!(
+                effective.transfer.remote_base, "/srv/rch-builds",
+                "{rejected}"
+            );
+            assert_eq!(
+                loaded.config.transfer.remote_base,
+                effective.transfer.remote_base
+            );
+            assert_eq!(
+                loaded.sources["transfer.remote_base"],
+                ConfigValueSource::UserConfig(user.clone())
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::fs::write(&project, "[transfer]\nremote_base = '~/rch-builds/'\n").unwrap();
+            let loaded = load_config_with_sources_from_paths(
+                Some(&user),
+                Some(&project),
+                Some(&HashMap::new()),
+            )
+            .unwrap();
+            assert!(loaded.config.transfer.remote_base.starts_with('/'));
+            assert!(loaded.config.transfer.remote_base.ends_with("/rch-builds"));
+            assert!(!loaded.config.transfer.remote_base.contains('~'));
+            assert_eq!(
+                loaded.sources["transfer.remote_base"],
+                ConfigValueSource::ProjectConfig(project)
+            );
+        }
     }
 
     #[test]

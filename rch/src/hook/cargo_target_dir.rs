@@ -1265,11 +1265,8 @@ mod managed_build_dir_tests {
         // The worktree remains buildable, but the archive deliberately omits
         // the required input. Verification must fail, not silently build the
         // working tree or reuse artifacts from the earlier verified package.
-        fs::write(
-            root.join("src/lib.rs"),
-            b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n",
-        )
-        .unwrap();
+        let failing_source = b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n";
+        fs::write(root.join("src/lib.rs"), failing_source).unwrap();
         let check = run(
             "worktree",
             "cargo check --offline -j1",
@@ -1281,9 +1278,42 @@ mod managed_build_dir_tests {
         assert_eq!(failed.status.code(), Some(101), "{failed:?}");
         assert!(String::from_utf8_lossy(&failed.stderr).contains("worktree-only.txt"));
         assert!(
-            failed_pool.join(&archive).is_file(),
+            String::from_utf8_lossy(&failed.stderr).contains("failed to verify package tarball")
+        );
+        // Cargo versions can retain the failed candidate at the final path or
+        // in tmp-crate. Both bounded locations must prove archive creation and
+        // contain the broken source, rather than an unrelated command failure.
+        let failed_archives: Vec<_> = [
+            failed_pool.join(&archive),
+            failed_pool
+                .join("package/tmp-crate")
+                .join(archive.file_name().unwrap()),
+        ]
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect();
+        assert!(
+            !failed_archives.is_empty(),
             "failure must occur after archive creation"
         );
+        for failed_archive in failed_archives {
+            let failed_bytes = fs::read(&failed_archive).unwrap();
+            let mut failed_members =
+                tar::Archive::new(flate2::read::GzDecoder::new(failed_bytes.as_slice()));
+            let mut saw_failing_source = false;
+            for entry in failed_members.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().into_owned();
+                assert!(!path.ends_with("worktree-only.txt"));
+                if path.ends_with("src/lib.rs") {
+                    let mut bytes = Vec::new();
+                    entry.read_to_end(&mut bytes).unwrap();
+                    assert_eq!(bytes.as_slice(), &failing_source[..]);
+                    saw_failing_source = true;
+                }
+            }
+            assert!(saw_failing_source);
+        }
         assert_eq!(
             fs::read(root.join("worktree-only.txt")).unwrap(),
             b"excluded input\n"
@@ -1380,9 +1410,9 @@ mod managed_build_dir_tests {
             .into_iter()
             .map(PathBuf::from),
         );
-        for command in [
-            "cargo package --offline",
-            "cargo publish --dry-run --locked",
+        for (command, expected_archive_count) in [
+            ("cargo package --offline", 1),
+            ("cargo publish --dry-run --locked", 3),
         ] {
             for target in [None, Some("/worker/managed pool")] {
                 let plan = super::ManagedCargoCommand::new(command, target).unwrap();
@@ -1399,7 +1429,7 @@ mod managed_build_dir_tests {
                         "package/*.crate",
                         "package/tmp-registry/*.crate",
                         "package/tmp-crate/*.crate",
-                    ]
+                    ][..expected_archive_count]
                 );
                 assert!(
                     get_project_artifact_patterns(kind, Some(plan.policy_command()), true)
@@ -1411,7 +1441,7 @@ mod managed_build_dir_tests {
                         "target/package/*.crate",
                         "target/package/tmp-registry/*.crate",
                         "target/package/tmp-crate/*.crate",
-                    ]
+                    ][..expected_archive_count]
                 );
                 let pipeline = crate::transfer::TransferPipeline::new(
                     PathBuf::from("/unused/local"),
@@ -1424,9 +1454,12 @@ mod managed_build_dir_tests {
                     .unwrap();
                 assert_eq!(
                     selected.into_iter().collect::<BTreeSet<_>>(),
-                    archives.iter().cloned().collect::<BTreeSet<_>>()
+                    archives[..expected_archive_count]
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
                 );
-                assert_eq!(excluded.len(), 5);
+                assert_eq!(excluded.len(), inventory.len() - expected_archive_count);
                 assert!(sync_back_verified_zero_package_archives(
                     Some(0),
                     plan.policy_command()

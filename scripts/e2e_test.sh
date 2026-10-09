@@ -141,7 +141,7 @@ test_name() {
 
 test_serial() {
     local file="$1"
-    /bin/grep -q '^# E2E_SERIAL=1' "$file"
+    command grep -q '^# E2E_SERIAL=1' "$file"
 }
 
 test_args() {
