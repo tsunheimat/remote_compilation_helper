@@ -26,6 +26,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published logging/cache/fixture repairs: `4e65b0a60ad5d97545dae20ff2fb5241b17faf18`
 - CI baseline code tree: `4a878e86833d3040474e7d18776f25b5b9e301ad`
 - Published canonical-root fixture repair: `4034fe2bcfb3a0ac77ee6f090addb3ab75932152`
+- Published filename fixture and CI diagnostics: `425dee6fec669955ff81316e1d4f56a485b248d7`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -51,6 +52,77 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## CI resource follow-up after `425dee6`
+
+The Linux x64 resource probe recorded two concurrent `rustc` processes using
+14.33 GiB of RSS together, with 722.6 MiB of host memory available in its last
+sample. The runner later stopped with exit 143, before the 30-minute limit.
+All 44 samples recorded zero host OOM kills; the last cgroup OOM counters were
+also zero. This establishes memory pressure, not the termination mechanism.
+The completed 95 harness summaries recorded 2,163 passes, zero failures and
+seven ignored cases before the nested daemon build was interrupted.
+
+Linux ARM's 59 samples also recorded zero host OOM kills. Its peak combined
+`rustc` RSS was 14.43 GiB and minimum available memory was 786.4 MiB. That job
+reached the explicit 30-minute limit during compilation, with no native harness
+results. Both macOS matrix jobs also timed out during compilation, so the
+filename-refusal branch below remains unverified on native macOS at this head.
+Coverage completed 95 harnesses with 2,163 passes and seven ignored cases before
+its own 30-minute limit; it did not produce a coverage-threshold verdict.
+
+The follow-up workflow uses one compiler job during Linux matrix tests,
+including inherited nested Cargo builds. Native test parallelism, compiler
+profiles and every job/test limit remain unchanged. It runs the existing
+nine-case filesystem fixture before the full workspace command, retaining a
+separate log for each. The complete workspace is still attempted after a fixture
+failure, and either failing stage fails the job. This prioritizes native evidence
+for the changed fixture without replacing the full-workspace gate.
+
+YAML comparison limits the change to the test-step body and the additional log
+upload path. Nine shell controls verify both commands run, Linux receives one
+compiler job, the macOS guard retains two, and failures 101/143 remain failures.
+The resource child is reaped. These use fake Cargo on Linux, including the
+macOS guard; native memory reduction and macOS fixture acceptance remain
+pending. The unchanged official UBS scanner reports zero critical, warning or
+informational findings in the exact extracted Bash body. UBS has no YAML
+scanner; YAML parsing, semantic comparison and Bash syntax were checked
+separately. No Rust source changed in this follow-up.
+
+At `425dee6`, the [standalone E2E workflow](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38139131073)
+passed all 41 script statuses on both Linux and macOS. Each inner suite recorded
+11 passes and two skips. Their 50 hook samples averaged 1.371 ms and 4.708 ms
+respectively, under the unchanged 10 ms limit. Separate JSONL files contain
+19 Linux and 13 macOS skip records, including missing Bun/worker/daemon
+capabilities and unrelated unimplemented scenarios; these are records, with
+duplicates, not counts of distinct tests. Outer script success does not prove
+those skipped paths.
+
+The [rsync workflow](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38139131071)
+passed 64 native transfer cases and strict checks. Its source archive's 1,390
+Git blobs and modes match `425dee6`. All five Unix
+[package jobs](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38139131078)
+passed; downloaded ZIP digests, archive checksums, exact three executable
+members and modes were verified. Windows reproduced its deferred import/type
+failure and aggregate package verification was skipped. Compiler, strict Clippy,
+docs, formatting, workflow/manifest/security guards and benchmarks passed.
+[Core E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38139131176/job/114473168252)
+passed with 164 reported native passes, 92 archived capability-skip records,
+and 11 shell passes/two skips. Its advisory comparison flagged CMake 21/461 ms
+and clang/make 42/662 ms (stored baseline/current p95); these remain
+unattributed. The [RABS workflow](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38139131069)
+passed all 42 accepted-hit cases and all 13 release-gate cases. Wrapper size was
+443,456 bytes and enforced p95 was 5,236 microseconds under the unchanged 10 ms
+limit. Its 41 release-build resource samples recorded at least 4,158,672 KiB
+available memory and zero host OOM kills. This is acceptance of the existing
+gate, not a measured speedup or an explanation of earlier runner shutdowns.
+All five workflows at `425dee6` are now terminal.
+
+Current CI evidence is retained under `rch-ci-head425-monitor-_l7941gr/` in the
+validation base. The workflow source, controls and UBS evidence are under
+`rch-linux-compiler-limit-WXHcMr0O/`. The separate job-budget proposal remains
+unapplied pending the user's decision. No complete-workspace or coverage pass,
+runtime speedup, merge, deployment or live-worker acceptance is claimed.
 
 ## Filesystem filename fixture follow-up after `4034fe2b`
 
@@ -118,8 +190,10 @@ package jobs passed, and their archive checksums, exact executable membership
 and modes were verified. Windows failed its deferred build and package
 aggregation was skipped. Coverage and macOS Intel tests reached their original
 30-minute limits. Full workspace, coverage and macOS standalone E2E acceptance
-remain open. Remaining workflow results were still in progress when this
-follow-up was prepared; these partial results are not full-suite acceptance.
+remain open. The macOS standalone job subsequently reached its 60-minute limit:
+37 of 41 outer script statuses passed. The self-test inner log also completed
+two native cases and three worker skips, but cancellation prevented its outer
+status from being written. These partial results are not full-suite acceptance.
 
 ## Source-root fixture follow-up after `4e65b0a`
 

@@ -199,6 +199,10 @@ jobs:
           set -o pipefail
           mkdir -p target/test-logs
           if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # Two concurrent rustc processes consumed over 14 GiB before a
+            # runner shutdown. Bound compilation, including nested Cargo builds.
+            # Native test parallelism and all gates retain their existing values.
+            export CARGO_BUILD_JOBS=1
             # A runner shutdown can prevent the artifact-upload step itself.
             # Record bounded resource observations in the live job log.
             python3 -u - <<'PY' &
@@ -246,14 +250,24 @@ jobs:
             rch_test_sampler_pid=$!
             trap 'rch_test_status=$?; trap - EXIT; kill "$rch_test_sampler_pid" 2>/dev/null || true; wait "$rch_test_sampler_pid" 2>/dev/null || true; exit "$rch_test_status"' EXIT
           fi
-          # Collect every harness result; Cargo still fails if any harness fails.
-          cargo test --no-fail-fast ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log
+          # Exercise the filesystem regression before unrelated workspace builds
+          # consume the job budget. Preserve both verdicts and still attempt the
+          # complete workspace after a fixture failure.
+          rch_fixture_status=0
+          cargo test --locked -p rabs-sandbox --test snapshot_capture_realfs -- --nocapture 2>&1 | tee target/test-logs/snapshot-capture-realfs.log || rch_fixture_status=$?
+          rch_workspace_status=0
+          cargo test --no-fail-fast ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log || rch_workspace_status=$?
+          if (( rch_workspace_status != 0 )); then
+            exit "$rch_workspace_status"
+          fi
+          exit "$rch_fixture_status"
       - name: Upload test logs on failure or cancellation
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.name }}
           path: |
+            target/test-logs/snapshot-capture-realfs.log
             target/test-logs/workspace-tests.log
             target/debug/deps/*.log
             **/test-output.log
