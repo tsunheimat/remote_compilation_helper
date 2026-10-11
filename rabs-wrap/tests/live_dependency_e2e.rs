@@ -552,10 +552,11 @@ fn assert_same_library(first: &Path, second: &Path, name: &str) {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
-    // Short root: the daemon socket path must fit sun_path.
+    // Keep the socket short and CARGO_MANIFEST_DIR equal to the wrapper's
+    // physical cwd when /tmp is a symlink (as it is on macOS).
     let dir = tempfile::Builder::new()
         .prefix("rl")
-        .tempdir_in("/tmp")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
         .unwrap();
     let world = World {
         root: dir.path().to_path_buf(),
@@ -740,7 +741,7 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
 fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_closure() {
     let dir = tempfile::Builder::new()
         .prefix("gl")
-        .tempdir_in("/tmp")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
         .unwrap();
     let mut world = World {
         root: dir.path().to_path_buf(),

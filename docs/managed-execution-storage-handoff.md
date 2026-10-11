@@ -31,6 +31,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published Darwin fixture repairs and approved CI ceilings: `352f025f10252d1bdc09191a6b099cc2a05760fb`
 - Published CI prerequisites and status evidence: `c5618ef688a1691f4b0b305a5249a56bdca6cde9`
 - Published prepared-wait and coverage-report repairs: `8edaa0f0315697720fcb4453bcaed1293aec9f59`
+- Published daemon response and native fixture repairs: `18e2235faf2df206939641c3256b4e6689ac0e09`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -56,6 +57,147 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Live-dependency fixture path correction after `18e2235f`
+
+The two live-dependency warmup assertions wait for an admitted compile while
+filtering `shadow` decisions from their progress trail. A refused request can
+therefore end in the same 600-second assertion as a genuinely unfinished
+toolchain probe. The wrapper records its physical current directory, while the
+fixture formerly put the lexical `/tmp` path in `CARGO_MANIFEST_DIR`. When that
+temporary root is a symlink, these paths differ and the existing exact working
+directory guard returns `LIVE_DEP_CWD`.
+
+A controlled run at the published `18e2235f` source used the actual daemon,
+wrapper and August compiler, with one owned package reached through a symlink
+and through its physical path. The alias requests compiled locally but the
+daemon logged `shadow` / `LIVE_DEP_CWD`; toolchain hashing had already completed
+in about two seconds. Requests through the physical path reached `execute`,
+`committed` and `verified` with unchanged binaries. The complete decision log,
+request environments, compiler outputs and source/executable hashes are retained
+under `rch-warmup-path-control-j9ltmujn/`. The native macOS ARM run at `18e2235f`
+then reproduced exactly this refusal in both failing cases: the request's
+`CARGO_HOME` and fixture roots used `/tmp`, while the daemon's `LIVE_DEP_CWD`
+detail named the physical `/private/tmp` package directory. The diagnostics
+establish the cause of those two current native failures.
+
+Both fixtures now create their short temporary directory under the canonical
+physical `/tmp` parent. The correction admits a fixture whose declared package
+directory equals its actual compiler cwd. Requests with mismatched directories
+remain refused by unchanged production code. Every compile, commit, verify,
+serve, byte-equality and negative-result assertion remains, as do both 600-second
+deadlines. The bounded failure diagnostics from `18e2235f` remain available.
+
+Both complete live-dependency cases passed locally with no ignores or filters.
+Locked workspace/all-target check, strict Clippy and formatting also passed,
+with non-document source hashes held. UBS returned exit zero, zero critical,
+78 warning and 59 informational records. Its four added-line informational
+records concern literal path slashes and intentional filesystem setup; the
+scanner and rules were unchanged. Evidence is under
+`rch-warmup-physical-fixtures-fxqvegwz/` and active-worktree validation directory
+`ubs-warmup-physical-report-approved.nhy6xh2j/`. Native Mac acceptance is pending.
+
+The completed native workspace jobs at `18e2235f` establish the preceding
+repair batch's results. Linux x64 completed 225 harnesses with 12,118 reported
+passes, no failures, 31 ignored cases and zero filtered cases. macOS ARM
+completed 216 harnesses with 10,021 passes, the two path-mismatch failures above,
+23 ignored cases and zero filtered cases. All 13 socket regression cases passed
+in the early selection and again in the full command, including the actual
+Darwin peer-close result. The three native Mac TLS targets passed 23, five and
+three cases. Canonical-root, prerequisite, shim and transfer fixes passed;
+unsupported raw-filename operations retained explicit refusal/skip records,
+and the non-Linux worker cleanup case proved refusal rather than reaping.
+Repeated focused cases are not additional unique coverage. Evidence is in
+`rch-ci-head18e223-monitor-y5hmt4mx/`. All five workflows at this revision are
+now terminal; the additional results are recorded below.
+
+The same revision's RABS release job passed its build and 443,456-byte wrapper
+size gate, and 12 replay, compiler, Cargo-worktree and doctor cases. Its enforcing
+wrapper timing case failed at 10,880 microseconds p95 against 10 ms. The log
+contains only the aggregate percentile, so the shape and cause of this loss are
+not established. The failed verdict remains in `rabs-release-outcomes.json`.
+No performance improvement is claimed from earlier passing hosts or revisions.
+
+The timing fixture now retains its existing 60 observations in original order
+after all measurement intervals finish and includes them in the evidence JSON.
+The five warm-ups, measured command, clock, percentile index, release/debug
+policy and strict 10 ms assertion are unchanged. Local debug execution verified
+that the JSON contains exactly 60 samples and that its reported p95 matches
+those observations; debug remains measurement-only and does not establish
+release acceptance. Workspace/all-target check, strict Clippy and formatting
+passed with source hashes held. The final two-file UBS scan returned exit zero,
+zero critical, 82 warning and 64 informational records; its four added-line
+notices concern the canonical fixture paths, and no scanner rule changed.
+Evidence is under `rch-wrapper-timing-evidence-zttpm8oo/` and
+`ubs-wrapper-evidence-report-approved.jzg32_dn/` in the validation locations.
+
+Core E2E at `18e2235f` passed 164 reported Cargo cases with 92 archived
+capability-skip records. The shell phase completed three passes and one skip,
+leaving nine outcomes absent when the job reached 30 minutes. GitHub's final
+annotation confirms that limit, rather than an observed shell assertion failure.
+The proposed core-E2E budget increase remains unapplied.
+
+macOS Intel also recorded an independent failure:
+`daemon_runtime::tests::boots_runs_and_shuts_down_obligation_clean` measured
+109 ms against its unchanged strict 100 ms boot limit. Its clean-obligation
+and four-subsystem checks passed before that assertion. The runtime code,
+dependency manifest and lockfile are unchanged from the preceding revision;
+the timing cause is not established. Failure messages now include the full
+already-measured receipt and available parallelism. Those expressions run only
+after a timing assertion fails, and neither boot nor shutdown measurement or
+limit changes. Production runtime code remains byte-identical.
+
+The final local follow-up passed all 106 Linux runtime-library cases at default
+test parallelism, with no ignores or filters, plus workspace/all-target check,
+strict Clippy and formatting. These Linux results do not resolve the native
+Intel timing observation. The three-file UBS scan returned exit zero, zero
+critical, 107 warning and 69 informational records. Its five added-line records
+are the four fixture-path notices and the unchanged boot assertion with expanded
+failure text. No scanner or gate change was made. Source-bound evidence is in
+`rch-final-followup-validation-nhflxy_q/` and
+`ubs-final-mac-followup-report-approved.u2uetg3z/`.
+
+Final CI results at `18e2235f`:
+
+- [Main CI](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38167414105)
+  concluded cancelled; its aggregate check failed and release builds skipped.
+  Both Linux architectures completed all 225 workspace harnesses with 12,118
+  reported passes, no failures, 31 ignores and zero filters. Compiler, Clippy,
+  documentation, formatting, workflow/manifest/security checks and benchmarks
+  passed. Coverage passed LCOV, HTML/text reporting and the unchanged 65% gate:
+  321,796/370,434 lines, or 86.87%, in the verified HTML artifact.
+- macOS ARM's complete counts and two diagnosed fixture failures are above.
+  macOS Intel completed the separate nine-case filesystem and 13-case socket
+  selections, including the native peer-close assertion. Its full workspace
+  command completed 12 harnesses with 174 passes and the 109 ms boot failure,
+  then was cancelled during the next `rabs-cas` harness. Later targets have no
+  verdict. GitHub's terminal annotation confirms the 60-minute job limit.
+  The full Intel job-log download returned `BlobNotFound`; the verified artifact
+  retains all three test logs, including the failure and partial workspace output.
+- [Standalone E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38167414088)
+  passed all 41 script statuses on both Linux and macOS. Each inner suite has
+  11 passes and two skips; all 50 hook samples were retained, with means of
+  1.474/6.954 ms below 10 ms. The formerly failing native saved-time scenario
+  passed. Separate JSONL audits retain 20 Linux and 13 Mac skip records, including
+  missing capabilities and pending remediation scenarios; duplicates are not
+  unique test outcomes, and the script pass does not establish those behaviors.
+- [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38167414112)
+  passed its separate 42 protocol cases, but the release job failed the 10.880 ms
+  wrapper gate described above after 12 other release cases passed.
+- [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38167414151)
+  passed all 64 selected transfer cases. All 1,390 archived Git blobs and modes
+  match this head.
+- [Test Release](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38167414233)
+  passed all five Unix package jobs. Uploaded digests, archive checksums, the
+  three executable members and their modes were independently verified. Windows
+  retained the deferred import/type failures; aggregate package verification
+  skipped. Its jobs remain enabled.
+
+The follow-up requires fresh CI. The two fixture paths are corrected, while the
+Intel boot and RABS wrapper timing failures remain recorded and unexplained.
+The workspace/core-E2E budget proposals remain unapplied, and the separate local
+full-toolchain deadline plus operator deployment/SSH/Nexus acceptance remain open.
+Keep PR #2 draft. No merge or deployment was performed.
 
 ## Native fixture repairs following the complete `8edaa0f0` results
 
@@ -141,11 +283,12 @@ owned directories and artifact bytes remain. This changes native Mac collection
 from two unsupported positive cases to one refusal case; it does not claim Mac
 worker reaping or relax the production platform guard.
 
-The two 600-second toolchain warmup failures remain unexplained. Their assertion
-messages now include a bounded tail of projected daemon decisions and the
+At `18e2235f`, the two 600-second toolchain warmup failures remained unexplained.
+Their assertion messages added a bounded tail of projected daemon decisions and the
 constructed toolchain environment. Full environments, cache keys and unparsed
 log contents are omitted. Deadlines and decision assertions are unchanged. This
-diagnostic change does not resolve or relabel either failed case.
+diagnostic change alone did not resolve or relabel either failed case. The
+subsequent path control and fixture correction are described above.
 
 Local validation used August nightly, default test parallelism and one compiler
 job, with the non-document source held unchanged throughout. Workspace/all-target

@@ -85,6 +85,9 @@ fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
             start.elapsed().as_micros()
         })
         .collect();
+    // Retain observations after timing ends; a failed p95 alone cannot show
+    // whether the whole run slowed down or only a few samples did.
+    let samples_us_in_order = samples.clone();
     samples.sort_unstable();
     let p95_us = samples[(samples.len() * 95) / 100];
     let p95_ms = p95_us as f64 / 1_000.0;
@@ -98,7 +101,8 @@ fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
     let enforcing = !cfg!(debug_assertions);
     let evidence = format!(
         "{{\"v\":1,\"suite\":\"perf/wrapper\",\"test\":\"rabs_wrap_end_to_end\",\
-         \"p95_us\":{p95_us},\"SLO_ms\":{SLO_MS},\"profile\":\"{}\",\"gate\":\"{}\"}}",
+         \"p95_us\":{p95_us},\"SLO_ms\":{SLO_MS},\"profile\":\"{}\",\"gate\":\"{}\",\
+         \"samples_us_in_order\":{samples_us_in_order:?}}}",
         if enforcing { "release" } else { "debug" },
         if enforcing {
             "enforcing"
