@@ -30,6 +30,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published Linux compiler bound and fixture priority: `5352da591f6202a7d8727d9d94e3623eb4e9c939`
 - Published Darwin fixture repairs and approved CI ceilings: `352f025f10252d1bdc09191a6b099cc2a05760fb`
 - Published CI prerequisites and status evidence: `c5618ef688a1691f4b0b305a5249a56bdca6cde9`
+- Published prepared-wait and coverage-report repairs: `8edaa0f0315697720fcb4453bcaed1293aec9f59`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -55,6 +56,185 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Native fixture repairs following the complete `8edaa0f0` results
+
+All five validation workflows at `8edaa0f0` are terminal. The source archive
+matches all 1,390 Git blobs and modes. Evidence is retained under
+`rch-ci-head8edaa-monitor-sh76kdk6/` in the validation base.
+
+- [Main CI](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38160004406)
+  passed Linux x64's complete 225-harness workspace command: 12,112 reported
+  passes, no failures, 31 ignored cases and zero filtered cases. Coverage passed
+  LCOV, HTML, text reporting and the unchanged 65% gate; its archived HTML index
+  reports 321,596/370,204 covered lines, or 86.87%. The separate nine-case
+  filesystem selection is repeated coverage, not nine additional unique cases.
+- macOS ARM completed 216 harnesses with 9,950 reported passes, 68 failures,
+  23 ignored cases and zero filtered cases. Its 14 failed targets include 25
+  canonical-parent fixture failures, four invalid-filename cases, 27 TLS fixture
+  failures, ten RCH/worker-tool cases and two toolchain warmup deadlines. The
+  intentionally failing T004 child appears inside one outer harness's output;
+  it is not a 69th top-level failure.
+- Linux ARM and macOS Intel reached their unchanged 60-minute ceilings during
+  the next chaos harness's nested build. Their 95 completed harnesses reported
+  2,163/2,013 passes, zero failures and seven/two ignored cases respectively.
+  Final GitHub annotations establish the job timeouts. Later cases lack a
+  verdict on those platforms.
+- Core E2E completed 164 reported native cases with 92 archived capability-skip
+  records, then all shell cases with 11 passes and two skips. Compiler, strict
+  Clippy, docs, formatting, workflow/manifest/security guards and benchmarks
+  passed. Main aggregate acceptance failed and release builds skipped.
+- [Standalone E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38160004368)
+  passed all 41 Linux script statuses. macOS passed 40 and failed the saved-time
+  scenario described below. Both inner hook suites passed 11 cases with two
+  skips; macOS's 50-sample hook mean was 7.6895 ms, below the 10 ms gate.
+- [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38160004375)
+  passed 42 protocol and 13 release-gate cases. Wrapper size was 443,456 bytes;
+  enforced p95 was 8,498 microseconds under 10 ms. Rsync passed all 64 selected
+  transfer cases. All five Unix package jobs passed and their uploaded archive
+  hashes, internal checksums, executable members and permissions were verified.
+  Windows retains the deferred compile failure and aggregate package verification
+  remains skipped; its jobs are still enabled.
+
+The fixture repair batch preserves the production path guards and test result
+assertions. Canonicalizing owned temporary parents fixes `/var` versus
+`/private/var` mismatches in the affected RABS fixtures and the real-Cargo artifact
+fixture. Production ancestor rejection, source identity, output ownership,
+recovery and delivery logic are unchanged.
+
+TLS fixtures now supply an owned OpenSSL request configuration for CA and CSR
+generation. The CA extensions occur once; the leaf certificate extensions and
+all TLS assertions remain unchanged. A controlled reproduction built the
+official OpenSSL 1.1.1w source archive after verifying its published SHA-256.
+With the former recipe and a host configuration supplying CA extensions, the
+certificate contained duplicate BasicConstraints and the actual RABS receiver
+rejected it with `ExtensionValueInvalid`. The owned configuration produced one
+extension and the same receiver reached listening. Both recipes succeeded with
+the local OpenSSL 3.4.1 control. These are certificate/receiver controls, not
+complete TLS delivery or historical-runner attribution. The original macOS
+certificate was not archived. Evidence is in `rch-mac-tls-ca-vfg74tfa/`.
+
+Four raw-filename cases now distinguish a native Darwin EILSEQ refusal from
+successful raw-filename execution. Only that exact macOS error is admitted;
+other errors still fail, and directory enumeration rejects a lossy alias.
+The wrapper still executes raw, empty and UTF-8 arguments. OUT_DIR tests retain
+distinct byte keys and real capture/replay; dep-info tests retain raw canonical
+bytes, actual installation and unchanged CAS bytes through explicitly named
+representable worktrees when the filesystem refuses raw names. Such a refusal
+prints a capability-skip record and does not prove raw-filename support.
+
+The shim fixture compares with a real process's PATH lookup, avoiding the host
+shell's extra tilde expansion. The adaptive-compression argument fixture supplies
+the existing pinned rsync capability description while retaining its exact zstd
+and compression-level assertions. The real-tar fixture selects actual GNU find,
+the worker's existing prerequisite; its production inventory script and archive
+selection assertions remain unchanged. macOS CI installs Go 1.25.12, coreutils
+and findutils, exposing only GNU timeout under the unprefixed worker command name.
+Other BSD tools remain the host defaults. Parsed YAML and shell-syntax checks
+confirm that the remaining job matrix, commands, gates and budgets are unchanged.
+Native prerequisite installation still requires CI acceptance.
+
+Two positive cleanup cases require the production Linux worker's `/proc` UUID
+source and now run on Linux. Non-Linux Unix instead executes the real sweep and
+job/pool claim paths, asserts refusal with zero reap counts, and verifies all
+owned directories and artifact bytes remain. This changes native Mac collection
+from two unsupported positive cases to one refusal case; it does not claim Mac
+worker reaping or relax the production platform guard.
+
+The two 600-second toolchain warmup failures remain unexplained. Their assertion
+messages now include a bounded tail of projected daemon decisions and the
+constructed toolchain environment. Full environments, cache keys and unparsed
+log contents are omitted. Deadlines and decision assertions are unchanged. This
+diagnostic change does not resolve or relabel either failed case.
+
+Local validation used August nightly, default test parallelism and one compiler
+job, with the non-document source held unchanged throughout. Workspace/all-target
+check, strict Clippy and formatting passed. The RABS library and binary harnesses
+reported 522 and 49 passes; their eight selected integration targets reported
+69 passes and one intentionally ignored child entry. The raw-argument, shim
+lookup, real-Cargo artifact, rsync argument and real-tar selections each passed
+their one case, and all 54 selected Linux ownership-sweep cases passed. No native
+Mac-only subcase or new warmup runtime verdict is included in these Linux counts.
+
+The final unchanged UBS scan of all 21 changed Rust files returned exit 1:
+12 critical, 2,943 warning and 2,159 informational records. All critical and 84
+added-line records were reviewed. Seven critical records concern nonsecret file
+identity comparisons; five concern deliberate test executable/script calls,
+including the fixed-name GNU find prerequisite probe. No scanner suppression or
+rule change was made, and no green UBS verdict is claimed. Exact source/scanner
+hashes, the raw report and review are in
+`ubs-mac-fixtures-report-approved.69miun4s/` under the active worktree's validation
+directory. Native test evidence is under `rch-mac-native-fixtures-6s1bsr9_/`.
+
+The proposed workspace and core-E2E budget increases remain unapplied pending
+the user's decision. The current limits are 60 and 30 minutes respectively.
+Keep PR #2 draft: this batch needs current-source native CI, the warmup failures
+remain open, and deployment/live SSH/Nexus acceptance belongs to the user.
+
+## Daemon response after peer close, following `8edaa0f0`
+
+The macOS standalone run at `8edaa0f0` completed 40 passing scripts and one
+failure in `e2e_bd-zked.sh`. Its first status request succeeded; the following
+saved-time structure request returned `RCH-E504` with `Socket is not connected
+(os error 57)`. The script did not archive its isolated daemon log. This run's
+hook timing gate passed with all 50 samples averaging 7.6895 ms; that does not
+explain the preceding revision's timing failure.
+
+The status exchange writes and flushes its request, shuts down its write half,
+then reads the response. The daemon can answer `GET /status` and close without
+waiting for client EOF. Darwin can report `ENOTCONN` for the later shutdown
+after the peer closes, leaving already-buffered response bytes unread. The
+[XNU socket implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c)
+and [Unix-domain disconnect handling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c)
+support that mechanism; the original CI log does not identify the failing I/O
+phase or establish its kernel source version. Attribution of that historical
+failure remains an inference until the native controlled case runs on macOS.
+
+The exchange now reads the response after a shutdown-only `NotConnected`
+error. It retains that error when the response is empty, propagates write,
+flush, other shutdown and read errors, and leaves HTTP/JSON validation with
+the existing callers. It never resends a command. Existing connect, send and
+response deadlines are unchanged. Stage-specific error context identifies
+which operation failed if another status request fails.
+
+Before the behavior change, the regression selection reported five passes and
+two failures: buffered valid data was discarded, and invalid UTF-8 was masked
+by the shutdown error. The final selection passed 13 cases, including six new
+cases and the existing request-EOF and timeout-policy cases. A separate status
+consumer test passed. The native socket-pair case orders an actual peer close
+before client shutdown using a channel rather than a sleep; it checks response
+bytes and a single exact request on every Unix host and additionally requires
+the observed `NotConnected` shutdown result on macOS. Its Linux execution
+passed; the native macOS assertion is pending fresh CI.
+
+Locked workspace/all-target check, strict Clippy and formatting passed with
+the final helper source hash held. The unchanged official UBS scan returned
+exit zero, zero critical, 89 warning and 43 informational records. The 21
+added-line records were reviewed: 16 intentional test assertions, four
+intentional `expect_err` checks and one division false positive on the request
+string. No scanner change or suppression was made. The saved-time E2E scenario
+passed against freshly built application binaries, including seven reported
+saved-time behavior cases with no failures or ignores and 1,792 unrelated cases
+filtered. Its daemon, compiler-check and behavior-test logs were exported from
+the private temporary filesystem and retained with the executable hashes.
+Evidence is retained
+under `rch-daemon-half-close-y7y436gv/` and
+`ubs-daemon-half-close-report-approved.sqs0uqhw/` in the validation locations.
+The saved-time script, daemon API and lockfile remain byte-identical to the
+published baseline.
+
+CI now runs the socket regression selection before the complete workspace
+command on all four native test platforms. It retains each command's exit
+status, attempts the full workspace even after a focused failure and archives
+the focused log on failure or cancellation. The new command uses the same
+workspace/package selection as the full command. Linux-hosted Cargo unit graphs
+for both selections, with and without the existing macOS `rchd` exclusion,
+confirm an identical CLI test unit and all its transitive dependencies. The
+focused graph omits only the `rabsd` doctest unit; that unit remains in the
+unchanged full command. This graph comparison is not native macOS execution.
+Repeated focused cases are not additional unique coverage. Every existing
+test command, deadline, matrix entry and compiler
+setting remains in place.
 
 ## Prepared wait and coverage reporting follow-up after `c5618ef6`
 
@@ -163,11 +343,12 @@ All five validation workflows at `c5618ef6` are terminal. Their evidence is unde
   verified. Windows reproduced the deferred import/type errors, and aggregate
   package verification skipped. Its jobs remain enabled.
 
-The separate 90-minute workspace proposal remains unapplied pending the user's
-decision. Core E2E retains its 30-minute limit. The two repairs above require
-fresh CI at their published revision; full native Mac acceptance, the hook
-timing failure, the separate local full-toolchain deadline and operator
-acceptance remain open. Keep PR #2 draft. No merge or deployment was performed.
+At that checkpoint, the separate 90-minute workspace proposal remained unapplied
+and core E2E retained its 30-minute limit. The complete `8edaa0f0` results above
+supersede that checkpoint's pending CI: coverage now passed, and the hook timing
+failure did not recur. Full native Mac acceptance, the separate local
+full-toolchain deadline and operator acceptance remain open. Keep PR #2 draft.
+No merge or deployment was performed.
 
 ## CI prerequisites and fixture evidence after `352f025f`
 

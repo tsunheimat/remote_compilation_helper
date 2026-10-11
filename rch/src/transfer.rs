@@ -10339,7 +10339,12 @@ Number of files transferred: 42
             "abc123".to_string(),
             transfer_config,
         )
-        .with_estimated_transfer_bytes(Some(500_000_000));
+        .with_estimated_transfer_bytes(Some(500_000_000))
+        .with_rsync(pinned_rsync(RsyncFlavor::Rsync {
+            major: 3,
+            minor: 4,
+            patch: 1,
+        }));
 
         let worker = WorkerConfig {
             id: WorkerId::new("mock-worker"),
@@ -14884,6 +14889,36 @@ fn main() {
     #[tokio::test]
     async fn windows_artifact_real_tar_returns_selected_files_and_hardlinks_only() {
         let _guard = test_guard!();
+        // The production inventory runs on the Windows worker's GNU userland.
+        // This local consumer must use real GNU find even on a BSD host.
+        let mut gnu_find = None;
+        for name in ["gfind", "find"] {
+            let Ok(path) = which::which(name) else {
+                continue;
+            };
+            let mut probe = Command::new(&path);
+            probe
+                .arg("--version")
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let version = tokio::time::timeout(Duration::from_secs(5), probe.output())
+                .await
+                .expect("GNU find version probe timed out")
+                .expect("resolved find must execute");
+            if version.status.success()
+                && String::from_utf8_lossy(&version.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("(GNU findutils)"))
+            {
+                gnu_find = Some(path);
+                break;
+            }
+        }
+        let gnu_find = gnu_find.expect(
+            "real GNU find is required for the local Windows/Cygwin artifact fixture; install findutils",
+        );
         let source = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
         for path in ["bin", "src", "target/debug", "peer/target/debug"] {
@@ -14905,12 +14940,22 @@ fn main() {
         )
         .unwrap();
         std::fs::write(destination.path().join("Cargo.toml"), b"local manifest").unwrap();
+        let inventory_script = windows_artifact_inventory_script(source.path().to_str().unwrap());
+        assert_eq!(inventory_script.matches("/usr/bin/find ").count(), 1);
+        let local_find = format!(
+            "{} ",
+            escape(Cow::from(
+                gnu_find.to_str().expect("GNU find path must be UTF-8")
+            ))
+        );
+        let local_inventory_script = inventory_script.replacen("/usr/bin/find ", &local_find, 1);
+        assert_eq!(local_inventory_script.matches(&local_find).count(), 1);
         let mut inventory = Vec::new();
         let mut shell = Command::new("sh");
         shell.arg("-s");
         run_windows_artifact_process(
             shell,
-            &windows_artifact_inventory_script(source.path().to_str().unwrap()),
+            &local_inventory_script,
             &mut inventory,
             1024 * 1024,
             TokioInstant::now() + Duration::from_secs(10),

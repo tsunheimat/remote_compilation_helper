@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn binary_unaligned_prefixes_are_copied_without_changing_the_old_tree() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let root = owner.path().join("old");
         fs::create_dir_all(root.join("artifacts/nested")).unwrap();
         let bytes: Vec<u8> = (0..CHUNK_BYTES + 17).map(|n| (n % 251) as u8).collect();
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn absent_members_are_misses_but_nonregular_oversized_and_linked_members_refuse() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let root = owner.path().join("old");
         fs::create_dir_all(root.join("artifacts")).unwrap();
         fs::write(root.join("artifacts/large"), b"AB").unwrap();
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn roots_and_destinations_cannot_alias_or_overlap() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let root = owner.path().join("old");
         fs::create_dir(&root).unwrap();
         let source = ResumeSource::open(&root).unwrap();
@@ -532,7 +532,7 @@ mod delivery_tests {
 
     #[test]
     fn interrupted_real_receiver_reuses_complete_diagnostics_and_partial_artifact() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let old = owner.path().join("interrupted");
         let mut first = Peer::new(&old, DeliveryMode::Execute);
         first.fail_artifact_at = Some(CHUNK_BYTES as u64);
@@ -598,7 +598,7 @@ mod delivery_tests {
 
     #[test]
     fn complete_and_unaligned_prefixes_use_exact_remaining_ranges() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         for length in [17, CHUNK_BYTES + 7, 2 * CHUNK_BYTES + 37] {
             let old = owner.path().join(format!("old-{length}"));
             fs::create_dir_all(old.join("artifacts")).unwrap();
@@ -630,7 +630,7 @@ mod delivery_tests {
 
     #[test]
     fn corrupt_prefix_cannot_be_blessed_by_valid_network_tail_hashes() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let old = owner.path().join("corrupt");
         fs::create_dir_all(old.join("artifacts")).unwrap();
         fs::write(old.join("artifacts/a"), b"corrupt-prefix").unwrap();
@@ -658,7 +658,7 @@ mod delivery_tests {
 
     #[test]
     fn resume_sources_never_authorize_execution_or_in_place_repair() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let old = owner.path().join("old");
         fs::create_dir(&old).unwrap();
         let source = ResumeSource::open(&old).unwrap();
@@ -686,7 +686,7 @@ mod delivery_tests {
 
     #[test]
     fn local_bytes_cannot_replace_missing_remote_result_or_retention_identity() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let old = owner.path().join("old");
         fs::create_dir(&old).unwrap();
         let source = ResumeSource::open(&old).unwrap();

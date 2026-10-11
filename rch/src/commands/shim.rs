@@ -2762,8 +2762,18 @@ esac
                 expected,
                 "{path}"
             );
+            // Native PATH lookup treats ~ literally. Some /bin/sh versions
+            // expand it while searching PATH, so they are not this oracle.
+            let actual = output_retrying_text_busy(
+                std::process::Command::new("cargo")
+                    .env_clear()
+                    .env("PATH", path)
+                    .env("HOME", dir.path())
+                    .current_dir(dir.path()),
+            );
+            assert!(actual.status.success(), "{path}: {actual:?}");
             assert_eq!(
-                shell_cargo_output(path.as_ref(), dir.path()),
+                String::from_utf8(actual.stdout).unwrap().trim(),
                 output,
                 "{path}"
             );

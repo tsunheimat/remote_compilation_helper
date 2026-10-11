@@ -1178,7 +1178,7 @@ mod tests {
     use super::*;
 
     fn generated_fixture() -> (tempfile::TempDir, DependencyActionPlan) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let cargo_home = dir.path().join("cargo-home");
         let source = cargo_home.join("registry/src/index/generated-1.0");
         let generated = dir.path().join("build-script/out");
@@ -1338,7 +1338,7 @@ mod tests {
     #[test]
     fn classic_cargo_layout_binds_the_run_record_beside_out_dir() {
         // Stable Cargo: target/<profile>/build/<pkg>-<hash>/{out,output,root-output}.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let unit = dir.path().join("build/anyhow-5c8e82dba5ceda6b");
         let out = unit.join("out");
         std::fs::create_dir_all(&out).unwrap();

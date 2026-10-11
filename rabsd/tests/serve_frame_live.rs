@@ -179,7 +179,7 @@ fn round_trip(stream: &mut UnixStream, line: &str) -> String {
 
 #[test]
 fn the_running_daemon_serves_a_committed_hit_over_the_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let state_dir = dir.path().to_path_buf();
     let artifact = b"the committed rlib, served over the wire".repeat(32);
     commit_one_action(&state_dir, &artifact);

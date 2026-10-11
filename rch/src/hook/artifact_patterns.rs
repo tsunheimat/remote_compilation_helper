@@ -820,7 +820,9 @@ mod profile_artifact_tests {
                 false,
             ),
         ] {
-            let root = tempfile::tempdir().unwrap().keep();
+            // Cargo reports physical executable paths, including macOS's
+            // /private/var identity for a tempdir reached through /var.
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
             let source = root.join("source project");
             let local_project = root.join("local project");
             std::fs::create_dir_all(source.join("src")).unwrap();

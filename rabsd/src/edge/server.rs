@@ -1378,7 +1378,7 @@ mod edge_liveness_tests {
         use crate::coord::prepared_operation::PreparedOperationStore;
         use serde_json::{Value, json};
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let root = temporary.path().join("operations");
         let store = PreparedOperationStore::open(&root).unwrap();
         let id = "0123456789abcdef0123456789abcdef";

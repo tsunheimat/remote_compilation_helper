@@ -180,6 +180,29 @@ jobs:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           # The real-Cargo build-dir fixture also executes cargo clippy.
           components: clippy
+      - name: Install Go for native recovery fixtures
+        if: runner.os == 'macOS'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.12'
+          cache: false
+      - name: Install native worker-command fixture prerequisites
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          brew install coreutils findutils
+          # Expose only timeout under its worker command name. Keep the host's
+          # BSD utilities in place; the Cygwin inventory fixture selects gfind.
+          rch_test_tools="$(mktemp -d "$RUNNER_TEMP/rch-test-tools.XXXXXX")"
+          ln -s "$(brew --prefix coreutils)/bin/gtimeout" "$rch_test_tools/timeout"
+          printf '%s\n' "$rch_test_tools" >> "$GITHUB_PATH"
+          "$rch_test_tools/timeout" --version
+          gfind --version
+          go version
+          openssl version -a
       - name: Install wrapper contract toolchain prerequisites
         run: |
           set -euo pipefail
@@ -252,15 +275,22 @@ jobs:
             rch_test_sampler_pid=$!
             trap 'rch_test_status=$?; trap - EXIT; kill "$rch_test_sampler_pid" 2>/dev/null || true; wait "$rch_test_sampler_pid" 2>/dev/null || true; exit "$rch_test_status"' EXIT
           fi
-          # Exercise the filesystem regression before unrelated workspace builds
-          # consume the job budget. Preserve both verdicts and still attempt the
-          # complete workspace after a fixture failure.
+          # Exercise focused regressions before the full workspace command.
+          # Preserve each verdict and still attempt the complete workspace
+          # after a fixture failure.
           rch_fixture_status=0
           cargo test --locked -p rabs-sandbox --test snapshot_capture_realfs -- --nocapture 2>&1 | tee target/test-logs/snapshot-capture-realfs.log || rch_fixture_status=$?
+          # Keep the full workspace's package selection for the native socket
+          # checks, including the Darwin peer-close assertion.
+          rch_command_status=0
+          cargo test --no-fail-fast ${{ matrix.cargo_args }} commands::helpers::daemon_command_tests -- --nocapture 2>&1 | tee target/test-logs/daemon-command.log || rch_command_status=$?
           rch_workspace_status=0
           cargo test --no-fail-fast ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log || rch_workspace_status=$?
           if (( rch_workspace_status != 0 )); then
             exit "$rch_workspace_status"
+          fi
+          if (( rch_command_status != 0 )); then
+            exit "$rch_command_status"
           fi
           exit "$rch_fixture_status"
       - name: Upload test logs on failure or cancellation
@@ -270,6 +300,7 @@ jobs:
           name: test-logs-${{ matrix.name }}
           path: |
             target/test-logs/snapshot-capture-realfs.log
+            target/test-logs/daemon-command.log
             target/test-logs/workspace-tests.log
             target/debug/deps/*.log
             **/test-output.log

@@ -224,6 +224,47 @@ impl Fixture {
     }
 }
 
+fn create_worktree_or_report_mac_filename_refusal(
+    parent: &Path,
+    name: &[u8],
+    representable_name: &str,
+) -> PathBuf {
+    let entries = || {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+            .collect::<BTreeSet<_>>()
+    };
+    let before = entries();
+    let workspace = parent.join(std::ffi::OsStr::from_bytes(name));
+    match std::fs::create_dir(&workspace) {
+        Ok(()) => workspace,
+        // Darwin EILSEQ is 92; other creation errors must still fail.
+        Err(error)
+            if cfg!(target_os = "macos")
+                && error.raw_os_error() == Some(92)
+                && std::str::from_utf8(name).is_err() =>
+        {
+            use std::io::Write as _;
+            assert_eq!(
+                entries(),
+                before,
+                "a refused raw filename must not create a lossy alias or substitute"
+            );
+            std::io::stderr()
+                .write_all(format!(
+                    "SKIP: non-UTF-8 subscriber directory {:?} installation not exercised: filesystem refused the name with Darwin EILSEQ (92); no substitute entry was created; byte-level dep-info derivation and installation continue through the explicit representable worktree {representable_name:?}\n",
+                    name
+                ).as_bytes())
+                .expect("write native filename refusal diagnostic");
+            let workspace = parent.join(representable_name);
+            std::fs::create_dir(&workspace).unwrap();
+            workspace
+        }
+        Err(error) => panic!("creating the subscriber worktree failed: {error}"),
+    }
+}
+
 #[test]
 fn two_subscribers_receive_metadata_library_and_correct_private_dep_info() {
     let fixture = Fixture::complete();
@@ -289,17 +330,34 @@ fn every_installed_output_respects_a_future_live_input_mtime() {
 
 #[test]
 fn non_utf8_subscriber_input_paths_survive_real_dep_info_installation() {
-    use std::os::unix::ffi::OsStringExt;
-    let fixture = Fixture::complete();
-    let workspace = fixture
-        .dir
-        .path()
-        .join(std::ffi::OsString::from_vec(b"workspace-\xff".to_vec()));
-    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    // The canonical dep-info keeps raw bytes even when a native subscriber
+    // filename is unavailable, so the real serving path must still translate it.
+    let fixture = Fixture::new(&[
+        (OutputRole::Materializable, "libunit.rlib", b"library\0\xff"),
+        (
+            OutputRole::DepInfo,
+            "unit.d",
+            b"/__rabs/out/unit/libunit.rmeta: /__rabs/workspace-\xfe/src/lib.rs\n\n/__rabs/workspace-\xfe/src/lib.rs:\n",
+        ),
+        (
+            OutputRole::ProvisionalMetadata,
+            "libunit.rmeta",
+            b"metadata\0\xfe",
+        ),
+    ]);
+    let canonical = fixture.location("unit.d");
+    let before = std::fs::read(&canonical).unwrap();
+    let workspace = create_worktree_or_report_mac_filename_refusal(
+        fixture.dir.path(),
+        b"workspace-\xff",
+        "representable workspace #",
+    );
+    std::fs::create_dir(workspace.join("src")).unwrap();
     std::fs::write(workspace.join("src/lib.rs"), b"pub fn value() {}\n").unwrap();
     let root = fixture.dir.path().join("raw-source-target");
     let mut expected = fixture.expected(&root);
     if let ExpectedOutputs::WithDepInfo { mappings, .. } = &mut expected {
+        mappings[0].0 = b"/__rabs/workspace-\xfe".to_vec();
         mappings[0].1 = workspace.as_os_str().as_bytes().to_vec();
     }
     assert!(matches!(
@@ -312,6 +370,7 @@ fn non_utf8_subscriber_input_paths_survive_real_dep_info_installation() {
     assert!(parsed.lines.iter().any(|line| matches!(line,
         rabsd::edge::dep_info::DepInfoLine::Rule { deps, .. } if deps.contains(&wanted)
     )));
+    assert_eq!(std::fs::read(canonical).unwrap(), before);
 }
 
 #[test]
@@ -465,7 +524,6 @@ fn relative_fixture(dep_info: &[u8]) -> Fixture {
 #[test]
 fn relative_dep_info_serves_two_worktrees_without_mutating_the_shared_cas_object() {
     use rabsd::edge::dep_info::{DepInfoLine, parse_dep_info};
-    use std::os::unix::ffi::OsStringExt;
 
     let fixture = relative_fixture(RELATIVE_DEP);
     let canonical = fixture.location("unit.d");
@@ -473,11 +531,12 @@ fn relative_dep_info_serves_two_worktrees_without_mutating_the_shared_cas_object
     let before_mtime = std::fs::metadata(&canonical).unwrap().modified().unwrap();
     let mut deliveries = Vec::new();
     for name in [&b"first worktree#"[..], &b"second worktree-\xff"[..]] {
-        let cwd = fixture
-            .dir
-            .path()
-            .join(std::ffi::OsString::from_vec(name.to_vec()));
-        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        let cwd = create_worktree_or_report_mac_filename_refusal(
+            fixture.dir.path(),
+            name,
+            "second representable worktree #$",
+        );
+        std::fs::create_dir(cwd.join("src")).unwrap();
         let source = cwd.join("src/lib.rs");
         std::fs::write(&source, b"pub fn value() {}\n").unwrap();
         let floor = UNIX_EPOCH + Duration::from_secs(2_000_000_000);

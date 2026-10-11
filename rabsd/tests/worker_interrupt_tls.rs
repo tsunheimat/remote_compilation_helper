@@ -164,6 +164,16 @@ impl Certificates {
     fn new() -> Self {
         let owner = tempfile::tempdir().unwrap();
         let root = owner.path();
+        // Keep host defaults from duplicating the CA extensions on OpenSSL 1.1.1.
+        fs::write(
+            root.join("request.cnf"),
+            "[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ca\n\
+             [dn]\nCN=RABS signal test fixture\n\
+             [ca]\nbasicConstraints=critical,CA:TRUE\n\
+             keyUsage=critical,keyCertSign,cRLSign\n\
+             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n",
+        )
+        .unwrap();
         let openssl = |args: &[&str]| {
             let output = Command::new("openssl")
                 .args(args)
@@ -178,6 +188,8 @@ impl Certificates {
         };
         openssl(&[
             "req",
+            "-config",
+            "request.cnf",
             "-x509",
             "-newkey",
             "rsa:2048",
@@ -191,10 +203,6 @@ impl Certificates {
             "ca.key",
             "-out",
             "ca.pem",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
         ]);
         for (name, usage, serial) in [("server", "serverAuth", "2"), ("worker", "clientAuth", "3")]
         {
@@ -204,6 +212,8 @@ impl Certificates {
             let ext = format!("{name}.ext");
             openssl(&[
                 "req",
+                "-config",
+                "request.cnf",
                 "-new",
                 "-newkey",
                 "rsa:2048",

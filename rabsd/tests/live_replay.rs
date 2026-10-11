@@ -60,7 +60,8 @@ fn replay_budget_fixture() -> (
     Arc<CoordLive>,
     OfferPreparedActionResult,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    // Keep owned fixture paths aligned with canonical CAS and serving paths.
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
     let authority = coord
@@ -393,7 +394,7 @@ fn live_edge_replay_uses_completed_comparisons_and_blocks_divergence() {
     use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
     use rabsd::coord::live::{ReplayRefusal, ServeError};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
     let authority = coord.acquire_boot_authority("live-replay-fixture").unwrap();
@@ -611,7 +612,7 @@ fn live_manifest_fixture() -> (
     CoordLive,
     OfferPreparedActionResult,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord.acquire_boot_authority("manifest-fixture").unwrap();

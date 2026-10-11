@@ -94,16 +94,34 @@ fn exec_preserves_non_utf8_argv_and_compiler_path() {
     let raw_compiler = dir
         .path()
         .join(OsString::from_vec(b"compiler-\xff".to_vec()));
-    std::fs::copy(&compiler, &raw_compiler).unwrap();
     let raw_arg = OsString::from_vec(b"source-\xfe.rs".to_vec());
-    let cases = [
-        (
-            &compiler,
-            vec![raw_arg.clone(), OsString::new(), "café".into()],
-        ),
-        (&raw_compiler, vec!["source.rs".into()]),
-        (&raw_compiler, vec![raw_arg]),
-    ];
+    let mut cases = vec![(
+        &compiler,
+        vec![raw_arg.clone(), OsString::new(), "café".into()],
+    )];
+    match std::fs::copy(&compiler, &raw_compiler) {
+        Ok(_) => {
+            cases.push((&raw_compiler, vec!["source.rs".into()]));
+            cases.push((&raw_compiler, vec![raw_arg]));
+        }
+        // Darwin EILSEQ is 92; qualify only the native filename subcase.
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(92) => {
+            use std::io::Write as _;
+            assert_eq!(
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>(),
+                vec![OsString::from("compiler")],
+                "a refused raw filename must not create a lossy alias or substitute"
+            );
+            std::io::stderr()
+                .write_all(b"SKIP: non-UTF-8 compiler filename execution not exercised: filesystem refused the name with Darwin EILSEQ (92); no substitute entry was created; raw, empty and UTF-8 argv still execute through the representable compiler\n")
+                .expect("write native filename refusal diagnostic");
+        }
+        Err(error) => panic!("creating the non-UTF-8 compiler filename failed: {error}"),
+    }
 
     for (executable, args) in cases {
         let direct = Command::new(executable).args(&args).output().unwrap();

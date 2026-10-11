@@ -105,6 +105,139 @@ impl Daemon {
             .filter(|value| value["kind"] == "rabsd-live-dependency")
             .collect()
     }
+
+    fn warmup_diagnostics(&self, world: &World) -> String {
+        let request_env = world.env("leaf");
+        // These names are retained verbatim by dependency-env-v1. Report only
+        // this toolchain-relevant projection, never the full request environment.
+        let toolchain_env: std::collections::BTreeMap<_, _> = [
+            "PATH",
+            "HOME",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "LD_LIBRARY_PATH",
+            "OUT_DIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+        ]
+        .into_iter()
+        .map(|name| {
+            let value = request_env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| bounded_diagnostic(value, 512));
+            (name, value)
+        })
+        .collect();
+        format!(
+            "compiler={:?}; constructed_toolchain_env_projection={toolchain_env:?}; {}",
+            bounded_diagnostic(&world.rustc.display().to_string(), 1024),
+            log_tail_diagnostics(&self.log)
+        )
+    }
+}
+
+fn bounded_diagnostic(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{} [TRUNCATED: {} additional bytes]",
+        &text[..end],
+        text.len() - end
+    )
+}
+
+fn diagnostic_log_record(record: &serde_json::Value) -> String {
+    let projected: serde_json::Map<_, _> =
+        ["kind", "decision", "crate", "reason", "detail", "compiler"]
+            .into_iter()
+            .filter_map(|name| {
+                record.get(name).map(|value| {
+                    let value = value.as_str().map_or_else(
+                        || "[non-string diagnostic field omitted]".to_owned(),
+                        |text| bounded_diagnostic(text, 512),
+                    );
+                    (name.to_owned(), serde_json::Value::String(value))
+                })
+            })
+            .collect();
+    bounded_diagnostic(&serde_json::Value::Object(projected).to_string(), 1024)
+}
+
+fn log_tail_diagnostics(path: &Path) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    const MAX_TAIL_BYTES: u64 = 8 * 1024;
+    const MAX_RECORDS: usize = 16;
+
+    let tail = (|| -> std::io::Result<_> {
+        let mut file = std::fs::File::open(path)?;
+        let start = file.metadata()?.len().saturating_sub(MAX_TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_TAIL_BYTES).read_to_end(&mut bytes)?;
+        Ok((start, bytes))
+    })();
+    let (start, bytes) = match tail {
+        Ok(tail) => tail,
+        Err(error) => {
+            return format!(
+                "rabsd.log tail read failed: {}",
+                bounded_diagnostic(&error.to_string(), 512)
+            );
+        }
+    };
+    let mut decisions = std::collections::VecDeque::new();
+    let mut decision_count = 0_usize;
+    let mut parse_errors = std::collections::VecDeque::new();
+    let mut parse_error_count = 0_usize;
+    let mut lines = Vec::new();
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(record) => {
+                let projected = diagnostic_log_record(&record);
+                if record["kind"] == "rabsd-live-dependency" {
+                    decision_count += 1;
+                    if decisions.len() == MAX_RECORDS {
+                        decisions.pop_front();
+                    }
+                    decisions.push_back(projected.clone());
+                }
+                lines.push(format!("tail line {index}: {projected}"));
+            }
+            Err(error) => {
+                let detail = bounded_diagnostic(
+                    &format!(
+                        "tail line {index}: JSON parse failed: {error}; {} raw bytes omitted (unparsed fields may contain keys/environment; boundary records may be truncated)",
+                        line.len()
+                    ),
+                    512,
+                );
+                parse_error_count += 1;
+                if parse_errors.len() == MAX_RECORDS {
+                    parse_errors.pop_front();
+                }
+                parse_errors.push_back(detail.clone());
+                lines.push(detail);
+            }
+        }
+    }
+    format!(
+        "rabsd.log tail: read={} bytes at offset={start}; earlier_log_bytes_omitted={start}; recent_unfiltered_decisions_available_in_tail={decisions:?}; earlier_decision_records_in_tail_omitted={}; JSON_parse_errors={parse_errors:?}; earlier_parse_errors_in_tail_omitted={}; projected_log_tail (keys/environment omitted)={}",
+        bytes.len(),
+        decision_count.saturating_sub(MAX_RECORDS),
+        parse_error_count.saturating_sub(MAX_RECORDS),
+        bounded_diagnostic(&lines.join("\n"), 8 * 1024)
+    )
 }
 
 impl Drop for Daemon {
@@ -459,7 +592,11 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
             trail.iter().all(|step| step == "toolchain-warming"),
             "unexpected decisions while warming: {trail:?}"
         );
-        assert!(Instant::now() < deadline, "toolchain probe never warmed");
+        assert!(
+            Instant::now() < deadline,
+            "toolchain probe never warmed: {}",
+            daemon.warmup_diagnostics(&world)
+        );
         std::thread::sleep(Duration::from_millis(250));
     };
     let key = daemon
@@ -629,7 +766,11 @@ fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_c
             decisions.iter().all(|step| step == "toolchain-warming"),
             "unexpected decisions while warming: {decisions:?}"
         );
-        assert!(Instant::now() < deadline, "toolchain probe never warmed");
+        assert!(
+            Instant::now() < deadline,
+            "toolchain probe never warmed: {}",
+            daemon.warmup_diagnostics(&world)
+        );
         std::thread::sleep(Duration::from_millis(250));
     };
     let key = daemon

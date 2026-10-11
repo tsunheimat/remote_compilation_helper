@@ -57,10 +57,23 @@ struct Certificates {
 impl Certificates {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
+        // OpenSSL 1.1.1 appends -addext values to host-configured extensions,
+        // which can duplicate basicConstraints. Own the request configuration.
+        fs::write(
+            root.path().join("request.cnf"),
+            "[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ca\n\
+             [dn]\nCN=RABS test fixture\n\
+             [ca]\nbasicConstraints=critical,CA:TRUE\n\
+             keyUsage=critical,keyCertSign,cRLSign\n\
+             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n",
+        )
+        .unwrap();
         openssl(
             root.path(),
             &[
                 "req",
+                "-config",
+                "request.cnf",
                 "-x509",
                 "-newkey",
                 "rsa:2048",
@@ -74,10 +87,6 @@ impl Certificates {
                 "ca.key",
                 "-out",
                 "ca.pem",
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-                "-addext",
-                "keyUsage=critical,keyCertSign,cRLSign",
             ],
         );
         for (name, usage, serial) in [("server", "serverAuth", "2"), ("worker", "clientAuth", "3")]
@@ -90,6 +99,8 @@ impl Certificates {
                 root.path(),
                 &[
                     "req",
+                    "-config",
+                    "request.cnf",
                     "-new",
                     "-newkey",
                     "rsa:2048",

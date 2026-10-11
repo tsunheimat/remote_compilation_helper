@@ -981,7 +981,7 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
     // The first path in RABS by which a cache hit becomes files on disk
     // (bd-iy2e0): gate -> reload the committed manifest from CAS bytes
     // -> materialize its outputs into a live worktree.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord
@@ -1102,7 +1102,7 @@ fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
 
     const BUILD: &str = "rabsd-build-under-test";
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
 
     // One committed, servable action to ask about.
@@ -1343,7 +1343,7 @@ fn a_hit_whose_outputs_differ_from_the_callers_work_is_refused() {
     // that work would produce. If the committed result produces anything
     // else, serving it would hand back a build missing files it was
     // promised — so it is not a hit, and not a single byte is written.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord

@@ -333,7 +333,7 @@ fn t004_the_harness_rejects_a_child_that_did_not_crash_where_it_was_told() {
     // and the commit and then panics instead of reaching `die_at`, so
     // it exits with a code rather than a signal and writes no sentinel.
     // `crash_at` must reject that.
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).expect("tempdir");
     let outcome = std::panic::catch_unwind(|| {
         crash_at("no-such-phase", dir.path());
     });
@@ -351,7 +351,9 @@ fn t004_the_harness_rejects_a_child_that_did_not_crash_where_it_was_told() {
 #[test]
 fn t004_every_publication_phase_survives_a_real_process_death() {
     for phase in PHASES {
-        let dir = tempfile::tempdir().expect("tempdir");
+        // The served phase must use a root without macOS's /var symlink.
+        let dir =
+            tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).expect("tempdir");
         let state_dir = dir.path().to_path_buf();
 
         crash_at(phase, &state_dir);
@@ -461,7 +463,8 @@ fn t004_a_retry_after_a_crash_converges_and_never_double_commits() {
     // a process-local id would pass H015's in-process retry and fail
     // here.
     for phase in [PHASE_UPLOADED, PHASE_COMMITTED] {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir =
+            tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).expect("tempdir");
         let state_dir = dir.path().to_path_buf();
 
         crash_at(phase, &state_dir);

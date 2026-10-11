@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn normal_executor_shutdown_yields_while_owned_threads_finish() {
         use std::task::Poll;
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let store = PreparedOperationStore::open(&root.path().join("operations")).unwrap();
         let (release, wait) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
