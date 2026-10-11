@@ -63,6 +63,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           shared-key: test-release-${{ matrix.target }}
           cache-on-failure: true
 

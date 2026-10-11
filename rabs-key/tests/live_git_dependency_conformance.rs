@@ -83,26 +83,42 @@ fn object_file(path: &Path) -> rabs_protocol::result_identity::TypedDigest {
 
 fn real_toolchain(plan: &DependencyActionPlan) -> ToolchainFacts {
     use rabs_key::canonical::CanonicalEncoder;
-    let compiler = Path::new(&plan.compiler);
-    let sysroot = compiler.parent().unwrap().parent().unwrap();
     let run = |args: &[&str]| {
         checked(
-            Command::new(compiler)
+            Command::new(&plan.compiler)
                 .args(args)
                 .env_clear()
                 .envs(plan.execution_env.iter().map(|(name, value)| (name, value))),
         )
     };
-    assert_eq!(
+    // Stock Cargo can record a PATH command such as `rustc`, including a
+    // rustup proxy. Ask that compiler for its actual toolchain before hashing
+    // the compiler bytes; neither a relative name nor the proxy owns a sysroot.
+    let sysroot = PathBuf::from(
         String::from_utf8(run(&["--print", "sysroot"]).stdout)
             .unwrap()
             .trim(),
-        sysroot.to_str().unwrap()
     );
+    assert!(
+        sysroot.is_absolute(),
+        "compiler returned a relative sysroot"
+    );
+    let compiler = sysroot.join("bin/rustc");
     let verbose_version = String::from_utf8(run(&["-vV"]).stdout)
         .unwrap()
         .trim_end()
         .to_owned();
+    let direct_version = checked(
+        Command::new(&compiler)
+            .arg("-vV")
+            .env_clear()
+            .envs(plan.execution_env.iter().map(|(name, value)| (name, value))),
+    );
+    assert_eq!(
+        String::from_utf8(direct_version.stdout).unwrap().trim_end(),
+        verbose_version,
+        "the recorded compiler must resolve to the hashed toolchain"
+    );
     let mut runtime_paths: Vec<_> = std::fs::read_dir(sysroot.join("lib"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -126,7 +142,7 @@ fn real_toolchain(plan: &DependencyActionPlan) -> ToolchainFacts {
                 pending.push(path);
             } else if meta.is_file() {
                 tree.push((
-                    path.strip_prefix(sysroot)
+                    path.strip_prefix(&sysroot)
                         .unwrap()
                         .to_str()
                         .unwrap()
@@ -143,7 +159,7 @@ fn real_toolchain(plan: &DependencyActionPlan) -> ToolchainFacts {
         enc.str(&path).str(digest.domain).bytes(&digest.bytes);
     }
     ToolchainFacts {
-        compiler_binary_digest: object_file(compiler),
+        compiler_binary_digest: object_file(&compiler),
         verbose_version,
         sysroot_root_digest: rabs_key::typed_digest::compute(
             "rabs.live-dependency.sysroot-tree.v1",

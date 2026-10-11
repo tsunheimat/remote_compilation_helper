@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tracing::Subscriber;
 use tracing_subscriber::{
@@ -212,7 +213,16 @@ where
 {
     let filter = config.env_filter();
     let (writer, file_guard) = build_writer(config)?;
-    let ansi = file_guard.is_none();
+    let console_is_terminal = if config.use_stderr {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    };
+    let ansi = file_guard.is_none()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("FORCE_COLOR").map_or(console_is_terminal, |value| {
+            crate::ui::context::force_color_enables(&value)
+        });
     let subscriber = build_subscriber(config, writer, ansi, filter, layer);
     finish_subscriber(subscriber, file_guard, allow_already_initialized)
 }
@@ -340,6 +350,85 @@ mod tests {
             _context: tracing_subscriber::layer::Context<'_, Registry>,
         ) {
             self.0.lock().unwrap().push(event.metadata().target());
+        }
+    }
+
+    #[test]
+    fn console_logging_honors_color_controls_in_all_formats() {
+        const CHILD_FORMAT: &str = "RCH_TEST_LOG_COLOR_CHILD_FORMAT";
+        const CHILD_STREAM: &str = "RCH_TEST_LOG_COLOR_CHILD_STREAM";
+        const MESSAGE: &str = "console logging color regression marker";
+        if let Ok(format) = std::env::var(CHILD_FORMAT) {
+            let config = LogConfig {
+                format: LogFormat::parse(&format).unwrap(),
+                use_stderr: std::env::var(CHILD_STREAM).unwrap() == "stderr",
+                ..LogConfig::default()
+            };
+            let _guards = init_logging(&config).unwrap();
+            tracing::info!("{MESSAGE}");
+            return;
+        }
+
+        // Each child initializes the real process-global subscriber without
+        // changing the environment or subscriber of other parallel tests.
+        for stream in ["stderr", "stdout"] {
+            for format in ["pretty", "compact", "json"] {
+                for (force_color, force_enables) in [
+                    (None, false),
+                    (Some("1"), true),
+                    (Some(""), true),
+                    (Some("0"), false),
+                    (Some("false"), false),
+                    (Some(" FaLsE "), false),
+                ] {
+                    for no_color in [None, Some(""), Some("1"), Some("0")] {
+                        let case = format!(
+                            "{stream}, {format}, FORCE_COLOR={force_color:?}, NO_COLOR={no_color:?}"
+                        );
+                        let mut child =
+                            std::process::Command::new(std::env::current_exe().unwrap());
+                        child
+                            .args([
+                                "--exact",
+                                "logging::tests::console_logging_honors_color_controls_in_all_formats",
+                                "--nocapture",
+                            ])
+                            .env(CHILD_FORMAT, format)
+                            .env(CHILD_STREAM, stream)
+                            .env_remove("RUST_LOG")
+                            .env_remove("FORCE_COLOR")
+                            .env_remove("NO_COLOR");
+                        if let Some(value) = force_color {
+                            child.env("FORCE_COLOR", value);
+                        }
+                        if let Some(value) = no_color {
+                            child.env("NO_COLOR", value);
+                        }
+                        let output = child.output().unwrap();
+                        let stdout = String::from_utf8(output.stdout).unwrap();
+                        let stderr = String::from_utf8(output.stderr).unwrap();
+                        assert!(output.status.success(), "{case}: {stdout}\n{stderr}");
+                        let (diagnostics, other) = if stream == "stderr" {
+                            (&stderr, &stdout)
+                        } else {
+                            (&stdout, &stderr)
+                        };
+                        let diagnostic = diagnostics
+                            .lines()
+                            .find(|line| line.contains(MESSAGE))
+                            .unwrap_or_else(|| panic!("{case}: missing diagnostic: {diagnostics}"));
+                        assert_eq!(
+                            diagnostic.contains('\u{1b}'),
+                            no_color.is_none() && force_enables && format != "json",
+                            "{case}: {diagnostic}"
+                        );
+                        assert!(
+                            !other.contains(MESSAGE),
+                            "{case}: diagnostics must stay on the configured stream"
+                        );
+                    }
+                }
+            }
         }
     }
 

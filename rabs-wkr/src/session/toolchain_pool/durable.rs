@@ -30,13 +30,24 @@ const LOCK: &str = ".toolchain-cache-v1.lock";
 const OBJECTS: &str = "toolchains-v1";
 const PENDING: &str = ".pending-";
 
+struct CacheLock(File);
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        // All execution leases retain the DurableCache through Arc. Once that
+        // owner ends, a descriptor inherited by an unrelated fork must not
+        // extend exclusivity until the child eventually execs or exits.
+        let _ = self.0.unlock();
+    }
+}
+
 pub(super) struct DurableCache {
     root: PathBuf,
     root_handle: File,
     objects_handle: File,
     // Remains locked while ANY execution lease owns this cache, not merely
     // while its supervisor is present in the process-global weak registry.
-    _lock: File,
+    _lock: CacheLock,
     max_bytes: u64,
     max_entries: usize,
     writer: Mutex<()>,
@@ -276,6 +287,7 @@ impl DurableCache {
         lock.try_lock().map_err(|error| {
             io::Error::other(format!("persistent toolchain cache already owned: {error}"))
         })?;
+        let lock = CacheLock(lock);
         require(
             same_file(&opened, &fs::symlink_metadata(&lock_path)?),
             "persistent cache lock replaced during acquisition",
@@ -295,7 +307,7 @@ impl DurableCache {
         }
         private_directory(&objects)?;
         let objects_handle = File::open(&objects)?;
-        lock.sync_all()?;
+        lock.0.sync_all()?;
         objects_handle.sync_all()?;
         root_handle.sync_all()?;
         let cache = Self {

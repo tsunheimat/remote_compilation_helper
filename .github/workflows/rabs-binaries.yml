@@ -67,6 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           shared-key: rabs-release-gates
           cache-on-failure: true
       - name: Install bubblewrap (worker capability + sandbox tests)

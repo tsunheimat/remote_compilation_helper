@@ -118,6 +118,17 @@ fn durable_pool_reopens_exact_inodes_without_the_original_installation() {
 fn the_last_execution_lease_keeps_the_durable_store_exclusively_owned() {
     let f = Fixture::new();
     let pool = f.pool();
+    // Keep the descriptor lifetime of an unrelated fork separate from the
+    // cache's real execution leases. The last lease must remain the owner.
+    let inherited = pool
+        .directory
+        .1
+        .as_ref()
+        .unwrap()
+        ._lock
+        .0
+        .try_clone()
+        .unwrap();
     let lease = pool
         .acquire(&f.source, Some(&f.identity), || false)
         .unwrap();
@@ -132,6 +143,8 @@ fn the_last_execution_lease_keeps_the_durable_store_exclusively_owned() {
     );
     let reopened = f.pool();
     assert!(reopened.lookup(&f.identity, || false).unwrap().is_some());
+    drop(inherited);
+    assert!(ToolchainPool::with_directory(1024, 8, Some(&f.cache)).is_err());
 }
 
 #[test]

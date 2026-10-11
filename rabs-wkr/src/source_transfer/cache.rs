@@ -114,6 +114,17 @@ struct Entry {
     used: SystemTime,
 }
 
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // An unrelated concurrent fork can briefly inherit the descriptor
+        // before CLOEXEC takes effect. Completion, not its last close, ends
+        // this writer's exclusive access to the optional cache.
+        let _ = self.0.unlock();
+    }
+}
+
 /// A path is only configuration, never an input capability. The cache owns a
 /// dedicated namespace below an explicitly configured private directory.
 #[derive(Debug, Clone)]
@@ -178,7 +189,7 @@ impl SourceCache {
         Some(bytes)
     }
 
-    fn writer(&self) -> io::Result<Option<File>> {
+    fn writer(&self) -> io::Result<Option<WriterLock>> {
         private_directory(&self.root)?;
         let path = self.root.join("lock");
         match fs::symlink_metadata(&path) {
@@ -200,7 +211,7 @@ impl SourceCache {
             return Err(invalid("source cache lock identity changed"));
         }
         match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
+            Ok(()) => Ok(Some(WriterLock(file))),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => Err(error),
         }
@@ -466,6 +477,10 @@ mod tests {
         let expected = &source.manifest().files()[0];
         let cache = SourceCache::open(parent.path()).unwrap();
         let lock = cache.writer().unwrap().unwrap();
+        // A concurrent fork can retain this same open file description until
+        // exec even though the descriptor has CLOEXEC. Keep a duplicate alive
+        // through the next upload to exercise that scheduling boundary.
+        let inherited = lock.0.try_clone().unwrap();
         assert_eq!(cache.remember(&source).unwrap(), 0);
         fs::write(cache.root.join(INCOMING), b"torn").unwrap();
         assert!(cache.load(expected).is_none());
@@ -473,6 +488,7 @@ mod tests {
         assert_eq!(cache.remember(&source).unwrap(), 1);
         assert!(!cache.root.join(INCOMING).exists());
         assert_eq!(cache.load(expected).unwrap(), b"good");
+        drop(inherited);
     }
 
     #[test]

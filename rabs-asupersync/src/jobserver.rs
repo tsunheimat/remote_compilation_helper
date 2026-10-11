@@ -323,6 +323,31 @@ mod tests {
     #[test]
     fn fifo_preload_counts_transferables_not_the_implicit_slot() {
         use std::os::unix::fs::OpenOptionsExt;
+        const CHILD: &str = "RABS_FIFO_PRELOAD_TEST_CHILD";
+        const COMPLETE: &str = "FIFO preload and EOF assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            // CLOEXEC does not prevent an unrelated parallel test's fork from
+            // retaining our writer before exec. Give the immediate EOF check
+            // a process that owns all launches and FIFO descriptors it tests.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "jobserver::tests::fifo_preload_counts_transferables_not_the_implicit_slot",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stderr.contains(COMPLETE),
+                "FIFO child did not complete its assertions: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                stderr
+            );
+            return;
+        }
         for tokens in [0, 1, 3, MAX_FIFO_TOKENS] {
             let directory = tempfile::tempdir().unwrap();
             let (path, mut writer, auth) = mint_fifo_jobserver(tokens, directory.path()).unwrap();
@@ -351,6 +376,7 @@ mod tests {
             drop(writer);
             assert_eq!(reader.read(&mut [0]).unwrap(), 0, "closed FIFO reaches EOF");
         }
+        eprintln!("{COMPLETE}");
     }
 
     #[test]

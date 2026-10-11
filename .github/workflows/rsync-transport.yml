@@ -58,6 +58,8 @@ jobs:
           toolchain: nightly-2026-06-06
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check transfer targets

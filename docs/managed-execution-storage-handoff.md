@@ -1,6 +1,6 @@
 # Managed execution storage: local Codex handoff
 
-Snapshot: 2026-10-09 UTC, local development continuation. Consumer: the draft PR
+Snapshot: 2026-10-11 UTC, local development continuation. Consumer: the draft PR
 reviewer and the user's next local session. The user requested continued
 development and said they will deploy later. Keep PR #2 draft. Deployment and
 live worker/Nexus acceptance remain with the user. Windows-specific repair and
@@ -22,6 +22,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published runtime repair batch: `45bfad2716b73dde524dc02bc376731a0f1fbf1a`
 - Published CI repair baseline: `e061220552d3d5465107b6f22e1e07f61469cf30`
 - Published profiling/toolchain repairs: `1c56ce1d9c5565acc295d622fa1e1d0933e10594`
+- Published toolchain/hook repair baseline: `968f1b16788cdb2a6355e7f58223605e46fc480c`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -48,12 +49,119 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
-## Current repair batch after `1c56ce1d`
+## Current repair batch after `968f1b1`
 
-All six workflows at `1c56ce1d` are terminal. The current batch addresses the
+All six workflows at `968f1b1` are terminal. The current changes address the
+remaining core E2E failures and defects exposed by the first complete local
+workspace runs. The native macOS hook repair is now confirmed at that published
+revision. Local validation of this patch is complete below, with failures
+retained. Current-source CI and full acceptance remain open; the PR stays draft.
+
+- Shared logging now follows the configured console stream's terminal status,
+  honors `FORCE_COLOR`, and lets any present `NO_COLOR` value disable color.
+  JSON and file logging retain their plain output. The original core CI failure
+  was colored debug output with `NO_COLOR`; the subsequent stream check also
+  caught colored piped output without an override. Both conditions are covered.
+- Source-cache writers explicitly unlock when their owner finishes. Durable
+  toolchain caches explicitly unlock after their last execution lease ends.
+  An unrelated child that briefly inherits a descriptor before `exec` no longer
+  extends either lock's ownership. Regression cases retain duplicate descriptors
+  across the owner transition and still enforce active-owner exclusion, verified
+  bytes, and exclusion by a newly opened owner. Managed execution-storage leases
+  intentionally inherited by descendants retain their existing behavior.
+- The FIFO preload test runs its existing assertions in an isolated child, with
+  both successful exit and a completion marker required. Counts 0, 1, 3 and 4096,
+  token return, immediate `WouldBlock`, and immediate EOF remain checked. A
+  failed `mkfifo` control also fails the parent test.
+- The live Cargo fixture asks the recorded compiler for its sysroot before
+  hashing the actual compiler and runtime files. It supports Cargo recording
+  `rustc` or a rustup proxy, and verifies that the direct compiler's verbose
+  version matches. Both real-Cargo cases pass with native-toolchain-first and
+  rustup-first PATH configurations; hashes and contract assertions remain.
+- Daemon-stop tests serialize only CLI-file preparation through successful
+  process spawn. A parallel fork can otherwise inherit another fixture's writable
+  executable handle and cause `ETXTBSY`. The lifecycle requests, socket identity,
+  refusal, unsafe-command, and original timeout assertions remain concurrent.
+- Nineteen Rust cache steps now include the root `Cargo.toml` hash in their key
+  prefix. The pinned cache action derives package manifests from Cargo metadata,
+  which omits this virtual-workspace root; the prior CI restored an exact cache
+  key despite the changed development profile and then declined to save it.
+  Core E2E also puts its built release binaries on PATH, which the two reliability
+  scripts require. Workflow parsing and semantic comparison confirm these are
+  the only workflow changes; test commands, budgets and enabled jobs are intact.
+
+The preceding full run failed the full-toolchain acquisition deadline and the
+daemon fixture's `ETXTBSY` launch. Its raw results remain separate from the final
+run below, which uses August nightly, ordinary Cargo profiles, two compiler jobs,
+the complete installed toolchain, and the original test parallelism and limits.
+
+| Final local validation | Observed result |
+| --- | --- |
+| Full default-feature workspace run | All 12,143 collected cases match 225 harness summaries: 12,110 reported passes, two failures, 31 ignored, zero filtered. The failures are the toolchain acquisition deadline and hook timing against the retained older release CLI, detailed below. |
+| Affected native regressions | All six daemon-stop cases passed, including the former `ETXTBSY` failure. FIFO, source-cache, durable-cache, real-Cargo compiler resolution, managed-storage integration, and both Go recovery cases passed in the full run. |
+| Console output | All 46 logging tests passed, including 144 actual child-process format/stream/environment combinations. The regression failed before the production repair. All 48 rebuilt CLI terminal/pipe controls passed; the older implementation failed ten of them. |
+| Affected shell checks | Stream isolation and both reliability scripts passed. The reliability scripts recorded 19 and 44 native passes respectively, with no failures or ignored cases; their filters overlap, so these are not 63 distinct cases. |
+| Required compiler checks | Locked workspace/all-target check, Clippy with warnings denied, and formatting passed. |
+| Rebuilt release CLI | The unchanged 13-case hook integration harness passed with no skips or filters. Its 20 timing samples averaged 2 ms under the unchanged 25 ms limit. |
+
+Eight reported workspace passes took explicit capability-skip paths: two
+delegated-cgroup cases, two signing-tool cases, three live-worker cases and one
+infrastructure smoke case. These do not establish live acceptance. All Rust,
+Cargo and workflow inputs remained unchanged throughout validation; only this
+handoff changed while the full run was executing.
+
+The full run's hook timing failure measured 130 ms against the 25 ms limit.
+That harness resolves `release/rch`, independently of Cargo's freshly built
+debug CLI. Its retained release executable was from October 9. The same binary
+subsequently passed all 13 cases at a 6 ms mean, before rebuilding; the current
+release CLI then passed at 2 ms. Both binaries, the unchanged harness identity,
+and all timing records are retained. This establishes variation between runs,
+not its cause or a performance improvement. The fresh release check does not
+erase either failure from the complete workspace run.
+
+The large-toolchain timeout remains open locally. The original three-case
+artifact harness reproduces it with the complete installed August toolchain
+and unchanged 30/60-second controls. Profiling now attributes most work to
+filesystem operations. Neither a second NFS-backed ext4 image nor a direct
+local-ext4 scratch directory resolved it in paired runs; the latter also had
+one 60-second compiler case time out. Retain these failures. No dataset
+exclusions, integrity-barrier changes or deadline increases were made.
+
+The current seven-file UBS scan returned exit zero and zero critical findings;
+322 warnings and 176 informational records are retained. Its eleven added-line
+records were reviewed as test assertions, fixture-lock failure propagation,
+bounded test labels, the fixed-argument child launch, and a path-string false
+positive. Scanner inputs and the six workflow hashes match the current source.
+Earlier broader-scope findings remain open; no all-scope scanner pass or scanner
+Cargo/AST/ShellCheck phase is claimed.
+
+| Terminal CI at `968f1b1` | Observed result |
+| --- | --- |
+| [CI 38001161692](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38001161692) | All-target/all-feature check, strict Clippy, docs, format, workflow/manifest/security guards and benchmarks passed. The four test jobs and coverage reached their existing 30-minute limits. No complete workspace or coverage verdict was produced. |
+| Core CI E2E | 164 reported native passes included 92 archived capability-skip records. Shell checks recorded seven passes, two skips and three failures before timeout: the two missing-PATH reliability scripts and the debug-color stream check repaired above. |
+| [E2E 38001161690](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38001161690) | Linux and macOS each completed all 41 discovered scripts. Each inner suite recorded 11 passes and two capability skips. The native macOS hook's 50 samples averaged 4.369 ms under the unchanged 10 ms mean limit. |
+| [Test Release 38001161789](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38001161789) | All five Unix package jobs passed; archive checksums, the exact three executables and executable modes were verified. Windows failed the deferred non-Unix import; aggregate verification was skipped. |
+| [RABS 38001161695](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38001161695) | Both jobs passed: 42 accepted-hit cases and 13 release-gate cases. Wrapper size was 443,456 bytes and enforced p95 was 8,325 microseconds under the unchanged 10 ms limit. |
+| [Rsync 38001161709](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38001161709) | Both jobs passed, including 64 native transfer cases. All 1,390 archived Git blobs and modes match the named head. |
+
+Dependabot automerge was skipped. Current evidence under the retained validation
+base includes `rch-ci-head968-monitor-ZuwWCDey/`,
+`rch-full-workspace-post968-repairs-lit9mkh6/`,
+`rch-full-workspace-final-repairs-7674usti/`,
+`rch-release-hook-final-control-9frhqqby/`,
+`rch-logging-terminal-regression-k04bs_b5/`,
+`rch-artifact-capture-profile-0rlbs9t9/`, and
+`rch-local-ext4-capture-control-jgs_n3n_/`. The current scan is retained in the
+active worktree under
+`target/managed-storage-validation-20261009/ubs-final-source-report-approved.ievg0cbu/`.
+
+## Toolchain and hook repairs at `968f1b1`
+
+All six workflows at `1c56ce1d` are terminal. This published batch addressed the
 remaining wrapper-fixture environment leak, development hashing cost, and
-portable hook checks. The PR remains draft; full current CI, coverage, native
-macOS confirmation, and operator deployment acceptance remain open.
+portable hook checks. Its completed CI results supersede the then-pending
+native macOS and workflow status below; operator deployment acceptance remains
+open.
 
 - C009's recorded and live flags matched in Linux CI, but the live environment
   contained the workflow's `CARGO_HTTP_TIMEOUT` and `CARGO_NET_RETRY`. The fixture
@@ -85,7 +193,7 @@ macOS confirmation, and operator deployment acceptance remain open.
   `grep -P` silently admits ANSI output. The repair uses fixed-string matching
   that also rejects grep errors, and one monotonic timer around each complete
   hook process. The 50 samples and 10 ms mean limit remain enforced; individual
-  samples are retained and printed. Native macOS acceptance still needs CI.
+  samples are retained and printed. Native macOS acceptance is recorded above.
 - The outer E2E runner places inner suite logs in its artifact directory as they
   are written. A controlled failure retained its nonempty inner log before the
   outer runner exited and produced a failed status. Cancellation still leaves
@@ -956,10 +1064,11 @@ gh run download 37726615177 --repo tsunheimat/remote_compilation_helper --name e
 
 `scripts/run_all_e2e.sh --filter=e2e_config_inspect.sh
 --out=target/e2e-local` can select a single scenario after its prerequisites are
-prepared. The CI setup builds the release workspace and places `target/release`
-on `PATH`. The separate `true_e2e` harness also needs its expected debug daemon;
-inspect the harness before deciding the build/profile fix. Respect local RCH
-offloading instructions and the user's chosen validation location.
+prepared. CI builds the application release binaries and places `target/release`
+on `PATH`. The separate `true_e2e` harness needs its expected debug daemon.
+Build the release CLI before running `hook_integration`: that helper resolves
+`release/rch` independently of Cargo's debug binary. Respect local RCH offloading
+instructions and the user's chosen validation location.
 
 ## Historical validation only
 

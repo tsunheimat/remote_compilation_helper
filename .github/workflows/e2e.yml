@@ -42,6 +42,7 @@ jobs:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
           shared-key: e2e-${{ matrix.os }}
       - name: Build E2E application binaries
