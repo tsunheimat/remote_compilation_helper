@@ -23,6 +23,8 @@ Windows support; existing Windows jobs have not been disabled.
 - Published CI repair baseline: `e061220552d3d5465107b6f22e1e07f61469cf30`
 - Published profiling/toolchain repairs: `1c56ce1d9c5565acc295d622fa1e1d0933e10594`
 - Published toolchain/hook repair baseline: `968f1b16788cdb2a6355e7f58223605e46fc480c`
+- Published logging/cache/fixture repairs: `4e65b0a60ad5d97545dae20ff2fb5241b17faf18`
+- CI baseline code tree: `4a878e86833d3040474e7d18776f25b5b9e301ad`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -49,13 +51,52 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
-## Current repair batch after `968f1b1`
+## Source-root fixture follow-up after `4e65b0a`
 
-All six workflows at `968f1b1` are terminal. The current changes address the
-remaining core E2E failures and defects exposed by the first complete local
-workspace runs. The native macOS hook repair is now confirmed at that published
-revision. Local validation of this patch is complete below, with failures
-retained. Current-source CI and full acceptance remain open; the PR stays draft.
+The cached macOS ARM retry at `4e65b0a` reached native tests and failed two
+source-transfer path assertions. `SourceReceiver::create` deliberately freezes
+the private parent's canonical path. On macOS, the tests supplied a path under
+`/var/folders` but compared the returned `/private/var/folders` path with that
+alias. The receiver's exact-byte and ownership behavior was not the mismatch.
+
+The two fixtures now compare the returned root with the canonical private
+parent. Input paths and byte, mode, incomplete-transfer, rejection and seal
+idempotence assertions remain in place. The production portion of
+`source_transfer.rs` is byte-identical to `4e65b0a`.
+
+An unchanged Linux test binary reproduced both failures through a symlinked
+temporary-directory ancestor while both tests passed through the direct path.
+With the corrected expectations, both cases pass through each path. The full
+sandbox unit suite also passes in both layouts: 209 passed, one explicitly
+ignored, zero failed or filtered. This admits valid ancestor aliases while
+retaining the existing invalid-input and ownership checks; it is not a runtime
+performance change. Native macOS confirmation at the follow-up revision remains
+pending.
+
+Locked workspace/all-target check, strict Clippy and formatting passed after the
+fixture change. The unchanged official single-file UBS scan returned zero
+critical findings, 49 warnings and 55 informational records. Its three
+added-line findings are the retained test assertion macros; all were reviewed.
+The before/after binaries, source hashes, negative control, complete unit output
+and required-check receipts are retained under
+`rch-source-root-canonicalization-7xxau3f6/` in the validation base. The scanner
+report is under
+`target/managed-storage-validation-20261009/ubs-source-root-report-approved.r5tk64vl/`
+in the active worktree.
+
+A separate three-line proposal would increase only workspace-test/coverage job
+ceilings from 30 to 60 minutes and standalone E2E from 60 to 90 minutes. It is
+unapplied pending the user's decision under the repository's gate policy. The
+current fixture repair retains all existing CI and native-test time limits.
+
+## Published repair batch at `4e65b0a`
+
+The published changes address the remaining core E2E failures and defects exposed
+by the first complete local workspace runs. Current-source core E2E, rsync, RABS
+and the five Unix packaging jobs pass. Full workspace, coverage and macOS E2E
+acceptance remain open. The native macOS hook passed at the preceding `968f1b1`
+revision; that result is historical, not a substitute for the current incomplete
+macOS run. Local and CI failures are retained below; the PR stays draft.
 
 - Shared logging now follows the configured console stream's terminal status,
   honors `FORCE_COLOR`, and lets any present `NO_COLOR` value disable color.
@@ -126,6 +167,9 @@ filesystem operations. Neither a second NFS-backed ext4 image nor a direct
 local-ext4 scratch directory resolved it in paired runs; the latter also had
 one 60-second compiler case time out. Retain these failures. No dataset
 exclusions, integrity-barrier changes or deadline increases were made.
+CI summary passes do not close this local failure: the artifact isolation tests
+can return early when canonical namespace support is unavailable, and successful
+test output is captured by the ordinary Cargo test command.
 
 The current seven-file UBS scan returned exit zero and zero critical findings;
 322 warnings and 176 informational records are retained. Its eleven added-line
@@ -134,6 +178,38 @@ bounded test labels, the fixed-argument child launch, and a path-string false
 positive. Scanner inputs and the six workflow hashes match the current source.
 Earlier broader-scope findings remain open; no all-scope scanner pass or scanner
 Cargo/AST/ShellCheck phase is claimed.
+
+| Current CI at `4e65b0a` | Observed result |
+| --- | --- |
+| [CI 38128170844](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170844) | All-target/all-feature check, strict Clippy, docs, format, workflow/manifest/security guards and benchmarks passed. The first attempt's four test jobs and coverage reached their original 30-minute limits. Linux x64 completed 95 harnesses with 2,163 reported passes and seven ignored cases; coverage completed ten harnesses with 189 passes. Neither is a complete suite or coverage verdict. The other three original test jobs stopped during compilation. |
+| [Core CI E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170844/job/114440189807) | Passed: 164 reported native passes include 92 archived capability-skip records. The shell suite completed with 11 passes and two capability skips. Stream isolation and both reliability scripts now pass at the published source. The existing advisory performance comparison flagged three timings, detailed below. |
+| [Linux ARM retry](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170844/job/114447550770) | Restored the exact 1,937,327,214-byte cache, compiled the test targets in 16m 26s, then completed 95 harnesses with 2,163 reported passes, seven ignored cases and no reported failures. The original 30-minute job limit interrupted a nested `cargo build -p rabsd --bin rabsd` during `chaos_faultinjection`; the remaining harnesses did not run. |
+| [macOS ARM retry](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170844/job/114453192163) | Restored the exact cache and compiled the test targets in 8m 51s. Sixty completed harness summaries recorded 1,670 reported passes, two failures and two ignored cases. Both failures are canonical-root path expectations in `rabs-sandbox`, addressed by the follow-up above. Cargo stopped with exit 101; this is an assertion failure, not a timeout or a complete suite. |
+| [E2E 38128170826](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170826) | Linux completed all 41 discovered scripts; its inner suite recorded 11 passes and two capability skips. Its 50 hook samples averaged 1.361 ms under the unchanged 10 ms mean limit. macOS reached the original 60-minute job limit after five passing script statuses; the sixth script was compiling when interrupted. The other 36 statuses are absent, not passes or skips. The successful aggregate job only published the report. |
+| [Test Release 38128170819](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170819) | All five Unix build/version/package jobs passed. Each downloaded ZIP digest, archive checksum, exact three executable members and executable modes were verified. Windows failed the deferred non-Unix `read_bounded_output_stream` import; aggregate verification was skipped. |
+| [RABS 38128170889](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170889) | Both jobs passed: 42 accepted-hit cases and 13 release-gate cases, without ignored or filtered cases. Wrapper size was 443,456 bytes and enforced p95 was 6,785 microseconds under the unchanged 10 ms limit. |
+| [Rsync 38128170880](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38128170880) | Both jobs passed, including 64 native transfer cases and strict checks. All 1,390 archived Git blobs and modes match `4e65b0a`; the CI merge archive is source-equivalent to that named head. |
+
+The advisory comparison retained these p95 flags: CMake exit-code success
+21/382 ms, clang/make exit-code success 42/678 ms, and all-workers-busy fail-open
+527/720 ms (stored baseline/current). The existing workflow ends this comparison
+with `|| true`; it is not an enforced gate. These results do not establish a
+cause or a performance improvement, and the stored baselines were not changed.
+
+Cache availability is a separate remaining limitation. A completed coverage
+cache upload was already absent from the subsequent inventory; four caches
+totalling 9,357,917,463 bytes remained. The macOS E2E cache archive failed to save.
+The Linux ARM retry proves that restoring its retained cache is insufficient to
+finish the complete suite within the existing limit. The nested daemon build
+requests different dependency features from the workspace build, so substituting
+an existing workspace executable would change the tested configuration. No such
+substitution, test exclusion, deadline increase or paid cache setting was made.
+
+Current CI receipts, original and retry job metadata, annotations, raw logs,
+verified artifact ZIPs, source binding and outcome summaries are retained under
+`rch-ci-head4e65-monitor-2pwf_pe_/` in the validation base. GitHub gives carried-over
+jobs new IDs during a targeted retry; those copied successes are not new test
+executions. The original job receipts above remain authoritative for those jobs.
 
 | Terminal CI at `968f1b1` | Observed result |
 | --- | --- |

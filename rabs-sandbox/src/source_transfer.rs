@@ -706,6 +706,9 @@ mod tests {
             SourceManifest::new(vec![entry("src/lib.rs", b"A\0\xffB"), entry("empty", b"")])
                 .unwrap();
         let root = owner.path().join("source");
+        // Temporary paths may contain an ancestor alias, as with /var on macOS.
+        // The receiver returns the canonical root while both paths access it.
+        let canonical_root = fs::canonicalize(owner.path()).unwrap().join("source");
         let mut receiver = SourceReceiver::create(&root, manifest.clone()).unwrap();
         assert!(SourceReceiver::create(&root, manifest).is_err());
         assert!(receiver.sealed_root().is_none());
@@ -743,7 +746,7 @@ mod tests {
                 .unwrap(),
             4
         );
-        assert_eq!(receiver.seal().unwrap(), root);
+        assert_eq!(receiver.seal().unwrap(), canonical_root);
         assert_eq!(fs::read(root.join("src/lib.rs")).unwrap(), b"A\0\xffB");
         assert_eq!(fs::read(root.join("empty")).unwrap(), b"");
         assert_eq!(
@@ -1008,6 +1011,7 @@ mod tests {
         let mut executable = entry("tools/run", &bytes);
         executable.executable = true;
         let root = owner.path().join("source");
+        let canonical_root = fs::canonicalize(owner.path()).unwrap().join("source");
         let mut receiver = SourceReceiver::create(
             &root,
             SourceManifest::new(vec![executable, entry(".cargo/config.toml", b"")]).unwrap(),
@@ -1023,13 +1027,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(receiver.seal().unwrap(), root);
+        assert_eq!(receiver.seal().unwrap(), canonical_root);
         assert_eq!(
             receiver.seal().unwrap(),
-            root,
+            canonical_root,
             "a successful seal is idempotent"
         );
-        assert_eq!(receiver.sealed_root(), Some(root.as_path()));
+        assert_eq!(receiver.sealed_root(), Some(canonical_root.as_path()));
         assert_eq!(fs::read(root.join("tools/run")).unwrap(), bytes);
         assert_eq!(
             fs::metadata(root.join("tools/run"))
