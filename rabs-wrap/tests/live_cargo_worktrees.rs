@@ -32,6 +32,8 @@ const INDEX: &str = "index.example-0123456789abcdef";
 
 /// Registry dependencies of the fixture project, all eligible for serving.
 const DEPENDENCIES: [&str; 3] = ["leaf", "side", "middle"];
+const APP_SOURCE: &str =
+    "fn main() { println!(\"{} {}\", middle::quad(3), middle::leaf_origin()); }\n";
 
 fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
@@ -223,20 +225,18 @@ impl World {
     }
 
     /// A fresh worktree of the same workspace project, with its own target.
-    fn worktree(&self, name: &str) -> PathBuf {
+    fn worktree(&self, name: &str, dependency: &str, main_source: &str) -> PathBuf {
         let worktree = self.root.join(name);
         std::fs::create_dir_all(worktree.join("src")).unwrap();
         std::fs::write(
             worktree.join("Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\nmiddle = \"1.0\"\n",
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\n{dependency} = \"1.0\"\n"
+            ),
         )
         .unwrap();
-        std::fs::write(
-            worktree.join("src/main.rs"),
-            "fn main() { println!(\"{} {}\", middle::quad(3), middle::leaf_origin()); }\n",
-        )
-        .unwrap();
+        std::fs::write(worktree.join("src/main.rs"), main_source).unwrap();
         worktree
     }
 
@@ -350,11 +350,12 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
         "pub fn quad(x: u32) -> u32 { side::shift(leaf::twice(leaf::twice(x))) }\n\
          pub fn leaf_origin() -> &'static str { leaf::origin() }\n",
     );
+    world.write_dependency("toolchain_probe", "", "pub fn warm() -> u8 { 17 }\n");
     let daemon = Daemon::start(&world.root, &world.socket);
 
     // The oracle: stock Cargo, no wrapper. Its output is what an agent gets
     // today and what every served artifact must equal byte for byte.
-    let stock = world.worktree("stock");
+    let stock = world.worktree("stock", "middle", APP_SOURCE);
     let started = Instant::now();
     let stock_build = world.cargo_build(&stock, false);
     let stock_elapsed = started.elapsed();
@@ -365,25 +366,29 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
     let expected_output = World::run_app(&stock);
     assert!(expected_output.starts_with("12 "), "{expected_output}");
 
-    // 1. The daemon hashes the toolchain in the background; until it is
-    //    warm every request is shadowed. Use throwaway worktrees until a
-    //    build's dependency compiles are admitted and commit.
+    // Hashing may finish between dependency compiles in one Cargo build.
+    // Warm a separate dependency so that transition cannot partially commit
+    // the three keys whose first admission is measured below.
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let worktree = world.worktree(&format!("warm-{attempt}"));
+        let worktree = world.worktree(
+            &format!("toolchain-probe-{attempt}"),
+            "toolchain_probe",
+            "fn main() { println!(\"{}\", toolchain_probe::warm()); }\n",
+        );
         let mark = daemon.decisions().len();
         world.cargo_build(&worktree, true);
         let decisions = daemon.settled_since(mark);
         if count(&decisions, "committed") > 0 {
             assert_eq!(
                 count(&decisions, "committed"),
-                DEPENDENCIES.len(),
-                "every dependency compile commits in the same build: {:?}\ndecisions: {decisions:#?}",
+                1,
+                "the separate toolchain probe commits once: {:?}\ndecisions: {decisions:#?}",
                 tally(&decisions)
             );
-            assert_eq!(World::run_app(&worktree), expected_output);
+            assert_eq!(World::run_app(&worktree), "17\n");
             break;
         }
         assert!(
@@ -398,9 +403,23 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
         std::thread::sleep(Duration::from_millis(250));
     }
 
+    // 1. With the toolchain ready, every measured dependency must commit in
+    // the same first build. No measured key was used by the warmup project.
+    let first = world.worktree("commit", "middle", APP_SOURCE);
+    let mark = daemon.decisions().len();
+    world.cargo_build(&first, true);
+    let decisions = daemon.settled_since(mark);
+    assert_eq!(
+        count(&decisions, "committed"),
+        DEPENDENCIES.len(),
+        "every dependency compile commits in the same build: {:?}\ndecisions: {decisions:#?}",
+        tally(&decisions)
+    );
+    assert_eq!(World::run_app(&first), expected_output);
+
     // Two more worktrees: the SAME keys, each a verifying execution.
     for name in ["verify-1", "verify-2"] {
-        let worktree = world.worktree(name);
+        let worktree = world.worktree(name, "middle", APP_SOURCE);
         let mark = daemon.decisions().len();
         world.cargo_build(&worktree, true);
         let decisions = daemon.settled_since(mark);
@@ -415,7 +434,7 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
 
     // 2. The served worktree: every dependency compile is answered from
     //    the cache and no compiler attempt is admitted for them.
-    let served = world.worktree("served");
+    let served = world.worktree("served", "middle", APP_SOURCE);
     let mark = daemon.decisions().len();
     let started = Instant::now();
     let build = world.cargo_build(&served, true);

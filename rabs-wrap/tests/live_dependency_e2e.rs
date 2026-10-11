@@ -21,6 +21,11 @@
 //!    bytes and new checkout files key it, while Git metadata never becomes
 //!    an admitted compiler input.
 //!
+//! The serving lane currently encodes four Linux targets. On other Unix
+//! hosts these cases instead require its exact unsupported-target refusal
+//! and compare the native fallback's library bytes and compiler output with
+//! stock rustc. A refusal is not evidence of dependency serving support.
+//!
 //! The compiler-never-ran half of "served" is proven deterministically by
 //! `live_protocol.rs`; here the daemon's own decision log shows the request
 //! was answered `hit` → `served` without an admitted execution.
@@ -31,6 +36,12 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const INDEX: &str = "index.example-0123456789abcdef";
+const SERVING_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+];
 
 fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
@@ -549,9 +560,70 @@ fn assert_same_library(first: &Path, second: &Path, name: &str) {
     );
 }
 
+fn native_target(world: &World) -> String {
+    let version = Command::new(&world.rustc)
+        .arg("-vV")
+        .output()
+        .expect("query the native compiler target");
+    assert!(version.status.success(), "{version:?}");
+    let version = String::from_utf8(version.stdout).unwrap();
+    version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc reports its native host target")
+        .to_owned()
+}
+
+/// Unsupported native targets must still compile locally without admitting
+/// execution or serving guessed outputs through the Linux dependency lane.
+fn assert_native_target_refusal(world: &World, daemon: &Daemon, host: &str) {
+    let expected_detail = format!("LIVE_DEP_OUTPUTS: UnknownTargetFamily({host:?})");
+
+    let stock_out = world.out_dir("native-stock");
+    let stock = world.stock("leaf", &stock_out, &[]);
+    assert_eq!(stock.status.code(), Some(0), "{stock:?}");
+    let fallback_out = world.out_dir("native-fallback");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let mark = daemon.decisions().len();
+        let output = world.wrapped("leaf", &fallback_out, &[], &[]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let decisions = daemon.decisions().split_off(mark);
+        if let [decision] = decisions.as_slice()
+            && decision["decision"] == "shadow"
+        {
+            assert_eq!(decision["crate"], "leaf", "{decision:#?}");
+            assert_eq!(decision["reason"], "LIVE_DEP_OUTPUTS", "{decision:#?}");
+            assert_eq!(decision["detail"], expected_detail, "{decision:#?}");
+            assert_eq!(output.stdout, stock.stdout);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .replace(fallback_out.to_str().unwrap(), "<OUT>"),
+                String::from_utf8_lossy(&stock.stderr)
+                    .replace(stock_out.to_str().unwrap(), "<OUT>"),
+                "native fallback changed compiler diagnostics"
+            );
+            assert_same_library(&fallback_out, &stock_out, "leaf");
+            return;
+        }
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision["decision"] == "toolchain-warming"),
+            "unsupported target admitted an unexpected decision: {decisions:#?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "native target refusal was not observed: {}",
+            daemon.warmup_diagnostics(world)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
-fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
+fn registry_dependency_lane_preserves_results_on_native_target() {
     // Keep the socket short and CARGO_MANIFEST_DIR equal to the wrapper's
     // physical cwd when /tmp is a symlink (as it is on macOS).
     let dir = tempfile::Builder::new()
@@ -575,6 +647,12 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
          pub fn version() -> &'static str { env!(\"CARGO_PKG_VERSION\") }\n",
     );
     let daemon = Daemon::start(&world.root, &world.socket);
+
+    let target = native_target(&world);
+    if !SERVING_TARGETS.contains(&target.as_str()) {
+        assert_native_target_refusal(&world, &daemon, &target);
+        return;
+    }
 
     // 1. Warm the toolchain probe (background hashing of the sysroot), then
     //    the first eligible compile executes and commits.
@@ -738,7 +816,7 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_closure() {
+fn git_workspace_dependency_lane_preserves_results_on_native_target() {
     let dir = tempfile::Builder::new()
         .prefix("gl")
         .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
@@ -751,6 +829,12 @@ fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_c
     };
     let checkout = world.fetch_git_workspace();
     let daemon = Daemon::start(&world.root, &world.socket);
+
+    let target = native_target(&world);
+    if !SERVING_TARGETS.contains(&target.as_str()) {
+        assert_native_target_refusal(&world, &daemon, &target);
+        return;
+    }
 
     let out_a = world.out_dir("wt-a");
     let deadline = Instant::now() + Duration::from_secs(600);

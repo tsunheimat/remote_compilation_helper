@@ -33,6 +33,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published prepared-wait and coverage-report repairs: `8edaa0f0315697720fcb4453bcaed1293aec9f59`
 - Published daemon response and native fixture repairs: `18e2235faf2df206939641c3256b4e6689ac0e09`
 - Published live-dependency fixture and timing diagnostics: `a836301151a10f6c4e5efca380fbfa97a8b46779`
+- Published hook resource diagnostics: `26cda270149e57aefee1fdf245b6b4190b730114`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -58,6 +59,110 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Fixture warmup and native target contracts after `26cda270`
+
+The RABS release worktree test at `26cda270` exposed a fixture race. Toolchain
+hashing completed during a Cargo build: `leaf` and `side` were still warming,
+while `middle` executed and committed. The fixture entered its three-commit
+assertion as soon as it observed any commit, so this valid partial transition
+failed with one commit instead of three. The primary application's separate
+`CARGO_PRIMARY_PACKAGE` refusal was expected and was not the cause.
+
+The fixture now warms the compiler through an independent registry dependency
+whose key is not one of the three measured keys. It then requires all three
+real dependencies to commit in the same first build. Both subsequent verifying
+builds, the three served hits with no admitted executions, comparison against
+stock Cargo's bytes, the fresh rebuild and member-only edit checks remain.
+The 600-second warmup bound is unchanged. A valid mid-build warmup transition
+no longer contaminates the measured keys; a missing measured commit,
+verification, served result, matching artifact or fresh rebuild still fails.
+This corrects setup and does not claim a performance improvement.
+
+Mac ARM reached the path-corrected fixtures and exposed the next contract:
+`derive_dependency_output_declarations` explicitly supports only x64/ARM64
+Linux GNU/musl targets. Its generic naming helper knows Darwin filenames, but
+that is not a serving-output closure proof. Both Mac requests correctly refused
+with `LIVE_DEP_OUTPUTS: UnknownTargetFamily("aarch64-apple-darwin")`; the former
+`LIVE_DEP_CWD` path mismatch was absent.
+
+The two cases now have names describing the native target contract. The actual
+compiler host is checked against the four supported triples; those targets
+retain their original positive serving bodies. Other Unix targets must observe
+the exact unsupported-target refusal, with no admitted execution or serving,
+and successfully compile locally. The fallback's stdout, diagnostics after
+output-directory normalization, library bytes and dep-info are compared with
+stock rustc. Other refusal reasons or unexpected decisions fail. The production
+target policy and all existing deadlines remain unchanged. This verifies a
+refusal contract; it does not add or prove Mac dependency serving.
+
+Final local validation passed both complete Linux dependency cases, all 11
+selected output-declaration contract cases, M4 in both debug and release, and
+workspace/all-target check, strict Clippy and formatting. No runtime case was
+ignored; the declaration selection filtered 324 unrelated cases. Source hashes
+were held throughout. A byte comparison confirms the unchanged Linux bodies,
+M4 application source and downstream assertions, and unchanged production
+policy. The unsupported-target branch was compiled but has not run on an
+unsupported native target yet. Evidence is under
+`rch-final-target-contract-tbemelzo/`; the preceding M4-only
+debug/release control and fresh release binary build are retained under
+`rch-m4-isolated-warmup-sl5mc7u8/`. Repeated cases are not extra unique coverage.
+
+The unchanged official UBS scan of both Rust files returned exit zero, zero
+critical, 117 warning and 85 informational records. Its 16 added-line records
+were reviewed: required assertions, an existing pattern of unique fixture-name
+allocation, intentional synchronous fixture setup and a path-slash false
+positive. Four unlocated notices describe scanner phases not evaluated. The
+separate Cargo checks above are not attributed to UBS. Scanner/source hashes,
+raw findings and review are in `ubs-final-fixture-contract-report-approved.pge6list/`.
+No scanner suppression, policy change or test ignore was introduced.
+
+All workflows at the published `26cda270` baseline are terminal:
+
+- [Main CI](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38178630833)
+  concluded cancelled; its aggregate check failed and release builds skipped.
+  Both Linux architectures completed 225 workspace harnesses with 12,118
+  reported passes, zero failures, 31 ignores and zero filters each. Compiler,
+  strict Clippy, docs, formatting, workflow/manifest/security checks and
+  benchmarks passed. Coverage completed reporting and the unchanged 65% gate
+  at 86.87% lines (321,817/370,437) in the verified HTML artifact.
+- Both Mac jobs reached the 60-minute limit. ARM completed 148 harnesses with
+  2,775 passes, the two target-contract failures above, three ignores and zero
+  filters, then stopped in the RCH binary harness. Intel completed 43 harnesses
+  with 926 passes, no failures, two ignores and zero filters, then stopped in
+  the protocol library harness. Neither incomplete harness nor later targets
+  has a completed verdict. Both Macs passed the earlier runtime boot case and
+  separate nine-case filesystem and 13-case socket selections, including the
+  native peer-close assertion. Focused cases are listed separately.
+- Core E2E completed within its unchanged 30-minute limit: 164 reported Cargo
+  passes with 92 archived capability-skip records, then all 13 shell outcomes
+  (11 passes and two opt-in skips). Install prompts and the separate true-E2E
+  shell case require their explicit enabling variables. No outcome is missing.
+- [Standalone E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38178630840)
+  passed all 41 script statuses on both platforms, with 11 inner passes and
+  two skips each. Fifty hook calls averaged 1.45431576 ms on Linux and
+  9.81096002 ms on Mac against the unchanged 10 ms gate. Both resource records
+  are valid; the Mac children used 0.244579 user and 0.160236 system CPU seconds
+  across those calls. This pass does not explain the earlier 12.77520082 ms
+  loss. Structured skip records remain qualified separately from script status.
+- [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38178630841)
+  passed 42 protocol and nine release cases, then failed the M4 warmup race
+  described above. The 443,456-byte wrapper passed its size gate. Doctor and
+  enforcing wrapper timing were not reached, so there is no p95 verdict here.
+- [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38178630853)
+  passed 64 selected cases and compiler/lint checks. All 1,390 archived Git
+  blobs and modes match the published head.
+- [Test Release](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38178630839)
+  passed all five Unix jobs, and every ZIP digest, archive checksum, executable
+  inventory and mode was independently verified. Windows retained its deferred
+  missing-import and two type errors; aggregate verification was skipped.
+
+The complete or explicitly partial records, annotations and verified artifacts
+are retained in `rch-ci-head26cda-monitor-541z21t1/`. Keep PR #2 draft pending
+native execution of the revised fixtures and complete Mac workspace results.
+The proposed workspace/core-E2E budgets remain unapplied; core E2E completed at
+the existing limit in this run. The separate local full-toolchain deadline,
+Windows deferral and operator deployment/live SSH/Nexus boundaries remain.
 
 ## Hook timing diagnostics after `a8363011`
 
