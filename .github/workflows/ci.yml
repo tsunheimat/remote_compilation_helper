@@ -478,7 +478,7 @@ jobs:
         env:
           RCH_MOCK_SSH: '1'
         # Reuse the preceding test execution for each report format.
-        run: cargo llvm-cov report --features rich-ui --workspace --html --output-dir coverage-html
+        run: cargo llvm-cov report --workspace --html --output-dir coverage-html
       - name: Generate per-crate coverage summary
         env:
           RCH_MOCK_SSH: '1'
@@ -486,13 +486,13 @@ jobs:
           set -o pipefail
           echo "## Coverage Summary" > coverage-summary.md
           echo "" >> coverage-summary.md
-          cargo llvm-cov report --features rich-ui --workspace --text 2>&1 | tee -a coverage-summary.md
+          cargo llvm-cov report --workspace --text 2>&1 | tee -a coverage-summary.md
       - name: Check coverage threshold
         env:
           RCH_MOCK_SSH: '1'
         # Fail if line coverage drops below 65% (goal: 75%)
         # See bead remote_compilation_helper-pacy for progress tracking
-        run: cargo llvm-cov report --features rich-ui --workspace --fail-under-lines 65
+        run: cargo llvm-cov report --workspace --fail-under-lines 65
       - uses: codecov/codecov-action@v4
         with:
           files: lcov.info

@@ -29,6 +29,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published filename fixture and CI diagnostics: `425dee6fec669955ff81316e1d4f56a485b248d7`
 - Published Linux compiler bound and fixture priority: `5352da591f6202a7d8727d9d94e3623eb4e9c939`
 - Published Darwin fixture repairs and approved CI ceilings: `352f025f10252d1bdc09191a6b099cc2a05760fb`
+- Published CI prerequisites and status evidence: `c5618ef688a1691f4b0b305a5249a56bdca6cde9`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -54,6 +55,119 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Prepared wait and coverage reporting follow-up after `c5618ef6`
+
+The Linux x64 workspace command completed all 225 harnesses: 12,111 reported
+passes, one failure, 31 ignored cases and zero filtered cases. Both preceding
+failures, the real-Cargo Clippy prerequisite and native force-stop fixture, now
+pass. The remaining failure is
+`actual_daemon_wait_never_reexecutes_uncertainty_or_reads_a_pre_start_cancelled_delivery`.
+
+Its pre-startup record was compared byte-for-byte after the daemon and wait
+client ran. The decoded failure differs in exactly four fields: attempt 1/2,
+mode execute/local recovery, recovery origin null/1, and the recovery detail.
+The daemon's existing prepared-job drivers independently attempt one local
+recovery after acquiring coordinator authority. Missing delivery bytes leave
+the operation uncertain; this path opens no worker connection and executes no
+compiler. UDS availability does not establish that this startup work is done.
+
+A native control seeded the same uncertain record and launched only the
+unchanged daemon. It reproduced all four changes before any wait client ran.
+Launching `--job-wait` afterwards returned the expected uncertainty error,
+printed no stdout, and left the settled record byte-identical. Delivery and
+installation directories remained absent. An initial synthetic control used
+incorrect state permissions and was refused; its log is retained. The matching
+control used the production store's private directory/file permissions.
+
+The fixture now observes exactly the permitted startup transition within the
+same ten-second readiness deadline used for socket setup. It checks the entire
+decoded record against the original plus those four expected changes, then
+retains the settled bytes for the existing post-client comparison. Child
+liveness and the deadline are checked before accepting readiness. This admits
+the legitimate independent startup transition that the old fixture rejected;
+unexpected startup changes, later wait-side mutations, output exposure, altered
+exit codes and unwanted delivery/installation still fail. The original client
+and process deadlines and every result assertion remain. Production recovery
+and wait code are unchanged.
+
+All three native wait-harness cases passed without ignores or filters. Locked
+workspace/all-target check, strict Clippy and formatting passed for the final
+source hashes. A separate workspace-selected invocation passed the same three
+cases with `serde_json` order preservation enabled, as confirmed by its Cargo
+unit graph; these repeated cases are not additional unique coverage. The
+unchanged official UBS scan returned exit zero, zero critical,
+35 warning and ten informational records. Six added-line warnings are intentional
+test assertions; no suppression or scanner change was made. Evidence is retained
+under `rch-prepared-wait-startup-kcnssf8k/`, including the final candidate results
+in `final/`, and `ubs-prepared-wait-final-report-approved.o1hrzmxw/` in the active
+worktree's validation directory.
+
+Coverage at `c5618ef6` completed 224 harness summaries with 12,110 reported
+passes, no failures, 31 ignored cases and zero filtered cases, and generated
+`lcov.info`. The next step failed because the installed `cargo-llvm-cov 0.9.1`
+rejects `--features` on `report`. HTML, summary and threshold acceptance are
+therefore absent. The three reporting commands now omit only that invalid
+feature selector. Their `--workspace` selection, the unchanged 65% line gate,
+and the original instrumented `--features rich-ui --workspace` test command
+remain in place.
+
+An independently downloaded official 0.9.1 binary was checked against its release
+digest and the [versioned command parser](https://github.com/taiki-e/cargo-llvm-cov/blob/v0.9.1/src/cli.rs).
+A two-member workspace control includes a member outside `default-members`
+and code enabled by `rich-ui`. Both HTML/text reports retained both members;
+LCOV records and counts matched the preceding test run, and profile/executable
+hashes did not change during reporting. The exact 65% gate rejected the 40%
+control and accepted the 97.14% control. Those are fixture coverage values, not
+this repository's coverage. Controls use August nightly with `llvm-tools-preview`
+installed and are retained under `rch-coverage-report-cli-swa1vu61/`. Parsed YAML
+comparison establishes that only the three report command strings changed.
+
+All five validation workflows at `c5618ef6` are terminal. Their evidence is under
+`rch-ci-headc561-monitor-xahwz6dc/`:
+
+- Linux ARM completed 225 workspace harnesses with 12,112 reported passes,
+  no failures, 31 ignored cases and zero filtered cases. Both Macs completed
+  95 harnesses with 2,013 passes, no failures and two ignored cases, then hit
+  their 60-minute job limits during the nested daemon build in the next chaos
+  harness. Final GitHub annotations confirm both timeouts. The separate
+  nine-case filesystem fixture passed on all four platforms; those repeated
+  cases are not additional unique coverage. Mac Intel's complete job-log
+  download returned `BlobNotFound`; its verified test-log artifact and final
+  timeout annotation are retained.
+- Compiler, strict Clippy, docs, formatting, workflow/manifest/security guards
+  and benchmarks passed. The main aggregate failed and release builds skipped.
+- Core E2E passed 164 reported native cases with 92 archived capability-skip
+  records. Its shell phase completed three passes and one skip before the
+  separate 30-minute job limit, leaving nine outcomes absent. The unchanged
+  advisory comparison flagged CMake 21/529 ms and clang/make 42/842 ms p95
+  (stored baseline/current); its `|| true` remains advisory, and no cause or
+  performance improvement is established.
+- Standalone Linux E2E passed all 41 script statuses, with 11 inner passes and
+  two skips. Its 50-sample hook mean was 1.451 ms under the 10 ms limit.
+  macOS completed 40 passing scripts and one failed `e2e_test.sh`: its inner
+  suite recorded ten passes, one failure and two skips. The failure is the
+  unchanged hook timing gate, with all 50 retained samples averaging 12.1627 ms
+  against 10 ms. This is a failed gate, not an attributed regression or a pass.
+- The macOS output-validation script that failed at `352f025f` now passed all
+  14 cases. All eight actual status replies, successful predicate outputs,
+  daemon log and durable history were retained on both platforms. This proves
+  evidence retention and this run's successful checks; the preceding failure's
+  cause remains unestablished.
+- RABS passed 42 protocol and 13 release-gate cases; wrapper size was 443,456
+  bytes and enforced p95 was 8,078 microseconds under 10 ms. Rsync passed all
+  64 selected transfer cases, with 3,303 unrelated cases filtered. All 1,390
+  archived Git blobs and modes match the published head.
+- All five Unix package jobs passed; uploaded ZIP digests, internal archive
+  checksums, three executable members and permissions were independently
+  verified. Windows reproduced the deferred import/type errors, and aggregate
+  package verification skipped. Its jobs remain enabled.
+
+The separate 90-minute workspace proposal remains unapplied pending the user's
+decision. Core E2E retains its 30-minute limit. The two repairs above require
+fresh CI at their published revision; full native Mac acceptance, the hook
+timing failure, the separate local full-toolchain deadline and operator
+acceptance remain open. Keep PR #2 draft. No merge or deployment was performed.
 
 ## CI prerequisites and fixture evidence after `352f025f`
 

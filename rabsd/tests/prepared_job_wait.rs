@@ -89,8 +89,7 @@ impl Process {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    fn ready(&mut self, socket: &Path) {
-        let until = Instant::now() + Duration::from_secs(10);
+    fn ready(&mut self, socket: &Path, until: Instant) {
         while std::os::unix::net::UnixStream::connect(socket).is_err() {
             assert!(
                 self.child.try_wait().unwrap().is_none(),
@@ -326,11 +325,48 @@ impl Fixture {
             .env_remove("RABS_COORD_TLS_KEY");
         command
     }
-    fn daemon(&self) -> Process {
+    fn daemon(&mut self) -> Process {
         let mut command = self.command();
         // Normal daemon mode installs the SIGTERM listener used by shutdown().
         let mut process = Process::start(&self.root, "daemon", &mut command);
-        process.ready(&self.socket);
+        let until = Instant::now() + Duration::from_secs(10);
+        process.ready(&self.socket, until);
+        let before: Value = serde_json::from_slice(&self.saved_record).unwrap();
+        if before["state"] == "uncertain" {
+            // Startup independently attempts local recovery of an uncertain
+            // execution. Observe that owner before testing a read-only client;
+            // socket readiness alone does not mean recovery has settled.
+            assert_eq!(before["mode"], "execute");
+            assert_eq!(before["attempt"], 1);
+            assert!(before["recovery_origin_attempt"].is_null());
+            let mut expected = before;
+            expected["attempt"] = json!(2);
+            expected["mode"] = json!("local_recovery");
+            expected["recovery_origin_attempt"] = json!(1);
+            expected["detail"] = json!(
+                "automatic local recovery: no complete receipt in owned local deliveries; explicit recovery required; explicit recovery required"
+            );
+            let record_path = self.state.join(format!("prepared-operations/{ID}.json"));
+            loop {
+                let bytes = fs::read(&record_path).unwrap();
+                let record: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(
+                    process.child.try_wait().unwrap().is_none(),
+                    "daemon exited during startup recovery: {}",
+                    String::from_utf8_lossy(&read_log(&process.stderr))
+                );
+                assert!(
+                    Instant::now() < until,
+                    "startup local recovery did not settle within daemon readiness: {record}"
+                );
+                if record["state"] == "uncertain" && record["mode"] == "local_recovery" {
+                    assert_eq!(record, expected, "unexpected startup recovery mutation");
+                    self.saved_record = bytes;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         process
     }
     fn wait(&self) -> Process {
@@ -350,7 +386,7 @@ impl Fixture {
 fn actual_daemon_wait_replays_complete_binary_streams_and_original_exit_without_bundle_or_credentials()
  {
     for exit in [0, 17, 130] {
-        let fixture = Fixture::new(Some(exit), false);
+        let mut fixture = Fixture::new(Some(exit), false);
         let receipt = fs::read(fixture.delivery.join("delivery.json")).unwrap();
         let inode = fs::metadata(fixture.delivery.join("diagnostics/stdout"))
             .unwrap()
@@ -386,7 +422,7 @@ fn actual_daemon_wait_replays_complete_binary_streams_and_original_exit_without_
 #[test]
 fn actual_daemon_wait_refuses_damaged_results_without_printing_even_the_valid_first_stream() {
     for corrupt in ["artifacts/app", "diagnostics/stderr"] {
-        let fixture = Fixture::new(Some(0), false);
+        let mut fixture = Fixture::new(Some(0), false);
         fs::write(fixture.delivery.join(corrupt), b"corrupted").unwrap();
         let mut daemon = fixture.daemon();
         let mut client = fixture.wait();
@@ -404,7 +440,7 @@ fn actual_daemon_wait_refuses_damaged_results_without_printing_even_the_valid_fi
 #[test]
 fn actual_daemon_wait_never_reexecutes_uncertainty_or_reads_a_pre_start_cancelled_delivery() {
     for cancelled in [false, true] {
-        let fixture = Fixture::new(None, cancelled);
+        let mut fixture = Fixture::new(None, cancelled);
         let mut daemon = fixture.daemon();
         let mut client = fixture.wait();
         let code = client.wait().code().unwrap();
