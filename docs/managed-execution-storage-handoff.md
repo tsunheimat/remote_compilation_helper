@@ -25,6 +25,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published toolchain/hook repair baseline: `968f1b16788cdb2a6355e7f58223605e46fc480c`
 - Published logging/cache/fixture repairs: `4e65b0a60ad5d97545dae20ff2fb5241b17faf18`
 - CI baseline code tree: `4a878e86833d3040474e7d18776f25b5b9e301ad`
+- Published canonical-root fixture repair: `4034fe2bcfb3a0ac77ee6f090addb3ab75932152`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -51,6 +52,75 @@ other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
 
+## Filesystem filename fixture follow-up after `4034fe2b`
+
+Native macOS CI at `4034fe2b` confirms the canonical-root repair below: all 196
+sandbox unit cases passed, including both formerly failing path assertions.
+The run then reached `snapshot_capture_realfs` and failed its special-node test
+and long-TMPDIR child because the filesystem refused creation of a filename
+containing byte `0xff`. The error occurred before capture ran: Darwin
+`EILSEQ` (92), defined in [Apple's errno header](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/sys/errno.h).
+The 72 top-level harness summaries recorded 1,690 passes, two failures and two
+ignored cases. The child failure's embedded summary is not counted again.
+
+The fixture still requires `CaptureRejection::InvalidPath` when a non-UTF-8
+filename can be created. Only the observed macOS `EILSEQ` refusal is recognized
+as an unavailable filename representation; the directory must remain empty and
+an explicit diagnostic records that application capture of this name was not
+exercised. Other setup errors still fail. Every Unix run also creates a
+non-UTF-8 symlink target, verifies its exact bytes and requires the capture
+layer's `InvalidPath` rejection. Special-node and escaping-link checks remain
+enforced. No production source or dependency changed.
+
+The workspace matrix now uses Cargo's `--no-fail-fast` to continue to later
+native harnesses after a failure while retaining Cargo's failing exit status.
+Linux test jobs also record bounded memory, cgroup, OOM-counter and process-RSS
+observations in the live job log, using the same approach already present in
+the RABS release workflow. At `4034fe2b`, both Linux test runners shut down with
+exit 143; ARM stopped after 27m 19s and x64 after 29m 39s. Neither annotation
+reported the 30-minute timeout, and no assertion failure preceded those exits.
+An OOM diagnosis is not established. The probe will provide evidence on the
+actual runner; the CI budget proposal remains unapplied.
+
+Workflow parsing confirms that only the matrix test step's shell body changed.
+All job limits, compiler settings, matrix members and other YAML values remain
+unchanged. Local shell controls preserved exits 0, 101 and 143 with the Linux
+probe enabled and confirmed that its child was reaped. The non-Linux guard
+controls preserved exits 0 and 101 without starting a probe. These controls
+ran on Linux and are not native macOS or CI-host resource evidence.
+
+All nine real-filesystem cases pass locally with no ignored or filtered cases,
+including the original invalid filename, the added invalid symlink target and
+the long-TMPDIR child. Locked workspace/all-target check, strict Clippy and
+formatting passed. Native execution of the macOS refusal branch at the new
+revision remains pending. The unchanged official single-file UBS scan returned
+zero critical findings, 45 warnings and 67 informational records; its seven
+added-line records are three test assertions and four intentional synchronous
+filesystem operations in this real-filesystem fixture.
+
+The source, test output and required-check receipts are retained under
+`rch-nonutf8-fixture-izf4f5u6/` in the validation base. Scanner evidence is in
+`target/managed-storage-validation-20261009/ubs-nonutf8-fixture-report-approved.97yzp9_v/`
+in the active worktree. CI evidence at `4034fe2b` is retained separately under
+`rch-ci-head4034-monitor-ti79i144/`; its archived 1,390 Git blobs and modes match
+that head. Its [RABS workflow](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38135231371)
+passed 42 accepted-hit cases and 13 release-gate cases, with wrapper size
+443,456 bytes and enforced p95 8,429 microseconds. Its
+[rsync workflow](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38135231401)
+passed 64 transfer cases and strict checks. Compiler, Clippy, docs and the early
+CI guards passed. Core E2E reported 164 native passes with 92 archived capability
+skips, plus 11 shell passes and two capability skips. Its advisory comparison
+flagged CMake 21/34 ms, Ninja 25/31 ms and clang/make 42/873 ms (stored
+baseline/current p95); these flags remain unattributed. Linux standalone E2E
+completed all 41 scripts with 11 inner passes and two capability skips; its
+50 hook samples averaged 1.207 ms under the unchanged 10 ms limit. All five Unix
+package jobs passed, and their archive checksums, exact executable membership
+and modes were verified. Windows failed its deferred build and package
+aggregation was skipped. Coverage and macOS Intel tests reached their original
+30-minute limits. Full workspace, coverage and macOS standalone E2E acceptance
+remain open. Remaining workflow results were still in progress when this
+follow-up was prepared; these partial results are not full-suite acceptance.
+
 ## Source-root fixture follow-up after `4e65b0a`
 
 The cached macOS ARM retry at `4e65b0a` reached native tests and failed two
@@ -70,8 +140,8 @@ With the corrected expectations, both cases pass through each path. The full
 sandbox unit suite also passes in both layouts: 209 passed, one explicitly
 ignored, zero failed or filtered. This admits valid ancestor aliases while
 retaining the existing invalid-input and ownership checks; it is not a runtime
-performance change. Native macOS confirmation at the follow-up revision remains
-pending.
+performance change. Native macOS confirmation at `4034fe2b` is recorded above;
+the later filesystem fixture failure remains a separate result.
 
 Locked workspace/all-target check, strict Clippy and formatting passed after the
 fixture change. The unchanged official single-file UBS scan returned zero

@@ -198,7 +198,56 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p target/test-logs
-          cargo test ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # A runner shutdown can prevent the artifact-upload step itself.
+            # Record bounded resource observations in the live job log.
+            python3 -u - <<'PY' &
+          import datetime
+          import json
+          import pathlib
+          import time
+
+          def read(path):
+              try:
+                  return pathlib.Path(path).read_text()
+              except OSError:
+                  return None
+
+          while True:
+              meminfo = read('/proc/meminfo') or ''
+              memory = {line.split(':', 1)[0]: line.split(':', 1)[1].strip()
+                        for line in meminfo.splitlines()
+                        if line.startswith(('MemTotal:', 'MemAvailable:', 'SwapTotal:', 'SwapFree:'))}
+              processes = []
+              for entry in pathlib.Path('/proc').iterdir():
+                  if not entry.name.isdecimal():
+                      continue
+                  fields = dict(line.split(':', 1) for line in (read(entry / 'status') or '').splitlines()
+                                if ':' in line)
+                  rss = int(fields.get('VmRSS', '0 kB').split()[0])
+                  if rss:
+                      processes.append({'pid': int(entry.name), 'name': fields.get('Name', '').strip(),
+                                        'rss_kib': rss, 'threads': fields.get('Threads', '').strip()})
+              cgroup = read('/proc/self/cgroup') or ''
+              relative = next((line.split('::', 1)[1] for line in cgroup.splitlines()
+                               if line.startswith('0::')), '/')
+              cgroup_root = pathlib.Path('/sys/fs/cgroup') / relative.lstrip('/')
+              print('RCH test runner resources ' + json.dumps({
+                  'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  'memory': memory, 'self_cgroup': cgroup,
+                  'cgroup': {name: read(cgroup_root / name) for name in
+                             ('memory.current', 'memory.max', 'memory.peak', 'memory.events', 'cpu.max')},
+                  'host_oom_kill': next((line for line in (read('/proc/vmstat') or '').splitlines()
+                                         if line.startswith('oom_kill ')), None),
+                  'largest_processes': sorted(processes, key=lambda row: row['rss_kib'], reverse=True)[:8]
+              }), flush=True)
+              time.sleep(30)
+          PY
+            rch_test_sampler_pid=$!
+            trap 'rch_test_status=$?; trap - EXIT; kill "$rch_test_sampler_pid" 2>/dev/null || true; wait "$rch_test_sampler_pid" 2>/dev/null || true; exit "$rch_test_status"' EXIT
+          fi
+          # Collect every harness result; Cargo still fails if any harness fails.
+          cargo test --no-fail-fast ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log
       - name: Upload test logs on failure or cancellation
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4

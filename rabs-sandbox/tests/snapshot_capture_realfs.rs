@@ -345,9 +345,42 @@ fn sealed_capture_refuses_special_nodes_lossy_paths_and_escaping_links() {
     let dir = tempfile::tempdir().unwrap();
     let lossy_root = dir.path().join("lossy");
     std::fs::create_dir(&lossy_root).unwrap();
-    std::fs::write(lossy_root.join(OsString::from_vec(vec![0xff])), "bytes").unwrap();
+    match std::fs::write(lossy_root.join(OsString::from_vec(vec![0xff])), "bytes") {
+        Ok(()) => assert!(matches!(
+            capture_sealed_source(&[("root".into(), lossy_root)], false, 1, 100),
+            Err(CaptureError::Rejected {
+                reason: CaptureRejection::InvalidPath,
+                ..
+            })
+        )),
+        // Darwin EILSEQ is 92. Some macOS filesystems refuse this name before
+        // the capture layer can observe it; other setup errors must still fail.
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(92) => {
+            use std::io::Write as _;
+            assert!(std::fs::read_dir(&lossy_root).unwrap().next().is_none());
+            writeln!(
+                std::io::stderr(),
+                "SKIP: invalid filename capture not exercised: filesystem refused the name with Darwin EILSEQ (92); no substitute entry was created"
+            )
+            .unwrap();
+        }
+        Err(error) => panic!("creating the non-UTF-8 filename fixture failed: {error}"),
+    }
+
+    // Symlink targets retain raw bytes even when entry names require UTF-8.
+    // Every Unix run must exercise the capture layer's InvalidPath rejection.
+    let lossy_target_root = dir.path().join("lossy-target");
+    std::fs::create_dir(&lossy_target_root).unwrap();
+    let target = OsString::from_vec(vec![0xff]);
+    let link = lossy_target_root.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert_eq!(
+        std::fs::read_link(&link).unwrap().as_os_str(),
+        target.as_os_str()
+    );
     assert!(matches!(
-        capture_sealed_source(&[("root".into(), lossy_root)], false, 1, 100),
+        capture_sealed_source(&[("root".into(), lossy_target_root)], false, 1, 100),
         Err(CaptureError::Rejected {
             reason: CaptureRejection::InvalidPath,
             ..
