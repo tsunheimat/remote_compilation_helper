@@ -32,6 +32,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published CI prerequisites and status evidence: `c5618ef688a1691f4b0b305a5249a56bdca6cde9`
 - Published prepared-wait and coverage-report repairs: `8edaa0f0315697720fcb4453bcaed1293aec9f59`
 - Published daemon response and native fixture repairs: `18e2235faf2df206939641c3256b4e6689ac0e09`
+- Published live-dependency fixture and timing diagnostics: `a836301151a10f6c4e5efca380fbfa97a8b46779`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -57,6 +58,90 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Hook timing diagnostics after `a8363011`
+
+The native Mac standalone E2E job at `a8363011` failed the unchanged hook
+startup gate: its 50 measured invocations averaged 12.77520082 ms against the
+10 ms limit. The complete sample sequence and failed result are retained in
+`rch-ci-heada836-monitor-0z476whg/`. Forty other script statuses passed; the inner
+suite had ten passes, one failure and two skips. The four hook cases after the
+timing assertion were not reached. Linux completed all 41 script statuses,
+with 11 inner passes and two skips, and averaged 1.43784872 ms for its hook
+samples. Capability and pending-scenario skips remain separate from script
+status; these results do not prove live-worker acceptance.
+
+The Mac timing cause is still unknown. The RCH, shared-library and telemetry
+source, dependency manifest/lockfile, toolchain, Cargo configuration, hook test
+and standalone workflow are unchanged between `18e2235f` and `a8363011`.
+The earlier Mac pass does not explain this failed observation.
+
+The follow-up adds child CPU time, context-switch counts, load averages and
+platform information after the original 50 measurement windows have finished.
+Removing that one diagnostic block produces the byte-identical published
+script. Invocation count, subprocess arguments, clock, mean calculation and
+10 ms assertion remain unchanged. This is diagnostic work, with no production
+performance change or improvement claim.
+
+Local validation passed shell syntax, embedded Python compilation, formatting,
+workspace/all-target check and strict Clippy, with non-document source held.
+The actual measurement block also ran all 50 invocations against the verified
+published Linux musl RCH executable and emitted valid resource JSON; this
+checks the diagnostic on Linux, not Mac performance acceptance or the complete
+shell suite. The unchanged official UBS scanner returned zero critical,
+warning and informational records for the changed shell file. Evidence is in
+`rch-hook-resource-validation-4ukxdf_4/`,
+`rch-hook-resource-control-oxvf6tqy/` and active-worktree validation directory
+`ubs-hook-resource-report-approved.tno8kbkp/`. Previous broader scanner findings
+and failed CI measurements remain recorded below.
+
+All five workflows at `a8363011` are terminal:
+
+- [Main CI](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38173588688)
+  concluded cancelled; its aggregate check failed and release builds skipped.
+  Linux x64 completed 225 workspace harnesses with 12,118 reported passes,
+  zero failures, 31 ignored cases and zero filtered cases. Compiler, strict
+  Clippy, docs, formatting, manifest/workflow/security checks and benchmarks
+  passed. Coverage completed reporting and the unchanged 65% gate at 86.87%
+  lines (321,801/370,437) in the verified HTML artifact.
+- Linux ARM and both Macs reached the 60-minute job limit during the chaos
+  fixture's nested daemon build. Each completed 95 preceding harnesses with
+  no recorded failures or filtered cases: Linux ARM had 2,163 reported passes
+  and seven ignores; each Mac had 2,013 passes and two ignores. Their next
+  harness and all later targets have no completed verdict. In particular,
+  neither Mac reached the corrected live-dependency cases. Both Macs passed
+  the earlier runtime boot case, which does not explain the preceding Intel
+  timing failure. All four platforms passed the separate nine-case filesystem
+  and 13-case socket selections; these are repeated coverage.
+- Core E2E completed 164 reported Cargo passes with 92 archived capability-skip
+  records. Its shell suite completed three passes and one skip, then reached
+  the 30-minute limit during path-dependency fixture setup; nine outcomes are
+  missing. GitHub's final annotations confirm all four job-limit cancellations.
+- [Standalone E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38173588755)
+  failed on the Mac hook timing assertion described above. Linux passed; the
+  aggregate report job succeeded, which does not make the workflow a pass.
+- [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38173588683)
+  passed all 42 protocol and 13 release cases, with no ignores or filters.
+  Wrapper size was 443,456 bytes and its enforced p95 was 6,960 microseconds
+  against the unchanged strict 10 ms limit. All 60 original-order samples
+  were retained and reproduce that percentile. This pass does not establish
+  the cause of the earlier 10,880-microsecond loss or a performance improvement.
+- [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38173588699)
+  passed 64 selected transfer cases and its compiler/lint checks. All 1,390
+  Git blobs and modes in the CI source archive match `a8363011` exactly.
+- [Test Release](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38173588692)
+  passed all five Unix build/version/package jobs. Every downloaded ZIP digest,
+  internal archive checksum, executable inventory and executable mode was
+  independently verified. Windows retained the deferred import/type errors;
+  aggregate verification was skipped.
+
+Terminal metadata, annotations, raw logs, verified archives and complete or
+explicitly partial outcome records are retained in
+`rch-ci-heada836-monitor-0z476whg/`. Keep PR #2 draft. The Mac hook timing cause,
+native acceptance of the path correction, workspace/core-E2E completion gaps,
+and the separate local full-toolchain deadline remain open. The proposed
+workspace/core-E2E budget changes remain unapplied pending the user's decision;
+deployment and live SSH/Nexus acceptance remain with the operator.
 
 ## Live-dependency fixture path correction after `18e2235f`
 

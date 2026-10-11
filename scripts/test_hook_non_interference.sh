@@ -193,6 +193,29 @@ with open(sys.argv[3], "w", encoding="utf-8") as samples:
             stderr=subprocess.DEVNULL, check=True,
         )
         samples.write(f"{time.perf_counter_ns() - start}\n")
+
+# Collect only after every measured invocation has finished. These counters
+# describe the same 50 children; they do not replace the wall-clock gate.
+try:
+    import json
+    import os
+    import resource
+
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    print(json.dumps({
+        "kind": "hook_timing_process_resources",
+        "iterations": int(sys.argv[2]),
+        "platform": sys.platform,
+        "machine": os.uname().machine,
+        "cpu_count": os.cpu_count(),
+        "load_average": os.getloadavg(),
+        "child_user_seconds": children.ru_utime,
+        "child_system_seconds": children.ru_stime,
+        "child_voluntary_context_switches": children.ru_nvcsw,
+        "child_involuntary_context_switches": children.ru_nivcsw,
+    }))
+except (AttributeError, ImportError, OSError) as error:
+    print(f"Hook timing resource diagnostics unavailable: {error}", file=sys.stderr)
 PY
 
 AVG_NS=$(awk '{ sum += $1 } END { print int(sum/NR) }' "$TIMING_LOG")
