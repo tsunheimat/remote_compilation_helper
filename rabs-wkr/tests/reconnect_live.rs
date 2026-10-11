@@ -97,6 +97,8 @@ impl Peer {
             worker.assert_alive();
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // Darwin inherits the listener's nonblocking mode on accept.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(IO_BUDGET)).unwrap();
                     stream.set_write_timeout(Some(IO_BUDGET)).unwrap();
                     return Self(BufReader::new(stream));

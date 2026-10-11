@@ -27,6 +27,7 @@ Windows support; existing Windows jobs have not been disabled.
 - CI baseline code tree: `4a878e86833d3040474e7d18776f25b5b9e301ad`
 - Published canonical-root fixture repair: `4034fe2bcfb3a0ac77ee6f090addb3ab75932152`
 - Published filename fixture and CI diagnostics: `425dee6fec669955ff81316e1d4f56a485b248d7`
+- Published Linux compiler bound and fixture priority: `5352da591f6202a7d8727d9d94e3623eb4e9c939`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -52,6 +53,97 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Native macOS fixture follow-up after `5352da59`
+
+The prioritized filesystem fixture passed all nine cases on Linux x64, Linux
+ARM64, macOS Intel and macOS ARM64. Both macOS logs explicitly record the
+unavailable invalid-filename subcase, while the invalid symlink-target rejection
+and long-TMPDIR fixture pass. These focused results are separate from the
+incomplete workspace runs; repeated cases are not additional unique coverage.
+
+The macOS ARM workspace run continued through 95 completed harnesses, recording
+1,995 passes, 18 failures and two ignored cases before its 30-minute limit.
+Those failures expose three fixture assumptions, addressed in this follow-up:
+
+- The jobserver replacement test used invented client descriptor numbers that
+  could equal the real worker's descriptors. It now keeps separate real client
+  and worker pipes alive, verifies the exact client close list and worker
+  installation, and requires that neither worker endpoint is closed.
+- Reconnection, shutdown and wrapper-capture fixtures accepted sockets from
+  nonblocking listeners and immediately used blocking I/O. Darwin inherits the
+  listener's properties, as documented by [Apple's accept manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/accept.2.html).
+  Five affected fixtures now explicitly restore blocking mode before their
+  existing read/write timeouts. This includes the same boundary in the
+  supervision and singleflight fixtures, which the interrupted macOS run had
+  not yet reached. All listener deadlines and assertions remain unchanged.
+- The wrapper framing helper dropped its peer entirely before inspecting EOF.
+  Darwin's [socket-option shutdown guard](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c)
+  can reject the subsequent timeout update with `EINVAL`. The helper now
+  half-closes the reply direction and retains the peer until reading finishes.
+  Every existing exact framing assertion remains; additional fully disconnected
+  cases still require failure. Production transport behavior is unchanged.
+
+All 173 locally selected cases passed across seven harnesses: 106 Asupersync
+library cases, 12 worker reconnection/shutdown cases, and 55 wrapper cases.
+There were no failures, ignored or filtered cases in these runs. Locked
+workspace/all-target check, strict Clippy and formatting passed. The two edited
+files containing production code retain byte-identical production prefixes;
+the other five Rust files are integration tests. Native macOS validation of
+this new fixture batch remains pending.
+
+The unchanged official seven-file UBS scan returned exit 1: one critical,
+307 warning and 129 informational findings. The critical record is unchanged
+timestamp-based staging-filename code, not security-token generation; exclusive
+creation refuses collisions. Its review and the seven added-line test-assertion
+records are retained. No scanner suppression, threshold or source change was
+used to silence the finding, and no all-scope scanner pass is claimed.
+
+At `5352da59`, all four workspace jobs and coverage reached their original
+30-minute limits. Linux ARM completed ten workspace harnesses with 189 passes;
+Linux x64 and macOS Intel stopped during workspace compilation after their
+separate nine-case fixture passes. Coverage completed 12 harnesses with 200
+passes before interruption in `rabs-cas`; LCOV and the 65% verdict are absent.
+The raw coverage job interleaves stdout/stderr, so its complete summary sequence
+supersedes an earlier undercount from grouping summaries by adjacent headers.
+Linux x64/ARM resource sampling recorded 60/59 samples, minimum available memory
+of 5,182,912/9,667,652 KiB, and peak observed combined rustc RSS of
+9,909,064/4,038,124 KiB. Both recorded zero host OOM kills. These observations
+do not establish a causal performance improvement or diagnose earlier shutdowns.
+
+Compiler, strict Clippy, docs, formatting, workflow/manifest/security guards and
+benchmarks passed. [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38143211275)
+passed 42 protocol and 13 release-gate cases, with wrapper size 443,456 bytes and
+enforced p95 8,640 microseconds under 10 ms. [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38143211273)
+passed 64 selected transfer cases, and all 1,390 archived Git blobs and modes
+match this head. All five Unix [package jobs](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38143211270)
+passed; downloaded digests, archive checksums, executable membership and modes
+were verified. Windows reproduced its deferred import/type errors; aggregate
+package verification was skipped.
+
+[Core E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38143211286/job/114484582073)
+passed 164 reported native cases, with 92 archived capability-skip records.
+Its shell phase recorded three passes and one skip, then reached the 30-minute
+limit during path-dependency setup; nine shell outcomes and the advisory
+comparison are absent. [Standalone Linux E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38143211279)
+passed all 41 script statuses, with 11 inner passes/two skips and a 1.455 ms hook
+mean under the unchanged 10 ms limit. Twelve structured skip records are retained
+separately; they are not distinct-case counts. The macOS standalone script step
+then reached its original 60-minute limit after seven passing script statuses.
+The eighth script was still running; 34 outer outcomes are absent. Cache cleanup
+was still active when the approved replacement configuration was prepared.
+
+Evidence is retained under `rch-ci-head5352-monitor-jamixdg7/` and
+`rch-darwin-fixture-repairs-ztlgowk5/` in the validation base. The scanner report
+is in active-worktree `target/managed-storage-validation-20261009/ubs-darwin-fixtures-report-approved.n_qnlczb/`.
+The user approved the prepared three-field CI budget change on October 11:
+workspace tests and coverage now have 60-minute job ceilings, and standalone
+E2E has 90 minutes. Assertions, per-test deadlines, compiler settings and the
+65% coverage threshold retain their existing values. YAML comparison verifies
+that only these three values changed. Earlier timeout results remain failures
+of the old budgets, not passes under the new configuration. Keep the PR draft:
+complete workspace/coverage, new native macOS fixture acceptance and operator
+acceptance remain open. No merge or deployment has been performed.
 
 ## CI resource follow-up after `425dee6`
 

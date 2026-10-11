@@ -119,6 +119,8 @@ impl Fixture {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // Darwin inherits the listener's nonblocking mode on accept.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(15)))
                 .unwrap();

@@ -171,7 +171,7 @@ jobs:
           # and other workspace crates have Unix-only dependencies (openssh, rich_rust)
           # The Windows build-release job still validates that binaries can be built for Windows
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     needs: check
     steps:
       - uses: actions/checkout@v4
@@ -443,7 +443,7 @@ jobs:
   # Coverage reporting (Linux only)
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     needs: check
     steps:
       - uses: actions/checkout@v4

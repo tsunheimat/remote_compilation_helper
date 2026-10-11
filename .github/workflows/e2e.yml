@@ -32,7 +32,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # One cold build plus the complete scenario suite; per-scenario budgets
     # and the runner's non-zero exit on any failure remain unchanged.
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: List E2E scenarios

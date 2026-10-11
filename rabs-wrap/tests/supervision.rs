@@ -120,6 +120,8 @@ impl Fixture {
                 Err(error) => panic!("accept: {error}"),
             });
             let mut writer = connection.unwrap();
+            // Darwin inherits the listener's nonblocking mode on accept.
+            writer.set_nonblocking(false).unwrap();
             writer
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();

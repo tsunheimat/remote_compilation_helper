@@ -1162,6 +1162,11 @@ mod tests {
         let sender = std::thread::spawn(move || {
             // An oversized/malformed reply may legitimately lose its reader.
             let _ = peer.write_all(&bytes);
+            // Exercise framing EOF without racing a full socket disconnect.
+            // Darwin rejects timeout changes after both directions close, so
+            // retain the half-closed peer until the reader has finished.
+            let _ = peer.shutdown(std::net::Shutdown::Write);
+            peer
         });
         let mut reader = BufReader::new(ConsultStream {
             stream,
@@ -1169,7 +1174,7 @@ mod tests {
         });
         let result = read_reply(&mut reader);
         drop(reader);
-        sender.join().unwrap();
+        drop(sender.join().unwrap());
         result
     }
 
@@ -1182,6 +1187,17 @@ mod tests {
                 reply_from_peer(bytes.to_vec()).unwrap_err().kind(),
                 io::ErrorKind::UnexpectedEof
             );
+            // A fully disconnected peer must also fail. Its transport error
+            // can precede framing inspection; the half-close above separately
+            // requires the parser's exact UnexpectedEof verdict.
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(bytes).unwrap();
+            drop(peer);
+            let mut reader = BufReader::new(ConsultStream {
+                stream,
+                deadline: Instant::now() + Duration::from_secs(2),
+            });
+            assert!(read_reply(&mut reader).is_err());
         }
         assert_eq!(
             reply_from_peer(vec![0xff, b'\n']).unwrap_err().kind(),
