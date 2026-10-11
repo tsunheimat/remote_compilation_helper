@@ -28,6 +28,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published canonical-root fixture repair: `4034fe2bcfb3a0ac77ee6f090addb3ab75932152`
 - Published filename fixture and CI diagnostics: `425dee6fec669955ff81316e1d4f56a485b248d7`
 - Published Linux compiler bound and fixture priority: `5352da591f6202a7d8727d9d94e3623eb4e9c939`
+- Published Darwin fixture repairs and approved CI ceilings: `352f025f10252d1bdc09191a6b099cc2a05760fb`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -53,6 +54,107 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## CI prerequisites and fixture evidence after `352f025f`
+
+All five validation workflows at `352f025f` are terminal. Linux x64 completed
+the entire workspace command: 225 harness summaries, 12,110 reported passes,
+two failures, 31 ignored cases and zero filtered cases. The two failures are
+addressed by this follow-up:
+
+- The real-Cargo build-directory fixture executes both `cargo test` and
+  `cargo clippy`. Workspace-test and coverage runners did not install Clippy
+  for the pinned August toolchain. Both jobs now request that component; the
+  fixture's actual compiler invocation, artifact checks and assertions remain.
+- The force-stop helper correctly refuses a mismatched socket peer before
+  sending request bytes. Its fake daemon treated that empty connection as an
+  unexpected mutating request and exited. A controlled baseline reproduced
+  exit 1 without a signal to either owned process. The fixture now tolerates
+  the empty connection; a real status round trip verifies it remains responsive
+  after refusal. Unknown nonempty requests still fail, and the production
+  force-stop helper is byte-identical.
+
+The 18 cases that failed on macOS ARM at `5352da59` now pass on both native Mac
+platforms. Each Mac completed 95 workspace harnesses with 2,013 passes, no
+failures and two ignored cases. Linux ARM completed the same 95 harness positions
+with 2,163 passes, no failures and seven ignored cases. All three reached the
+approved 60-minute ceiling while the following chaos harness compiled its nested
+daemon dependency graph. Later harnesses, including wrapper singleflight and
+supervision, have no native Mac verdict in this run. The separate nine-case
+filesystem fixture passed on all four platforms; its repeated cases are not
+additional unique coverage.
+
+Coverage completed 149 harness summaries with 6,349 passes, one failure and
+11 ignored cases. Its failure is the same missing Clippy component. LCOV and
+the unchanged 65% coverage verdict were not produced. Compiler, strict Clippy,
+docs, formatting, workflow/manifest/security guards and benchmarks passed.
+
+The [standalone E2E run](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38147420738)
+recorded 41 passing Linux script statuses and 40 passes/one failure on macOS.
+Each platform's inner suite recorded 11 passes and two capability skips; the
+50-sample hook means were 1.223/5.235 ms under the unchanged 10 ms limit.
+The macOS failure is `e2e_bd-2ga8.sh`: the immediate status check after
+`hook_no_ansi` did not establish the expected completed build. Its combined
+failure message did not distinguish CLI failure from a rejected status value,
+and its raw fixture files were outside the uploaded directory. Its cause is
+not established. Ten unchanged Linux repetitions passed, as did replay of all
+80 captured status checks through jq 1.8.2; this does not support the proposed
+numeric-precision explanation or replace the failed native observation.
+
+That script now retains status responses, predicate output, daemon logs and
+durable history in the uploaded artifact directory, and reports the two failure
+paths separately. Every completion, exit-code and output assertion remains.
+This is a diagnostic repair, not a claim that the macOS failure is resolved.
+
+Other terminal results at `352f025f`:
+
+- [Core E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38147420717/job/114497565310)
+  passed 164 reported native cases, including 92 archived capability-skip
+  records. Its shell suite completed with 11 passes and two skips. The existing
+  advisory comparison flagged CMake 21/840 ms and clang/make 42/792 ms p95
+  (stored baseline/current). Its `|| true` behavior is unchanged; these are
+  retained advisory failures, not an enforced timing pass or a causal diagnosis.
+- [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38147420745)
+  passed 42 protocol and 13 release-gate cases. Wrapper size was 443,456 bytes;
+  enforced p95 was 8,476 microseconds under 10 ms.
+- [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38147420690)
+  passed 64 selected transfer cases and strict checks. All 1,390 archived Git
+  blobs and modes match the published head.
+- All five Unix [package jobs](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38147420710)
+  passed. ZIP digests, archive checksums, the three executable members and their
+  modes were independently verified. Windows reproduced the deferred import
+  and type errors; aggregate verification was skipped.
+
+Local validation of this follow-up passed the real-Clippy fixture, locked
+workspace/all-target check, strict Clippy and formatting. The force-stop suite
+passed all 11 native tests against the built CLI, with source and binary hashes
+held. Its refusal control now receives a subsequent status response without
+signalling either process; a planted mutating request still crashes the fake
+daemon. Direct attempts through the installed Python wrapper selected an
+overlong temporary path and failed fixture startup. Those failed attempts are
+retained; the successful run used `/usr/bin/python3` and verified `/tmp` as the
+actual temporary directory, matching the CI context.
+
+The output-validation script passed its 14 native cases. Injected status-command
+and predicate failures each produced a failed script and retained all eight
+status files plus durable history. A failed artifact-copy control also failed
+the script. The unchanged official Bash UBS scan reported zero findings. The
+Python scan returned exit 1 with two critical, two warning and 43 informational
+records. Both critical records are reviewed false positives on the unchanged
+test-driver executable argument; the new-line records are two informational
+method notices. Reports, reviews and unchanged scanner identities are retained;
+no suppression or all-scope scanner pass is claimed.
+
+Evidence is under `rch-ci-head352f-monitor-61yn44rn/` and
+`rch-macos-status-investigation-hqyqunwr/` in the validation base. Scanner reports
+are in active-worktree `target/managed-storage-validation-20261009/ubs-status-evidence-report-approved.0tfsnz0t/`
+and `ubs-force-peer-report-approved.z2wadirp/`. A one-line proposal to give the
+workspace-test matrix 90 minutes passes `git apply --check` but remains unapplied
+pending the user's decision. The previously approved limits remain 60 minutes
+for workspace tests and coverage, and 90 for standalone E2E. Keep PR #2 draft:
+complete cross-platform workspace/coverage acceptance, the unexplained macOS
+status observation, the local full-toolchain deadline and operator acceptance
+remain open. No merge or deployment has been performed.
 
 ## Native macOS fixture follow-up after `5352da59`
 

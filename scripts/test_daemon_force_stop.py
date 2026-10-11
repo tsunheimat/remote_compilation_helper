@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,10 @@ while True:
             if not chunk:
                 break
             request.extend(chunk)
+        # The real helper rejects a mismatched SO_PEERCRED identity before it
+        # sends any request. That read-only connection must not kill the fixture.
+        if not request:
+            continue
         if request == b'POST /restart-admission\n':
             peer.sendall(b'HTTP/1.1 200 OK\r\n\r\n{"restart_permitted":false,"active_build_ids":[41],"queued_build_ids":[],"client_lease_ids":[]}')
             continue
@@ -122,6 +127,19 @@ class Fixture:
         self.child.wait(timeout=5)
         self.child.stderr.close()
 
+    def status_reply(self):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(.2)
+            peer.connect(str(self.path))
+            peer.sendall(b'GET /status\n')
+            peer.shutdown(socket.SHUT_WR)
+            reply = bytearray()
+            while chunk := peer.recv(4096):
+                reply.extend(chunk)
+                if len(reply) > force.MAX_REPLY:
+                    raise AssertionError('fixture status reply exceeded its bound')
+            return bytes(reply)
+
     def __enter__(self):
         return self
 
@@ -173,6 +191,10 @@ class NativeForceStop(unittest.TestCase):
                         self.assertFalse(reply['success'])
                         self.assertFalse(daemon.marker.exists())
                         self.assertTrue(daemon.path.exists())
+                        # A round trip is a barrier after the helper's rejected
+                        # connection; an immediate poll can miss a fixture crash.
+                        self.assertEqual(daemon.status_reply().split(b'\r\n\r\n', 1)[0],
+                                         b'HTTP/1.1 200 OK')
                         self.assertIsNone(daemon.child.poll())
 
     def test_real_term_requires_process_exit_and_natural_socket_retirement(self):
@@ -212,6 +234,7 @@ class NativeForceStop(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'another process'):
                     force.stop(str(daemon.path), other.child.pid, .2, .3)
                 for process in (daemon, other):
+                    force.decode_status(process.status_reply(), str(process.path), process.child.pid)
                     self.assertIsNone(process.child.poll())
                     self.assertFalse(process.marker.exists())
                     self.assertTrue(process.path.exists())

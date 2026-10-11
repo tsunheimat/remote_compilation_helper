@@ -64,12 +64,32 @@ record_fail() {
 }
 
 cleanup() {
+    local scenario_status=$? artifact_status=0 history_file
     if [[ -n "$daemon_pid" ]]; then
         kill "$daemon_pid" >/dev/null 2>&1 || true
         wait "$daemon_pid" >/dev/null 2>&1 || true
         daemon_pid=""
     fi
-    # Retain the fixture and daemon log so a failed scenario remains inspectable.
+    # The runner uploads E2E_LOG_DIR, not TMPDIR. Copy evidence after the daemon
+    # exits so even an immediate status-read failure retains its durable history.
+    if [[ -n "${E2E_LOG_DIR:-}" && -n "$tmp_root" && -d "$tmp_root" ]]; then
+        for history_file in "${socket_path%.sock}.history"*; do
+            if [[ -f "$history_file" && ! -L "$history_file" ]]; then
+                cp "$history_file" "$tmp_root/" || artifact_status=1
+            fi
+        done
+        if ! mkdir -p "$E2E_LOG_DIR" || ! cp -R "$tmp_root" "$E2E_LOG_DIR/"; then
+            artifact_status=1
+        fi
+        if [[ "$artifact_status" -ne 0 ]]; then
+            printf 'Failed to retain output-validation evidence under %s\n' "$E2E_LOG_DIR" >&2
+            if [[ "$scenario_status" -eq 0 ]]; then
+                scenario_status=1
+            fi
+        fi
+    fi
+    # Preserve a test failure even when all evidence copies succeed.
+    exit "$scenario_status"
 }
 trap cleanup EXIT
 
@@ -196,13 +216,21 @@ run_output_fixture() {
         record_fail
         return 1
     fi
-    if ! "$rch_bin" status --json >"$output_prefix.status.json" 2>"$output_prefix.status.err" \
-        || ! jq -e --argjson code "$expected_exit" --argjson previous "$last_build_id" \
+    if ! "$rch_bin" status --json >"$output_prefix.status.json" 2>"$output_prefix.status.err"; then
+        log_json "verify" "Status command failed before completion validation" "$test_name" "fail"
+        cat "$output_prefix.status.json" "$output_prefix.status.err" >&2
+        record_fail
+        return 1
+    fi
+    if ! jq -e --argjson code "$expected_exit" --argjson previous "$last_build_id" \
         '.success == true and (.data.daemon.active_builds | length) == 0 and
          (.data.daemon.recent_builds[0] | .id > $previous and .exit_code == $code and
           .worker_id == "mock-1" and .command == "cargo build")' \
-        "$output_prefix.status.json" >/dev/null; then
-        log_json "verify" "Daemon did not record and release this completed build" "$test_name" "fail"
+        "$output_prefix.status.json" >"$output_prefix.status-check.out" 2>"$output_prefix.status-check.err"; then
+        log_json "verify" "Daemon did not record and release this completed build" "$test_name" "fail" \
+            "$(jq -nc --arg previous "$last_build_id" '{previous_build_id:$previous}')"
+        cat "$output_prefix.status.json" "$output_prefix.status.err" \
+            "$output_prefix.status-check.out" "$output_prefix.status-check.err" >&2
         record_fail
         return 1
     fi

@@ -178,6 +178,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          # The real-Cargo build-dir fixture also executes cargo clippy.
+          components: clippy
       - name: Install wrapper contract toolchain prerequisites
         run: |
           set -euo pipefail
@@ -450,7 +452,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-          components: llvm-tools-preview
+          components: llvm-tools-preview, clippy
       - name: Install wrapper contract toolchain prerequisites
         run: |
           set -euo pipefail
