@@ -1,6 +1,6 @@
 # Managed execution storage: local Codex handoff
 
-Snapshot: 2026-10-11 UTC, local development continuation. Consumer: the draft PR
+Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR
 reviewer and the user's next local session. The user requested continued
 development and said they will deploy later. Keep PR #2 draft. Deployment and
 live worker/Nexus acceptance remain with the user. Windows-specific repair and
@@ -34,6 +34,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published daemon response and native fixture repairs: `18e2235faf2df206939641c3256b4e6689ac0e09`
 - Published live-dependency fixture and timing diagnostics: `a836301151a10f6c4e5efca380fbfa97a8b46779`
 - Published hook resource diagnostics: `26cda270149e57aefee1fdf245b6b4190b730114`
+- Published isolated warmup and native target contracts: `2960380a9d4821c0180b0c6917e53e1977cd8523`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -59,6 +60,198 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Buffered edge reads and concurrent breaker readers after `2960380a`
+
+The published revision's [RABS release job](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38185933990/job/114608132473)
+passed replay, both dependency cases, the corrected Cargo worktree fixture and
+doctor, then failed the unchanged wrapper overhead gate: p95 10,597 microseconds
+against the strict 10 ms limit. All 60 observations are retained; six were at or
+above 10 ms. This result remains a failure.
+
+A separate native Linux trace found 4,912 one-byte socket reads across three
+requests. The daemon now keeps an 8 KiB buffered reader for the whole connection,
+including hello, requests, completion and capture acknowledgment. Frame size,
+request count and absolute deadline checks are unchanged. Writes use the same
+underlying socket without discarding prefetched input. A candidate trace of
+three requests recorded six 8 KiB receive requests and no one-byte receive
+requests, with three matching decision receipts. Traced timings are excluded
+from the performance comparison.
+
+The first local Cargo worktree check after this change failed with two of three
+verifications. A diagnostic reproduction then showed `leaf` receiving `EAGAIN`
+from the breaker lock before either concurrent dependency connected to the
+daemon. The wrapper previously took an exclusive lock just to read its breaker
+decision. It now permits shared decision reads; updates remain exclusive. A
+probe releases its shared lock, acquires exclusive ownership without waiting,
+re-reads the current state, and publishes its reservation before connecting.
+Contended writers and unavailable locks still fall back locally. No gate,
+assertion, concurrency setting, timeout or dependency pin was relaxed.
+
+The same-invocation release comparison kept the incumbent daemon and wrapper
+live alongside both candidate combinations. Each used five warmups and 60
+observations, with forward/reverse alternating order. All three produced 65
+identical normalized shadow decisions and successful compiler passthroughs.
+
+| Local release variant | p95 | Median | Daemon CPU during measured requests |
+| --- | --- | --- | --- |
+| Incumbent daemon and wrapper | 5.436 ms | 4.874 ms | 0.14 s |
+| Buffered daemon and incumbent wrapper | 3.887 ms | 3.211 ms | 0.04 s |
+| Buffered daemon and shared-reader wrapper | 3.824 ms | 3.233 ms | 0.04 s |
+
+The combined p95 is 29.65% lower in this controlled overhead fixture. Wrapper
+CPU stayed approximately 0.164 s per variant; daemon CPU uses Linux process
+counters with 10 ms resolution. This is not a fleet throughput or real-project
+build speed claim. The separate, unchanged release gate passed at 4.038 ms p95.
+CI still needs to test the new source.
+
+A black-box release comparison also held a real shared file lock in a separate
+process: the incumbent produced no daemon consultation, while the candidate
+consulted and preserved compiler status and breaker state. Both refused to
+consult under an exclusive lock or to reserve an open-breaker probe while a
+reader remained. After release, the candidate probed and reset the state to
+closed. These controls preserve the breaker's exclusion semantics.
+
+Local checks, with source hashes held:
+
+- Edge unit tests: 32 passed, zero failures/ignores, 492 filtered; real-daemon
+  edge, output-capture and serving targets: 8 + 5 + 1 passed, none filtered.
+  These source-identical edge results precede the wrapper lock change.
+- Final wrapper unit and socket protocol targets: 36 + 8 passed, none filtered.
+- Existing seeded daemon-kill, sustained-death recovery and 200-consult soak
+  cases: three passed, none ignored or filtered. This native run is separate
+  from the interrupted CI coverage compilation.
+- Real Cargo worktrees and registry/Git dependency targets: 1 + 2 passed in
+  debug, and 1 + 2 passed in release, none filtered.
+- Runtime ownership policy: six passed across 352 Rust source files. Workspace
+  all-target check, strict Clippy and formatting passed.
+
+Evidence is retained under
+`/mnt/hdd-vibe-coding-share/remote-test-local-fallback-claude1/tmp/` in
+`rch-live-consult-profile-s0sw_ux8/`,
+`rch-buffered-edge-validation-wwsi7o2i/`,
+`rch-buffered-shared-breaker-validation-_l34o0pc/`, and
+`rch-buffered-breaker-comparison-7mnym7jm/`. The initial failed test, diagnostic
+trace, incumbent binaries, all measurements, CPU observations and matching
+decision receipts are retained. Published-head CI logs, verified artifacts and
+parsed outcomes are in `rch-ci-head296038-monitor-n_2bg8zx/` under the same root.
+The subsequent source-identical chaos checks are in
+`rch-breaker-chaos-validation-lqc1gj6v/`.
+
+The unchanged official UBS scan returned exit 1: one critical, 196 warnings and
+97 informational findings. Its critical finding calls the existing timestamp
+used in a staging filename a security token; the statement is unchanged from
+HEAD, and `create_new`, mode 0600 and exclusive atomic publication guard the
+file. All 24 added-line findings were reviewed: 17 enforcing test assertions and
+seven contextual informational notices. This is not a green UBS result. No
+rule changes or suppressions were introduced. Full findings, source/scanner
+hashes and review are in
+`target/managed-storage-validation-20261009/ubs-buffered-breaker-report-approved.7yj75k7r/`.
+
+At `2960380a`, both standalone E2E platforms passed all 41 scripts; their inner
+suites each recorded 11 passes and two explicit skips. The 50-sample hook mean
+was 1.165 ms on Linux and 8.499 ms on macOS, under the existing 10 ms gate.
+Rsync passed 64 cases with zero failures/ignores and 3,309 filtered. All five
+Unix release jobs passed; downloaded packages independently verified artifact
+digests, archive checksums, names and executable contents. Windows still failed
+the known unavailable stream-helper compilation, so aggregate package
+verification was skipped. Core E2E passed 164 Cargo cases with no failures,
+ignores or filtered cases, plus 11 shell cases with two explicit skips. Its
+existing non-enforcing historical timing report recorded four threshold
+exceedances, 20 comparisons within threshold and nine new entries; the green
+E2E job is not a pass for that advisory report. Main workspace tests and coverage
+have separate verdicts: coverage ended after a runner shutdown and exit 143
+during the chaos fixture's nested daemon build. Its 95 completed harnesses
+recorded 2,163 passes and seven ignores without a reported assertion failure;
+the interrupted target and remaining targets did not complete. No coverage
+report or threshold result was produced, and the shutdown cause is
+unestablished. Linux x64 completed all 225 workspace harnesses: 12,118 passed,
+zero failed, 31 ignored and zero filtered. The separate nine filesystem and 13
+socket selections passed and repeat workspace coverage. Linux ARM and both Macs
+exceeded the unchanged 60-minute ceiling, confirmed by GitHub annotations. Each
+completed 95 harnesses before interruption in `chaos_faultinjection`: Linux ARM
+recorded 2,163 passes and seven ignores; each Mac recorded 2,013 passes and two
+ignores, with no reported failures or filters. All three stopped during the
+fixture's nested daemon compilation. Neither Mac reached the new dependency
+target-contract cases, so their native execution remains unverified. Main CI
+and its aggregate check failed; its release stage skipped. Every workflow at
+this revision is terminal.
+
+## Daemon preparation in workspace fixtures after `2960380a`
+
+The timed-out jobs had already compiled the workspace test graph, then the
+first wrapper fixture invoked a package-only production daemon build. Cargo's
+unit graphs show different dependency features, including Asupersync, so this
+invocation compiled a second dependency graph. This is a fixture preparation
+problem; the timeouts are not passing test results.
+
+The five wrapper fixtures now share one preparation helper. Workspace tests
+pass their existing package/feature selection through
+`RABS_TEST_WORKSPACE_ARGS`; the helper asks Cargo to prepare that same test
+graph with `--no-run`. Coverage passes its existing `--workspace --features
+rich-ui` selection. The helper always invokes Cargo and requires success, so an
+existing daemon file alone cannot establish freshness. Scope validation refuses
+excluding `rabsd`, changing the manifest, target, profile or build directory,
+or executing a nested test run. Parent-package metadata is removed from the
+child environment while compiler flags, instrumentation and target placement
+remain. Standalone fixtures retain a production daemon build in their debug or
+release profile. Release selection now applies to all five helpers; previously
+only the overhead fixture passed `--release`, while the others built debug and
+then selected a daemon beside the release wrapper. This closes that freshness
+gap for standalone release execution.
+
+The existing assertions, samples and deadlines are unchanged. The first local
+run passed chaos, worktrees, dependencies and debug overhead, but the wrapper
+contract suite failed with Linux `ETXTBSY` while directly executing its freshly
+copied compiler script, before the wrapper was invoked. A diagnostic trace of
+three execution cases passed but showed a fork overlapping another test's open
+executable writer. A separate controlled native probe reproduced errno 26 while
+a child retained a CLOEXEC writer and restored exact exit status, raw-argument
+stdout and stderr after closure. The original failure's retaining PID was not
+captured.
+
+Executable writes/copies and all wrapper-fixture process launches now share a
+short preparation guard, including the helper's Cargo spawn. The guard ends
+after spawn, before waiting for any child; runtime tests still run concurrently.
+The 14 launch-site changes preserve arguments and I/O settings, including all
+seven output calls' original null-input/piped-output defaults. There are no
+retries or discarded failures. No dependency version or CI ceiling changed.
+This is build-setup maintenance and has no separate performance claim.
+The unit graphs and closure comparison are retained in
+`rch-nested-cargo-graphs-lujkabaa/` under the native evidence root above. Final
+native Linux validation is retained in
+`rch-workspace-daemon-preparation-final-5w5_4mne/`, with source hashes held:
+
+- The workspace test graph compiled successfully; compilation alone is not a
+  full-workspace runtime pass.
+- All five complete fixture targets passed: chaos three, worktrees one,
+  dependencies two, debug overhead one and wrapper contracts ten. None failed,
+  was ignored or filtered. Each invoked Cargo and reused the prepared workspace
+  without recompilation; preparation checks took 1.53 to 2.17 seconds.
+- Standalone release worktrees, dependencies, overhead and wrapper targets
+  passed 1 + 2 + 1 + 10 cases with no failures, ignores or filters. The unchanged
+  enforcing overhead gate passed at 4.691 ms p95 across all 60 retained samples.
+  The separate debug 5.205 ms observation is measurement-only.
+- Locked workspace/all-target compiler and strict Clippy checks, plus formatting,
+  passed. Earlier edge/protocol results above bind to the unchanged production
+  files; repeated profiles are not additional unique coverage.
+
+Native Mac execution and fresh published-head CI remain required. The first
+failed local run is retained in
+`rch-workspace-daemon-preparation-lxmuks02/`, the trace in
+`rch-wrapper-script-exec-boundary-f_zpbaj4/`, and the deterministic writer
+control in `rch-script-writer-control-__d1aefo/`. The first run also retains a
+log-reader error: it initially counted the worktree fixture's intentional stock
+compilation as a workspace rebuild. The corrected reader examines only Cargo's
+preparation phase; all later fixture compilation output remains visible.
+
+The final nine-file UBS scan returned exit 1, one critical, 360 warnings and
+223 informational findings. Its critical record is the unchanged staging-name
+false positive discussed above. All 31 added-line notices were reviewed: test
+assertions, synchronous file operations, path-literal notices and a test-only
+error assertion. No suppression or scanner-rule change was made. Source/scanner
+hashes, the full result and review are retained in
+`target/managed-storage-validation-20261009/ubs-daemon-preparation-final-report-approved.ojuunlkq/`.
 
 ## Fixture warmup and native target contracts after `26cda270`
 
@@ -2080,6 +2273,37 @@ investigate the host/cancellation event separately from assertion failures.
    already passed locally; they do not prove acceptance on an operator's worker.
 4. Leave Windows-specific repair deferred and keep PR #2 draft while required
    acceptance remains open. Existing Windows build failures remain visible.
+
+When the user is ready to deploy, run the worker acceptance in this order:
+
+1. Select a POSIX worker and provision the chosen persistent volume, package
+   configuration and credentials. Follow the [configuration guide](guides/configuration.md#worker-cache-scratch-and-environment-placement).
+   Keep source mirrors, tools and target pools outside `/tmp` if using private
+   mounts. Start with `tmp_mode = "env"` and inspect the effective controller
+   configuration with `rch config validate` and
+   `rch config get execution.storage.root --sources`.
+2. In a representative project, run
+   `RCH_REQUIRE_REMOTE=1 rch exec -- cargo test`. Check its selected worker and
+   durable completion receipt, compiler/test status and returned artifacts.
+   Require the actual remote path to succeed; a local fallback is not evidence
+   for worker storage placement.
+3. On that worker, verify the configured cache paths and per-job scratch path.
+   Repeat the build to check cache persistence. Exercise a failed build and a
+   normal RCH cancellation of an owned job; verify the original status and
+   receipt behavior, and that scratch is reclaimed only after its lease is
+   released. Do not purge shared caches or unrelated jobs to create a fixture.
+4. Use a project whose package manager is configured for the intended Nexus
+   repository. Confirm a successful fetch in the Nexus access records, then
+   repeat it to verify reuse of the worker cache. Environment defaults alone do
+   not install registry configuration or credentials into a new `CARGO_HOME`.
+5. If private `/tmp` is required, verify mount namespace privileges on that
+   worker, switch to `tmp_mode = "private_mount"`, and repeat success, failure
+   and cancellation checks. Confirm `/tmp` resolves to the job scratch while
+   the watchdog record remains visible in the parent namespace. A privilege
+   refusal is a valid refusal test, not proof that private mounting succeeded.
+
+These are operator acceptance steps, not claims of deployment or live SSH/Nexus
+validation by this development session.
 
 The current CI/E2E/release configuration follows `rust-toolchain.toml` at
 `nightly-2026-08-31`. Earlier June results remain historical; the alignment and

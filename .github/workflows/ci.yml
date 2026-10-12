@@ -220,6 +220,8 @@ jobs:
       - name: Run tests
         env:
           RCH_MOCK_SSH: '1'
+          # Nested fixture preparation must use this same unified test graph.
+          RABS_TEST_WORKSPACE_ARGS: ${{ matrix.cargo_args }}
         run: |
           set -o pipefail
           mkdir -p target/test-logs
@@ -503,6 +505,7 @@ jobs:
       - name: Generate LCOV coverage
         env:
           RCH_MOCK_SSH: '1'
+          RABS_TEST_WORKSPACE_ARGS: --workspace --features rich-ui
         # Build debug binaries first for E2E tests that need them
         run: cargo llvm-cov --features rich-ui --workspace --lcov --output-path lcov.info
       - name: Generate HTML coverage report

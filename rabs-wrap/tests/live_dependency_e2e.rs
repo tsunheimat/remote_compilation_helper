@@ -31,9 +31,12 @@
 //! was answered `hit` → `served` without an admitted execution.
 #![cfg(unix)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+use support::rabsd_bin;
 
 const INDEX: &str = "index.example-0123456789abcdef";
 const SERVING_TARGETS: [&str; 4] = [
@@ -45,30 +48,6 @@ const SERVING_TARGETS: [&str; 4] = [
 
 fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
-}
-
-/// Always ask Cargo, once per test process: it is a no-op when fresh, and a
-/// daemon left over from an older tree must never answer for this one.
-fn rabsd_bin() -> PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let mut build = Command::new(env!("CARGO"));
-        build.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
-        // Parent test metadata invalidates build-script fingerprints (e.g. Ring).
-        // Cargo supplies the correct package metadata for each child build.
-        for (name, _) in std::env::vars_os() {
-            if name.to_str().is_some_and(|name| {
-                name.starts_with("CARGO_PKG_")
-                    || name.starts_with("CARGO_BIN_EXE_")
-                    || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH")
-            }) {
-                build.env_remove(name);
-            }
-        }
-        let status = build.status().expect("build rabsd");
-        assert!(status.success(), "rabsd build failed");
-    });
-    Path::new(wrap()).with_file_name("rabsd")
 }
 
 /// The real toolchain binary (`<sysroot>/bin/rustc`), not a proxy.

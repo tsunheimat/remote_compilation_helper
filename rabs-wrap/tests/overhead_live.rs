@@ -5,37 +5,14 @@
 //! measurement-only in debug — same calibration as the original C010.
 #![cfg(unix)]
 
+mod support;
+
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::rabsd_bin;
 
 const SLO_MS: f64 = 10.0;
-
-/// Always ask Cargo, once per test process: it is a no-op when fresh, and a
-/// daemon left over from an older tree must never answer for this one.
-fn rabsd_bin() -> std::path::PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let mut build = Command::new(env!("CARGO"));
-        build.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
-        // Parent test metadata invalidates build-script fingerprints (e.g. Ring).
-        // Cargo supplies the correct package metadata for each child build.
-        for (name, _) in std::env::vars_os() {
-            if name.to_str().is_some_and(|name| {
-                name.starts_with("CARGO_PKG_")
-                    || name.starts_with("CARGO_BIN_EXE_")
-                    || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH")
-            }) {
-                build.env_remove(name);
-            }
-        }
-        if !cfg!(debug_assertions) {
-            build.arg("--release");
-        }
-        assert!(build.status().expect("build rabsd").success());
-    });
-    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
-}
 
 #[test]
 fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {

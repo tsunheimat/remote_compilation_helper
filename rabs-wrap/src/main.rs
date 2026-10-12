@@ -377,22 +377,32 @@ fn load_state(path: &str) -> BreakerState {
 /// The lock has a stable inode SEPARATE from the atomically replaced
 /// state file. Never wait for another wrapper: contention and unavailable
 /// locking both mean local passthrough, not a queue in front of rustc.
-fn try_lock_breaker(path: &str) -> Option<std::fs::File> {
+fn open_breaker_lock(path: &str) -> Option<std::fs::File> {
     if let Some(parent) = std::path::Path::new(path)
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let lock = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .open(format!("{path}.lock"))
-        .ok()?;
+        .ok()
+}
+
+fn try_lock_breaker(path: &str) -> Option<std::fs::File> {
+    let lock = open_breaker_lock(path)?;
     lock.try_lock().ok()?;
+    Some(lock)
+}
+
+fn try_read_breaker(path: &str) -> Option<std::fs::File> {
+    let lock = open_breaker_lock(path)?;
+    lock.try_lock_shared().ok()?;
     Some(lock)
 }
 
@@ -783,18 +793,29 @@ fn consult_succeeded(reply: &str) -> bool {
 
 fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
     let policy = BreakerPolicy::default();
-    // The breaker lock covers DECISIONS and RECORDS, not the consult. A
-    // closed breaker admits concurrent consults: holding the lock across a
-    // consult made every parallel compile of a `cargo -jN` build skip RABS
-    // (observed live: ~40% of eligible compiles under -j4). Only the open
-    // breaker's single probe keeps the lock for its whole window, which is
-    // what makes "one probe per cooldown" exact.
+    // Closed-breaker decisions share a read lock. Exclusive reads made
+    // concurrent Cargo compiles skip RABS before either reached the daemon.
+    // Records remain exclusive, and no closed-breaker lock spans a consult.
+    // An open breaker's single probe holds an exclusive reservation for its
+    // whole window, which makes "one probe per cooldown" exact.
     let (probe_guard, probing_state, connect_timeout_ms, decision_timeout_ms) = {
-        let Some(guard) = try_lock_breaker(path) else {
+        let Some(mut guard) = try_read_breaker(path) else {
             return Live::PassThrough;
         };
-        let state = load_state(path);
-        let now = now_ms();
+        let mut state = load_state(path);
+        let mut now = now_ms();
+        if matches!(decide(&policy, &state, now), ConnectDecision::Probe { .. }) {
+            // Never upgrade a held shared lock: release it, acquire exclusive
+            // ownership without waiting, then re-read. Another wrapper may
+            // have reserved a probe or recovered the daemon in between.
+            drop(guard);
+            let Some(exclusive) = try_lock_breaker(path) else {
+                return Live::PassThrough;
+            };
+            guard = exclusive;
+            state = load_state(path);
+            now = now_ms();
+        }
         match decide(&policy, &state, now) {
             ConnectDecision::SkipToLocal => return Live::PassThrough,
             ConnectDecision::Attempt {
@@ -1432,6 +1453,83 @@ mod tests {
         daemon.join().unwrap();
         // The success was folded into the current record.
         assert_eq!(load_state(&path_text), BreakerState::fresh());
+    }
+
+    #[test]
+    fn closed_breaker_readers_can_consult_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breaker");
+        let path = path.to_str().unwrap();
+        store_state(path, &BreakerState::fresh()).unwrap();
+        let _reader = try_read_breaker(path).unwrap();
+        let socket = dir.path().join("edge.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connected) => break connected,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "reader prevented consultation");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("\"kind\":\"hello\""));
+            stream.write_all(b"{\"kind\":\"hello-ok\"}\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("/tc/bin/rustc"));
+            stream
+                .write_all(
+                    b"{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow\"}\n",
+                )
+                .unwrap();
+        });
+
+        assert!(matches!(
+            observe_with_breaker(
+                socket.to_str().unwrap(),
+                path,
+                &["/tc/bin/rustc".to_owned()]
+            ),
+            Live::PassThrough
+        ));
+        daemon.join().unwrap();
+        assert_eq!(load_state(path), BreakerState::fresh());
+        assert!(try_lock_breaker(path).is_none(), "reader remains held");
+    }
+
+    #[test]
+    fn shared_reader_cannot_reserve_an_open_breaker_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breaker");
+        let path = path.to_str().unwrap();
+        let socket = dir.path().join("edge.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let state = BreakerState::Open {
+            opened_at_ms: now_ms().saturating_sub(BreakerPolicy::default().cooldown_ms * 2),
+            last_probe_started_at_ms: None,
+        };
+        store_state(path, &state).unwrap();
+        let _reader = try_read_breaker(path).unwrap();
+
+        observe_with_breaker(socket.to_str().unwrap(), path, &[]);
+
+        assert_eq!(load_state(path), state);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
