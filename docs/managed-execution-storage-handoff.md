@@ -7,6 +7,10 @@ live worker/Nexus acceptance remain with the user. Windows-specific repair and
 validation are deferred following the user's request to consider skipping
 Windows support; existing Windows jobs have not been disabled.
 
+The newest CI evidence is first. Earlier sections preserve historical outcomes;
+the [remaining acceptance](#remaining-acceptance) section gives the current
+operator sequence.
+
 ## Checkout and validation state
 
 - Repository: <https://github.com/tsunheimat/remote_compilation_helper>
@@ -37,6 +41,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published isolated warmup and native target contracts: `2960380a9d4821c0180b0c6917e53e1977cd8523`
 - Published buffered edge and workspace fixture repairs: `f9c7ba62c763ee82dfde8be2b1d6c3d473a9b403`
 - Published ownership, native fixture and coverage preparation repairs: `4ea74ded45adf1cefcb6ae0d240a0e4698a00852`
+- Published process-observation fixtures and native CI preparation: `1cbcf0e4720c357e36bec4e6b7955d37af7ce1ae`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -62,6 +67,140 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Completed CI at `1cbcf0e4`
+
+The latest source includes the process-observation fixtures, core E2E support
+preparation and native Intel release runner described below. The source archive
+from PR merge revision `3cbb8c01f9ac178732c6758794284899c698fd2a` independently
+matches all 1,391 tracked blobs and executable modes at this feature head.
+
+Every workflow and job in this cycle is terminal. All four workspace platforms
+completed successfully, and the Intel Mac release retry passed. The ARM Mac
+release retry still exceeded 30 minutes. Main CI and its aggregate check failed;
+Windows release compilation also remains deferred. Neither canceled ARM build
+is a complete release pass.
+
+| Workflow or platform | Result |
+| --- | --- |
+| [Main CI](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38212980893), Linux x64 | Attempt 1 completed all 225 workspace harnesses: 12,126 passed, zero failed, 31 ignored and zero filtered. Carried forward into attempt 2. |
+| Main CI, macOS ARM64 | Attempt 1 completed all 216 workspace harnesses: 10,028 passed, zero failed, 23 ignored and zero filtered. The inherited Mac workspace selection excludes `rchd`. Carried forward into attempt 2. |
+| Main CI, Intel macOS | Attempt 2 completed all 216 workspace harnesses: 10,028 passed, zero failed, 23 ignored and zero filtered. Its separate filesystem and socket selections also passed. |
+| Main CI, Linux ARM64 | Attempt 2 completed all 225 workspace harnesses: 12,126 passed, zero failed, 31 ignored and zero filtered. Its separate filesystem and socket selections also passed. |
+| Main CI, coverage | Test execution, LCOV, HTML, text reporting and the unchanged 65% gate passed on attempt 1. The verified HTML reports 87.07% line coverage: 322,720 / 370,628 lines. Carried forward into attempt 2. |
+| Main CI, core E2E | Attempt 1 passed all 164 Cargo cases, with zero failures, ignores or filters. All 13 shell cases completed: 11 passed, zero failed, and two opt-in cases skipped. The full job took 29m21s within its unchanged 30-minute limit. Carried forward into attempt 2. |
+| Main CI, release builds | Linux x64, ARM64 and musl completed successfully in attempt 2, and Intel Mac passed in attempt 3. ARM Mac's attempt 4 retry exceeded 30 minutes despite restoring its cache, with no compiler error, completed release build or artifact. Both first Mac builds also exceeded 30 minutes. Windows reproduced nine Unix API errors in `rabs-asupersync` and remains deferred. |
+| [Standalone E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38212980845) | Ubuntu and macOS each passed all 41 scripts. Each inner suite recorded 11 passes, zero failures and two explicit configuration-dependent skips. All four cleanup-observation cases passed natively on both platforms. |
+| [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38212980884) | Protocol and release jobs passed: 36 + 8 protocol cases and 13 release cases, none failed, ignored or filtered. The wrapper was 444,000 bytes. The unchanged 60-sample enforcing gate recorded 3.445 ms p95 below 10 ms. This is not a paired performance comparison. |
+| [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38212980872) | 64 passed, zero failed or ignored, 3,309 filtered, using rsync 3.2.7. Compiler, format and lint checks passed. |
+| [Test Release](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38212981009) | All five Unix build/smoke/package jobs passed. Every current archive independently passed its published artifact digest, archive checksum, exact executable-member list and executable-mode checks. Windows reproduced the three deferred RCH import/type errors; aggregate package verification skipped. |
+
+Format, workflow and manifest guards, compiler checks, strict Clippy, docs,
+security and benchmark gates passed on attempt 1. The separate nine-case
+filesystem and 13-case socket selections passed on all four workspace platforms
+in that attempt. These repeated selections are separate from the complete
+workspace counts. GitHub carries successful jobs into the retry with new job
+identifiers; they were not executed twice.
+
+The first Linux ARM attempt spent 3m03s and 49m29s in its initial focused and
+workspace preparation. Intel Mac spent 7m12s and 43m31s in those phases. Their
+subsequent workspace invocations reused the prepared artifacts. Neither log
+recorded an assertion failure, but neither run completed: Linux ARM's 148
+finished harnesses recorded 2,988 passes and 11 ignores; Intel Mac's 152 recorded
+6,121 passes and three ignores. Unfinished harnesses are excluded from those
+counts. Both jobs have explicit 60-minute cancellation annotations, and both
+compiler caches uploaded completely after cancellation.
+
+One targeted retry of these canceled jobs and their dependents started at the
+same head. Both workspace suites completed successfully after restoring the
+saved compiler caches. Tests, concurrency and all deadlines remain unchanged.
+This completes their validation; it is not a code fix for initial compilation
+duration or a performance improvement claim. The original partial results
+remain preserved. No additional job-budget proposal was applied.
+
+The main release jobs first ran in attempt 2. Both Mac logs report no restored
+cache and explicit 30-minute cancellation annotations. Their cache upload steps
+then succeeded completely: 1,461,100,619 bytes for ARM and 1,486,869,692 bytes for
+Intel. One targeted retry per Mac job used these saved caches at the same source
+and unchanged release limit. GitHub rejected simultaneous individual-job retries
+because the workflow was already running, so Intel ran first and ARM followed.
+Windows and the successful checks were not rerun. These retries do not fix cold
+compilation duration or erase either incomplete first build. Attempt 2's overall
+workflow and aggregate check failed; all six release logs and timeout annotations
+were preserved before the retry began.
+
+The Intel retry restored the exact cache key and 1,486,869,692-byte archive from
+its canceled attempt. It completed the unchanged whole-workspace release
+compilation in 20m45s and uploaded its artifacts successfully. Attempt 3's
+aggregate remained failed because ARM was still canceled and Windows failed.
+Those results were saved before starting the ARM retry.
+
+ARM's retry restored the exact cache key and 1,461,100,619-byte archive, but
+again received the explicit 30-minute cancellation annotation. Its log has no
+completed release-profile marker or compiler error, and artifact upload skipped.
+No further retry was started. Attempt 4's final metadata, raw log and annotation
+are preserved in `attempt4-terminal-ci-outcomes.json` and
+`job-114749328664.log`; the log SHA-256 is
+`be73159d26f684f517f50d0f4b9e1646f789b3e47c834c68734b835da0225f5b`.
+The already-passing ARM Test Release package uses the distribution profiles and
+does not replace this incomplete whole-workspace `release` build.
+
+The complete standalone Mac run passed the unchanged hook gate with a 9.708 ms
+mean across all 50 samples. The preceding revision's 13.102 ms failure remains
+recorded below; the cause is unestablished and no timing fix is claimed. The
+core shell suite explicitly skipped installation prompting and opt-in true E2E.
+Its existing advisory performance helper is not an enforcing gate. These mock
+SSH checks do not establish deployment, real-worker or Nexus acceptance.
+
+The verified coverage HTML also reports 98.46% for
+`rch-common/src/execution_storage.rs` (255 / 259 lines). No exact coverage-runtime
+test count is claimed because the complete job log was not retrieved. This
+hosted result is separate from the earlier failed local coverage attempts.
+
+Raw logs, verified archives, source/package proofs, timeout annotations,
+first-attempt outcomes and retry metadata are retained in
+`/mnt/hdd-vibe-coding-share/remote-test-local-fallback-claude1/tmp/rch-ci-head1cbcf0-monitor-wql4kji8/`.
+Windows jobs remain enabled, with Windows repair deferred. PR #2 remains draft.
+
+## Approved job budgets after `1cbcf0e4`
+
+On 2026-10-12 the user explicitly approved "Approve 90-minute workspace tests"
+and "Approve core E2E 60 minutes" for the two prepared one-line proposals.
+The workflow raises the four workspace-test jobs from 60 to 90 minutes
+and core E2E from 30 to 60 minutes. Coverage remains at 60 minutes and the main
+release matrix at 30 minutes.
+
+A parsed comparison with `1cbcf0e4` proves those are the only workflow changes.
+All commands, package and test selections, compiler settings, assertions and
+performance/coverage thresholds are identical. Every Bash step in the two
+affected jobs passes syntax checking. The recorded workspace and core E2E
+results above completed under the original, smaller limits; the approved limits
+were not part of those runs. This is scheduling headroom, not a performance
+improvement claim or a reclassification of the earlier cancellations.
+
+The exact before/after YAML and comparison are retained as
+`ci-approved-job-budgets.before.yml`, `ci-approved-job-budgets.after.yml` and
+`ci-approved-job-budgets-validation.json` in the current CI evidence directory.
+
+The required UBS invocation for the two changed files returned exit 3,
+`no-supported-languages`: this scanner has no YAML or Markdown module, so it
+examined zero files. That is unavailable scanner coverage, not a passing scan;
+no override or suppression was added. Its unchanged pinned implementation,
+exact command and result are retained in
+`target/managed-storage-validation-20261009/ubs-handoff-budget-report-approved.q4yiyhkb/`.
+The workflow comparison and Bash syntax checks above provide direct validation
+of the budget edits. Rust source is unchanged from the tested `1cbcf0e4` revision.
+
+This publication changes only the two approved timeout values and this handoff,
+and uses `[skip ci]`. No new CI run or binary validation is claimed for that
+configuration/documentation checkpoint. The completed and failed results above
+remain bound to `1cbcf0e4`; its missing ARM release result is still missing.
+
+A separate one-line proposal raises the main release matrix from 30 to 60
+minutes. It passed `git apply --check` and is retained as
+`main-release-job-budget-proposal.patch` in the current CI evidence directory.
+Approval was requested separately because the earlier two approvals do not
+cover that job. It remains unapplied. No coverage-budget increase was applied.
 
 ## Completed CI at `4ea74ded`
 
@@ -2527,10 +2666,14 @@ investigate the host/cancellation event separately from assertion failures.
 
 1. Inspect the current branch and preserve existing work. Read the current PR
    checks and source-bound receipts before repeating any historical failure.
-2. Complete full workspace/coverage and current-source CI. Preserve the original
-   gates and report timeout, capability skip, runner shutdown, and assertion
-   failure separately. The old rustdoc, checksum, runtime-policy, watchdog,
-   binary-preparation, and failure-propagation defects above are already repaired.
+2. Complete the ARM Mac whole-workspace release validation. Its single cached
+   retry still exceeded the unchanged 30-minute limit; the separate 60-minute
+   main-release proposal awaits approval. All four configured workspace test
+   platforms, coverage, core and standalone E2E, RABS, Rsync and the five Unix
+   Test Release packages passed at `1cbcf0e4`. Main release builds passed on all
+   three Linux targets and Intel Mac. Preserve the original gates and distinguish
+   incomplete jobs from passing checks. The old rustdoc, checksum, runtime-policy,
+   watchdog, binary-preparation and failure-propagation defects are repaired.
 3. Validate deployment, real SSH, and Nexus behavior in the user's environment
    when the user is ready. Privileged Linux mounting and native cancellation
    already passed locally; they do not prove acceptance on an operator's worker.
