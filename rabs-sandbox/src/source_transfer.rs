@@ -701,11 +701,14 @@ mod tests {
     #[test]
     fn exact_binary_chunks_and_empty_files_seal_only_after_complete_verification() {
         use std::os::unix::fs::PermissionsExt;
-        let owner = tempfile::tempdir().unwrap();
+        let owner = crate::private_test_directory().unwrap();
         let manifest =
             SourceManifest::new(vec![entry("src/lib.rs", b"A\0\xffB"), entry("empty", b"")])
                 .unwrap();
         let root = owner.path().join("source");
+        // Temporary paths may contain an ancestor alias, as with /var on macOS.
+        // The receiver returns the canonical root while both paths access it.
+        let canonical_root = fs::canonicalize(owner.path()).unwrap().join("source");
         let mut receiver = SourceReceiver::create(&root, manifest.clone()).unwrap();
         assert!(SourceReceiver::create(&root, manifest).is_err());
         assert!(receiver.sealed_root().is_none());
@@ -743,7 +746,7 @@ mod tests {
                 .unwrap(),
             4
         );
-        assert_eq!(receiver.seal().unwrap(), root);
+        assert_eq!(receiver.seal().unwrap(), canonical_root);
         assert_eq!(fs::read(root.join("src/lib.rs")).unwrap(), b"A\0\xffB");
         assert_eq!(fs::read(root.join("empty")).unwrap(), b"");
         assert_eq!(
@@ -764,7 +767,7 @@ mod tests {
     #[test]
     fn complete_file_mismatch_and_conflicting_retries_poison_the_whole_stage() {
         for retry in [false, true] {
-            let owner = tempfile::tempdir().unwrap();
+            let owner = crate::private_test_directory().unwrap();
             let mut receiver = SourceReceiver::create(
                 &owner.path().join("source"),
                 SourceManifest::new(vec![entry("a", b"AB")]).unwrap(),
@@ -825,7 +828,7 @@ mod tests {
 
     #[test]
     fn seal_rehashes_disk_bytes_not_just_the_accepted_chunk_transcript() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = crate::private_test_directory().unwrap();
         let (mut receiver, root) = completed_source(owner.path());
         fs::write(root.join("src/lib.rs"), b"XY").unwrap();
         assert_poisoned(&mut receiver);
@@ -836,7 +839,7 @@ mod tests {
 
     #[test]
     fn accepted_prefix_edits_cannot_hide_behind_a_valid_final_chunk_hash() {
-        let owner = tempfile::tempdir().unwrap();
+        let owner = crate::private_test_directory().unwrap();
         let root = owner.path().join("source");
         let mut receiver = SourceReceiver::create(
             &root,
@@ -863,7 +866,7 @@ mod tests {
             "src/extra.rs",
             "empty-dir",
         ] {
-            let owner = tempfile::tempdir().unwrap();
+            let owner = crate::private_test_directory().unwrap();
             let (mut receiver, root) = completed_source(owner.path());
             let path = root.join(extra);
             if extra == "empty-dir" {
@@ -879,7 +882,7 @@ mod tests {
     #[test]
     fn seal_refuses_missing_replaced_and_resized_members() {
         for change in 0..4 {
-            let owner = tempfile::tempdir().unwrap();
+            let owner = crate::private_test_directory().unwrap();
             let (mut receiver, root) = completed_source(owner.path());
             let path = root.join("src/lib.rs");
             match change {
@@ -898,7 +901,7 @@ mod tests {
     #[test]
     fn root_replacement_never_redirects_upload_or_sealing() {
         for during_upload in [false, true] {
-            let owner = tempfile::tempdir().unwrap();
+            let owner = crate::private_test_directory().unwrap();
             let root = owner.path().join("source");
             let mut receiver = SourceReceiver::create(
                 &root,
@@ -930,7 +933,7 @@ mod tests {
     fn symlinked_parent_never_receives_source_bytes_or_mode_changes() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         for during_upload in [false, true] {
-            let owner = tempfile::tempdir().unwrap();
+            let owner = crate::private_test_directory().unwrap();
             let root = owner.path().join("source");
             let mut receiver = SourceReceiver::create(
                 &root,
@@ -970,7 +973,7 @@ mod tests {
     fn seal_rejects_final_symlinks_and_hardlinks() {
         use std::os::unix::fs::symlink;
         for change in 0..3 {
-            let owner = tempfile::tempdir().unwrap();
+            let owner = crate::private_test_directory().unwrap();
             let (mut receiver, root) = completed_source(owner.path());
             let path = root.join("src/lib.rs");
             let preserved = owner.path().join("preserved");
@@ -990,7 +993,7 @@ mod tests {
     #[test]
     fn a_substituted_fifo_is_rejected_without_waiting_for_a_writer() {
         use rustix::fs::{CWD, Mode, mkfifoat};
-        let owner = tempfile::tempdir().unwrap();
+        let owner = crate::private_test_directory().unwrap();
         let (mut receiver, root) = completed_source(owner.path());
         let path = root.join("src/lib.rs");
         fs::rename(&path, owner.path().join("preserved")).unwrap();
@@ -1001,13 +1004,14 @@ mod tests {
     #[test]
     fn exact_multichunk_binary_empty_and_executable_inputs_remain_usable() {
         use std::os::unix::fs::PermissionsExt;
-        let owner = tempfile::tempdir().unwrap();
+        let owner = crate::private_test_directory().unwrap();
         let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK * 2 + 17)
             .map(|n| (n % 256) as u8)
             .collect();
         let mut executable = entry("tools/run", &bytes);
         executable.executable = true;
         let root = owner.path().join("source");
+        let canonical_root = fs::canonicalize(owner.path()).unwrap().join("source");
         let mut receiver = SourceReceiver::create(
             &root,
             SourceManifest::new(vec![executable, entry(".cargo/config.toml", b"")]).unwrap(),
@@ -1023,13 +1027,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(receiver.seal().unwrap(), root);
+        assert_eq!(receiver.seal().unwrap(), canonical_root);
         assert_eq!(
             receiver.seal().unwrap(),
-            root,
+            canonical_root,
             "a successful seal is idempotent"
         );
-        assert_eq!(receiver.sealed_root(), Some(root.as_path()));
+        assert_eq!(receiver.sealed_root(), Some(canonical_root.as_path()));
         assert_eq!(fs::read(root.join("tools/run")).unwrap(), bytes);
         assert_eq!(
             fs::metadata(root.join("tools/run"))

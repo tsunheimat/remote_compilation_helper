@@ -7,6 +7,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/e2e_common.sh
+source "$PROJECT_ROOT/scripts/lib/e2e_common.sh"
 LOG_PREFIX="[path-dep-fixtures]"
 
 log() {
@@ -23,19 +25,19 @@ require_cmd() {
 }
 
 assert_topology() {
-  [[ -d /data/projects ]] || fail "expected canonical root /data/projects to exist"
-  [[ -L /dp ]] || fail "expected /dp to be a symlink"
-
-  local resolved
-  resolved="$(readlink -f /dp)"
-  [[ "$resolved" == "/data/projects" ]] || fail "/dp should resolve to /data/projects (got: $resolved)"
+  local topology_dir worker_bin
+  topology_dir="$(mktemp -d "${TMPDIR:-/tmp}/rch-topology-fixture-XXXXXX")"
+  worker_bin="$(e2e_worker_binary)" || fail "worker binary unavailable"
+  e2e_assert_worker_topology "$worker_bin" "$topology_dir" \
+    || fail "worker topology capability verdicts failed; see $topology_dir"
+  log "worker accepted valid topology and rejected wrong/missing aliases; evidence: $topology_dir"
 }
 
 run_fixture_tests() {
   log "running deterministic multi-repo fixture unit tests"
   (
     cd "$PROJECT_ROOT"
-    cargo test -p rch-common multi_repo_fixture_ -- --nocapture
+    e2e_cargo_test -p rch-common --lib multi_repo_fixture_ -- --nocapture
   )
 }
 
@@ -43,9 +45,9 @@ run_topology_smoke_tests() {
   log "running topology smoke tests (bootstrap + preflight gating)"
   (
     cd "$PROJECT_ROOT"
-    cargo test -p rch topology_bootstrap_ -- --nocapture
-    cargo test -p rchd topology_preflight_ -- --nocapture
-    cargo test -p rch-wkr probe_projects_topology_ -- --nocapture
+    e2e_cargo_test -p rch --bin rch topology_bootstrap_ -- --nocapture
+    e2e_cargo_test -p rchd --bin rchd topology_preflight_ -- --nocapture
+    e2e_cargo_test -p rch-wkr --bin rch-wkr probe_projects_topology_ -- --nocapture
   )
 }
 
@@ -53,13 +55,14 @@ run_topology_nightly_tests() {
   log "running topology nightly tests (deep canonicalization edge coverage)"
   (
     cd "$PROJECT_ROOT"
-    cargo test -p rch-common path_topology::tests:: -- --nocapture
+    e2e_cargo_test -p rch-common --lib path_topology::tests:: -- --nocapture
   )
 }
 
 main() {
   require_cmd cargo
-  require_cmd readlink
+  require_cmd ln
+  require_cmd jq
   local topology_test_tier="${RCH_TOPOLOGY_TEST_TIER:-smoke}"
 
   log "validating canonical/alias topology invariants"

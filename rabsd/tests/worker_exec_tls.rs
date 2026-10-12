@@ -57,10 +57,23 @@ struct Certificates {
 impl Certificates {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
+        // OpenSSL 1.1.1 appends -addext values to host-configured extensions,
+        // which can duplicate basicConstraints. Own the request configuration.
+        fs::write(
+            root.path().join("request.cnf"),
+            "[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ca\n\
+             [dn]\nCN=RABS test fixture\n\
+             [ca]\nbasicConstraints=critical,CA:TRUE\n\
+             keyUsage=critical,keyCertSign,cRLSign\n\
+             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n",
+        )
+        .unwrap();
         openssl(
             root.path(),
             &[
                 "req",
+                "-config",
+                "request.cnf",
                 "-x509",
                 "-newkey",
                 "rsa:2048",
@@ -74,10 +87,6 @@ impl Certificates {
                 "ca.key",
                 "-out",
                 "ca.pem",
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-                "-addext",
-                "keyUsage=critical,keyCertSign,cRLSign",
             ],
         );
         for (name, usage, serial) in [("server", "serverAuth", "2"), ("worker", "clientAuth", "3")]
@@ -90,6 +99,8 @@ impl Certificates {
                 root.path(),
                 &[
                     "req",
+                    "-config",
+                    "request.cnf",
                     "-new",
                     "-newkey",
                     "rsa:2048",
@@ -372,9 +383,12 @@ async fn authenticate_offer(
             grant["execution_lease"]["request_id"],
             request()["request_id"]
         );
+        let original_request = request();
+        let mut canonical_request = original_request.clone();
+        canonical_request.sort_all_objects();
         assert_eq!(
             grant["execution_lease"]["request_sha256"],
-            hash(&serde_json::to_vec(&request()).unwrap())
+            hash(&serde_json::to_vec(&canonical_request).unwrap())
         );
         request()
     };
@@ -1852,9 +1866,11 @@ fn actual_prepared_toolchain_transfers_complete_tree_before_dispatch_and_replays
                 let (session, grant) = authenticate_grant(&mut peer.stream, &pin, &offered).await;
                 assert_eq!(grant["source_transfer"], SOURCE_TRANSFER);
                 assert_eq!(grant["toolchain_transfer"], TOOLCHAIN_TRANSFER_VERSION);
+                let mut canonical_request = request.clone();
+                canonical_request.sort_all_objects();
                 assert_eq!(
                     grant["execution_lease"]["request_sha256"],
-                    hash(&serde_json::to_vec(&request).unwrap())
+                    hash(&serde_json::to_vec(&canonical_request).unwrap())
                 );
                 receive_prepared_source(&mut peer.stream, &request, &received_source).await;
                 let toolchain = receive_prepared_toolchain(
@@ -1918,9 +1934,11 @@ fn actual_prepared_toolchain_transfers_complete_tree_before_dispatch_and_replays
     assert!(receiver.wait().success(), "{}", receiver.logs());
     let report: Value = serde_json::from_slice(&fs::read(&receiver.stdout).unwrap()).unwrap();
     assert_eq!(report["delivery"]["acknowledgments_confirmed"], true);
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     assert_eq!(
         report["delivery"]["receipt"]["request_sha256"],
-        hash(&serde_json::to_vec(&request).unwrap())
+        hash(&serde_json::to_vec(&canonical_request).unwrap())
     );
     assert_eq!(report["publication_authorized"], false);
     assert_eq!(report["reexecute"], false);
@@ -2009,9 +2027,12 @@ fn actual_prepared_toolchain_rejects_forged_seal_without_dispatch_or_output_inst
 
 #[test]
 fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let certificates = Certificates::new();
-    let owner = tempfile::tempdir().unwrap();
+    let owner = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let root = fs::canonicalize(owner.path()).unwrap();
     let (bundle, request, source) = prepared_build_bundle(&root);
     let delivery = root.join("delivery");
@@ -2045,9 +2066,11 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
                     grant["execution_lease"]["request_id"],
                     request["request_id"]
                 );
+                let mut canonical_request = request.clone();
+                canonical_request.sort_all_objects();
                 assert_eq!(
                     grant["execution_lease"]["request_sha256"],
-                    hash(&serde_json::to_vec(&request).unwrap())
+                    hash(&serde_json::to_vec(&canonical_request).unwrap())
                 );
                 receive_prepared_source(&mut peer.stream, &request, &received_source).await;
                 assert_eq!(
@@ -2084,9 +2107,11 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
     let report: Value = serde_json::from_slice(&fs::read(&receiver.stdout).unwrap()).unwrap();
     assert_eq!(report["kind"], "worker-build");
     assert_eq!(report["delivery"]["acknowledgments_confirmed"], false);
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     assert_eq!(
         report["delivery"]["receipt"]["request_sha256"],
-        hash(&serde_json::to_vec(&request).unwrap())
+        hash(&serde_json::to_vec(&canonical_request).unwrap())
     );
     assert_eq!(report["installed_outputs"]["kind"], "worker-output-install");
     assert_eq!(report["installed_outputs"]["reused"], false);
@@ -2292,6 +2317,15 @@ fn actual_prepared_build_preserves_failed_compiler_exit_and_diagnostics_without_
                 "stdout_bytes":0, "stdout_sha256":hash(b""),
                 "stderr_bytes":diagnostic.len(), "stderr_sha256":hash(diagnostic),
                 "artifact_ack_required":false, "artifact_manifest":null})).await.unwrap();
+            let stdout_query = receive(&mut peer.stream).await.unwrap();
+            assert_eq!(stdout_query["kind"], "output-read");
+            assert_eq!(stdout_query["request_id"], 7);
+            assert_eq!(stdout_query["stream"], "stdout");
+            assert_eq!(stdout_query["offset"], 0);
+            send(&mut peer.stream, &json!({"kind":"output-chunk", "request_id":7,
+                "stream":"stdout", "offset":0, "next_offset":0, "total_bytes":0,
+                "eof":true, "data_hex":"", "chunk_sha256":hash(b""),
+                "sha256":hash(b"")})).await.unwrap();
             let query = receive(&mut peer.stream).await.unwrap();
             assert_eq!(query["kind"], "output-read");
             assert_eq!(query["stream"], "stderr");

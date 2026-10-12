@@ -30,7 +30,7 @@ use std::path::PathBuf;
 /// What the edge observes about one consult (parsed from the frame).
 #[derive(Debug, Clone)]
 pub struct ConsultObservation {
-    /// Full argv after the wrapper (argv[0] = real tool path).
+    /// Full argv after the wrapper (`argv[0]` = real tool path).
     pub argv: Vec<String>,
     /// Working directory of the invocation.
     pub cwd: String,

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
-use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome};
+use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome, authority_digest};
 use rabs_cas::serving_state::ServeDecision;
 use rabs_cas::test_support::{
     divergent_offer_with_manifest_bytes, install_admission_world, install_admission_world_with_ids,
@@ -60,7 +60,8 @@ fn replay_budget_fixture() -> (
     Arc<CoordLive>,
     OfferPreparedActionResult,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    // Keep owned fixture paths aligned with canonical CAS and serving paths.
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
     let authority = coord
@@ -121,10 +122,18 @@ fn matching_comparison(
     };
     install_admission_world_with_ids(&mut *cas.store().lock().unwrap(), &authority, ids);
     let mut comparison = original.clone();
+    comparison
+        .authority
+        .action_generation
+        .created_under_authority_digest = authority_digest(&authority);
     comparison.authority.coordinator = authority;
     comparison.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
     comparison.authority.attempt_id = AttemptId(ids.attempt);
     comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
+    // Restart reconciliation removes the synthetic evidence locations because
+    // they have no real backing files. Seed this newly admitted fixture offer's
+    // closure again; the manifest and served artifact retain their real CAS bytes.
+    install_offer_closure(&mut *cas.store().lock().unwrap(), &comparison);
     comparison
 }
 
@@ -385,7 +394,7 @@ fn live_edge_replay_uses_completed_comparisons_and_blocks_divergence() {
     use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
     use rabsd::coord::live::{ReplayRefusal, ServeError};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
     let authority = coord.acquire_boot_authority("live-replay-fixture").unwrap();
@@ -603,7 +612,7 @@ fn live_manifest_fixture() -> (
     CoordLive,
     OfferPreparedActionResult,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord.acquire_boot_authority("manifest-fixture").unwrap();

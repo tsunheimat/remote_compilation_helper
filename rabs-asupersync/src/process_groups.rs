@@ -100,7 +100,7 @@ pub struct GroupMember {
 /// Specification for one managed external action launch.
 #[derive(Debug, Clone)]
 pub struct ProcessGroupSpec {
-    /// Program argv[0].
+    /// Program `argv[0]`.
     pub program: String,
     /// Remaining arguments.
     pub args: Vec<String>,
@@ -145,7 +145,7 @@ impl ManagedProcessGroup {
     ///
     /// Stdio defaults to null so an action cannot accidentally hold the
     /// coordinator's terminal; callers needing pipes pass a configurator
-    /// to [`spawn_with`]. The leader's pgid is asserted against `/proc`
+    /// to [`Self::spawn_with`]. The leader's pgid is asserted against `/proc`
     /// immediately after spawn so a platform that silently ignored the
     /// grouping request fails loudly here instead of corrupting cleanup
     /// later.

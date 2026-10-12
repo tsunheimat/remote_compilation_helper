@@ -65,9 +65,11 @@ impl Fixture {
             hex(&h.clone().finalize()),
             "7497e2536c19fb3baafb427a06172b18c4875de95d09c10030d895b99ea6636a"
         );
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         let receipt = json!({"version":1,"kind":"verified-worker-delivery","request_id":7,
             "worker_id":"worker","boot_generation":1,"incarnation":"00000000000000000000000000000001",
-            "request_sha256":hash(&serde_json::to_vec(&request).unwrap()),"exit_code":0,"stop_reason":null,
+            "request_sha256":hash(&serde_json::to_vec(&canonical_request).unwrap()),"exit_code":0,"stop_reason":null,
             "stdout_bytes":stdout.len(),"stdout_sha256":hash(stdout),"stderr_bytes":0,"stderr_sha256":hash(b""),
             "artifact_manifest":{"unit":"dep","files":[{"name":"nested/a","bytes":artifact.len(),
                 "sha256":hash(artifact),"executable":true}],"total_bytes":artifact.len(),"manifest_sha256":hex(&h.finalize())},

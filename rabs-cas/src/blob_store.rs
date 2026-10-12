@@ -5,8 +5,8 @@
 //!
 //! 1. stream into a PRIVATE staging file (per-process, per-put name —
 //!    never inside the published namespace), computing the H002
-//!    [`DigestSet`] while writing and enforcing the logical-size limit
-//!    as bytes arrive (a limit breach aborts the stream, it never
+//!    [`crate::digest_set::DigestSet`] while writing and enforcing the
+//!    logical-size limit as bytes arrive (a limit breach aborts the stream, it never
 //!    truncates);
 //! 2. verify the computed content id against the DECLARED object id
 //!    and the declared logical size — mismatches are typed refusals

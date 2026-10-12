@@ -55,6 +55,9 @@ schemars = "1.2.2"
 # Async runtime
 tokio = { version = "1.49.0", features = ["full"] }
 
+# RABS worker TLS uses the ring provider already selected by Asupersync.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+
 # CLI
 clap = { version = "4.6.6", features = ["derive", "env"] }
 clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
@@ -167,6 +170,12 @@ rich_rust = { version = "0.2.3" }
 # Use default-features = false for cross-platform compatibility (rich-ui uses Unix-only rich_rust)
 # Crates that need rich-ui should explicitly enable it via features = ["rich-ui"]
 rch-common = { path = "rch-common", version = "2.1.0", default-features = false }
+
+# Full-toolchain verification repeatedly hashes every installed file. Optimize
+# SHA-256 in development too; leave application code, debug assertions, and
+# overflow checks at their normal development settings.
+[profile.dev.package."sha2:0.11.0"]
+opt-level = 3
 
 [profile.release]
 opt-level = "z"

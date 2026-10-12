@@ -3,8 +3,8 @@
 //!
 //! A bypassed worker ([`crate::bypass_record::BypassRecord`]) may only rejoin
 //! the fleet after it passes a recovery probe across **every** required
-//! dimension for [`AutoRejoinCriteria::required_consecutive_passes`] consecutive
-//! rounds AND then passes a single canary build through the same path real
+//! dimension for [`crate::bypass_record::AutoRejoinCriteria::required_consecutive_passes`]
+//! consecutive rounds AND then passes a single canary build through the same path real
 //! builds use. This module is the pure decision core of that loop:
 //!
 //! - [`decide_probe`] takes a worker's record + the [`RecoveryProbe`] result and
@@ -21,7 +21,8 @@
 //! lucky SSH response, and never while any hard dimension is failing. A single
 //! failing dimension resets the pass streak. The daemon must also never probe an
 //! admin-disabled worker for auto-rejoin; that is an admin-axis decision the
-//! caller enforces ([`AutoRejoinCriteria`] lives on the eligibility axis only).
+//! caller enforces ([`crate::bypass_record::AutoRejoinCriteria`] lives on the
+//! eligibility axis only).
 //!
 //! The probe *execution* (SSH/shell, exact `rch-wkr --version`, protocol
 //! handshake, toolchain/target, disk+inode, load, telemetry) and the canary

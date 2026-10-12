@@ -17,10 +17,13 @@
 //! `rand`.
 #![cfg(unix)]
 
+mod support;
+
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use support::rabsd_bin;
 
 const SEED: u64 = 0x5EED_C0DE_1234_5678;
 
@@ -40,23 +43,8 @@ impl Lcg {
     }
 }
 
-fn rabsd() -> std::path::PathBuf {
-    // The rabsd binary lives beside ours in the target dir. Always ask
-    // Cargo, once per test process: it is a no-op when fresh, and a daemon
-    // left over from an older tree must never answer for this one.
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
-        assert!(status.success(), "rabsd build failed");
-    });
-    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
-}
-
 fn spawn_daemon(dir: &std::path::Path) -> Child {
-    Command::new(rabsd())
+    Command::new(rabsd_bin())
         .env("RABS_SOCKET_PATH", dir.join("rabsd.sock"))
         .env("RABS_BOOT_MARKER", dir.join("rabsd.boot"))
         .env("RABS_STATE_DIR", dir.join("state"))

@@ -23,7 +23,7 @@ mod rustc_outputs;
 mod rustc_request;
 
 use asupersync::cx::Cx;
-use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use asupersync::net::unix::{UnixListener, UnixStream};
 use asupersync::signal::ShutdownReceiver;
 use liveness::{Limit, WorkError};
@@ -57,6 +57,11 @@ const LIVE_COMPLETION_WORKERS: usize = 8;
 /// How long an admitted local execution may run before its completion
 /// frame must arrive (the attempt lease is longer still).
 const LOCAL_EXECUTION_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Retain read-ahead for the entire admitted connection: hello, requests,
+/// completion and capture acknowledgments may arrive in the same socket read.
+/// Buffering avoids a kernel read for every byte without changing frame bounds.
+type EdgeStream = BufReader<UnixStream>;
 
 #[derive(Clone)]
 struct EdgeLimits {
@@ -288,7 +293,7 @@ async fn accept_loop(
 }
 
 /// One absolute budget covers the ENTIRE frame, not each trickled byte.
-async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Option<Vec<u8>> {
+async fn read_frame_with_budget(stream: &mut EdgeStream, budget: Duration) -> Option<Vec<u8>> {
     read_frame_bounded(stream, budget, MAX_FRAME_BYTES).await
 }
 
@@ -296,7 +301,7 @@ async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Op
 /// frame kind (a live completion carrying its transcript) that may exceed
 /// the ordinary request bound.
 async fn read_frame_bounded(
-    stream: &mut UnixStream,
+    stream: &mut EdgeStream,
     budget: Duration,
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
@@ -325,17 +330,17 @@ async fn read_frame_bounded(
 }
 
 /// None means EOF, a truncated/oversized frame, or an exhausted read budget.
-async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+async fn read_frame(stream: &mut EdgeStream) -> Option<Vec<u8>> {
     read_frame_with_budget(stream, FRAME_IO_BUDGET).await
 }
 
-async fn write_frame(stream: &mut UnixStream, line: &str) -> bool {
+async fn write_frame(stream: &mut EdgeStream, line: &str) -> bool {
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(b'\n');
     asupersync::time::timeout(
         asupersync::time::wall_now(),
         FRAME_IO_BUDGET,
-        stream.write_all(&bytes),
+        stream.get_mut().write_all(&bytes),
     )
     .await
     .is_ok_and(|result| result.is_ok())
@@ -363,12 +368,13 @@ impl Drop for Flight {
 
 async fn handle_connection(
     id: u64,
-    mut stream: UnixStream,
+    stream: UnixStream,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     services: EdgeServices,
     limits: EdgeLimits,
 ) {
+    let mut stream = EdgeStream::new(stream);
     let EdgeServices {
         shadow,
         coord,
@@ -377,7 +383,7 @@ async fn handle_connection(
     } = services;
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
-    let (peer_uid, peer_gid) = match stream.peer_cred() {
+    let (peer_uid, peer_gid) = match stream.get_ref().peer_cred() {
         Ok(cred) => (cred.uid, cred.gid),
         Err(error) => {
             log_line(
@@ -1378,7 +1384,7 @@ mod edge_liveness_tests {
         use crate::coord::prepared_operation::PreparedOperationStore;
         use serde_json::{Value, json};
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let root = temporary.path().join("operations");
         let store = PreparedOperationStore::open(&root).unwrap();
         let id = "0123456789abcdef0123456789abcdef";
@@ -1547,6 +1553,86 @@ mod edge_liveness_tests {
     }
 
     #[test]
+    fn live_frame_reader_preserves_pipelined_bytes_across_replies() {
+        use std::io::{BufRead, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.sock");
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let listener = UnixListener::bind(&path).await.unwrap();
+            let (sent, ready) = mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let mut socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket.write_all(b"hello\n\n\xff\0\r\nack\n").unwrap();
+                sent.send(()).unwrap();
+                let mut reply = String::new();
+                std::io::BufReader::new(socket)
+                    .read_line(&mut reply)
+                    .unwrap();
+                assert_eq!(reply, "accepted\n");
+            });
+            let (stream, _) = listener.accept().await.unwrap();
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut stream = EdgeStream::new(stream);
+            assert_eq!(read_frame(&mut stream).await.unwrap(), b"hello");
+            assert!(write_frame(&mut stream, "accepted").await);
+            assert_eq!(read_frame(&mut stream).await.unwrap(), b"");
+            assert_eq!(read_frame(&mut stream).await.unwrap(), b"\xff\0\r");
+            assert_eq!(read_frame(&mut stream).await.unwrap(), b"ack");
+            assert!(read_frame(&mut stream).await.is_none());
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn live_frame_reader_keeps_exact_bounds_and_refuses_truncation() {
+        use std::io::Write;
+        // Include boundaries on both sides of the read buffer and the larger
+        // completion-frame path. The delimiter does not consume payload budget.
+        for bound in [
+            0,
+            1,
+            8191,
+            8192,
+            8193,
+            MAX_FRAME_BYTES,
+            MAX_FRAME_BYTES + 17,
+        ] {
+            for (length, terminated, accepted) in [
+                (bound, true, true),
+                (bound + 1, true, false),
+                (bound, false, false),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("edge.sock");
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                runtime.block_on(async {
+                    let listener = UnixListener::bind(&path).await.unwrap();
+                    let writer = std::thread::spawn(move || {
+                        let mut socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+                        let mut bytes = vec![b'x'; length];
+                        if terminated {
+                            bytes.push(b'\n');
+                        }
+                        socket.write_all(&bytes).unwrap();
+                    });
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = EdgeStream::new(stream);
+                    let frame = read_frame_bounded(&mut stream, FRAME_IO_BUDGET, bound).await;
+                    assert_eq!(frame.is_some(), accepted, "{bound}/{length}/{terminated}");
+                    if let Some(frame) = frame {
+                        assert_eq!(frame, vec![b'x'; bound]);
+                    }
+                    writer.join().unwrap();
+                });
+            }
+        }
+    }
+
+    #[test]
     fn live_frame_reader_expires_a_trickling_peer_without_resetting_its_budget() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -1564,7 +1650,8 @@ mod edge_liveness_tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             });
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = EdgeStream::new(stream);
             let frame = read_frame_with_budget(&mut stream, Duration::from_millis(30)).await;
             assert!(frame.is_none());
             drop(stream);

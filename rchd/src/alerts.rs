@@ -357,7 +357,7 @@ impl AlertManager {
     /// `cleared_pending_clean` so UIs can grey it out. `active_alerts()`
     /// evicts it after `cleared_retention` elapses.
     ///
-    /// This is the counterpart to [`handle_circuit_open`] and is the key
+    /// This is the counterpart to [`Self::handle_circuit_open`] and is the key
     /// fix for bd-3ogaz: without it, a transient circuit-open alert would
     /// persist forever in `rch status` even after the worker recovers.
     pub fn handle_circuit_closed(&self, worker_id: &str) {

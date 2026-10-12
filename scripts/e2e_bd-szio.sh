@@ -12,10 +12,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-szio.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-${PROJECT_ROOT}/target/e2e_bd-szio.jsonl}"
+# shellcheck source=lib/e2e_common.sh
+source "$SCRIPT_DIR/lib/e2e_common.sh"
 
 timestamp() {
-    date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
+    e2e_timestamp
 }
 
 log_json() {
@@ -44,7 +46,7 @@ die() {
 
 check_dependencies() {
     log_json "setup" "Checking dependencies"
-    for cmd in cargo jq timeout; do
+    for cmd in cargo jq python3; do
         command -v "$cmd" >/dev/null 2>&1 || die "Missing dependency: $cmd"
     done
 }
@@ -75,7 +77,7 @@ test_module_compilation() {
 test_cache_cleanup_unit_tests() {
     log_json "test" "Cache cleanup unit tests"
 
-    if cargo test -p rchd cache_cleanup --no-fail-fast >/dev/null 2>&1; then
+    if e2e_cargo_test -p rchd cache_cleanup --no-fail-fast; then
         log_json "verify" "All cache_cleanup unit tests passed" '{"result":"pass"}'
     else
         die "Cache cleanup unit tests failed"
@@ -86,7 +88,7 @@ test_cache_cleanup_unit_tests() {
 test_daemon_config_includes_cache_cleanup() {
     log_json "test" "DaemonConfig includes cache_cleanup section"
 
-    if cargo test -p rchd test_daemon_config_parses_cache_cleanup_section --no-fail-fast >/dev/null 2>&1; then
+    if e2e_cargo_test -p rchd test_daemon_config_parses_cache_cleanup_section --no-fail-fast; then
         log_json "verify" "Daemon config parses cache_cleanup section" '{"result":"pass"}'
     else
         die "Daemon config parsing failed"
@@ -100,29 +102,61 @@ test_daemon_startup_with_cleanup() {
     local rchd_bin
     rchd_bin="$(build_rchd)"
 
-    local tmp_socket
-    tmp_socket="$(mktemp -u /tmp/rchd-test-XXXXXX.sock)"
+    local runtime_dir artifact_dir
+    runtime_dir="$(e2e_runtime_dir)"
+    artifact_dir="$(mktemp -d "$(dirname "$LOG_FILE")/bd-szio-startup.XXXXXX")"
+    if ! python3 - "$rchd_bin" "$runtime_dir" "$artifact_dir" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
 
-    # Start daemon briefly and check logs for cleanup scheduler
-    local log_output
-    log_output="$(mktemp)"
-
-    # Start rchd in background with verbose logging
-    timeout 3 "$rchd_bin" -s "$tmp_socket" --foreground -v 2>"$log_output" || true
-
-    # Check if cleanup scheduler message appears (or if daemon started at all)
-    # The daemon may exit quickly if no workers are configured, which is fine
-    if grep -q "Cache cleanup scheduler" "$log_output" 2>/dev/null || \
-       grep -q "RCH daemon" "$log_output" 2>/dev/null || \
-       grep -q "Listening on" "$log_output" 2>/dev/null; then
-        log_json "verify" "Daemon startup includes cleanup scheduler" '{"check":"startup_log","result":"pass"}'
-    else
-        # If we can't verify via logs, check that binary runs
-        log_json "verify" "Daemon binary runs successfully" '{"note":"log check inconclusive","result":"pass"}'
+binary, root, artifacts = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
+config = root / "config"
+config.mkdir()
+(config / "workers.toml").write_text("workers = []\n")
+(config / "daemon.toml").write_text("[cache_cleanup]\nenabled = true\n")
+socket = root / "rchd.sock"
+env = {key: value for key, value in os.environ.items() if not key.startswith("RCH_")}
+env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "xdg-config"),
+           XDG_DATA_HOME=str(root / "data"), XDG_CACHE_HOME=str(root / "cache"),
+           XDG_STATE_HOME=str(root / "state"), RCH_CONFIG_DIR=str(config),
+           RCH_STATE_HOME=str(root / "state" / "rch"), RCH_MOCK_SSH="1", NO_COLOR="1")
+log_path = artifacts / "daemon.stderr"
+stdout_path = artifacts / "daemon.stdout"
+with stdout_path.open("wb") as stdout, log_path.open("wb") as stderr:
+    process = subprocess.Popen([binary, "--socket", str(socket), "--workers-config",
+                                str(config / "workers.toml"), "--metrics-port", "0",
+                                "--foreground", "--verbose"],
+                               env=env, stdout=stdout, stderr=stderr)
+    try:
+        deadline = time.monotonic() + 3
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError(f"daemon exited before readiness: {process.returncode}; {log_path}")
+            # The daemon's console tracing uses stdout; retain both streams.
+            diagnostics = stdout_path.read_bytes() + log_path.read_bytes()
+            if socket.is_socket() and b"Cache cleanup scheduler started" in diagnostics:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"scheduler and socket were not ready within 3s; {log_path}")
+            time.sleep(0.05)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+print(f"Native scheduler readiness verified; retained artifacts: {artifacts}; runtime: {root}")
+PY
+    then
+        die "Daemon cache cleanup startup failed; retained artifacts: $artifact_dir; runtime: $runtime_dir"
     fi
-
-    # Intentionally do not delete temp artifacts (avoid destructive rm -f/rm -rf patterns).
-    :
+    log_json "verify" "Daemon startup includes cleanup scheduler" \
+        '{"check":"scheduler_and_socket","result":"pass"}'
 }
 
 main() {

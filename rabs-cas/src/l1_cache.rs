@@ -62,7 +62,7 @@ impl LatencyRing {
 
 /// Cumulative lookup statistics + latency percentiles.
 ///
-/// Percentiles are over the most recent [`LatencyRing::CAP`] samples of
+/// Percentiles are over the most recent `LatencyRing::CAP` samples of
 /// each class (a daemon's tail behavior matters more than its birth).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LookupStats {

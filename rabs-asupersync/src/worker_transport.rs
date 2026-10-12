@@ -465,6 +465,11 @@ impl TlsFiles {
         let chain =
             CertificateChain::from_pem(&read_pem(&self.certificate)?).map_err(|e| e.to_string())?;
         let key = PrivateKey::from_pem(&read_pem(&self.private_key)?).map_err(|e| e.to_string())?;
+        // The pinned Asupersync config builder selects ring, but its mutual-TLS
+        // certificate verifier consults Rustls' process default. Feature
+        // unification may enable both providers, making auto-selection panic.
+        // An explicitly installed application provider remains authoritative.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         TlsAcceptor::builder(chain, key)
             .require_client_auth(roots)
             .alpn_protocols_required(vec![WORKER_ALPN.to_vec()])

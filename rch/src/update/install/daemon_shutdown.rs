@@ -483,6 +483,9 @@ mod tests {
                 let mut command = String::new();
                 stream.read_to_string(&mut command).await.unwrap();
                 let value = match command.as_str() {
+                    // The startup deadline can abandon a connection after
+                    // connect and before writing. No daemon mutation arrived.
+                    "" => continue,
                     STATUS => &status,
                     ADMISSION_STATUS => &admission,
                     other => panic!("readiness must not mutate daemon state: {other}"),
@@ -731,8 +734,10 @@ while time.monotonic() < deadline:
             raise ValueError('unexpected mutation: ' + repr(data))
         connection.sendall(b'HTTP/1.1 200 OK\r\n\r\n' + json.dumps(value).encode())
 server.close()
-with open(done, 'w') as output:
+pending = done + '.pending'
+with open(pending, 'x') as output:
     output.write('finished')
+os.rename(pending, done)
 "#;
 
     #[tokio::test]

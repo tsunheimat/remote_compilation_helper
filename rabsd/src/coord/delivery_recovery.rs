@@ -374,10 +374,14 @@ pub fn install_delivery_outputs(
             Err(error) => return Err(error),
         }
         let parent = destination.parent().expect("named absolute destination");
-        let staging = tempfile::Builder::new()
-            .prefix(".rabs-output-staging-")
-            .tempdir_in(parent)?
-            .keep();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".rabs-output-staging-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let staging = builder.tempdir_in(parent)?.keep();
         let names = verified_artifact_names(request, &delivery.receipt["artifact_manifest"])?;
         super::worker_delivery::create_artifact_directories(
             &staging,
@@ -508,13 +512,15 @@ pub fn recover_existing_delivery(
             )?;
         }
         let receipt = read_receipt(&destination.join("delivery.json"))?;
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         require(
             number(&receipt, "version")? == 1
                 && text(&receipt, "kind")? == "verified-worker-delivery"
                 && number(&receipt, "request_id")? == number(request, "request_id")?
                 && text(&receipt, "worker_id")? == expected_worker
                 && digest(&receipt, "request_sha256")?
-                    == hex(&Sha256::digest(serde_json::to_vec(request)?))
+                    == hex(&Sha256::digest(serde_json::to_vec(&canonical_request)?))
                 && receipt
                     .get("publication_authorized")
                     .and_then(Value::as_bool)

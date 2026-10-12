@@ -815,7 +815,8 @@ fn operations_watermark<E: rabs_cas::metadata_store::SqlEngine>(
     Ok(store.operation_update_high_water()?)
 }
 
-/// The real CAS directory, viewed through [`FilesystemReality`].
+/// The real CAS directory, viewed through
+/// [`FilesystemReality`](rabs_cas::startup_reconciliation::FilesystemReality).
 struct CasFilesystem {
     root: PathBuf,
 }

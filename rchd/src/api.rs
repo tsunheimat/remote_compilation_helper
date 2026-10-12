@@ -364,7 +364,7 @@ pub struct ActiveBuild {
     pub heartbeat_detail: Option<String>,
     /// Monotonic progress counter from the hook.
     pub heartbeat_counter: u64,
-    /// Progress estimate in [0,100], when available.
+    /// Progress estimate in `[0,100]`, when available.
     pub heartbeat_percent: Option<f64>,
     /// Slots currently owned by this build.
     pub slots: u32,
@@ -374,7 +374,7 @@ pub struct ActiveBuild {
     pub detector_heartbeat_stale: bool,
     /// Latest detector check: progress evidence currently stale.
     pub detector_progress_stale: bool,
-    /// Latest detector confidence in [0,1].
+    /// Latest detector confidence in `[0,1]`.
     pub detector_confidence: f64,
     /// Build age at last detector evaluation.
     pub detector_build_age_secs: u64,

@@ -889,6 +889,29 @@ mod tests {
 
     #[test]
     fn test_daemon_metric_helpers() {
+        const CHILD: &str = "RCH_DAEMON_METRIC_HELPERS_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            // API tests increment these same production globals. A fresh
+            // process preserves the exact helper assertions and endpoint
+            // labels without resetting another test's metric history.
+            let selector = concat!(module_path!(), "::test_daemon_metric_helpers");
+            let selector = selector.split_once("::").unwrap().1;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", selector, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "exact child test must execute its assertions: {stdout} {stderr}"
+            );
+            return;
+        }
         let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_daemon_metric_helpers");

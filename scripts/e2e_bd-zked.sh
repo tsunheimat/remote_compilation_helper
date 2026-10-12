@@ -16,7 +16,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-zked.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_bd-zked.jsonl}"
+# shellcheck source=lib/e2e_common.sh
+source "$SCRIPT_DIR/lib/e2e_common.sh"
+daemon_pid=""
+tmp_root=""
+
+cleanup() {
+    if [[ -n "$daemon_pid" ]]; then
+        kill "$daemon_pid" >/dev/null 2>&1 || true
+        wait "$daemon_pid" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
 
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -25,11 +37,14 @@ timestamp() {
 log_json() {
     local phase="$1"
     local message="$2"
-    local extra="${3:-{}}"
+    local extra="${3:-}"
+    [[ -n "$extra" ]] || extra='{}'
     local ts
     ts="$(timestamp)"
-    printf '{"ts":"%s","test":"bd-zked","phase":"%s","message":"%s",%s}\n' \
-        "$ts" "$phase" "$message" "${extra#\{}" | sed 's/,}$/}/' | tee -a "$LOG_FILE"
+    jq -nc --arg ts "$ts" --arg phase "$phase" --arg message "$message" \
+        --argjson extra "$extra" \
+        '{ts:$ts,test:"bd-zked",phase:$phase,message:$message} + $extra' \
+        | tee -a "$LOG_FILE"
 }
 
 die() {
@@ -45,7 +60,7 @@ check_dependencies() {
 }
 
 build_rch() {
-    local rch_bin="${PROJECT_ROOT}/target/debug/rch"
+    local rch_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch"
     if [[ -x "$rch_bin" ]]; then
         log_json "setup" "Using existing rch binary" "{\"path\":\"$rch_bin\"}" >&2
         echo "$rch_bin"
@@ -57,6 +72,34 @@ build_rch() {
     echo "$rch_bin"
 }
 
+start_daemon() {
+    local rchd_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rchd"
+    if [[ ! -x "$rchd_bin" ]]; then
+        log_json "setup" "Building rchd (debug)"
+        (cd "$PROJECT_ROOT" && cargo build -p rchd) || die "cargo build -p rchd failed"
+    fi
+    tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/rch-saved-time-XXXXXX")"
+    printf 'workers = []\n' > "$tmp_root/workers.toml"
+    export RCH_CONFIG_DIR="$tmp_root"
+    export XDG_CACHE_HOME="$tmp_root/cache" XDG_STATE_HOME="$tmp_root/state"
+    export XDG_DATA_HOME="$tmp_root/data"
+    local runtime_root
+    runtime_root="$(e2e_runtime_dir)"
+    export RCH_SOCKET_PATH="$runtime_root/rch.sock"
+    RCH_DAEMON_INSTALLS_HOOKS=0 "$rchd_bin" --socket "$RCH_SOCKET_PATH" --workers-config "$tmp_root/workers.toml" \
+        --foreground > "$tmp_root/rchd.log" 2>&1 &
+    daemon_pid=$!
+    for _ in {1..50}; do
+        if [[ -S "$RCH_SOCKET_PATH" ]]; then
+            log_json "setup" "Isolated daemon ready" "{\"root\":\"$tmp_root\"}"
+            return 0
+        fi
+        kill -0 "$daemon_pid" 2>/dev/null || die "rchd exited during startup; see $tmp_root/rchd.log"
+        sleep 0.1
+    done
+    die "Daemon socket not ready; see $tmp_root/rchd.log"
+}
+
 # Test 1: Verify saved_time field exists in status JSON schema
 test_saved_time_field_exists() {
     local rch_bin="$1"
@@ -65,15 +108,11 @@ test_saved_time_field_exists() {
     local json_output
     json_output="$("$rch_bin" status --json 2>/dev/null)" || true
 
-    # Check if output is valid JSON
-    if ! echo "$json_output" | jq -e '.' >/dev/null 2>&1; then
-        # Daemon not running - check that our types compile correctly
-        log_json "verify" "Daemon not running, checking type compilation" '{"daemon_status":"not_running"}'
-        return 0
-    fi
+    echo "$json_output" | jq -e '.success == true' >/dev/null 2>&1 \
+        || die "Isolated daemon status did not return success: $json_output"
 
     # Check saved_time field exists (can be null or object)
-    if ! echo "$json_output" | jq -e '.data | has("saved_time")' >/dev/null 2>&1; then
+    if ! echo "$json_output" | jq -e '.data.daemon | has("saved_time")' >/dev/null 2>&1; then
         die "saved_time field missing from status JSON response"
     fi
 
@@ -88,13 +127,11 @@ test_saved_time_structure() {
     local json_output
     json_output="$("$rch_bin" status --json 2>/dev/null)" || true
 
-    if ! echo "$json_output" | jq -e '.' >/dev/null 2>&1; then
-        log_json "verify" "Daemon not running, skipping structure check" '{"daemon_status":"not_running"}'
-        return 0
-    fi
+    echo "$json_output" | jq -e '.success == true' >/dev/null 2>&1 \
+        || die "Isolated daemon status did not return success: $json_output"
 
     local saved_time
-    saved_time="$(echo "$json_output" | jq '.data.saved_time')"
+    saved_time="$(echo "$json_output" | jq '.data.daemon.saved_time')"
 
     if [[ "$saved_time" == "null" ]]; then
         # No remote builds - this is valid
@@ -114,59 +151,25 @@ test_saved_time_structure() {
     log_json "verify" "SavedTimeStats has all required fields" "{\"fields\":\"${required_fields[*]}\",\"result\":\"pass\"}"
 }
 
-# Test 3: Verify saved_time_stats() unit tests pass (or library compilation succeeds)
+# Test 3: Run the saved-time behavior tests; compilation alone is not acceptance.
 test_unit_tests() {
-    log_json "test" "Verifying saved_time_stats implementation compiles correctly"
-
-    # First check if the library compiles (not tests, which may have unrelated issues)
-    local compile_check
-    compile_check=$(cd "$PROJECT_ROOT" && cargo check -p rchd 2>&1)
-
-    if echo "$compile_check" | grep -qiE "^error\[E"; then
-        die "rchd library compilation failed"
+    log_json "test" "Running saved_time_stats behavior tests"
+    if ! (cd "$PROJECT_ROOT" && cargo test -p rchd -- history::tests::test_saved_time --nocapture) \
+        >"$tmp_root/saved-time-tests.log" 2>&1; then
+        die "Saved-time unit tests failed; see $tmp_root/saved-time-tests.log"
     fi
-
-    # Verify the saved_time_stats function exists and the tests exist in source
-    if grep -q "fn saved_time_stats" "$PROJECT_ROOT/rchd/src/history.rs" 2>/dev/null; then
-        log_json "verify" "saved_time_stats function exists" '{"result":"pass"}'
-    else
-        die "saved_time_stats function not found"
-    fi
-
-    if grep -q "test_saved_time_stats" "$PROJECT_ROOT/rchd/src/history.rs" 2>/dev/null; then
-        log_json "verify" "Unit test functions exist in source" '{"result":"pass"}'
-    else
-        die "saved_time_stats unit tests not found in source"
-    fi
-
-    # Try to run tests - if they fail due to unrelated compilation issues, that's OK
-    local test_output
-    if test_output=$(cd "$PROJECT_ROOT" && cargo test -p rchd -- history::tests::test_saved_time 2>&1); then
-        local test_count
-        test_count=$(echo "$test_output" | grep -oP '\d+ passed' | head -1 || echo "0 passed")
-        log_json "verify" "Unit tests passed" "{\"result\":\"pass\",\"tests\":\"$test_count\"}"
-    else
-        # Test compilation might have unrelated errors - library compiles, so our code is OK
-        log_json "verify" "Library compiles; test suite has unrelated issues" '{"result":"pass","note":"library compiles cleanly"}'
-    fi
+    grep -qE 'test result: ok\. [1-9][0-9]* passed' "$tmp_root/saved-time-tests.log" \
+        || die "Saved-time test selection ran no passing tests"
+    log_json "verify" "Saved-time behavior tests passed" '{"result":"pass"}'
 }
 
 # Test 4: Verify time_saved_ms is never negative (saturating_sub)
 test_no_negative_savings() {
     log_json "test" "Verifying time_saved_ms cannot be negative"
 
-    # Verify the implementation uses saturating_sub by checking source code
-    if grep -q "saturating_sub" "$PROJECT_ROOT/rchd/src/history.rs" 2>/dev/null; then
-        log_json "verify" "saturating_sub used for time_saved_ms calculation" '{"result":"pass"}'
-    else
-        # Also acceptable if the implementation ensures non-negative differently
-        # Check for explicit max(0, ...) pattern
-        if grep -qE "(\.max\(0\)|saturating)" "$PROJECT_ROOT/rchd/src/history.rs" 2>/dev/null; then
-            log_json "verify" "Non-negative savings protection found" '{"result":"pass"}'
-        else
-            die "No protection against negative savings found in history.rs"
-        fi
-    fi
+    grep -q 'test history::tests::test_saved_time_stats_no_negative_savings .* ok' "$tmp_root/saved-time-tests.log" \
+        || die "Non-negative savings behavior test did not pass"
+    log_json "verify" "Non-negative savings behavior test passed" '{"result":"pass"}'
 }
 
 # Test 5: Check human-readable output format
@@ -175,13 +178,12 @@ test_human_readable_output() {
     log_json "test" "Checking human-readable status output"
 
     local status_output
-    status_output="$("$rch_bin" status 2>&1)" || true
+    status_output="$("$rch_bin" status 2>&1)" || die "Isolated daemon human status failed"
 
-    # We can't easily test human output without actual data, but we verify the command runs
-    if echo "$status_output" | grep -qiE "(saved|status|daemon|error)" 2>/dev/null; then
+    if echo "$status_output" | grep -qiE "(saved|status|daemon)" 2>/dev/null; then
         log_json "verify" "Human-readable output generated successfully" '{"result":"pass"}'
     else
-        log_json "verify" "Human-readable output check inconclusive" '{"result":"pass","note":"daemon may not be running"}'
+        die "Isolated daemon human status did not describe its status"
     fi
 }
 
@@ -193,16 +195,14 @@ test_build_stats_structure() {
     local json_output
     json_output="$("$rch_bin" status --json 2>/dev/null)" || true
 
-    if ! echo "$json_output" | jq -e '.' >/dev/null 2>&1; then
-        log_json "verify" "Daemon not running, skipping stats check" '{"daemon_status":"not_running"}'
-        return 0
-    fi
+    echo "$json_output" | jq -e '.success == true' >/dev/null 2>&1 \
+        || die "Isolated daemon status did not return success: $json_output"
 
     # Verify stats field exists with required subfields
     local stats_fields=("total_builds" "success_count" "failure_count" "remote_count" "local_count" "avg_duration_ms")
 
     for field in "${stats_fields[@]}"; do
-        if ! echo "$json_output" | jq -e ".data.stats | has(\"$field\")" >/dev/null 2>&1; then
+        if ! echo "$json_output" | jq -e ".data.daemon.stats | has(\"$field\")" >/dev/null 2>&1; then
             die "Missing required field in stats: $field"
         fi
     done
@@ -215,19 +215,14 @@ test_type_definition() {
     log_json "test" "Verifying SavedTimeStats type compilation"
 
     # Check that the type exists and compiles
-    if (cd "$PROJECT_ROOT" && cargo check -p rch-common 2>&1 | grep -qiE "error\["); then
-        die "rch-common compilation error"
-    fi
-
-    # Verify the type is exported
-    if ! grep -q "pub struct SavedTimeStats" "$PROJECT_ROOT/rch-common/src/types.rs" 2>/dev/null; then
-        die "SavedTimeStats struct not found in types.rs"
-    fi
+    (cd "$PROJECT_ROOT" && cargo check -p rch-common) >"$tmp_root/common-check.log" 2>&1 \
+        || die "rch-common compilation failed; see $tmp_root/common-check.log"
 
     log_json "verify" "SavedTimeStats type defined and exported" '{"result":"pass"}'
 }
 
 main() {
+    mkdir -p "$(dirname "$LOG_FILE")"
     : > "$LOG_FILE"
     log_json "setup" "Starting bd-zked E2E tests (saved-time summary)"
 
@@ -236,6 +231,7 @@ main() {
     local rch_bin
     rch_bin="$(build_rch)"
     log_json "setup" "Built/found rch binary" "{\"path\":\"$rch_bin\"}"
+    start_daemon
 
     # Run all tests
     test_type_definition

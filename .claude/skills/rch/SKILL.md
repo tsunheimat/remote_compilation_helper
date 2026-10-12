@@ -86,6 +86,16 @@ Run in order; stop at the first failing stage.
 
 ## Quick Fixes
 
+Treat transient illness as temporary: do not edit `workers.toml` or permanently
+disable a worker because it is slow, briefly unreachable, or failing probes.
+The daemon uses temporary bypass, probe backoff, a canary build, and auto-rejoin.
+Watch `rch status --fleet` and `rch status --remediation`; reserve configuration
+changes and permanent disablement for deliberate maintenance or decommissioning.
+For `RCH-I001` (no admissible workers), use `rch admit "<cmd>"` to distinguish
+missing capabilities from pressure or unavailable capacity before changing the
+fleet. Use `rch doctor --fix` for supported repairs and `rch daemon restart`
+after active builds finish; do not hand-delete sockets or kill daemon processes.
+
 | Symptom | Command |
 |---------|---------|
 | Hook not installed | `rch hook install && rch hook status` (Gemini/Codex: `rch agents install-hook gemini-cli\|codex-cli`) |
@@ -187,6 +197,22 @@ When in genuine doubt, capture the escalation packet (end of `references/RECOVER
 | Build the committed tree, ignore others' edits | `rch exec --base HEAD --clean-overlay --overlay-path src/lib.rs -- cargo test` (remote-only by construction) |
 | Byte-exact source receipt | `rch exec --source-content-receipt -- cargo test --locked` → `rch.source_content_receipt.v1` |
 | Several cargo commands | separate invocations — a shell-wrapped chain is refused (`RCH-E301`) |
+
+For a remote proof with invocation-level self-healing disabled, start from a
+healthy daemon and pass the build command directly after `--`:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test -p rch-common --lib proof
+```
+
+This refuses local fallback; a refusal is not a passing test or proof of remote
+execution. Keep the remote outcome and exit code with the validation result.
+The incident ledger is `<state>/incidents.jsonl`, and deferred proof intents and
+replay state are in `<state>/proofs.jsonl` (overridable with
+`[remediation.proof] store_path`). Resolve `<state>` from `RCH_STATE_HOME`, then
+`$XDG_STATE_HOME/rch`, then `~/.local/state/rch`, falling back to `/tmp/rch`.
+Structured test evidence is written under `target/test-logs/`; CI also uploads
+E2E artifacts. Inspect these records when a proof is refused or deferred.
 
 ---
 

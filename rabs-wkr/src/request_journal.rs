@@ -164,12 +164,16 @@ fn fresh_incarnation() -> io::Result<String> {
 /// Digest the complete parsed wire request, including future extensions such as
 /// artifact declarations, and its effective timeout. Unknown fields cannot be
 /// accidentally omitted by a projection of only the original request struct.
+/// Object key order is canonical across serde_json feature combinations; array
+/// order, scalar values, and the original wire request remain unchanged.
 /// The persisted fingerprint avoids recording raw argv or source paths.
 #[must_use]
 pub fn request_fingerprint(request: &Value, timeout: Duration) -> String {
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     let framed = json!([
         "rabs.worker-request.v1",
-        request,
+        canonical_request,
         timeout.as_secs(),
         timeout.subsec_nanos()
     ]);
@@ -633,7 +637,7 @@ mod tests {
 
     #[test]
     fn exclusive_owner_and_durable_generation_survive_restart() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let first = open(root.path());
         assert!(WorkerJournal::open(root.path(), "worker", "coord:7000").is_err());
         let incarnation = first.incarnation();
@@ -646,7 +650,7 @@ mod tests {
 
     #[test]
     fn uncertain_execution_blocks_both_replay_and_new_work_after_restart() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         assert_eq!(
             journal.admit(&request(10), Duration::from_secs(1)).unwrap(),
@@ -671,7 +675,7 @@ mod tests {
 
     #[test]
     fn terminal_reconciliation_never_promises_output_recovery_or_publication() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         journal.admit(&request(1), Duration::from_secs(1)).unwrap();
         let mut done = receipt(1);
@@ -708,8 +712,59 @@ mod tests {
     }
 
     #[test]
+    fn canonical_request_identity_preserves_values_ordered_arrays_and_timeout() {
+        let original: Value = serde_json::from_str(
+            r#"{"request_id":3,"kind":"canonical-exec","args":["private.rs","--cfg=fixture"],"extension":{"z":2,"a":[{"y":true,"b":null},7]}}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"extension":{"a":[{"b":null,"y":true},7],"z":2},"args":["private.rs","--cfg=fixture"],"kind":"canonical-exec","request_id":3}"#,
+        )
+        .unwrap();
+        let original_wire = serde_json::to_vec(&original).unwrap();
+        let reordered_wire = serde_json::to_vec(&reordered).unwrap();
+        let timeout = Duration::new(1, 23);
+        // Fixed vector independently hashes the canonical JSON array containing
+        // the domain, complete request, timeout seconds and timeout nanoseconds.
+        let expected = "8a73f61335fcef405a4a646f489fca0baa88f3b2f77dfe48e44e323aa1bcc67a";
+        assert_eq!(request_fingerprint(&original, timeout), expected);
+        assert_eq!(request_fingerprint(&reordered, timeout), expected);
+        let root = crate::private_test_directory();
+        let mut journal = open(root.path());
+        assert_eq!(journal.admit(&original, timeout).unwrap(), None);
+        drop(journal);
+        let mut journal = open(root.path());
+        assert_eq!(
+            journal.admit(&reordered, timeout).unwrap(),
+            Some("durable-request-already-admitted")
+        );
+        let mut scalar = original.clone();
+        scalar["extension"]["z"] = json!(3);
+        let mut array = original.clone();
+        array["args"].as_array_mut().unwrap().reverse();
+        let mut extension = original.clone();
+        extension["extension"]["future"] = json!(false);
+        for changed in [&scalar, &array, &extension] {
+            assert_ne!(request_fingerprint(changed, timeout), expected);
+            assert_eq!(
+                journal.admit(changed, timeout).unwrap(),
+                Some("durable-request-conflict")
+            );
+        }
+        for changed_timeout in [Duration::new(2, 23), Duration::new(1, 24)] {
+            assert_ne!(request_fingerprint(&original, changed_timeout), expected);
+            assert_eq!(
+                journal.admit(&original, changed_timeout).unwrap(),
+                Some("durable-request-conflict")
+            );
+        }
+        assert_eq!(serde_json::to_vec(&original).unwrap(), original_wire);
+        assert_eq!(serde_json::to_vec(&reordered).unwrap(), reordered_wire);
+    }
+
+    #[test]
     fn changed_request_and_budget_cannot_reuse_an_identity() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         let original = request(3);
         journal.admit(&original, Duration::from_secs(1)).unwrap();
@@ -730,7 +785,7 @@ mod tests {
 
     #[test]
     fn failed_directory_sync_poisoning_preserves_admission_after_reopen() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         journal.fail_after_rename = true;
         assert!(journal.admit(&request(8), Duration::from_secs(1)).is_err());
@@ -747,7 +802,7 @@ mod tests {
 
     #[test]
     fn corrupt_state_and_wrong_bindings_never_reset_history() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         drop(open(root.path()));
         assert!(WorkerJournal::open(root.path(), "other", "coord:7000").is_err());
         assert!(WorkerJournal::open(root.path(), "worker", "other:7000").is_err());
@@ -765,7 +820,7 @@ mod tests {
 
     #[test]
     fn missing_prior_state_and_symlink_state_fail_closed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let lock = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -784,7 +839,7 @@ mod tests {
 
     #[test]
     fn unresolved_terminal_error_does_not_authorize_new_work() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         journal.admit(&request(1), Duration::from_secs(1)).unwrap();
         journal
@@ -841,7 +896,7 @@ mod tests {
 
     #[test]
     fn durable_result_resumes_only_for_original_request_and_recipient() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         let receipt = seal(&mut journal, 1);
         journal.finish(1, &receipt, true).unwrap();
@@ -908,7 +963,7 @@ mod tests {
 
     #[test]
     fn uncommitted_seal_cannot_certify_a_previous_boots_execution() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         let _uncommitted_receipt = seal(&mut journal, 1);
         drop(journal);
@@ -929,7 +984,7 @@ mod tests {
 
     #[test]
     fn failed_acceptance_barrier_never_deletes_the_only_retained_bytes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         let receipt = seal(&mut journal, 1);
         journal.finish(1, &receipt, true).unwrap();
@@ -952,7 +1007,7 @@ mod tests {
 
     #[test]
     fn corrupted_retained_bytes_refuse_startup_without_resetting_admission() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         let receipt = seal(&mut journal, 1);
         journal.finish(1, &receipt, true).unwrap();
@@ -967,7 +1022,7 @@ mod tests {
 
     #[test]
     fn reconnect_restores_each_interrupted_transfer_without_reboot_or_reexecution() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         let receipt = seal(&mut journal, 1);
         journal.finish(1, &receipt, true).unwrap();
@@ -1041,7 +1096,7 @@ mod tests {
 
     #[test]
     fn reconnect_does_not_resolve_uncertain_execution_or_poisoned_persistence() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         journal.admit(&request(10), Duration::from_secs(1)).unwrap();
         let before = std::fs::read(root.path().join(STATE_FILE)).unwrap();
@@ -1060,7 +1115,7 @@ mod tests {
 
     #[test]
     fn reconnect_refuses_a_corrupt_seal_without_resetting_the_live_journal() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = open(root.path());
         let receipt = seal(&mut journal, 1);
         journal.finish(1, &receipt, true).unwrap();

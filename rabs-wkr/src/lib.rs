@@ -26,3 +26,12 @@ pub mod session;
 pub mod source_task;
 pub mod source_transfer;
 pub mod toolchain_transfer;
+
+#[cfg(all(test, unix))]
+fn private_test_directory() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("private test directory")
+}

@@ -1197,26 +1197,30 @@ pub async fn daemon_restart(opts: StopOptions, ctx: &OutputContext) -> Result<()
 pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
     let socket_path_str = configured_socket_path()?;
+    let report_error = |error: ApiError| -> Result<()> {
+        if ctx.is_json() {
+            ctx.json(&ApiResponse::<()>::err("daemon reload", error))?;
+        } else {
+            ctx.error(&error.to_string());
+            for step in &error.remediation {
+                eprintln!("  {step}");
+            }
+        }
+        // The response is already emitted. Preserve a failing process status
+        // without asking main to emit a second error envelope.
+        Err(crate::doctor::DoctorExit(1).into())
+    };
 
     // Check if daemon is running
     if !Path::new(&socket_path_str).exists() {
-        if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::<()>::err(
-                "daemon reload",
-                ApiError::new(ErrorCode::InternalDaemonNotRunning, "Daemon is not running"),
-            ));
-        } else {
-            println!(
-                "{} Daemon is not running. Start it with {}",
-                StatusIndicator::Error.display(style),
-                style.highlight("rch daemon start")
-            );
-        }
-        return Ok(());
+        return report_error(
+            ApiError::new(ErrorCode::InternalDaemonNotRunning, "Daemon is not running")
+                .with_remediation(["Run 'rch daemon start' to start the daemon"]),
+        );
     }
 
     if !ctx.is_json() {
-        println!(
+        eprintln!(
             "{} Reloading daemon configuration...",
             StatusIndicator::Info.display(style)
         );
@@ -1234,25 +1238,16 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
                         let error_msg = reload
                             .error
                             .unwrap_or_else(|| "unknown reload error".to_string());
-                        if ctx.is_json() {
-                            let _ = ctx.json(&ApiResponse::<()>::err(
-                                "daemon reload",
-                                ApiError::internal(format!("Reload failed: {}", error_msg)),
-                            ));
-                        } else {
-                            println!(
-                                "{} Reload failed: {}",
-                                StatusIndicator::Error.display(style),
-                                error_msg
-                            );
-                        }
-                        return Ok(());
+                        return report_error(ApiError::internal(format!(
+                            "Reload failed: {}",
+                            error_msg
+                        )));
                     }
 
                     let has_changes = reload.added > 0 || reload.updated > 0 || reload.removed > 0;
 
                     if ctx.is_json() {
-                        let _ = ctx.json(&ApiResponse::ok(
+                        ctx.json(&ApiResponse::ok(
                             "daemon reload",
                             DaemonReloadResponse {
                                 success: true,
@@ -1269,7 +1264,7 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
                                     Some("No configuration changes detected".to_string())
                                 },
                             },
-                        ));
+                        ))?;
                     } else {
                         if has_changes {
                             println!(
@@ -1293,34 +1288,18 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    if ctx.is_json() {
-                        let _ = ctx.json(&ApiResponse::<()>::err(
-                            "daemon reload",
-                            ApiError::internal(format!("Failed to parse reload response: {}", e)),
-                        ));
-                    } else {
-                        println!(
-                            "{} Failed to parse reload response: {}",
-                            StatusIndicator::Error.display(style),
-                            e
-                        );
-                    }
+                    return report_error(ApiError::internal(format!(
+                        "Failed to parse reload response: {}",
+                        e
+                    )));
                 }
             }
         }
         Err(e) => {
-            if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::<()>::err(
-                    "daemon reload",
-                    ApiError::internal(format!("Failed to communicate with daemon: {}", e)),
-                ));
-            } else {
-                println!(
-                    "{} Failed to communicate with daemon: {}",
-                    StatusIndicator::Error.display(style),
-                    e
-                );
-            }
+            return report_error(ApiError::internal(format!(
+                "Failed to communicate with daemon: {}",
+                e
+            )));
         }
     }
 

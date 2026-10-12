@@ -24,18 +24,18 @@ Scenarios (each emits a PASS/FAIL line):
   s3  reinstall_on_change    Modify manifest -> action=Installed, prev_hash != new.
   s4  fingerprint_persisted  .rch_dep_fingerprint.json exists after install.
 
-Skipped automatically when bun is not in PATH (only s0 + s5 run, others SKIP).
+Scenarios s1-s4 are skipped unless bun --version succeeds (only s0 + s5 run).
 
 Environment:
   RCH_E2E_LOG    Override the JSONL log path (default: /tmp/rch_e2e_bun_prepare_<UTC>.jsonl).
-  RCHWKR_BIN     Path to the rch-wkr binary (default: <repo>/target/release/rch-wkr).
-                 If not present, the script builds the release crate.
+  RCHWKR_BIN     Path to rch-wkr (default: $CARGO_TARGET_DIR/debug/rch-wkr,
+                 or <repo>/target/debug/rch-wkr). Builds the debug crate if absent.
 
 Output:
   - Stdout: one human line per assertion + "==== TOTAL: PASS=N FAIL=M ===="
   - JSONL log: one structured event per assertion, fields {ts, run_id, test,
     phase, event, status, detail}.
-  - Build log: cargo output goes to <log>.build.log so the JSONL stays valid JSON.
+  - Preparation log: diagnostics go to <log>.prepare.log so the JSONL stays valid.
 
 Exit codes:
   0  all assertions passed
@@ -46,14 +46,12 @@ HELP
 esac
 
 LOG_FILE=${RCH_E2E_LOG:-/tmp/rch_e2e_bun_prepare_$(date -u +%Y%m%dT%H%M%SZ).jsonl}
-BUILD_LOG=${LOG_FILE%.jsonl}.build.log
+BUILD_LOG=${LOG_FILE%.jsonl}.prepare.log
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
-PROJECT_ROOT=$(git rev-parse --show-toplevel)
-RCHWKR=${RCHWKR_BIN:-${PROJECT_ROOT}/target/release/rch-wkr}
+PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+RCHWKR=${RCHWKR_BIN:-${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch-wkr}
 TMP=$(mktemp -d /tmp/rch_e2e_bun_XXXXXX)
-# Quote $TMP at trap-set time only (single-quoted body ensures it's not
-# re-expanded - it's already pinned to the safe mktemp path).
-trap 'rm -rf "$TMP"' EXIT
+# Retain the preparation responses and runtime diagnostics for inspection.
 PASS=0
 FAIL=0
 
@@ -79,12 +77,12 @@ print(json.dumps({
 
 emit setup begin INFO "log=$LOG_FILE build_log=$BUILD_LOG tmp=$TMP rch_wkr=$RCHWKR"
 
-# Build rch-wkr release if missing. Build output goes to a SEPARATE log
+# Build rch-wkr if missing. Build output goes to a SEPARATE log
 # file - we MUST NOT pollute the JSONL with cargo's free-form output, or
 # any `jq -c` consumer would crash.
 if [ ! -x "$RCHWKR" ]; then
     emit setup build_rch_wkr INFO
-    (cd "$PROJECT_ROOT" && cargo build --release -p rch-wkr) >>"$BUILD_LOG" 2>&1
+    (cd "$PROJECT_ROOT" && cargo build -p rch-wkr) >>"$BUILD_LOG" 2>&1
 fi
 [ -x "$RCHWKR" ] || { emit setup build_rch_wkr FAIL "$RCHWKR missing"; exit 2; }
 
@@ -115,20 +113,24 @@ fi
 emit s5 begin INFO "bad_manifest_handled"
 mkdir -p "$TMP/bad_proj"
 echo '{ "broken json' >"$TMP/bad_proj/package.json"
-"$RCHWKR" prepare --project "$TMP/bad_proj" --runtime bun >"$TMP/bad_prep.json" 2>>"$BUILD_LOG" || true
-ACTION_BAD=$(jq -r '.action' "$TMP/bad_prep.json" 2>/dev/null || echo "EXIT_NONZERO")
+BAD_EXIT=0
+"$RCHWKR" prepare --project "$TMP/bad_proj" --runtime bun >"$TMP/bad_prep.json" 2>>"$BUILD_LOG" || BAD_EXIT=$?
+ACTION_BAD=$(jq -er '.action' "$TMP/bad_prep.json" 2>/dev/null || true)
 # Allow Failed (when bun present + parse error) OR EXIT_NONZERO (when bun absent + spawn error)
-if [ "$ACTION_BAD" = "Failed" ] || [ "$ACTION_BAD" = "EXIT_NONZERO" ]; then
+if [ "$ACTION_BAD" = "Failed" ] || [ "$BAD_EXIT" -eq 1 ]; then
     PASS=$((PASS + 1))
-    emit s5 failure_handled PASS "result=$ACTION_BAD"
+    emit s5 failure_handled PASS "action=$ACTION_BAD exit=$BAD_EXIT"
 else
     FAIL=$((FAIL + 1))
-    emit s5 failure_handled FAIL "expected Failed or EXIT_NONZERO got=$ACTION_BAD"
+    emit s5 failure_handled FAIL "expected Failed or nonzero error exit, action=$ACTION_BAD exit=$BAD_EXIT"
 fi
 
-# Skip the bun-specific tests if bun is not installed.
-if ! command -v bun >/dev/null 2>&1; then
-    emit setup bun_missing SKIP "bun not in PATH; skipping bun-install scenarios"
+# A PATH shim is not evidence of an installed runtime. Exercise the actual
+# version command before treating Bun installation/cache scenarios as runnable.
+BUN_VERSION_EXIT=0
+bun --version >"$TMP/bun-version.stdout" 2>"$TMP/bun-version.stderr" || BUN_VERSION_EXIT=$?
+if [ "$BUN_VERSION_EXIT" -ne 0 ]; then
+    emit setup bun_missing SKIP "bun --version failed (exit=$BUN_VERSION_EXIT); scenarios s1-s4 were not executed; diagnostics=$TMP/bun-version.stderr"
     emit summary "done" "INFO" "pass=$PASS fail=$FAIL (bun-specific scenarios skipped)"
     echo "==== TOTAL: PASS=$PASS FAIL=$FAIL (bun-specific scenarios skipped) ===="
     [ "$FAIL" -eq 0 ] || exit 1

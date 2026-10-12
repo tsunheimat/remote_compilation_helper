@@ -456,9 +456,10 @@ mod tests {
     #[test]
     fn alias_cannot_acquire_another_lock_for_the_same_store() {
         let dir = private_tempdir();
-        let root = dir.path().join("cas");
+        let fixture_root = dir.path().canonicalize().unwrap();
+        let root = fixture_root.join("cas");
         let mounted = mount_and_reconcile(&root).unwrap();
-        let alias = dir.path().join("alias");
+        let alias = fixture_root.join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();
         assert!(mount_and_reconcile(&alias).is_err());
         drop(mounted);

@@ -25,7 +25,13 @@ env:
   # Reduce network retries for faster failure
   CARGO_NET_RETRY: 2
   CARGO_HTTP_TIMEOUT: 30
-  RUSTUP_TOOLCHAIN: nightly-2026-06-06
+  # The pinned asupersync Git dependency stalls with Cargo's built-in fetcher
+  # on cold runners; use the runner's Git transport for dependency downloads.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Bound compiler concurrency on hosted runners, as in the E2E workflow.
+  CARGO_BUILD_JOBS: 2
+  # Match the repository pin and the toolchain used by the worker fleet.
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
 
 jobs:
   # Fast syntax and type checking - gate for other jobs
@@ -36,9 +42,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          # Include the virtual workspace root omitted by Cargo package metadata.
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
       - run: cargo check --all-targets --all-features
 
@@ -88,7 +96,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -101,10 +109,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -127,8 +136,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -160,27 +171,139 @@ jobs:
           # and other workspace crates have Unix-only dependencies (openssh, rich_rust)
           # The Windows build-release job still validates that binaries can be built for Windows
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     needs: check
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          # The real-Cargo build-dir fixture also executes cargo clippy.
+          components: clippy
+      - name: Install Go for native recovery fixtures
+        if: runner.os == 'macOS'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.12'
+          cache: false
+      - name: Install native worker-command fixture prerequisites
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          brew install coreutils findutils
+          # Expose only timeout under its worker command name. Keep the host's
+          # BSD utilities in place; the Cygwin inventory fixture selects gfind.
+          rch_test_tools="$(mktemp -d "$RUNNER_TEMP/rch-test-tools.XXXXXX")"
+          ln -s "$(brew --prefix coreutils)/bin/gtimeout" "$rch_test_tools/timeout"
+          printf '%s\n' "$rch_test_tools" >> "$GITHUB_PATH"
+          "$rch_test_tools/timeout" --version
+          gfind --version
+          go version
+          openssl version -a
+      - name: Install wrapper contract toolchain prerequisites
+        run: |
+          set -euo pipefail
+          for channel in stable beta nightly; do
+            rustup toolchain install "$channel" --profile minimal --no-self-update
+            rustup run "$channel" rustc --version --verbose
+            rustup run "$channel" cargo --version --verbose
+          done
+          rustup toolchain list
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           shared-key: test-${{ matrix.name }}
           cache-on-failure: true
       - name: Run tests
         env:
           RCH_MOCK_SSH: '1'
-        run: cargo test ${{ matrix.cargo_args }}
-      - name: Upload test logs on failure
-        if: failure()
+          # Nested fixture preparation must use this same unified test graph.
+          RABS_TEST_WORKSPACE_ARGS: ${{ matrix.cargo_args }}
+        run: |
+          set -o pipefail
+          mkdir -p target/test-logs
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # Two concurrent rustc processes consumed over 14 GiB before a
+            # runner shutdown. Bound compilation, including nested Cargo builds.
+            # Native test parallelism and all gates retain their existing values.
+            export CARGO_BUILD_JOBS=1
+            # A runner shutdown can prevent the artifact-upload step itself.
+            # Record bounded resource observations in the live job log.
+            python3 -u - <<'PY' &
+          import datetime
+          import json
+          import pathlib
+          import time
+
+          def read(path):
+              try:
+                  return pathlib.Path(path).read_text()
+              except OSError:
+                  return None
+
+          while True:
+              meminfo = read('/proc/meminfo') or ''
+              memory = {line.split(':', 1)[0]: line.split(':', 1)[1].strip()
+                        for line in meminfo.splitlines()
+                        if line.startswith(('MemTotal:', 'MemAvailable:', 'SwapTotal:', 'SwapFree:'))}
+              processes = []
+              for entry in pathlib.Path('/proc').iterdir():
+                  if not entry.name.isdecimal():
+                      continue
+                  fields = dict(line.split(':', 1) for line in (read(entry / 'status') or '').splitlines()
+                                if ':' in line)
+                  rss = int(fields.get('VmRSS', '0 kB').split()[0])
+                  if rss:
+                      processes.append({'pid': int(entry.name), 'name': fields.get('Name', '').strip(),
+                                        'rss_kib': rss, 'threads': fields.get('Threads', '').strip()})
+              cgroup = read('/proc/self/cgroup') or ''
+              relative = next((line.split('::', 1)[1] for line in cgroup.splitlines()
+                               if line.startswith('0::')), '/')
+              cgroup_root = pathlib.Path('/sys/fs/cgroup') / relative.lstrip('/')
+              print('RCH test runner resources ' + json.dumps({
+                  'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  'memory': memory, 'self_cgroup': cgroup,
+                  'cgroup': {name: read(cgroup_root / name) for name in
+                             ('memory.current', 'memory.max', 'memory.peak', 'memory.events', 'cpu.max')},
+                  'host_oom_kill': next((line for line in (read('/proc/vmstat') or '').splitlines()
+                                         if line.startswith('oom_kill ')), None),
+                  'largest_processes': sorted(processes, key=lambda row: row['rss_kib'], reverse=True)[:8]
+              }), flush=True)
+              time.sleep(30)
+          PY
+            rch_test_sampler_pid=$!
+            trap 'rch_test_status=$?; trap - EXIT; kill "$rch_test_sampler_pid" 2>/dev/null || true; wait "$rch_test_sampler_pid" 2>/dev/null || true; exit "$rch_test_status"' EXIT
+          fi
+          # Exercise focused regressions before the full workspace command.
+          # Preserve each verdict and still attempt the complete workspace
+          # after a fixture failure.
+          rch_fixture_status=0
+          cargo test --locked -p rabs-sandbox --test snapshot_capture_realfs -- --nocapture 2>&1 | tee target/test-logs/snapshot-capture-realfs.log || rch_fixture_status=$?
+          # Keep the full workspace's package selection for the native socket
+          # checks, including the Darwin peer-close assertion.
+          rch_command_status=0
+          cargo test --no-fail-fast ${{ matrix.cargo_args }} commands::helpers::daemon_command_tests -- --nocapture 2>&1 | tee target/test-logs/daemon-command.log || rch_command_status=$?
+          rch_workspace_status=0
+          cargo test --no-fail-fast ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log || rch_workspace_status=$?
+          if (( rch_workspace_status != 0 )); then
+            exit "$rch_workspace_status"
+          fi
+          if (( rch_command_status != 0 )); then
+            exit "$rch_command_status"
+          fi
+          exit "$rch_fixture_status"
+      - name: Upload test logs on failure or cancellation
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.name }}
           path: |
+            target/test-logs/snapshot-capture-realfs.log
+            target/test-logs/daemon-command.log
+            target/test-logs/workspace-tests.log
             target/debug/deps/*.log
             **/test-output.log
           retention-days: 7
@@ -189,18 +312,28 @@ jobs:
   # Runs true E2E tests gated by --features true-e2e
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     needs: [check, clippy]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
       - name: Build release binaries
-        run: cargo build --release
+        # The Cargo and shell harnesses consume these application binaries.
+        # RABS spine release builds and gates have their own workflow.
+        run: |
+          cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+      - name: Build debug support binaries for cargo E2E harness
+        # Cargo's integration-test command builds target/debug/rch with its
+        # true-e2e feature set. Prepare only the daemon and worker here, keeping
+        # package selection stable for their dependency feature resolution.
+        run: cargo build --locked -p rch -p rchd -p rch-wkr --bin rchd --bin rch-wkr
       - name: Run cargo-based E2E tests (feature-gated)
         env:
           RCH_MOCK_SSH: '1'
@@ -208,9 +341,10 @@ jobs:
           RCH_E2E_SKIP_WORKER_CHECK: '1'
           RCH_TEST_LOGGING: '1'
         run: |
+          set -o pipefail
           mkdir -p test-results/cargo-e2e
           # Run E2E tests via cargo test with true-e2e feature
-          cargo test --features true-e2e -p rch --test true_e2e -- --test-threads=1 2>&1 | tee test-results/cargo-e2e/output.log || true
+          cargo test --features true-e2e -p rch --test true_e2e -- --test-threads=1 2>&1 | tee test-results/cargo-e2e/output.log
       - name: Run shell-based E2E tests
         env:
           RCH_MOCK_SSH: '1'
@@ -219,6 +353,7 @@ jobs:
           E2E_LOG_DIR: test-results/e2e-logs
           E2E_JUNIT_FILE: test-results/e2e-logs/junit.xml
         run: |
+          set -o pipefail
           chmod +x scripts/e2e_test.sh
           ./scripts/e2e_test.sh 2>&1 | tee e2e-output.log
       - name: Check test performance regression
@@ -246,9 +381,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           shared-key: benchmark
           cache-on-failure: true
       - name: Install Python
@@ -298,7 +434,8 @@ jobs:
             packages: musl-tools
           - os: ubuntu-24.04-arm  # Native ARM64 runner (10x faster than cross-compile)
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
+          # Match the native Intel runner used by tests and release packaging.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -311,10 +448,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           shared-key: release-${{ matrix.target }}
           cache-on-failure: true
       - name: Install packages (Linux)
@@ -342,42 +480,75 @@ jobs:
   # Coverage reporting (Linux only)
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     needs: check
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
-          components: llvm-tools-preview
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: llvm-tools-preview, clippy
+      - name: Install wrapper contract toolchain prerequisites
+        run: |
+          set -euo pipefail
+          for channel in stable beta nightly; do
+            rustup toolchain install "$channel" --profile minimal --no-self-update
+            rustup run "$channel" rustc --version --verbose
+            rustup run "$channel" cargo --version --verbose
+          done
+          rustup toolchain list
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
+          # Keep the ordinary target cache out of this job: coverage owns one
+          # fresh instrumented tree after the previous runner exhausted disk.
+          shared-key: coverage-registry
+          cache-targets: false
           cache-on-failure: true
-      - name: Build binaries for E2E tests
-        run: cargo build --workspace
+      - name: Build instrumented binaries for E2E tests
+        run: |
+          rch_coverage_target="$(mktemp -d "$RUNNER_TEMP/rch-coverage-target.XXXXXX")"
+          rch_coverage_env="$(mktemp "$RUNNER_TEMP/rch-coverage-env.XXXXXX")"
+          export CARGO_TARGET_DIR="$rch_coverage_target"
+          export CARGO_LLVM_COV_TARGET_DIR="$rch_coverage_target"
+          cargo llvm-cov show-env --sh > "$rch_coverage_env"
+          source "$rch_coverage_env"
+          printf 'CARGO_TARGET_DIR=%s\nCARGO_LLVM_COV_TARGET_DIR=%s\nRCH_COVERAGE_ENV=%s\n' \
+            "$CARGO_TARGET_DIR" "$CARGO_LLVM_COV_TARGET_DIR" "$rch_coverage_env" >> "$GITHUB_ENV"
+          # Prepare the same test graph plus the standalone worker binary.
+          # This avoids separate production/test dependency feature variants.
+          cargo build --workspace --features rich-ui --bins --tests --profile test
       - name: Generate LCOV coverage
         env:
           RCH_MOCK_SSH: '1'
-        # Build debug binaries first for E2E tests that need them
-        run: cargo llvm-cov --features rich-ui --workspace --lcov --output-path lcov.info
+          RABS_TEST_WORKSPACE_ARGS: --workspace --features rich-ui
+        # Match cargo-llvm-cov's default --tests selection. The fresh target
+        # contains no previous profiles, so no cleanup or second build tree is
+        # needed. All report formats and the threshold consume this execution.
+        run: |
+          source "$RCH_COVERAGE_ENV"
+          cargo test --features rich-ui --workspace --tests
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info
       - name: Generate HTML coverage report
         env:
           RCH_MOCK_SSH: '1'
-        run: cargo llvm-cov --features rich-ui --workspace --html --output-dir coverage-html
+        # Reuse the preceding test execution for each report format.
+        run: cargo llvm-cov report --workspace --html --output-dir coverage-html
       - name: Generate per-crate coverage summary
         env:
           RCH_MOCK_SSH: '1'
         run: |
+          set -o pipefail
           echo "## Coverage Summary" > coverage-summary.md
           echo "" >> coverage-summary.md
-          cargo llvm-cov --features rich-ui --workspace --text 2>&1 | tee -a coverage-summary.md
+          cargo llvm-cov report --workspace --text 2>&1 | tee -a coverage-summary.md
       - name: Check coverage threshold
         env:
           RCH_MOCK_SSH: '1'
         # Fail if line coverage drops below 65% (goal: 75%)
         # See bead remote_compilation_helper-pacy for progress tracking
-        run: cargo llvm-cov --features rich-ui --workspace --fail-under-lines 65
+        run: cargo llvm-cov report --workspace --fail-under-lines 65
       - uses: codecov/codecov-action@v4
         with:
           files: lcov.info

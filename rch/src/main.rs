@@ -1082,7 +1082,7 @@ The fleet dashboard is the encrypted static console under dashboard/ (see
 dashboard/README.md). URL resolution: --url, then RCH_DASHBOARD_URL, then
 [dashboard] url in config.toml. Agents should use <url>/api/fleet?view=help."#)]
     Web {
-        /// Dashboard URL (overrides RCH_DASHBOARD_URL and [dashboard] url)
+        /// Dashboard URL (overrides RCH_DASHBOARD_URL and `[dashboard]` url)
         #[arg(long)]
         url: Option<String>,
 

@@ -12,7 +12,16 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 /// The inode stays on disk. Unlinking it on release would let a waiting opener
 /// lock the old inode while a new recovery command locks its replacement.
 pub(super) struct RecoveryOwnership {
-    _gate: File,
+    gate: File,
+}
+
+impl Drop for RecoveryOwnership {
+    fn drop(&mut self) {
+        // An unrelated concurrent spawn can retain a copy until exec. Its
+        // inherited descriptor must not extend this recovery's ownership.
+        // Unlock the shared open-file description without unlinking the gate.
+        let _ = self.gate.unlock();
+    }
 }
 
 fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
@@ -42,13 +51,14 @@ fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
             "cannot acquire exclusive job recovery: {error}; another recovery may be active; retry the same wrapper"
         )
     })?;
-    let held = gate.metadata()?;
+    let ownership = RecoveryOwnership { gate };
+    let held = ownership.gate.metadata()?;
     let named = std::fs::symlink_metadata(&path)?;
     anyhow::ensure!(
         safe(&held) && safe(&named) && held.dev() == named.dev() && held.ino() == named.ino(),
         "recovery lock path changed during acquisition"
     );
-    Ok(RecoveryOwnership { _gate: gate })
+    Ok(ownership)
 }
 
 fn validate_same_owner(observed: &DurableJobLease, latest: &DurableJobLease) -> anyhow::Result<()> {
@@ -221,6 +231,31 @@ mod tests {
             path: writer.path.clone(),
             lease: Arc::new(Mutex::new(writer.snapshot())),
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_owner_unlocks_the_journal_with_an_inherited_handle_open() {
+        let (_directory, writer) = fixture();
+        let before = std::fs::read(&writer.path).unwrap();
+        let owner = acquire_gate(&writer.path).unwrap();
+        // This duplicate models the shared open-file description retained by
+        // a concurrent fork before its CLOEXEC descriptors are closed.
+        let inherited = owner.gate.try_clone().unwrap();
+        let inode = inherited.metadata().unwrap().ino();
+        assert!(acquire_gate(&writer.path).is_err());
+        drop(owner);
+        let next = acquire_gate(&writer.path).unwrap();
+        assert_eq!(
+            std::fs::metadata(writer.path.with_extension("recovery.lock"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+        drop(inherited);
+        assert!(acquire_gate(&writer.path).is_err());
+        drop(next);
+        let _released = acquire_gate(&writer.path).unwrap();
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
     }
 
     #[tokio::test]

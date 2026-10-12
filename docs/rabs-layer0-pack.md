@@ -16,8 +16,8 @@ Current schema: **`LAYER0_PACK_VERSION = 4`**.
 ```bash
 cargo run -p rabs-key --bin layer0_render -- --help
 
-# Nothing is enabled unless you ask for it AND the host proves it:
-layer0_render                                         # inert: your defaults stay
+# Host probes select the available baseline tools; other knobs require opt-in:
+layer0_render                                       # availability-selected defaults
 layer0_render --zthreads 4 --target-cpu x86-64-v2     # opt into two knobs
 layer0_render --cranelift --line-tables-only          # dev-iteration profile
 ```
@@ -34,9 +34,11 @@ names that toolchain's capabilities, and a different one may not have them.
 
 ## Knob inventory
 
-Every knob is independently toggleable (`Layer0Pack::disable(id)`), every knob
-is off until both an explicit request and host evidence agree, and a disabled
-knob contributes **nothing** to the config — its reason stays in the inventory.
+Every knob is independently toggleable (`Layer0Pack::disable(id)`). Host probes
+select the linker, Apple SDK baseline, sccache baseline, and optional hakari
+plan. Debug settings, compiler frontend threads, Cranelift, target CPU, and
+deployment target require explicit requests. A disabled knob contributes
+**nothing** to the config — its reason stays in the inventory.
 
 | Knob id | Effect | Required evidence | Kill condition |
 |---|---|---|---|
@@ -140,8 +142,9 @@ proof closes that gap on whatever host it runs on:
 rch exec --job --result-dir l0-proof -- ./scripts/e2e_l0_pack.sh
 ```
 
-It renders the pack twice (bare and opted-in), asserts the bare render is
-inert, builds a real subject with `cargo build --config`, and then reads the
+It renders the pack twice (bare and opted-in), checks the bare render against
+independently probed host defaults, builds a real subject with
+`cargo build --config`, and then reads the
 **verbose rustc invocations** back to confirm each rendered flag actually
 reached the compiler and is absent from the stock variant. Cold-build samples
 are appended in the B015 `layer0-baseline v1` NDJSON shape

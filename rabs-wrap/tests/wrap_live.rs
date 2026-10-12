@@ -5,32 +5,46 @@
 //! byte-identical with and without the wrapper.
 #![cfg(unix)]
 
+mod support;
+
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
+use support::rabsd_bin;
 
 fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
 }
 
-/// The rabsd binary lives beside ours in the target dir. Always ask Cargo,
-/// once per test process: it is a no-op when fresh, and a daemon left over
-/// from an older tree must never answer for this one.
-fn rabsd_bin() -> std::path::PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
-        assert!(status.success(), "rabsd build failed");
-    });
-    std::path::Path::new(wrap()).with_file_name("rabsd")
+/// Only preparation and fork/exec share a guard; every child runs and is waited
+/// for outside it, preserving concurrent streaming and breaker observations.
+trait FixtureCommand {
+    fn fixture_spawn(&mut self) -> std::io::Result<Child>;
+    fn fixture_status(&mut self) -> std::io::Result<ExitStatus>;
+    fn fixture_output(&mut self) -> std::io::Result<Output>;
+}
+
+impl FixtureCommand for Command {
+    fn fixture_spawn(&mut self) -> std::io::Result<Child> {
+        support::spawn(self)
+    }
+
+    fn fixture_status(&mut self) -> std::io::Result<ExitStatus> {
+        self.fixture_spawn()?.wait()
+    }
+
+    fn fixture_output(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.fixture_spawn()?.wait_with_output()
+    }
 }
 
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let _preparation = support::process_setup_guard();
     let path = dir.join(name);
     std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -51,6 +65,35 @@ fn wrap_env(dir: &std::path::Path) -> Vec<(String, String)> {
 }
 
 #[test]
+fn daemon_preparation_scope_requires_current_workspace_and_daemon() {
+    for scope in [
+        "--workspace",
+        "--workspace --exclude rchd",
+        "--workspace --features rich-ui",
+        "--workspace --all-features --no-default-features",
+    ] {
+        assert!(support::workspace_args(scope).is_ok(), "{scope}");
+    }
+    for scope in [
+        "",
+        "-p rabsd",
+        "--workspace --exclude rabsd",
+        "--workspace --exclude rabs*",
+        "--workspace --exclude",
+        "--workspace --features",
+        "--workspace --features --release",
+        "--workspace --manifest-path other/Cargo.toml",
+        "--workspace --target-dir other",
+        "--workspace --profile dev",
+        "--workspace --target other",
+        "--workspace --test other",
+        "--workspace -- --nocapture",
+    ] {
+        assert!(support::workspace_args(scope).is_err(), "{scope}");
+    }
+}
+
+#[test]
 fn exec_preserves_exit_codes_args_and_streams() {
     let dir = tempfile::tempdir().unwrap();
     let fake = write_script(
@@ -63,7 +106,7 @@ fn exec_preserves_exit_codes_args_and_streams() {
     for (key, value) in wrap_env(dir.path()) {
         command.env(key, value);
     }
-    let output = command.output().unwrap();
+    let output = command.fixture_output().unwrap();
     assert_eq!(output.status.code(), Some(42), "exit code preserved");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("args:2:--crate-name:fx"), "{stdout}");
@@ -84,25 +127,50 @@ fn exec_preserves_non_utf8_argv_and_compiler_path() {
     let raw_compiler = dir
         .path()
         .join(OsString::from_vec(b"compiler-\xff".to_vec()));
-    std::fs::copy(&compiler, &raw_compiler).unwrap();
     let raw_arg = OsString::from_vec(b"source-\xfe.rs".to_vec());
-    let cases = [
-        (
-            &compiler,
-            vec![raw_arg.clone(), OsString::new(), "café".into()],
-        ),
-        (&raw_compiler, vec!["source.rs".into()]),
-        (&raw_compiler, vec![raw_arg]),
-    ];
+    let mut cases = vec![(
+        &compiler,
+        vec![raw_arg.clone(), OsString::new(), "café".into()],
+    )];
+    let copied = {
+        let _preparation = support::process_setup_guard();
+        std::fs::copy(&compiler, &raw_compiler)
+    };
+    match copied {
+        Ok(_) => {
+            cases.push((&raw_compiler, vec!["source.rs".into()]));
+            cases.push((&raw_compiler, vec![raw_arg]));
+        }
+        // Darwin EILSEQ is 92; qualify only the native filename subcase.
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(92) => {
+            use std::io::Write as _;
+            assert_eq!(
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>(),
+                vec![OsString::from("compiler")],
+                "a refused raw filename must not create a lossy alias or substitute"
+            );
+            std::io::stderr()
+                .write_all(b"SKIP: non-UTF-8 compiler filename execution not exercised: filesystem refused the name with Darwin EILSEQ (92); no substitute entry was created; raw, empty and UTF-8 argv still execute through the representable compiler\n")
+                .expect("write native filename refusal diagnostic");
+        }
+        Err(error) => panic!("creating the non-UTF-8 compiler filename failed: {error}"),
+    }
 
     for (executable, args) in cases {
-        let direct = Command::new(executable).args(&args).output().unwrap();
+        let direct = Command::new(executable)
+            .args(&args)
+            .fixture_output()
+            .unwrap();
         assert_eq!(direct.status.code(), Some(23));
         let wrapped = Command::new(wrap())
             .arg(executable)
             .args(&args)
             .envs(wrap_env(dir.path()))
-            .output()
+            .fixture_output()
             .unwrap();
         assert_eq!(wrapped.status, direct.status, "wrapper must not panic");
         assert_eq!(wrapped.stdout, direct.stdout, "argv bytes changed");
@@ -123,7 +191,7 @@ fn exec_preserves_death_by_signal() {
     for (key, value) in wrap_env(dir.path()) {
         command.env(key, value);
     }
-    let status = command.status().unwrap();
+    let status = command.fixture_status().unwrap();
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(
         status.signal(),
@@ -150,7 +218,7 @@ fn streaming_is_unbuffered_by_construction_10mb_stderr() {
     for (key, value) in wrap_env(dir.path()) {
         command.env(key, value);
     }
-    let output = command.output().unwrap();
+    let output = command.fixture_output().unwrap();
     // Report what actually happened: a bare `assert!` here said only
     // "false", which is useless for an intermittent failure. This one is
     // flaky (~1 run in 12 on a busy fleet worker) and the exit status is
@@ -178,7 +246,7 @@ fn probes_skip_state_entirely() {
     command.arg(&fake).arg("-vV");
     command.env("RABS_BREAKER_FILE", &breaker);
     command.env("RABS_SOCKET_PATH", dir.path().join("absent.sock"));
-    let output = command.output().unwrap();
+    let output = command.fixture_output().unwrap();
     assert!(output.status.success());
     assert!(
         !breaker.exists(),
@@ -211,7 +279,7 @@ fn busy_breaker_in_another_process_does_not_block_compiler_exec() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .fixture_spawn()
         .unwrap();
     // A watchdog, not a latency benchmark: a blocking lock must not hang
     // the whole test runner. The parent retains the lock until child exit.
@@ -240,7 +308,7 @@ fn busy_breaker_in_another_process_does_not_block_compiler_exec() {
         .args(["--crate-name", "fx"])
         .envs(wrap_env(dir.path()))
         .env("RABS_TEST_COMPILER_MARKER", &marker)
-        .status()
+        .fixture_status()
         .unwrap();
     assert_eq!(status.code(), Some(42));
     let state = std::fs::read(dir.path().join("breaker")).unwrap();
@@ -269,7 +337,10 @@ fn daemon_dead_fails_open_fast_and_breaker_opens_per_model() {
         for (key, value) in &envs {
             command.env(key, value);
         }
-        assert!(command.status().unwrap().success(), "fail-open held");
+        assert!(
+            command.fixture_status().unwrap().success(),
+            "fail-open held"
+        );
     }
     let state = std::fs::read(dir.path().join("breaker")).unwrap();
     let decoded = rabs_protocol::wrapper_breaker::decode_state(&state).unwrap();
@@ -286,7 +357,7 @@ fn daemon_dead_fails_open_fast_and_breaker_opens_per_model() {
     for (key, value) in &envs {
         command.env(key, value);
     }
-    assert!(command.status().unwrap().success());
+    assert!(command.fixture_status().unwrap().success());
     let decoded = rabs_protocol::wrapper_breaker::decode_state(
         &std::fs::read(dir.path().join("breaker")).unwrap(),
     )
@@ -312,7 +383,7 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .fixture_spawn()
         .expect("spawn rabsd");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() {
@@ -344,7 +415,7 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
             OsString::from_vec(raw_value.to_vec()),
         );
         command.env(OsString::from_vec(b"RABS_TEST_\xff".to_vec()), "untouched");
-        let output = command.output().unwrap();
+        let output = command.fixture_output().unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout.as_slice(), raw_value);
     }
@@ -358,7 +429,7 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
 
     Command::new("kill")
         .args(["-TERM", &daemon.id().to_string()])
-        .status()
+        .fixture_status()
         .unwrap();
     assert_eq!(daemon.wait().unwrap().code(), Some(0));
 }
@@ -397,7 +468,7 @@ fn interposition_build_is_byte_identical_with_and_without_wrapper() {
             Some(wrapper) => command.env("RUSTC_WRAPPER", wrapper),
             None => command.env_remove("RUSTC_WRAPPER"),
         };
-        let output = command.output().unwrap();
+        let output = command.fixture_output().unwrap();
         assert!(
             output.status.success(),
             "{}",

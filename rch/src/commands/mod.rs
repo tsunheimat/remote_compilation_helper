@@ -639,6 +639,7 @@ mod tests {
     fn config_show_response_serializes() {
         let _guard = test_guard!();
         let response = ConfigShowResponse {
+            execution_storage: Default::default(),
             general: ConfigGeneralSection {
                 enabled: true,
                 force_local: false,
@@ -677,6 +678,7 @@ mod tests {
                 verify_max_size_bytes: 100 * 1024 * 1024,
             },
             environment: ConfigEnvironmentSection {
+                remote_keys: Vec::new(),
                 allowlist: vec!["RUSTFLAGS".to_string()],
             },
             circuit: ConfigCircuitSection {

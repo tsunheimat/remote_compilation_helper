@@ -140,7 +140,7 @@ pub struct RaAdmission {
 /// Admit an IDE-triggered command to a lane.
 ///
 /// `family` comes from classifying RA's expanded argv through K016's
-/// matrix ([`cargo_command_eligibility::enforce`]); only families that
+/// matrix ([`crate::cargo_command_eligibility::enforce`]); only families that
 /// matrix already accelerates can earn the shared-authority lane here.
 /// Everything else — mutating, interactive, unrecognized — stays on
 /// whatever that matrix granted, minus any authority this module's

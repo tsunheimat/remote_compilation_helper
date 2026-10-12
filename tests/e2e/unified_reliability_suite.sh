@@ -25,6 +25,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/e2e_common.sh
+source "$PROJECT_ROOT/scripts/lib/e2e_common.sh"
 LOG_PREFIX="[unified-e2e]"
 
 E2E_MODE="${RCH_E2E_MODE:-smoke}"
@@ -62,7 +64,7 @@ require_cmd() {
 emit_phase_event() {
   local family="$1" phase="$2" status="$3" duration_ms="${4:-0}"
   local ts
-  ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ts="$(e2e_timestamp)"
   printf '{"timestamp":"%s","family":"%s","phase":"%s","status":"%s","duration_ms":%d,"mode":"%s"}\n' \
     "$ts" "$family" "$phase" "$status" "$duration_ms" "$E2E_MODE" >> "$SUITE_LOG"
 }
@@ -86,14 +88,14 @@ run_family() {
   local family="$1"
   shift
   local start_ms
-  start_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+  start_ms="$(e2e_now_ms)"
 
   log "--- $family ---"
   emit_phase_event "$family" "start" "running"
 
   if "$@" 2>&1 | tee -a "${SUITE_DIR}/${family}.log"; then
     local end_ms
-    end_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+    end_ms="$(e2e_now_ms)"
     local duration=$(( end_ms - start_ms ))
     emit_phase_event "$family" "done" "pass" "$duration"
     log "PASS: $family (${duration}ms)"
@@ -101,7 +103,7 @@ run_family() {
     FAMILIES_RUN+=("$family:pass")
   else
     local end_ms
-    end_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+    end_ms="$(e2e_now_ms)"
     local duration=$(( end_ms - start_ms ))
     emit_phase_event "$family" "done" "fail" "$duration"
     warn "FAIL: $family (${duration}ms)"
@@ -126,7 +128,7 @@ run_path_deps() {
   log "running cross-repo path dependency E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test cross_repo_path_deps_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test cross_repo_path_deps_e2e -- --nocapture
   )
 }
 
@@ -138,7 +140,7 @@ run_repo_convergence() {
   log "running repo convergence E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test repo_convergence_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test repo_convergence_e2e -- --nocapture
   )
 }
 
@@ -150,7 +152,7 @@ run_process_triage() {
   log "running process triage contract E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test process_triage_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test process_triage_e2e -- --nocapture
   )
 }
 
@@ -162,7 +164,7 @@ run_disk_pressure() {
   log "running disk pressure policy unit tests"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rchd -- disk_pressure --nocapture
+    e2e_cargo_test -p rchd --bin rchd -- disk_pressure --nocapture
   )
 }
 
@@ -174,7 +176,7 @@ run_fault_injection() {
   log "running fault-injection E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test fault_injection_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test fault_injection_e2e -- --nocapture
   )
 }
 
@@ -186,7 +188,7 @@ run_reliability_harness() {
   log "running reliability harness foundation tests"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- e2e::tests --nocapture
+    e2e_cargo_test -p rch-common --lib -- e2e::tests --nocapture
   )
 }
 
@@ -198,7 +200,7 @@ run_reliability_logging() {
   log "running reliability logging schema contract tests"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- logging::tests --nocapture
+    e2e_cargo_test -p rch-common --lib -- logging::tests --nocapture
   )
 }
 
@@ -208,13 +210,14 @@ run_reliability_logging() {
 
 run_topology_fixtures() {
   log "running topology fixture smoke tests"
-  if [[ ! -d /data/projects ]] || [[ ! -L /dp ]]; then
-    skip_family "topology_fixtures" "missing /data/projects or /dp symlink"
-    return 0
-  fi
+  local topology_dir worker_bin
+  topology_dir="$(mktemp -d "${TMPDIR:-/tmp}/rch-suite-topology-XXXXXX")"
+  worker_bin="$(e2e_worker_binary)" || return 1
+  e2e_assert_worker_topology "$worker_bin" "$topology_dir" || return 1
+  log "worker accepted valid topology and rejected wrong/missing aliases; evidence: $topology_dir"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- multi_repo_fixture_ --nocapture
+    e2e_cargo_test -p rch-common --lib -- multi_repo_fixture_ --nocapture
   )
 }
 
@@ -226,7 +229,7 @@ run_classification_regression() {
   log "running command classification regression tests"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- classify --nocapture
+    e2e_cargo_test -p rch-common -- classify --nocapture
   )
 }
 
@@ -238,7 +241,7 @@ run_cross_worker_parity() {
   log "running cross-worker determinism/parity E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test cross_worker_parity_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test cross_worker_parity_e2e -- --nocapture
   )
 }
 
@@ -250,7 +253,7 @@ run_soak_concurrency() {
   log "running soak concurrency E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test soak_concurrency_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test soak_concurrency_e2e -- --nocapture
   )
 }
 
@@ -262,7 +265,7 @@ run_schema_contract() {
   log "running JSON/log schema contract tests"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test schema_contract_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test schema_contract_e2e -- --nocapture
   )
 }
 
@@ -274,7 +277,7 @@ run_deterministic_replay() {
   log "running deterministic replay workflow E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test deterministic_replay_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test deterministic_replay_e2e -- --nocapture
   )
 }
 
@@ -286,7 +289,7 @@ run_performance_budget() {
   log "running performance budget assertion E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test performance_budget_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test performance_budget_e2e -- --nocapture
   )
 }
 
@@ -298,7 +301,7 @@ run_local_remote_parity() {
   log "running local-vs-remote parity validation E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test local_remote_parity_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test local_remote_parity_e2e -- --nocapture
   )
 }
 
@@ -310,7 +313,7 @@ run_feature_flags_rollout() {
   log "running feature flags and staged rollout E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test feature_flags_rollout_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test feature_flags_rollout_e2e -- --nocapture
   )
 }
 
@@ -322,7 +325,7 @@ run_contract_drift() {
   log "running cross-project helper contract-drift compatibility E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test contract_drift_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test contract_drift_e2e -- --nocapture
   )
 }
 
@@ -334,7 +337,7 @@ run_redaction_retention() {
   log "running redaction and retention governance E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test redaction_retention_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test redaction_retention_e2e -- --nocapture
   )
 }
 
@@ -346,7 +349,7 @@ run_reliability_doctor() {
   log "running reliability doctor E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test reliability_doctor_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test reliability_doctor_e2e -- --nocapture
   )
 }
 
@@ -358,7 +361,7 @@ run_ux_regression() {
   log "running UX regression E2E scenarios"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test ux_regression_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test ux_regression_e2e -- --nocapture
   )
 }
 
@@ -370,7 +373,7 @@ run_coverage_matrix() {
   log "running reliability coverage matrix staleness checks"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test reliability_coverage_matrix_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test reliability_coverage_matrix_e2e -- --nocapture
   )
 }
 
@@ -382,7 +385,7 @@ run_ci_test_tiers() {
   log "running CI test tier definition validation"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test ci_test_tiers_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test ci_test_tiers_e2e -- --nocapture
   )
 }
 
@@ -394,7 +397,7 @@ run_slo_guardrails() {
   log "running SLO guardrail regression checks"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test slo_guardrails_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test slo_guardrails_e2e -- --nocapture
   )
 }
 
@@ -406,7 +409,7 @@ run_docs_validation() {
   log "running documentation validation checks"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test docs_validation_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test docs_validation_e2e -- --nocapture
   )
 }
 
@@ -418,7 +421,7 @@ run_release_gate_signoff() {
   log "running release gate sign-off checklist"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test release_gate_signoff_e2e -- --nocapture
+    e2e_cargo_test -p rch-common --test release_gate_signoff_e2e -- --nocapture
   )
 }
 
@@ -430,7 +433,7 @@ run_nightly_topology_deep() {
   log "running nightly deep topology canonicalization tests"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- path_topology::tests --nocapture
+    e2e_cargo_test -p rch-common --lib -- path_topology::tests --nocapture
   )
 }
 
@@ -438,8 +441,8 @@ run_nightly_contract_schema_deep() {
   log "running nightly schema deep validation"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- repo_updater_contract::tests --nocapture
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- process_triage::tests --nocapture
+    e2e_cargo_test -p rch-common --lib -- repo_updater_contract::tests --nocapture || exit 1
+    e2e_cargo_test -p rch-common --lib -- process_triage::tests --nocapture || exit 1
   )
 }
 
@@ -447,7 +450,7 @@ run_nightly_reliability_benchmarks() {
   log "running nightly criterion benchmarks for reliability pipeline"
   (
     cd "$PROJECT_ROOT"
-    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo bench -p rch-common --bench reliability_bench -- --quick
+    cargo bench -p rch-common --bench reliability_bench -- --quick
   )
 }
 
@@ -496,6 +499,8 @@ EOJSON
 
 main() {
   require_cmd cargo
+  require_cmd jq
+  require_cmd ln
 
   setup_suite_dir
 

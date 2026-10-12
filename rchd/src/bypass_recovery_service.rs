@@ -3,7 +3,7 @@
 //!
 //! When a worker hits a transient failure it is quarantined into
 //! [`crate::workers::EligibilityState::TemporaryBypass`] and a durable
-//! [`BypassRecord`] is written (see [`record_worker_bypass`], the producer). It
+//! [`BypassRecord`] is written by `record_worker_bypass_locked`. It
 //! then drops out of scheduling (its `status()` reads `Unreachable`). This
 //! service is the consumer side: a background task that, for each bypassed
 //! worker whose backoff window has elapsed, runs a recovery probe across every
@@ -26,9 +26,10 @@
 //! The durable [`BypassRecord`] (backoff, counters, next-probe time, survives
 //! restart) and the in-memory [`crate::workers::WorkerLifecycle`] eligibility
 //! (what selection reads) are two views of the same quarantine. This service is
-//! the single place that advances them together — and [`Self::reconcile_on_start`]
-//! re-derives the lifecycle from the persisted records on daemon startup so a
-//! restart can never silently un-bypass a worker.
+//! the single place that advances them together — and
+//! [`BypassRecoveryService::reconcile_on_start`] re-derives the lifecycle from the
+//! persisted records on daemon startup so a restart can never silently un-bypass
+//! a worker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -306,9 +307,9 @@ impl SshRecoveryProber {
     }
 }
 
-/// Map exact-path capability [`ProbedFacts`] (+ fresh load + telemetry verdict)
-/// onto the 7-dimension [`RecoveryProbe`]. Pure, so the dimension fidelity is
-/// unit-tested without real SSH.
+/// Map exact-path capability [`ProbedFacts`](rch_common::capability_probe::ProbedFacts)
+/// (+ fresh load + telemetry verdict) onto the 7-dimension [`RecoveryProbe`]. Pure,
+/// so the dimension fidelity is unit-tested without real SSH.
 ///
 /// `worker_binary_ok` requires the exact-path `rch-wkr` to have reported a
 /// version; `toolchain_ok` requires cargo plus every configured target/toolchain;

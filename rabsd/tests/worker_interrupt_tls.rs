@@ -164,6 +164,16 @@ impl Certificates {
     fn new() -> Self {
         let owner = tempfile::tempdir().unwrap();
         let root = owner.path();
+        // Keep host defaults from duplicating the CA extensions on OpenSSL 1.1.1.
+        fs::write(
+            root.join("request.cnf"),
+            "[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ca\n\
+             [dn]\nCN=RABS signal test fixture\n\
+             [ca]\nbasicConstraints=critical,CA:TRUE\n\
+             keyUsage=critical,keyCertSign,cRLSign\n\
+             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n",
+        )
+        .unwrap();
         let openssl = |args: &[&str]| {
             let output = Command::new("openssl")
                 .args(args)
@@ -178,6 +188,8 @@ impl Certificates {
         };
         openssl(&[
             "req",
+            "-config",
+            "request.cnf",
             "-x509",
             "-newkey",
             "rsa:2048",
@@ -191,10 +203,6 @@ impl Certificates {
             "ca.key",
             "-out",
             "ca.pem",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
         ]);
         for (name, usage, serial) in [("server", "serverAuth", "2"), ("worker", "clientAuth", "3")]
         {
@@ -204,6 +212,8 @@ impl Certificates {
             let ext = format!("{name}.ext");
             openssl(&[
                 "req",
+                "-config",
+                "request.cnf",
                 "-new",
                 "-newkey",
                 "rsa:2048",
@@ -320,12 +330,15 @@ async fn authenticate(stream: &mut SecureWorkerStream, pin: &str, resume: bool) 
     if resume {
         assert!(grant.get("execution_lease").is_none());
     } else {
+        let original_request = request();
+        let mut canonical_request = original_request.clone();
+        canonical_request.sort_all_objects();
         assert_eq!(
             grant["execution_lease"],
             json!({
                 "version":"request-renewal-v1", "session_id":session,
                 "lease_id":challenge["token_id"], "request_id":7,
-                "request_sha256":hash(&serde_json::to_vec(&request()).unwrap()),
+                "request_sha256":hash(&serde_json::to_vec(&canonical_request).unwrap()),
                 "boot_generation":1, "incarnation":"00000000000000000000000000000001",
                 "ttl_ms":30000,
             })

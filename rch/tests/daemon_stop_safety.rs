@@ -126,6 +126,11 @@ impl Drop for Daemon {
 }
 
 fn run_cli(root: &Path, socket: &Path, action: &str, json_output: bool, flags: &[&str]) -> Output {
+    // A parallel spawn can inherit a copy's CLOEXEC writer until exec and make
+    // the copied CLI fail with ETXTBSY. Complete preparation and exec together;
+    // the lifecycle requests and all their assertions still run concurrently.
+    static CLI_PREPARATION: Mutex<()> = Mutex::new(());
+    let preparation = CLI_PREPARATION.lock().unwrap();
     let bin = root.join("bin");
     let config = root.join("config");
     std::fs::create_dir_all(&bin).unwrap();
@@ -171,6 +176,7 @@ fn run_cli(root: &Path, socket: &Path, action: &str, json_output: bool, flags: &
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
+    drop(preparation);
     let deadline = Instant::now() + Duration::from_secs(20);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {

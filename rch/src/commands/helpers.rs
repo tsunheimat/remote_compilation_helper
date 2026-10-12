@@ -755,12 +755,34 @@ pub(crate) async fn send_daemon_command_to_socket(
     )
     .await
     .context("Timed out connecting to daemon socket")??;
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
 
-    tokio::time::timeout(DAEMON_COMMAND_IO_TIMEOUT, async {
-        writer.write_all(command.as_bytes()).await?;
-        writer.flush().await?;
-        writer.shutdown().await
+    exchange_daemon_command(reader, writer, command).await
+}
+
+#[cfg(unix)]
+async fn exchange_daemon_command<R, W>(reader: R, mut writer: W, command: &str) -> Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let shutdown_error = tokio::time::timeout(DAEMON_COMMAND_IO_TIMEOUT, async {
+        writer
+            .write_all(command.as_bytes())
+            .await
+            .context("Failed to write daemon command")?;
+        writer
+            .flush()
+            .await
+            .context("Failed to flush daemon command")?;
+        match writer.shutdown().await {
+            Ok(()) => Ok(None),
+            // Darwin can report ENOTCONN if the daemon already sent its
+            // response and closed. Read those buffered bytes before deciding
+            // whether the exchange failed; never resend the command.
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(Some(error)),
+            Err(error) => Err(error).context("Failed to shut down daemon request"),
+        }
     })
     .await
     .context("Timed out sending daemon command")??;
@@ -770,7 +792,14 @@ pub(crate) async fn send_daemon_command_to_socket(
     let response_timeout = daemon_command_response_timeout(command);
     tokio::time::timeout(response_timeout, reader.read_to_string(&mut response))
         .await
-        .context("Timed out waiting for daemon response")??;
+        .context("Timed out waiting for daemon response")?
+        .context("Failed to read daemon response")?;
+
+    if response.is_empty()
+        && let Some(error) = shutdown_error
+    {
+        return Err(error).context("Daemon closed without returning a response");
+    }
 
     Ok(response)
 }
@@ -848,8 +877,203 @@ fn daemon_command_is_capabilities_refresh(command: &str) -> bool {
 #[cfg(all(test, unix))]
 mod daemon_command_tests {
     use super::*;
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     use tokio::net::UnixListener;
+
+    struct CommandWriter<W> {
+        inner: W,
+        written: Vec<u8>,
+        write_error: Option<io::ErrorKind>,
+        shutdown_error: Option<io::ErrorKind>,
+        peer_closed: Option<tokio::sync::oneshot::Receiver<()>>,
+        shutdown_result: Option<Option<io::ErrorKind>>,
+    }
+
+    impl<W> CommandWriter<W> {
+        fn new(inner: W) -> Self {
+            Self {
+                inner,
+                written: Vec::new(),
+                write_error: None,
+                shutdown_error: None,
+                peer_closed: None,
+                shutdown_result: None,
+            }
+        }
+    }
+
+    impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CommandWriter<W> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(kind) = self.write_error {
+                return Poll::Ready(Err(kind.into()));
+            }
+            let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+            if let Poll::Ready(Ok(count)) = result {
+                self.written.extend_from_slice(&bytes[..count]);
+            }
+            result
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(closed) = self.peer_closed.as_mut() {
+                match Pin::new(closed).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => self.peer_closed = None,
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    }
+                }
+            }
+            let result = if let Some(kind) = self.shutdown_error {
+                Poll::Ready(Err(kind.into()))
+            } else {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            };
+            if let Poll::Ready(result) = &result {
+                self.shutdown_result = Some(result.as_ref().err().map(io::Error::kind));
+            }
+            result
+        }
+    }
+
+    const COMMAND: &str = "GET /status\n";
+    const RESPONSE: &str = "HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}\n";
+
+    #[tokio::test]
+    async fn send_daemon_command_reads_buffered_response_after_not_connected_shutdown() -> Result<()>
+    {
+        let mut writer = CommandWriter::new(tokio::io::sink());
+        writer.shutdown_error = Some(io::ErrorKind::NotConnected);
+
+        let response = exchange_daemon_command(RESPONSE.as_bytes(), &mut writer, COMMAND).await?;
+
+        assert_eq!(response, RESPONSE);
+        assert_eq!(writer.written, COMMAND.as_bytes());
+        assert_eq!(
+            writer.shutdown_result,
+            Some(Some(io::ErrorKind::NotConnected))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_daemon_command_preserves_shutdown_error_without_response() {
+        let mut writer = CommandWriter::new(tokio::io::sink());
+        writer.shutdown_error = Some(io::ErrorKind::NotConnected);
+
+        let error = exchange_daemon_command(tokio::io::empty(), &mut writer, COMMAND)
+            .await
+            .expect_err("a disconnected peer without a response must fail");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::NotConnected)
+        );
+        assert_eq!(writer.written, COMMAND.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn send_daemon_command_preserves_response_read_errors() {
+        let mut writer = CommandWriter::new(tokio::io::sink());
+        writer.shutdown_error = Some(io::ErrorKind::NotConnected);
+
+        let error = exchange_daemon_command(&b"\xff"[..], &mut writer, COMMAND)
+            .await
+            .expect_err("an invalid response must still fail after peer close");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData)
+        );
+        assert_eq!(writer.written, COMMAND.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn send_daemon_command_preserves_other_shutdown_errors() {
+        let mut writer = CommandWriter::new(tokio::io::sink());
+        writer.shutdown_error = Some(io::ErrorKind::PermissionDenied);
+
+        let error = exchange_daemon_command(RESPONSE.as_bytes(), &mut writer, COMMAND)
+            .await
+            .expect_err("unrelated shutdown errors must fail");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(writer.written, COMMAND.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn send_daemon_command_preserves_request_write_errors() {
+        let mut writer = CommandWriter::new(tokio::io::sink());
+        writer.write_error = Some(io::ErrorKind::NotConnected);
+
+        let error = exchange_daemon_command(RESPONSE.as_bytes(), &mut writer, COMMAND)
+            .await
+            .expect_err("an unsent request must fail despite buffered data");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::NotConnected)
+        );
+        assert!(writer.written.is_empty());
+        assert!(writer.shutdown_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_daemon_command_reads_response_when_native_peer_closes_before_shutdown()
+    -> Result<()> {
+        let (client, mut server) = UnixStream::pair().context("create connected sockets")?;
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut request = vec![0; COMMAND.len()];
+            server
+                .read_exact(&mut request)
+                .await
+                .context("read request")?;
+            assert_eq!(request, COMMAND.as_bytes());
+            server
+                .write_all(RESPONSE.as_bytes())
+                .await
+                .context("write response")?;
+            drop(server);
+            closed_tx
+                .send(())
+                .expect("client still waiting for peer close");
+            Result::<()>::Ok(())
+        });
+        let (reader, writer) = client.into_split();
+        let mut writer = CommandWriter::new(writer);
+        // Order the real peer close before shutdown without a timing sleep.
+        writer.peer_closed = Some(closed_rx);
+
+        let result = exchange_daemon_command(reader, &mut writer, COMMAND).await;
+        server.await.context("server task")??;
+        assert_eq!(result?, RESPONSE);
+        assert_eq!(writer.written, COMMAND.as_bytes());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            writer.shutdown_result,
+            Some(Some(io::ErrorKind::NotConnected))
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn send_daemon_command_half_closes_request_before_waiting_for_response() -> Result<()> {

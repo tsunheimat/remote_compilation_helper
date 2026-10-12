@@ -1239,6 +1239,77 @@ fn test_workers_probe_help() {
     crate::test_log!("TEST PASS: test_workers_probe_help");
 }
 
+#[cfg(unix)]
+#[test]
+fn test_workers_probe_unknown_id_is_nonzero_with_config_error() {
+    for workers in [
+        "workers = []\n",
+        "[[workers]]\nid = \"configured\"\nhost = \"fixture.invalid\"\nuser = \"fixture\"\n",
+    ] {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(config.path().join("workers.toml"), workers).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+            .env("RCH_CONFIG_DIR", config.path())
+            .env_remove("RCH_OUTPUT_FORMAT")
+            .env_remove("TOON_DEFAULT_FORMAT")
+            .args([
+                "--no-self-healing",
+                "--json",
+                "workers",
+                "probe",
+                "missing-worker",
+            ])
+            .output()
+            .expect("Failed to run rch workers probe missing-worker");
+
+        assert_eq!(output.status.code(), Some(1));
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("Expected one JSON error envelope on stdout");
+        assert_eq!(response["command"], "workers probe");
+        assert_eq!(response["success"], false);
+        assert!(response["data"].is_null());
+        assert_eq!(response["error"]["code"], "RCH-E008");
+        assert_eq!(response["error"]["category"], "config");
+        assert_eq!(response["error"]["context"]["worker_id"], "missing-worker");
+
+        let plain = Command::new(env!("CARGO_BIN_EXE_rch"))
+            .env("RCH_CONFIG_DIR", config.path())
+            .env_remove("RCH_JSON")
+            .env("NO_COLOR", "1")
+            .args(["--no-self-healing", "workers", "probe", "missing-worker"])
+            .output()
+            .unwrap();
+        assert_eq!(plain.status.code(), Some(1));
+        assert!(plain.stdout.is_empty(), "diagnostics belong on stderr");
+        let diagnostic = String::from_utf8(plain.stderr).unwrap();
+        assert!(diagnostic.contains("RCH-E008"), "{diagnostic}");
+        assert!(diagnostic.contains("missing-worker"), "{diagnostic}");
+        assert!(diagnostic.contains("rch workers list"), "{diagnostic}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workers_probe_all_with_empty_fleet_succeeds() {
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(config.path().join("workers.toml"), "workers = []\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .env("RCH_CONFIG_DIR", config.path())
+        .env_remove("RCH_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .args(["--no-self-healing", "--json", "workers", "probe", "--all"])
+        .output()
+        .expect("Failed to run rch workers probe --all");
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("Expected one JSON success envelope on stdout");
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["results"], serde_json::json!([]));
+    assert_eq!(response["data"]["summary"]["total"], 0);
+    assert!(response["error"].is_null());
+}
+
 #[test]
 fn test_workers_capabilities_help() {
     init_test_logging();
@@ -1288,6 +1359,120 @@ fn test_daemon_status_help() {
 
     assert!(output.status.success(), "rch daemon status --help failed");
     crate::test_log!("TEST PASS: test_daemon_status_help");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_daemon_reload_status_matches_response() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    for (case, reply, expected_exit, message) in [
+        ("missing", None, 1, "Daemon is not running"),
+        ("refused", None, 1, "Failed to communicate with daemon"),
+        (
+            "rejected",
+            Some(r#"{"success":false,"error":"invalid workers fixture"}"#),
+            1,
+            "invalid workers fixture",
+        ),
+        (
+            "malformed",
+            Some("not json"),
+            1,
+            "Failed to parse reload response",
+        ),
+        ("changed", Some(r#"{"success":true,"added":1}"#), 0, ""),
+        ("unchanged", Some(r#"{"success":true}"#), 0, ""),
+    ] {
+        for machine in [true, false] {
+            // Keep the real Unix socket short even when the caller's TMPDIR
+            // points at a long shared-storage path.
+            let fixture = tempfile::tempdir_in("/tmp").unwrap();
+            let socket = fixture.path().join("daemon.sock");
+            std::fs::write(fixture.path().join("workers.toml"), "workers = []\n").unwrap();
+            if case == "refused" {
+                // Leave an unserved socket entry to exercise connect failure.
+                drop(UnixListener::bind(&socket).unwrap());
+            }
+            let server = reply.map(|reply| {
+                let listener = UnixListener::bind(&socket).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "CLI did not send reload");
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("reload fixture accept: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = String::new();
+                    stream.read_to_string(&mut request).unwrap();
+                    assert_eq!(request, "POST /reload\n");
+                    write!(stream, "HTTP/1.0 200 OK\r\n\r\n{reply}").unwrap();
+                })
+            });
+
+            let mut command = Command::new(env!("CARGO_BIN_EXE_rch"));
+            command
+                .env_clear()
+                .env("HOME", fixture.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("RCH_CONFIG_DIR", fixture.path())
+                .env("RCH_SOCKET_PATH", &socket)
+                .env("XDG_CACHE_HOME", fixture.path().join("cache"))
+                .env("NO_COLOR", "1")
+                .current_dir(fixture.path())
+                .arg("--no-self-healing");
+            if machine {
+                command.arg("--json");
+            }
+            let output = command.args(["daemon", "reload"]).output().unwrap();
+            if let Some(server) = server {
+                server.join().unwrap();
+            }
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "{case}: {output:?}"
+            );
+            if machine {
+                // Parsing the whole stream rejects duplicate error envelopes.
+                let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(response["command"], "daemon reload");
+                assert_eq!(response["success"], expected_exit == 0, "{case}");
+                if expected_exit == 0 {
+                    assert_eq!(response["data"]["added"], usize::from(case == "changed"));
+                    assert!(response["error"].is_null());
+                } else {
+                    let code = if case == "missing" {
+                        "RCH-E502"
+                    } else {
+                        "RCH-E504"
+                    };
+                    assert_eq!(response["error"]["code"], code);
+                    assert!(
+                        response["error"]["details"]
+                            .as_str()
+                            .unwrap()
+                            .contains(message)
+                    );
+                }
+            } else if expected_exit != 0 {
+                assert!(output.stdout.is_empty(), "diagnostics belong on stderr");
+                assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+            }
+        }
+    }
 }
 
 // =============================================================================

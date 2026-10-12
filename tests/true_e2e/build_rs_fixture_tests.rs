@@ -2,7 +2,7 @@
 //!
 //! This test module validates that the `with_build_rs` fixture is well-formed:
 //! - `cargo build` succeeds (build.rs runs and generates OUT_DIR code)
-//! - the generated file exists under target/debug/build/*/out/generated.rs
+//! - the generated file exists in Cargo's reported OUT_DIR
 //! - `cargo run` output confirms the generated symbols are linked
 //! - `cargo test` passes within the fixture itself
 
@@ -78,20 +78,24 @@ fn test_build_rs_generates_code() {
 
     let fixture_path = fixture_dir();
 
-    // Build first (this test is standalone; validate build succeeded).
+    // Build first and use Cargo's actual OUT_DIR, including an inherited
+    // CARGO_TARGET_DIR and either native build-directory layout.
     logger.log_with_context(
         LogLevel::Info,
         LogSource::Custom("test".to_string()),
-        "Running cargo build",
+        "Running cargo build --message-format=json",
         vec![
             ("phase".to_string(), "execute".to_string()),
             ("cwd".to_string(), fixture_path.display().to_string()),
-            ("cmd".to_string(), "cargo build".to_string()),
+            (
+                "cmd".to_string(),
+                "cargo build --message-format=json".to_string(),
+            ),
         ],
     );
 
     let output = match Command::new("cargo")
-        .args(["build"])
+        .args(["build", "--message-format=json"])
         .current_dir(&fixture_path)
         .output()
     {
@@ -111,38 +115,27 @@ fn test_build_rs_generates_code() {
         panic!("Fixture build failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     }
 
-    let build_dir = fixture_path.join("target/debug/build");
-    if !build_dir.exists() {
-        logger.error(format!(
-            "Build directory should exist after build: {}",
-            build_dir.display()
-        ));
-        panic!(
-            "Build directory should exist after build: {}",
-            build_dir.display()
-        );
-    }
-
-    let mut found = None;
-    for entry in std::fs::read_dir(&build_dir).expect("read_dir on target/debug/build failed") {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let candidate = path.join("out/generated.rs");
-        if candidate.exists() {
-            found = Some(candidate);
-            break;
-        }
-    }
-
-    let Some(generated) = found else {
-        panic!(
-            "generated.rs should exist under OUT_DIR (target/debug/build/*/out/generated.rs) for fixture {}",
-            fixture_path.display()
-        );
-    };
+    let out_dirs: Vec<PathBuf> = std::str::from_utf8(&output.stdout)
+        .expect("Cargo JSON output must be UTF-8")
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("valid Cargo JSON message")
+        })
+        .filter(|message| message["reason"] == "build-script-executed")
+        .map(|message| {
+            PathBuf::from(
+                message["out_dir"]
+                    .as_str()
+                    .expect("build-script message must name OUT_DIR"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        out_dirs.len(),
+        1,
+        "the dependency-free fixture must report exactly one build script"
+    );
+    let generated = out_dirs[0].join("generated.rs");
 
     let contents = std::fs::read_to_string(&generated).expect("Failed to read generated.rs");
     assert!(

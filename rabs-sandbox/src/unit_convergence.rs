@@ -38,7 +38,7 @@ pub struct RustcInvocation {
     pub metadata: Vec<String>,
     /// Every `-C extra-filename=…` value, in argv order.
     pub extra_filename: Vec<String>,
-    /// The full argv (wrapper's view: argv[0] is the real rustc).
+    /// The full argv (wrapper's view: `argv[0]` is the real rustc).
     pub argv: Vec<String>,
 }
 

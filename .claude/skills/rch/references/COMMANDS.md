@@ -115,8 +115,8 @@ rch config export [--format shell|env]
 rch completions generate <shell> | install [<shell>] [--dry-run] | uninstall <shell> [--dry-run] | status
 ```
 
-There is no `rch config check`; it is `validate` (syntax) / `lint` / `doctor`
-(semantic, incl. missing `identity_file` keys).
+Use `rch config validate` for syntax, `rch config lint` for linting, and
+`rch config doctor` for semantic checks, including missing `identity_file` keys.
 
 ## Doctor, Self-Test, Error Catalog
 
@@ -189,13 +189,13 @@ rch schema export [-o DIR] | list
 ## Things That Do NOT Exist
 
 `rch workers add|remove` (use `workers init`, `workers discover --add`, or
-`config edit --workers`) · `rch config check` · `rch hook install --force` ·
+`config edit --workers`) · `rch hook install --force` ·
 `rch fleet enable` · `rch status --stats` · `rch bypass`, `rch reconcile`,
 `rch inventory`, `rch toolchain`, `rch wrapper` at top level · env vars
 `RCH_DISABLED`, `RCH_BYPASS`, `RCH_FORCE_LOCAL`, `RCH_DAEMON_SOCKET`, `RCH_LOG`,
-`RCH_DRY_RUN`, `RCH_NO_COLOR` · config file `daemon.toml` **does** exist
-(`rchd` reads `~/.config/rch/daemon.toml`) but `.rch.toml` does not (project
-override is `.rch/config.toml`).
+`RCH_NO_COLOR`. Preview classification with `rch diagnose --dry-run "<cmd>"`.
+The daemon reads `~/.config/rch/daemon.toml`; project overrides belong in
+`.rch/config.toml`.
 
 ## Other Binaries
 

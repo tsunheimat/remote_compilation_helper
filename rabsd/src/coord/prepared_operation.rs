@@ -397,7 +397,9 @@ fn validate_bound_request(request: &Value) -> io::Result<()> {
 }
 
 fn request_digest(request: &Value) -> io::Result<String> {
-    let bytes = serde_json::to_vec(request)?;
+    let mut canonical = request.clone();
+    canonical.sort_all_objects();
+    let bytes = serde_json::to_vec(&canonical)?;
     require(
         bytes.len() <= MAX_FRAME_BYTES,
         "prepared request exceeds frame budget",
@@ -1274,6 +1276,8 @@ impl OperationClaim {
             OperationOutcome::Completed { result } | OperationOutcome::Cancelled { result } => {
                 let delivery = &result["delivery"];
                 let receipt = &delivery["receipt"];
+                let mut canonical_request = record.request.clone();
+                canonical_request.sort_all_objects();
                 let exit_code = receipt["exit_code"]
                     .as_i64()
                     .and_then(|code| i32::try_from(code).ok())
@@ -1287,7 +1291,7 @@ impl OperationClaim {
                         && receipt["transport_authenticated"] == true
                         && receipt["request_sha256"].as_str()
                             == Some(
-                                Sha256::digest(serde_json::to_vec(&record.request)?)
+                                Sha256::digest(serde_json::to_vec(&canonical_request)?)
                                     .iter()
                                     .map(|byte| format!("{byte:02x}"))
                                     .collect::<String>()

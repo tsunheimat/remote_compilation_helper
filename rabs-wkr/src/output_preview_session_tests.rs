@@ -185,9 +185,11 @@ fn request() -> Value {
 
 fn selection(journal: &WorkerJournal, ttl_ms: u64) -> ExecutionLeaseSelection {
     let request = request();
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     let grant = json!({"kind":"session-ok", "session_id":SESSION, "execution_lease":{
         "version":REQUEST_EXECUTION_LEASE_VERSION, "session_id":SESSION, "lease_id":LEASE,
-        "request_id":REQUEST, "request_sha256":rabs_wkr::session::sha256_hex(&serde_json::to_vec(&request).unwrap()),
+        "request_id":REQUEST, "request_sha256":rabs_wkr::session::sha256_hex(&serde_json::to_vec(&canonical_request).unwrap()),
         "boot_generation":journal.boot_generation().0,
         "incarnation":format!("{:032x}", journal.incarnation().0), "ttl_ms":ttl_ms}});
     execution_lease_selection(&grant.to_string(), true, Some(SESSION), journal).unwrap()
@@ -390,7 +392,7 @@ fn assert_full_outputs<F: Future>(
 
 #[test]
 fn live_preview_refusals_preserve_bytes_and_partial_query_survives_terminal_race() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::private_test_directory();
     let mut journal =
         WorkerJournal::open(root.path(), "preview-session-test", "coordinator").unwrap();
     let selected = selection(&journal, 5000);
@@ -463,7 +465,7 @@ fn negotiation_gates_consumption_and_real_capture_reports_exact_bounded_tail_gap
         .map(|index| (index % 256) as u8)
         .collect();
     for enabled in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         std::fs::write(root.path().join("payload"), &payload).unwrap();
         let mut journal =
             WorkerJournal::open(root.path(), "preview-session-test", "coordinator").unwrap();
@@ -551,7 +553,7 @@ fn negotiation_gates_consumption_and_real_capture_reports_exact_bounded_tail_gap
 
 #[test]
 fn preview_polling_preserves_lease_renewal_and_cancellation_with_complete_diagnostics() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::private_test_directory();
     let mut journal =
         WorkerJournal::open(root.path(), "preview-session-test", "coordinator").unwrap();
     let ttl_ms = rabs_protocol::lease_semantics::MIN_TTL_MS;

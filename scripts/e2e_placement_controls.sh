@@ -34,6 +34,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PROJECT_ROOT
+# shellcheck source=lib/e2e_common.sh
+source "$SCRIPT_DIR/lib/e2e_common.sh"
 
 E2E_SKIP_EXIT=4
 BEAD_ID="bd-session-history-remediation-ocv9i.13.5"
@@ -87,7 +89,7 @@ PY
     esac
 }
 
-now_ms() { date +%s%3N 2>/dev/null || echo 0; }
+now_ms() { e2e_now_ms; }
 
 command -v python3 >/dev/null 2>&1 || {
     echo "python3 unavailable; skipping" >&2

@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-2m7j.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_bd-2m7j.jsonl}"
 
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -21,11 +21,12 @@ timestamp() {
 log_json() {
     local phase="$1"
     local message="$2"
-    local extra="${3:-{}}"
+    local extra="${3:-}"
+    [[ -n "$extra" ]] || extra='{}'
     local ts
     ts="$(timestamp)"
-    printf '{"ts":"%s","test":"bd-2m7j","phase":"%s","message":"%s",%s}\n' \
-        "$ts" "$phase" "$message" "${extra#\{}" | sed 's/,}$/}/' | tee -a "$LOG_FILE"
+    jq -nc --arg ts "$ts" --arg phase "$phase" --arg message "$message" --argjson extra "$extra" \
+        '{ts:$ts,test:"bd-2m7j",phase:$phase,message:$message} + $extra' | tee -a "$LOG_FILE"
 }
 
 die() {

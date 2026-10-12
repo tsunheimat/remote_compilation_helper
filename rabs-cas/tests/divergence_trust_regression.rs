@@ -400,6 +400,8 @@ fn publication_divergence_survives_reevaluation_and_reopen_differential() {
             &mut reference as &mut dyn RabsMetadataStore,
             &mut candidate as &mut dyn RabsMetadataStore,
         ] {
+            store.intern_domain(rabs_cas::publication::AUTHORITY_DIGEST_DOMAIN);
+            store.intern_domain(rabs_key::typed_digest::DOMAIN_ACTION_KEY);
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
             let protected = protected_snapshot(store);
             let evaluation = reevaluate_action(store, &authority, &action, &policies, 60).unwrap();
@@ -602,6 +604,8 @@ fn failed_incident_diagnostic_keeps_stale_renewals_fenced_after_reopen_different
             &mut reference as &mut dyn RabsMetadataStore,
             &mut candidate as &mut dyn RabsMetadataStore,
         ] {
+            store.intern_domain(rabs_cas::publication::AUTHORITY_DIGEST_DOMAIN);
+            store.intern_domain(rabs_key::typed_digest::DOMAIN_ACTION_KEY);
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
             assert!(store.list_divergence_incidents(&key).unwrap().is_empty());
             assert_serving_refused(store, presentation_only);

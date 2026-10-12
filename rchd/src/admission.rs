@@ -177,7 +177,7 @@ impl AdmissionGate {
     /// Evaluate a worker for admission into the selection pool.
     ///
     /// Called once per worker per selection round.  The verdict is cached
-    /// for later retrieval by [`get_pressure_penalty`].
+    /// for later retrieval by [`Self::get_pressure_penalty`].
     pub async fn evaluate(
         &self,
         worker: &WorkerState,

@@ -958,7 +958,7 @@ pub async fn workers_probe(
         .and_then(|root| detect_toolchain(root).ok())
         .map(|toolchain| toolchain.rustup_toolchain());
 
-    if workers.is_empty() {
+    if workers.is_empty() && (all || worker_id.is_none()) {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<WorkersProbeResponse>::ok(
                 "workers probe",
@@ -996,21 +996,21 @@ pub async fn workers_probe(
 
     if targets.is_empty() {
         if let Some(id) = worker_id {
+            let error = ApiError::new(
+                ErrorCode::ConfigInvalidWorker,
+                format!("Worker '{}' not found in configuration", id),
+            )
+            .with_context("worker_id", &id)
+            .with_remediation(["Run 'rch workers list' to see configured worker IDs"]);
             if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::<()>::err(
-                    "workers probe",
-                    ApiError::new(
-                        ErrorCode::ConfigInvalidWorker,
-                        format!("Worker '{}' not found", id),
-                    ),
-                ));
+                ctx.json(&ApiResponse::<()>::err("workers probe", error))?;
             } else {
-                println!(
-                    "{} Worker '{}' not found in configuration.",
-                    StatusIndicator::Warning.display(style),
-                    style.highlight(&id)
-                );
+                ctx.error(&error.to_string());
+                for step in &error.remediation {
+                    eprintln!("  {step}");
+                }
             }
+            return Err(crate::doctor::DoctorExit(1).into());
         }
         return Ok(());
     }

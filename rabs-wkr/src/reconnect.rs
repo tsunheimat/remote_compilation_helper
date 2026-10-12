@@ -346,7 +346,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_receipt_cannot_certify_an_uncertain_admission() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::private_test_directory();
         let mut journal = WorkerJournal::open(root.path(), "shutdown-test", "coord").unwrap();
         let report = CapabilityReport {
             worker_id: "shutdown-test".to_owned(),

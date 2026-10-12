@@ -33,7 +33,7 @@
 //! dimensions. Beyond the idle window, pooled targets and the durable
 //! `rch-cargo-cache-*` caches must clear two LIVENESS GATES before anything
 //! removes them: no open file descriptor (or cwd) anywhere under the dir, and
-//! no live process whose command line names it. See [`gate_snapshot_fragment`]
+//! no live process whose command line names it. See `gate_snapshot_fragment`
 //! and [`evaluate_gc_candidate`]. A gate that cannot be evaluated counts as
 //! "in use": an error must never make a directory eligible for deletion.
 //!
@@ -642,7 +642,7 @@ pub const MIN_POOLED_IDLE_MINUTES: u64 = 24 * 60;
 /// Build the worker-wide sweep script shared by the daemon's periodic reaper
 /// (`rchd::stale_target_reap`) and the on-demand `rch gc` — one builder so the
 /// two can never drift (bead 6dj11). Applies [`reap_loop_body`] to every
-/// candidate from [`candidate_discovery_preamble`] and always prints a final
+/// candidate from `candidate_discovery_preamble` and always prints a final
 /// `RCH_WORKER_REAP_METRICS removed=<n> freed_kb=<kb>` line.
 ///
 /// `pooled_idle_minutes` adds a SECOND pass over the pooled
@@ -897,7 +897,7 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
 /// `RCH_TARGET_ENTRY <newest_mtime_unix> <kb> <handles> <procs> <path>`
 ///
 /// `<handles>` and `<procs>` are the two liveness gates (`free`, `held`, or
-/// `unknown`); see [`gate_snapshot_fragment`]. `unknown` is the fail-closed
+/// `unknown`); see `gate_snapshot_fragment`. `unknown` is the fail-closed
 /// answer and makes a warm-cache dir ineligible.
 ///
 /// `newest_mtime_unix` is the newest mtime of the dir or any descendant (the
@@ -1509,7 +1509,7 @@ pub const ABANDONED_GC_CLAIM_MIN_MINUTES: u64 = 6 * 60;
 /// `__gc_source_end` (ssh timeout, kill, OOM, reboot) leaves its `fc-*.claim`
 /// behind, and it fences every build of that tree from then on. The claim is
 /// kept on purpose after a KILL, because the `rm` child may still be deleting
-/// (see [`source_claim_gate_fragment`]), so a free metadata lock does not
+/// (see `source_claim_gate_fragment`), so a free metadata lock does not
 /// prove the deletion is over. A claim counts as abandoned only when, under
 /// the registry's metadata lock, all of these hold:
 /// - it is at least `min_age_minutes` old;
@@ -2697,7 +2697,9 @@ mod tests {
     /// pool under the TMP BASE (the case that was invisible before) is reaped,
     /// a stale job dir under `$base` is reaped, and an ACTIVE dir in either
     /// location survives.
-    #[cfg(unix)]
+    /// The durable source-ownership transaction requires Linux's /proc UUID
+    /// source and the worker's GNU realpath/flock/sync tools.
+    #[cfg(target_os = "linux")]
     #[test]
     fn worker_sweep_executes_and_reaps_only_idle_dirs() {
         use std::process::Command;
@@ -2780,6 +2782,75 @@ mod tests {
         let (removed, _freed) =
             parse_worker_reap_metrics(&stdout).expect("sweep must print its metrics line");
         assert_eq!(removed, 2, "exactly the two idle dirs; stdout: {stdout}");
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn worker_sweep_refuses_unavailable_source_ownership_on_non_linux_unix() {
+        use std::process::Command;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        assert!(
+            std::fs::read_to_string("/proc/sys/kernel/random/uuid").is_err(),
+            "this refusal fixture requires an unavailable Linux kernel UUID source"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let base = root.join("projects");
+        let tmpbase = root.join("scratch");
+        let stale_job = base.join("repo/.rch-target-w1-job-1-2-0");
+        let active_job = base.join("repo/.rch-target-w1-job-9-9-9");
+        let stale_pool = tmpbase.join("rch/proj/hash/.rch-target-w1-pool-stale");
+        let active_pool = tmpbase.join("rch/proj/hash/.rch-target-w1-pool-active");
+        for path in [&stale_job, &active_job, &stale_pool, &active_pool] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("artifact.o"), b"owned artifact").unwrap();
+        }
+        let old =
+            std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_577_836_800));
+        for path in [&stale_job, &stale_pool] {
+            std::fs::File::open(path.join("artifact.o"))
+                .unwrap()
+                .set_times(old)
+                .unwrap();
+            std::fs::File::open(path).unwrap().set_times(old).unwrap();
+        }
+        let cmd = worker_sweep_command_with_registry(
+            base.to_str().unwrap(),
+            60,
+            Some(MIN_POOLED_IDLE_MINUTES),
+            None,
+            root.join("claims-v1").to_str().unwrap(),
+        );
+        let out = Command::new("sh")
+            .args(["-c", &cmd])
+            .env("TMPDIR", &tmpbase)
+            .output()
+            .expect("actual worker sweep should execute");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(parse_worker_reap_metrics(&stdout), Some((0, 0)), "{out:?}");
+        assert!(parse_reap_events(&stdout).is_empty(), "{out:?}");
+        let skips = parse_gc_skips(&stdout);
+        assert!(
+            skips.iter().any(|skip| skip.trigger == "ttl"
+                && skip.reason == "source-ownership"
+                && std::path::Path::new(&skip.path) == stale_job),
+            "unavailable source ownership must be reported: {out:?}"
+        );
+        assert!(
+            skips.iter().any(|skip| skip.trigger == "pooled-ttl"
+                && ["gate", "source-ownership"].contains(&skip.reason.as_str())
+                && std::path::Path::new(&skip.path) == stale_pool),
+            "stale pooled ownership refusal must be reported: {out:?}"
+        );
+        for path in [&stale_job, &active_job, &stale_pool, &active_pool] {
+            assert!(path.is_dir(), "owned directory was removed: {path:?}");
+            assert_eq!(
+                std::fs::read(path.join("artifact.o")).unwrap(),
+                b"owned artifact"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3483,7 +3554,8 @@ mod tests {
 
     /// When the sync root sits UNDER the tmp base, both discovery passes match
     /// the same dirs. Without dedup the byte-cap pass would count them twice.
-    #[cfg(unix)]
+    /// Successful reaping needs the Linux source-ownership transaction.
+    #[cfg(target_os = "linux")]
     #[test]
     fn overlapping_roots_are_deduped_not_double_counted() {
         use std::process::Command;

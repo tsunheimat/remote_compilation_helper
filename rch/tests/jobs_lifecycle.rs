@@ -376,8 +376,23 @@ fn matching_cancellation_requests_only_the_original_wrapper() {
 #[test]
 fn owner_exit_during_status_does_not_erase_a_new_recovery_intent() {
     let mut fixture = Fixture::new(true);
-    // Positive absence of this synthetic process, without ever signalling it.
-    fixture.lease.wrapper_pid = u32::MAX;
+    // Reap a process this fixture actually owns. Out-of-range synthetic PIDs
+    // are unknown identities and cannot authorize completion reconciliation.
+    let owner = OwnedChild(Some(
+        Command::new("/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let owner_pid = owner.0.as_ref().unwrap().id();
+    assert!(owner.finish().status.success());
+    assert_eq!(
+        rch_common::process_identity::owner_presence(owner_pid, None),
+        rch_common::process_identity::OwnerPresence::Absent
+    );
+    fixture.lease.wrapper_pid = owner_pid;
     write_lease(&fixture.lease_path, &fixture.lease);
     let path = fixture.lease_path.clone();
     let mut latest = fixture.lease.clone();

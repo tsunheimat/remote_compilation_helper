@@ -217,7 +217,7 @@ fn cache_preparation_failure_permanently_fences_the_source_owner() {
 
 #[test]
 fn warm_source_cache_still_prepares_an_independent_request_owned_cargo_home() {
-    let cache = tempfile::tempdir().unwrap();
+    let cache = crate::private_test_directory();
     let (manifest, mut start, request) = declarations(7);
     start["allow_cached_files"] = json!(true);
     let mut cold = cached_state(cache.path());

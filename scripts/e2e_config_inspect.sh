@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_config_inspect.jsonl"
+LOG_FILE="${RCH_E2E_LOG:-$PROJECT_ROOT/target/e2e_config_inspect.jsonl}"
 
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -22,11 +22,14 @@ timestamp() {
 log_json() {
     local phase="$1"
     local message="$2"
-    local extra="${3:-{}}"
+    local extra="${3:-}"
+    [[ -n "$extra" ]] || extra='{}'
     local ts
     ts="$(timestamp)"
-    printf '{"ts":"%s","test":"config_inspect","phase":"%s","message":"%s",%s}\n' \
-        "$ts" "$phase" "$message" "${extra#\{}" | sed 's/,}$/}/' | tee -a "$LOG_FILE"
+    jq -nc --arg ts "$ts" --arg phase "$phase" --arg message "$message" \
+        --argjson extra "$extra" \
+        '{ts:$ts,test:"config_inspect",phase:$phase,message:$message} + $extra' \
+        | tee -a "$LOG_FILE"
 }
 
 die() {
@@ -42,7 +45,7 @@ check_dependencies() {
 }
 
 build_rch() {
-    local rch_bin="${PROJECT_ROOT}/target/debug/rch"
+    local rch_bin="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch"
     if [[ -x "$rch_bin" ]]; then
         log_json "setup" "Using existing rch binary" "{\"path\":\"$rch_bin\"}" >&2
         echo "$rch_bin"
@@ -68,10 +71,10 @@ test_lint_missing_workers() {
 enabled = true
 EOF
 
-    # Run lint with custom HOME (should fail with error)
+    # Select only this fixture's config, independent of the host config and cwd.
     local exit_code=0
     local output
-    output=$(HOME="$test_home" "$rch_bin" --json config lint 2>&1) || exit_code=$?
+    output=$(cd "$test_home" && RCH_CONFIG_DIR="$test_home/.config/rch" "$rch_bin" --json config lint 2>&1) || exit_code=$?
 
     # Should exit with code 1 (errors found)
     if [[ "$exit_code" -ne 1 ]]; then
@@ -137,7 +140,7 @@ user = "test"
 EOF
 
     local output
-    output=$(HOME="$test_home" "$rch_bin" --json config diff 2>&1)
+    output=$(cd "$test_home" && RCH_CONFIG_DIR="$test_home/.config/rch" "$rch_bin" --json config diff 2>&1)
 
     # Should show changes for log_level, confidence_threshold, compression_level
     local total_changes
@@ -203,7 +206,7 @@ user = "test"
 EOF
 
     local output
-    output=$(HOME="$test_home" "$rch_bin" --json config lint 2>&1 || true)
+    output=$(cd "$test_home" && RCH_CONFIG_DIR="$test_home/.config/rch" "$rch_bin" --json config lint 2>&1 || true)
 
     # Should detect multiple warnings
     local warning_count
@@ -217,6 +220,7 @@ EOF
 }
 
 main() {
+    mkdir -p "$(dirname "$LOG_FILE")"
     : > "$LOG_FILE"
     check_dependencies
 
@@ -235,9 +239,7 @@ main() {
     test_diff_shows_changes "$rch_bin" "$tmp_root"
     test_lint_risky_config "$rch_bin" "$tmp_root"
 
-    # Cleanup
-    rm -rf "$tmp_root"
-
+    log_json "setup" "Retained test fixtures" "{\"root\":\"$tmp_root\"}"
     log_json "summary" "All config_inspect checks passed" '{"result":"pass"}'
 }
 

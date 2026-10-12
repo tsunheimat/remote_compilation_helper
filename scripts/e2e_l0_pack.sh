@@ -50,17 +50,51 @@ RENDER=$(cargo metadata --no-deps --format-version 1 \
 [ -x "$RENDER" ] || { log "layer0_render not built at $RENDER"; exit 2; }
 
 # Two renders. The BARE one proves the pack's default posture: no opt-in knob
-# is on without an explicit request. The one documented exception is the
+# is on without an explicit request. The documented host defaults are the
 # linker (L0-c, `layer0_render --help`): wild/lld is selected by AVAILABILITY
-# alone when the clang driver and a known host triple are present, so on such
-# a host the bare render carries exactly that linker block and nothing else.
-# The OPTED-IN one is the subject of the flag assertions below — every knob
-# in it was asked for AND proven available on this host.
+# alone when the clang driver and a known host triple are present, and the
+# Apple SDK baseline (L0-g), which pins the independently probed xcrun SDK,
+# and sccache, whose version probe must succeed.
+# The OPTED-IN one adds only requested compiler knobs proven available on
+# this host and is the subject of the flag assertions below.
 "$RENDER" >"$OUT/layer0-bare.toml" 2>"$OUT/render-bare.stderr"
 HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
-LINKER_LIVE_RE="^(\[target\.${HOST_TRIPLE//./\\.}\]|linker = \"clang\"|rustflags = \[\"-C\", \"link-arg=(-fuse-ld=lld|--ld-path=wild)\"\])$"
-if grep -v '^#' "$OUT/layer0-bare.toml" | grep '[^[:space:]]' | grep -Evq "$LINKER_LIVE_RE"; then
-  log "FAIL: an unrequested pack rendered live config beyond the auto-selected linker:"
+LINKER_LIVE_RE="\[target\.${HOST_TRIPLE//./\\.}\]|linker = \"clang\"|rustflags = \[\"-C\", \"link-arg=(-fuse-ld=lld|--ld-path=wild)\"\]"
+SDK_LIVE_RE=""
+case "$HOST_TRIPLE" in
+  *-apple-*)
+    SDK_VERSION=""
+    SDK_PATH=""
+    if SDK_VERSION=$(xcrun --show-sdk-version 2>"$OUT/sdk-version.stderr") \
+      && SDK_PATH=$(xcrun --show-sdk-path 2>"$OUT/sdk-path.stderr") \
+      && [ -n "$SDK_VERSION" ] && [ -n "$SDK_PATH" ]; then
+      printf '%s\n' "$SDK_VERSION" >"$OUT/sdk-version.txt"
+      printf '%s\n' "$SDK_PATH" >"$OUT/sdk-path.txt"
+      if [ ! -d "$SDK_PATH" ] \
+        || ! grep -Fxq -- "# sdk baseline: $SDK_VERSION" "$OUT/layer0-bare.toml" \
+        || ! grep -Fxq -- "SDKROOT = \"$SDK_PATH\"" "$OUT/layer0-bare.toml"; then
+        log "FAIL: bare render does not pin the independently probed existing Apple SDK"
+        exit 3
+      fi
+      SDK_PATH_RE=$(printf '%s\n' "$SDK_PATH" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
+      SDK_LIVE_RE="|\\[env\\]|SDKROOT = \"$SDK_PATH_RE\""
+    fi
+    ;;
+esac
+SCCACHE_LIVE_RE=""
+SCCACHE_AVAILABLE=false
+if sccache --version >"$OUT/sccache-version.txt" 2>"$OUT/sccache-version.stderr"; then
+  SCCACHE_AVAILABLE=true
+  if ! grep -Fxq -- '[build]' "$OUT/layer0-bare.toml" \
+    || ! grep -Fxq -- 'rustc-wrapper = "sccache"' "$OUT/layer0-bare.toml"; then
+    log "FAIL: bare render omits the independently probed sccache baseline"
+    exit 3
+  fi
+  SCCACHE_LIVE_RE='|\[build\]|rustc-wrapper = "sccache"'
+fi
+BARE_LIVE_RE="^($LINKER_LIVE_RE$SDK_LIVE_RE$SCCACHE_LIVE_RE)$"
+if grep -v '^#' "$OUT/layer0-bare.toml" | grep '[^[:space:]]' | grep -Evq "$BARE_LIVE_RE"; then
+  log "FAIL: an unrequested pack rendered live config beyond the probed host defaults:"
   cat "$OUT/layer0-bare.toml" >&2
   exit 3
 fi
@@ -68,7 +102,7 @@ if grep -q '^linker = "clang"' "$OUT/layer0-bare.toml" && ! command -v clang >/d
   log "FAIL: bare render selected a clang-driven linker but clang is absent"
   exit 3
 fi
-log "bare render touches nothing but the availability-selected linker -> $OUT/layer0-bare.toml"
+log "bare render contains only independently checked host defaults -> $OUT/layer0-bare.toml"
 
 TARGET_CPU=${TARGET_CPU:-x86-64-v2}
 case "$(rustc -vV | sed -n 's/^host: //p')" in
@@ -76,6 +110,17 @@ case "$(rustc -vV | sed -n 's/^host: //p')" in
 esac
 "$RENDER" --zthreads 4 --line-tables-only --cranelift --target-cpu "$TARGET_CPU" \
   >"$OUT/layer0.toml" 2>"$OUT/render.stderr"
+if [ -n "${SDK_PATH:-}" ] \
+  && { ! grep -Fxq -- "# sdk baseline: $SDK_VERSION" "$OUT/layer0.toml" \
+    || ! grep -Fxq -- "SDKROOT = \"$SDK_PATH\"" "$OUT/layer0.toml"; }; then
+  log "FAIL: opted-in render changed the independently probed Apple SDK baseline"
+  exit 3
+fi
+if [ "$SCCACHE_AVAILABLE" = true ] \
+  && ! grep -Fxq -- 'rustc-wrapper = "sccache"' "$OUT/layer0.toml"; then
+  log "FAIL: opted-in render changed the independently probed sccache baseline"
+  exit 3
+fi
 log "rendered pack -> $OUT/layer0.toml"
 cat "$OUT/layer0.toml" >&2
 cat "$OUT/render.stderr" >&2
@@ -107,7 +152,7 @@ fi
 # A subject with enough object files that linking is a measurable share of the
 # build, built OUTSIDE the repo so the tree is never mutated.
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/rch-l0-proof.XXXXXX")
-trap 'rm -rf "$SCRATCH"' EXIT
+trap 'log "Retained layer-0 build fixture: $SCRATCH"' EXIT
 mkdir -p "$SCRATCH/subject/src/bin"
 cat >"$SCRATCH/subject/Cargo.toml" <<'TOML'
 [package]
@@ -147,7 +192,7 @@ build_once() { # variant iteration -> duration in $DURATION
   [ "$variant" = layer0 ] && extra=(--config "$PWD/$OUT/layer0.toml")
   start=$(now_ms)
   CARGO_TARGET_DIR=$target CARGO_INCREMENTAL=0 RCH_CARGO_WRAPPER_BYPASS=1 \
-    cargo build --manifest-path "$SCRATCH/subject/Cargo.toml" --verbose "${extra[@]}" \
+    cargo build --manifest-path "$SCRATCH/subject/Cargo.toml" --verbose ${extra[@]+"${extra[@]}"} \
     >"$OUT/cargo-$variant-$iteration.stdout" 2>"$OUT/cargo-$variant-$iteration.stderr" || code=$?
   end=$(now_ms)
   DURATION=$((end - start))

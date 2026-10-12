@@ -135,6 +135,8 @@ impl Peer {
                 Err(error) => panic!("accept: {error}"),
             }
         };
+        // Darwin inherits the listener's nonblocking mode on accept.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(BUDGET)).unwrap();
         stream.set_write_timeout(Some(BUDGET)).unwrap();
         Self {

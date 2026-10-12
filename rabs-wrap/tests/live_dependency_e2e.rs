@@ -21,33 +21,33 @@
 //!    bytes and new checkout files key it, while Git metadata never becomes
 //!    an admitted compiler input.
 //!
+//! The serving lane currently encodes four Linux targets. On other Unix
+//! hosts these cases instead require its exact unsupported-target refusal
+//! and compare the native fallback's library bytes and compiler output with
+//! stock rustc. A refusal is not evidence of dependency serving support.
+//!
 //! The compiler-never-ran half of "served" is proven deterministically by
 //! `live_protocol.rs`; here the daemon's own decision log shows the request
 //! was answered `hit` → `served` without an admitted execution.
 #![cfg(unix)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+use support::rabsd_bin;
 
 const INDEX: &str = "index.example-0123456789abcdef";
+const SERVING_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+];
 
 fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
-}
-
-/// Always ask Cargo, once per test process: it is a no-op when fresh, and a
-/// daemon left over from an older tree must never answer for this one.
-fn rabsd_bin() -> PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
-        assert!(status.success(), "rabsd build failed");
-    });
-    Path::new(wrap()).with_file_name("rabsd")
 }
 
 /// The real toolchain binary (`<sysroot>/bin/rustc`), not a proxy.
@@ -95,6 +95,139 @@ impl Daemon {
             .filter(|value| value["kind"] == "rabsd-live-dependency")
             .collect()
     }
+
+    fn warmup_diagnostics(&self, world: &World) -> String {
+        let request_env = world.env("leaf");
+        // These names are retained verbatim by dependency-env-v1. Report only
+        // this toolchain-relevant projection, never the full request environment.
+        let toolchain_env: std::collections::BTreeMap<_, _> = [
+            "PATH",
+            "HOME",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "LD_LIBRARY_PATH",
+            "OUT_DIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+        ]
+        .into_iter()
+        .map(|name| {
+            let value = request_env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| bounded_diagnostic(value, 512));
+            (name, value)
+        })
+        .collect();
+        format!(
+            "compiler={:?}; constructed_toolchain_env_projection={toolchain_env:?}; {}",
+            bounded_diagnostic(&world.rustc.display().to_string(), 1024),
+            log_tail_diagnostics(&self.log)
+        )
+    }
+}
+
+fn bounded_diagnostic(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{} [TRUNCATED: {} additional bytes]",
+        &text[..end],
+        text.len() - end
+    )
+}
+
+fn diagnostic_log_record(record: &serde_json::Value) -> String {
+    let projected: serde_json::Map<_, _> =
+        ["kind", "decision", "crate", "reason", "detail", "compiler"]
+            .into_iter()
+            .filter_map(|name| {
+                record.get(name).map(|value| {
+                    let value = value.as_str().map_or_else(
+                        || "[non-string diagnostic field omitted]".to_owned(),
+                        |text| bounded_diagnostic(text, 512),
+                    );
+                    (name.to_owned(), serde_json::Value::String(value))
+                })
+            })
+            .collect();
+    bounded_diagnostic(&serde_json::Value::Object(projected).to_string(), 1024)
+}
+
+fn log_tail_diagnostics(path: &Path) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    const MAX_TAIL_BYTES: u64 = 8 * 1024;
+    const MAX_RECORDS: usize = 16;
+
+    let tail = (|| -> std::io::Result<_> {
+        let mut file = std::fs::File::open(path)?;
+        let start = file.metadata()?.len().saturating_sub(MAX_TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_TAIL_BYTES).read_to_end(&mut bytes)?;
+        Ok((start, bytes))
+    })();
+    let (start, bytes) = match tail {
+        Ok(tail) => tail,
+        Err(error) => {
+            return format!(
+                "rabsd.log tail read failed: {}",
+                bounded_diagnostic(&error.to_string(), 512)
+            );
+        }
+    };
+    let mut decisions = std::collections::VecDeque::new();
+    let mut decision_count = 0_usize;
+    let mut parse_errors = std::collections::VecDeque::new();
+    let mut parse_error_count = 0_usize;
+    let mut lines = Vec::new();
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(record) => {
+                let projected = diagnostic_log_record(&record);
+                if record["kind"] == "rabsd-live-dependency" {
+                    decision_count += 1;
+                    if decisions.len() == MAX_RECORDS {
+                        decisions.pop_front();
+                    }
+                    decisions.push_back(projected.clone());
+                }
+                lines.push(format!("tail line {index}: {projected}"));
+            }
+            Err(error) => {
+                let detail = bounded_diagnostic(
+                    &format!(
+                        "tail line {index}: JSON parse failed: {error}; {} raw bytes omitted (unparsed fields may contain keys/environment; boundary records may be truncated)",
+                        line.len()
+                    ),
+                    512,
+                );
+                parse_error_count += 1;
+                if parse_errors.len() == MAX_RECORDS {
+                    parse_errors.pop_front();
+                }
+                parse_errors.push_back(detail.clone());
+                lines.push(detail);
+            }
+        }
+    }
+    format!(
+        "rabsd.log tail: read={} bytes at offset={start}; earlier_log_bytes_omitted={start}; recent_unfiltered_decisions_available_in_tail={decisions:?}; earlier_decision_records_in_tail_omitted={}; JSON_parse_errors={parse_errors:?}; earlier_parse_errors_in_tail_omitted={}; projected_log_tail (keys/environment omitted)={}",
+        bytes.len(),
+        decision_count.saturating_sub(MAX_RECORDS),
+        parse_error_count.saturating_sub(MAX_RECORDS),
+        bounded_diagnostic(&lines.join("\n"), 8 * 1024)
+    )
 }
 
 impl Drop for Daemon {
@@ -220,14 +353,18 @@ impl World {
             env.retain(|(present, _)| present != key);
             env.push(((*key).to_owned(), (*value).to_owned()));
         }
-        Command::new(wrap())
+        let mut command = Command::new(wrap());
+        command
             .arg(&self.rustc)
             .args(self.args(name, out, externs))
             .current_dir(self.package(name))
-            .env_clear()
-            .envs(env)
-            .output()
-            .expect("run rabs-wrap")
+            .env_clear();
+        // Profiling the wrapper must not create files in the dependency's
+        // immutable source tree. The daemon still constructs the compiler env.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command.envs(env).output().expect("run rabs-wrap")
     }
 
     /// Stock rustc, no wrapper, same argv: the oracle for served bytes.
@@ -402,13 +539,75 @@ fn assert_same_library(first: &Path, second: &Path, name: &str) {
     );
 }
 
+fn native_target(world: &World) -> String {
+    let version = Command::new(&world.rustc)
+        .arg("-vV")
+        .output()
+        .expect("query the native compiler target");
+    assert!(version.status.success(), "{version:?}");
+    let version = String::from_utf8(version.stdout).unwrap();
+    version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc reports its native host target")
+        .to_owned()
+}
+
+/// Unsupported native targets must still compile locally without admitting
+/// execution or serving guessed outputs through the Linux dependency lane.
+fn assert_native_target_refusal(world: &World, daemon: &Daemon, host: &str) {
+    let expected_detail = format!("LIVE_DEP_OUTPUTS: UnknownTargetFamily({host:?})");
+
+    let stock_out = world.out_dir("native-stock");
+    let stock = world.stock("leaf", &stock_out, &[]);
+    assert_eq!(stock.status.code(), Some(0), "{stock:?}");
+    let fallback_out = world.out_dir("native-fallback");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let mark = daemon.decisions().len();
+        let output = world.wrapped("leaf", &fallback_out, &[], &[]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let decisions = daemon.decisions().split_off(mark);
+        if let [decision] = decisions.as_slice()
+            && decision["decision"] == "shadow"
+        {
+            assert_eq!(decision["crate"], "leaf", "{decision:#?}");
+            assert_eq!(decision["reason"], "LIVE_DEP_OUTPUTS", "{decision:#?}");
+            assert_eq!(decision["detail"], expected_detail, "{decision:#?}");
+            assert_eq!(output.stdout, stock.stdout);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .replace(fallback_out.to_str().unwrap(), "<OUT>"),
+                String::from_utf8_lossy(&stock.stderr)
+                    .replace(stock_out.to_str().unwrap(), "<OUT>"),
+                "native fallback changed compiler diagnostics"
+            );
+            assert_same_library(&fallback_out, &stock_out, "leaf");
+            return;
+        }
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision["decision"] == "toolchain-warming"),
+            "unsupported target admitted an unexpected decision: {decisions:#?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "native target refusal was not observed: {}",
+            daemon.warmup_diagnostics(world)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
-fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
-    // Short root: the daemon socket path must fit sun_path.
+fn registry_dependency_lane_preserves_results_on_native_target() {
+    // Keep the socket short and CARGO_MANIFEST_DIR equal to the wrapper's
+    // physical cwd when /tmp is a symlink (as it is on macOS).
     let dir = tempfile::Builder::new()
         .prefix("rl")
-        .tempdir_in("/tmp")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
         .unwrap();
     let world = World {
         root: dir.path().to_path_buf(),
@@ -428,6 +627,12 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
     );
     let daemon = Daemon::start(&world.root, &world.socket);
 
+    let target = native_target(&world);
+    if !SERVING_TARGETS.contains(&target.as_str()) {
+        assert_native_target_refusal(&world, &daemon, &target);
+        return;
+    }
+
     // 1. Warm the toolchain probe (background hashing of the sysroot), then
     //    the first eligible compile executes and commits.
     let out_a = world.out_dir("wt-a");
@@ -445,7 +650,11 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
             trail.iter().all(|step| step == "toolchain-warming"),
             "unexpected decisions while warming: {trail:?}"
         );
-        assert!(Instant::now() < deadline, "toolchain probe never warmed");
+        assert!(
+            Instant::now() < deadline,
+            "toolchain probe never warmed: {}",
+            daemon.warmup_diagnostics(&world)
+        );
         std::thread::sleep(Duration::from_millis(250));
     };
     let key = daemon
@@ -586,10 +795,10 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_closure() {
+fn git_workspace_dependency_lane_preserves_results_on_native_target() {
     let dir = tempfile::Builder::new()
         .prefix("gl")
-        .tempdir_in("/tmp")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
         .unwrap();
     let mut world = World {
         root: dir.path().to_path_buf(),
@@ -599,6 +808,12 @@ fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_c
     };
     let checkout = world.fetch_git_workspace();
     let daemon = Daemon::start(&world.root, &world.socket);
+
+    let target = native_target(&world);
+    if !SERVING_TARGETS.contains(&target.as_str()) {
+        assert_native_target_refusal(&world, &daemon, &target);
+        return;
+    }
 
     let out_a = world.out_dir("wt-a");
     let deadline = Instant::now() + Duration::from_secs(600);
@@ -615,7 +830,11 @@ fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_c
             decisions.iter().all(|step| step == "toolchain-warming"),
             "unexpected decisions while warming: {decisions:?}"
         );
-        assert!(Instant::now() < deadline, "toolchain probe never warmed");
+        assert!(
+            Instant::now() < deadline,
+            "toolchain probe never warmed: {}",
+            daemon.warmup_diagnostics(&world)
+        );
         std::thread::sleep(Duration::from_millis(250));
     };
     let key = daemon

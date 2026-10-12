@@ -1541,7 +1541,7 @@ impl SshPool {
     /// on the pooled client so it does not disturb the pool's shared default
     /// (e.g. a long build vs. a short health probe). The connect timeout and
     /// control-master/persist settings come from the pool's options — except
-    /// that Windows workers are ALWAYS non-mux (see [`pooled_client_options`]):
+    /// that Windows workers are ALWAYS non-mux (see `pooled_client_options`):
     /// Windows OpenSSH cannot multiplex, so a pooled mux session hangs at the
     /// command stage.
     pub async fn run_with_timeout(

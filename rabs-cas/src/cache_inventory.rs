@@ -21,7 +21,7 @@
 //! allowed-set hides every project name.
 //!
 //! Worker-over-SSH probing is a follow-on once a wire envelope carries
-//! [`crate::pressure::WorkerPressureSnapshot`]; this module covers the
+//! [`rabs_protocol::pressure::WorkerPressureSnapshot`]; this module covers the
 //! LOCAL edge plus store-recorded facts.
 
 use crate::l1_cache::{L1ActionCache, L1EntrySnapshot, LookupStats};
@@ -66,8 +66,8 @@ pub struct L2ProjectCache {
 pub struct WorkerToolchains {
     /// Worker identity.
     pub worker: String,
-    /// Recorded capabilities that look like toolchains (rustc/<ver>,
-    /// cargo/<ver>, ...). Filtered, never raw rows.
+    /// Recorded capabilities that look like toolchains (`rustc/<ver>`,
+    /// `cargo/<ver>`, ...). Filtered, never raw rows.
     pub toolchains: Vec<String>,
 }
 

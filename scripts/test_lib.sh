@@ -78,7 +78,7 @@ log_json() {
     local data="${3:-}"
 
     local timestamp
-    timestamp="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    timestamp="$(e2e_timestamp)" || return 1
 
     local duration_ms=0
     if [[ $TEST_START_MS -gt 0 ]]; then
@@ -87,23 +87,19 @@ log_json() {
         duration_ms=$((now_ms - TEST_START_MS))
     fi
 
-    # Build JSON entry
-    local json_entry
-    if [[ -n "$data" ]]; then
-        json_entry=$(cat <<EOF
-{"timestamp":"$timestamp","test_name":"$TEST_LOG_NAME","phase":"$phase","message":"$message","duration_ms":$duration_ms,"data":$data}
-EOF
-)
-    else
-        json_entry=$(cat <<EOF
-{"timestamp":"$timestamp","test_name":"$TEST_LOG_NAME","phase":"$phase","message":"$message","duration_ms":$duration_ms}
-EOF
-)
-    fi
+    # Encode every string and preserve the optional typed JSON data. Invalid
+    # caller data must fail instead of appending a malformed success receipt.
+    local json_entry has_data=false
+    [[ -z "$data" ]] || has_data=true
+    json_entry="$(jq -nc --arg timestamp "$timestamp" --arg test_name "$TEST_LOG_NAME" \
+        --arg phase "$phase" --arg message "$message" --argjson duration_ms "$duration_ms" \
+        --argjson has_data "$has_data" --argjson data "${data:-null}" \
+        '{timestamp:$timestamp,test_name:$test_name,phase:$phase,message:$message,duration_ms:$duration_ms}
+         + (if $has_data then {data:$data} else {} end)')" || return 1
 
     # Write to log file
     if [[ -n "$TEST_LOG_FILE" ]]; then
-        echo "$json_entry" >> "$TEST_LOG_FILE"
+        printf '%s\n' "$json_entry" >> "$TEST_LOG_FILE" || return 1
     fi
 
     # Also emit to stdout for CI visibility
@@ -146,17 +142,11 @@ log_terminal_info() {
     fi
 
     local data
-    if [[ -n "$width" ]]; then
-        data=$(cat <<EOF
-{"stdout_tty":$stdout_tty,"stderr_tty":$stderr_tty,"term":"$term","no_color":$no_color,"force_color":$force_color,"width":$width}
-EOF
-)
-    else
-        data=$(cat <<EOF
-{"stdout_tty":$stdout_tty,"stderr_tty":$stderr_tty,"term":"$term","no_color":$no_color,"force_color":$force_color}
-EOF
-)
-    fi
+    data="$(jq -nc --argjson stdout_tty "$stdout_tty" --argjson stderr_tty "$stderr_tty" \
+        --arg term "$term" --argjson no_color "$no_color" --argjson force_color "$force_color" \
+        --arg width "$width" \
+        '{stdout_tty:$stdout_tty,stderr_tty:$stderr_tty,term:$term,no_color:$no_color,force_color:$force_color}
+         + (if $width == "" then {} else {width:($width | tonumber)} end)')" || return 1
 
     log_json setup "Terminal info captured" "$data"
 }
@@ -164,7 +154,7 @@ EOF
 # Mark test as passed and exit 0.
 #
 test_pass() {
-    log_json verify "TEST PASS"
+    log_json verify "TEST PASS" || exit 1
     exit 0
 }
 
@@ -175,7 +165,9 @@ test_pass() {
 #
 test_fail() {
     local reason="${1:-Unknown failure}"
-    log_json verify "TEST FAIL" "{\"reason\":\"$reason\"}"
+    local data
+    data="$(jq -nc --arg reason "$reason" '{reason:$reason}')" || exit 1
+    log_json verify "TEST FAIL" "$data"
     exit 1
 }
 
@@ -186,7 +178,9 @@ test_fail() {
 #
 test_skip() {
     local reason="${1:-}"
-    log_json setup "TEST SKIP" "{\"reason\":\"$reason\"}"
+    local data
+    data="$(jq -nc --arg reason "$reason" '{reason:$reason}')" || exit 1
+    log_json setup "TEST SKIP" "$data" || exit 1
     exit "${E2E_SKIP_EXIT:-4}"
 }
 
@@ -195,13 +189,7 @@ test_skip() {
 # ============================================================================
 
 _test_now_ms() {
-    if date +%s%3N >/dev/null 2>&1; then
-        date +%s%3N
-        return
-    fi
-    local seconds
-    seconds="$(date +%s)"
-    printf '%s000' "$seconds"
+    e2e_now_ms
 }
 
 # ============================================================================

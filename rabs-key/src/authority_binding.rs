@@ -1,11 +1,11 @@
 //! Generation ↔ authority digest binding and its admission check
 //! (bead F033; plan §22 rules; risk R117).
 //!
-//! An [`ActionGeneration`] does not carry a second full copy of the
-//! coordinator authority — it carries the **canonical digest** of the
-//! authority that created it, and every attempt/publication carries the
-//! ONE full authority value. Admission recomputes the digest from the
-//! full value and requires equality:
+//! An [`ActionGeneration`](rabs_protocol::generation::ActionGeneration) does
+//! not carry a second full copy of the coordinator authority — it carries
+//! the **canonical digest** of the authority that created it, and every
+//! attempt/publication carries the ONE full authority value. Admission
+//! recomputes the digest from the full value and requires equality:
 //!
 //! ```text
 //! generation.created_under_authority_digest

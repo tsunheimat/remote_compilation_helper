@@ -44,10 +44,14 @@ impl Drop for OwnedChild {
 }
 
 fn connect_worker() -> (OwnedChild, BufReader<TcpStream>, TcpStream) {
+    use std::os::unix::fs::PermissionsExt;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let state = tempfile::tempdir().unwrap();
+    let state = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_rabs-wkr"))
         .args([
             "--coordinator",

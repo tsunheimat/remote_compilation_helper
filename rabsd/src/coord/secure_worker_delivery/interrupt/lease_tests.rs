@@ -6,11 +6,13 @@ use rabs_protocol::lease_semantics::REQUEST_EXECUTION_LEASE_VERSION;
 use sha2::{Digest, Sha256};
 
 fn selection(request: &Value) -> Value {
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     json!({"kind":"session-ok", "execution_lease":{
         "version":REQUEST_EXECUTION_LEASE_VERSION, "session_id":11, "lease_id":12,
         "request_id":request["request_id"],
         "request_sha256":crate::coord::secure_worker_delivery::hex(
-            &Sha256::digest(serde_json::to_vec(request).unwrap())),
+            &Sha256::digest(serde_json::to_vec(&canonical_request).unwrap())),
         "boot_generation":1, "incarnation":format!("{:032x}", 2), "ttl_ms":1000,
     }})
 }

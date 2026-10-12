@@ -221,7 +221,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let root = tempfile::tempdir().unwrap();
-        let out = root.path().join("out");
+        let mut out = root.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
         let first = OsStr::from_bytes(b"gen-\xff.rs");
         let second = OsStr::from_bytes(b"gen-\xfe.rs");
@@ -231,8 +231,53 @@ mod tests {
             "the fixture must be indistinguishable under the decode this replaced, \
              or it is not exercising the collapse"
         );
-        std::fs::write(out.join(first), b"first").unwrap();
-        std::fs::write(out.join(second), b"second").unwrap();
+        assert_eq!(
+            relative_key(std::path::Path::new(first)),
+            b"gen-\xff.rs".to_vec()
+        );
+        assert_eq!(
+            relative_key(std::path::Path::new(second)),
+            b"gen-\xfe.rs".to_vec()
+        );
+        let mut names = [first, second];
+        let mut native_files = BTreeMap::new();
+        for (name, contents) in [(first, &b"first"[..]), (second, &b"second"[..])] {
+            match std::fs::write(out.join(name), contents) {
+                Ok(()) => {
+                    native_files.insert(name.as_bytes().to_vec(), contents.to_vec());
+                }
+                #[cfg(target_os = "macos")]
+                Err(error) if error.raw_os_error() == Some(92) => {
+                    use std::io::Write as _;
+                    let observed: std::collections::BTreeSet<_> = std::fs::read_dir(&out)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+                        .collect();
+                    assert_eq!(
+                        observed,
+                        native_files
+                            .keys()
+                            .cloned()
+                            .collect::<std::collections::BTreeSet<_>>()
+                    );
+                    std::io::stderr()
+                        .write_all(format!(
+                            "SKIP: non-UTF-8 OUT_DIR filename {:?} capture/replay not exercised: filesystem refused the name with Darwin EILSEQ (92); no substitute entry was created; raw relative keys and representable real-file capture/replay remain exercised\n",
+                            name.as_bytes()
+                        ).as_bytes())
+                        .expect("write native filename refusal diagnostic");
+                }
+                Err(error) => panic!("creating the non-UTF-8 OUT_DIR filename failed: {error}"),
+            }
+        }
+        assert_eq!(OutDirState::capture(&out).unwrap().files, native_files);
+        if native_files.len() != 2 {
+            out = root.path().join("representable-out");
+            std::fs::create_dir(&out).unwrap();
+            names = [OsStr::new("gen-first.rs"), OsStr::new("gen-second.rs")];
+            std::fs::write(out.join(names[0]), b"first").unwrap();
+            std::fs::write(out.join(names[1]), b"second").unwrap();
+        }
 
         let captured = OutDirState::capture(&out).unwrap();
         assert_eq!(
@@ -241,8 +286,14 @@ mod tests {
             "both files must be in the state: {:?}",
             captured.files.keys().collect::<Vec<_>>()
         );
-        assert_eq!(captured.files[&b"gen-\xff.rs".to_vec()], b"first".to_vec());
-        assert_eq!(captured.files[&b"gen-\xfe.rs".to_vec()], b"second".to_vec());
+        assert_eq!(
+            captured.files[&names[0].as_bytes().to_vec()],
+            b"first".to_vec()
+        );
+        assert_eq!(
+            captured.files[&names[1].as_bytes().to_vec()],
+            b"second".to_vec()
+        );
 
         // And the round trip holds: replaying the captured state into a
         // clean directory reproduces it exactly, which is the property
@@ -252,7 +303,7 @@ mod tests {
         assert_eq!(
             OutDirState::capture(&clean).unwrap(),
             captured,
-            "replay of a non-UTF-8 state must equal the state"
+            "replay must equal the captured state for the filenames the filesystem accepted"
         );
     }
 

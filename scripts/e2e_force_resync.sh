@@ -37,7 +37,7 @@ rem_init "e2e_force_resync"
 
 # Resolve the rch binary (prefer release, then debug, then PATH). Empty if none.
 RCH_BIN=""
-for cand in "$PROJECT_ROOT/target/release/rch" "$PROJECT_ROOT/target/debug/rch"; do
+for cand in "${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/rch" "${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/release/rch"; do
     [[ -x "$cand" ]] && { RCH_BIN="$cand"; break; }
 done
 [[ -z "$RCH_BIN" ]] && command -v rch >/dev/null 2>&1 && RCH_BIN="$(command -v rch)"
@@ -80,23 +80,24 @@ sc_preview_no_action() {
     tmp="$(mktemp -d)"
     local out
     if out="$("$RCH_BIN" sync --project "$tmp" --json 2>/dev/null)" \
-        && printf '%s' "$out" | grep -q '"command":"sync"' \
-        && printf '%s' "$out" | grep -q '"applied":false'; then
+        && printf '%s' "$out" | jq -e '.command == "sync" and .success == true and .data.applied == false' >/dev/null; then
         rem_scenario_pass "RCH-I001" "preview emitted an envelope with applied=false" "" "$fp"
     else
         rem_scenario_fail "preview_envelope_missing" "preview did not emit applied=false envelope: ${out:0:200}"
     fi
-    rm -rf "$tmp"
 }
 
 # Applying (--force, no --dry-run) without a target worker must refuse rather
 # than silently no-op.
 sc_apply_requires_target() {
     local fp="rch sync --force --json"
-    if "$RCH_BIN" sync --force --json >/dev/null 2>&1; then
-        rem_scenario_fail "apply_without_target_not_refused" "force apply without --worker/--all should fail"
+    local out command_exit=0
+    out="$("$RCH_BIN" sync --force --json 2>&1)" || command_exit=$?
+    if [[ "$command_exit" == 1 ]] && printf '%s\n' "$out" | jq -e \
+        '.success == false and (.error.code | startswith("RCH-E")) and (.error.details | contains("explicit target"))' >/dev/null; then
+        rem_scenario_pass "RCH-I001" "force apply without a target returned exit 1 and its explicit-target error" "" "$fp"
     else
-        rem_scenario_pass "RCH-I001" "force apply without a target was refused (nonzero exit)" "" "$fp"
+        rem_scenario_fail "apply_without_target_not_refused" "expected exit 1 and explicit-target error; got exit=$command_exit: ${out:0:200}"
     fi
 }
 
@@ -104,10 +105,14 @@ sc_apply_requires_target() {
 # nothing is invalidated).
 sc_apply_unknown_worker() {
     local fp="rch sync --force --worker __rch_e2e_absent__ --json"
-    if "$RCH_BIN" sync --force --worker __rch_e2e_absent__ --json >/dev/null 2>&1; then
-        rem_scenario_fail "unknown_worker_not_refused" "force apply against an unknown worker should fail"
+    local out command_exit=0
+    out="$("$RCH_BIN" sync --force --worker __rch_e2e_absent__ --json 2>&1)" || command_exit=$?
+    if [[ "$command_exit" == 1 ]] && printf '%s\n' "$out" | jq -e \
+        '.success == false and (.error.code | startswith("RCH-E")) and
+         (.error.details | contains("__rch_e2e_absent__") and contains("not configured"))' >/dev/null; then
+        rem_scenario_pass "RCH-I001" "force apply against an unknown worker returned exit 1 and its configuration error" "" "$fp"
     else
-        rem_scenario_pass "RCH-I001" "force apply against an unknown worker was refused" "" "$fp"
+        rem_scenario_fail "unknown_worker_not_refused" "expected exit 1 and unknown-worker error; got exit=$command_exit: ${out:0:200}"
     fi
 }
 

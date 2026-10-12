@@ -24,10 +24,12 @@ pub(super) fn grant(hello: &Value, request: &Value, session: u64, lease: u64) ->
             }),
         "authenticated execution requires renewable worker execution leases",
     )?;
+    let mut canonical_request = request.clone();
+    canonical_request.sort_all_objects();
     let value = json!({
         "version":REQUEST_EXECUTION_LEASE_VERSION, "session_id":session, "lease_id":lease,
         "request_id":request["request_id"],
-        "request_sha256":hex(&Sha256::digest(serde_json::to_vec(request)?)),
+        "request_sha256":hex(&Sha256::digest(serde_json::to_vec(&canonical_request)?)),
         "boot_generation":hello["boot_generation"], "incarnation":hello["incarnation"],
         "ttl_ms":DEFAULT_TTL_MS,
     });
@@ -128,12 +130,14 @@ impl ExecutionLease {
     }
 
     pub(super) fn validate_request(&self, request: &Value) -> io::Result<()> {
+        let mut canonical_request = request.clone();
+        canonical_request.sort_all_objects();
         require(
             !self.stopped
                 && self.active.is_none()
                 && request["kind"] == "canonical-exec"
                 && request["request_id"].as_u64() == Some(self.identity.request_id)
-                && <[u8; 32]>::from(Sha256::digest(serde_json::to_vec(request)?))
+                && <[u8; 32]>::from(Sha256::digest(serde_json::to_vec(&canonical_request)?))
                     == self.identity.request_sha256,
             "execution lease does not own the exact dispatch",
         )
@@ -253,6 +257,40 @@ mod tests {
         reply["kind"] = json!("execution-lease-renewed");
         reply["accepted"] = json!(accepted);
         reply
+    }
+
+    #[test]
+    fn lease_identity_ignores_object_order_but_binds_nested_values_and_array_order() {
+        let original: Value = serde_json::from_str(
+            r#"{"request_id":3,"kind":"canonical-exec","args":["private.rs","--cfg=fixture"],"extension":{"z":2,"a":[{"y":true,"b":null},7]}}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"extension":{"a":[{"b":null,"y":true},7],"z":2},"args":["private.rs","--cfg=fixture"],"kind":"canonical-exec","request_id":3}"#,
+        )
+        .unwrap();
+        let original_wire = serde_json::to_vec(&original).unwrap();
+        let reordered_wire = serde_json::to_vec(&reordered).unwrap();
+        let hello = json!({"execution_leases":[REQUEST_EXECUTION_LEASE_VERSION],
+            "boot_generation":1, "incarnation":format!("{:032x}", 2)});
+        let value = grant(&hello, &original, 11, 12).unwrap();
+        assert_eq!(
+            value["request_sha256"],
+            "b600d15f2ad66159757d7b356a62f5d28f3e13b06a11c6998179e4c64f12dc2d"
+        );
+        let lease = ExecutionLease::parse(&value).unwrap();
+        lease.validate_request(&reordered).unwrap();
+        let mut scalar = original.clone();
+        scalar["extension"]["z"] = json!(3);
+        let mut array = original.clone();
+        array["args"].as_array_mut().unwrap().reverse();
+        let mut extension = original.clone();
+        extension["extension"]["future"] = json!(false);
+        for changed in [&scalar, &array, &extension] {
+            assert!(lease.validate_request(changed).is_err());
+        }
+        assert_eq!(serde_json::to_vec(&original).unwrap(), original_wire);
+        assert_eq!(serde_json::to_vec(&reordered).unwrap(), reordered_wire);
     }
 
     #[test]

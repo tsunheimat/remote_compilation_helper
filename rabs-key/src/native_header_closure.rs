@@ -88,7 +88,7 @@ pub struct HeaderEntry {
 /// Why a read could not be admitted to a closed view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureViolation {
-    /// Stable reason code ([`VIOLATED_*`] constants).
+    /// Stable reason code (`VIOLATED_*` constants).
     pub reason_code: &'static str,
     /// The offending path (or raw spelling).
     pub subject: String,

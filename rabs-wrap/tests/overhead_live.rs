@@ -5,26 +5,14 @@
 //! measurement-only in debug — same calibration as the original C010.
 #![cfg(unix)]
 
+mod support;
+
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::rabsd_bin;
 
 const SLO_MS: f64 = 10.0;
-
-/// Always ask Cargo, once per test process: it is a no-op when fresh, and a
-/// daemon left over from an older tree must never answer for this one.
-fn rabsd_bin() -> std::path::PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let mut build = Command::new(env!("CARGO"));
-        build.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
-        if !cfg!(debug_assertions) {
-            build.arg("--release");
-        }
-        assert!(build.status().expect("build rabsd").success());
-    });
-    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
-}
 
 #[test]
 fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
@@ -74,6 +62,9 @@ fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
             start.elapsed().as_micros()
         })
         .collect();
+    // Retain observations after timing ends; a failed p95 alone cannot show
+    // whether the whole run slowed down or only a few samples did.
+    let samples_us_in_order = samples.clone();
     samples.sort_unstable();
     let p95_us = samples[(samples.len() * 95) / 100];
     let p95_ms = p95_us as f64 / 1_000.0;
@@ -87,7 +78,8 @@ fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
     let enforcing = !cfg!(debug_assertions);
     let evidence = format!(
         "{{\"v\":1,\"suite\":\"perf/wrapper\",\"test\":\"rabs_wrap_end_to_end\",\
-         \"p95_us\":{p95_us},\"SLO_ms\":{SLO_MS},\"profile\":\"{}\",\"gate\":\"{}\"}}",
+         \"p95_us\":{p95_us},\"SLO_ms\":{SLO_MS},\"profile\":\"{}\",\"gate\":\"{}\",\
+         \"samples_us_in_order\":{samples_us_in_order:?}}}",
         if enforcing { "release" } else { "debug" },
         if enforcing {
             "enforcing"

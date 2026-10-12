@@ -164,7 +164,7 @@ pub const COMPATIBILITY_MATRIX: &[CompatibilityRow] = &[
 /// construction, so "classify what the user typed" is unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedCargoInvocation {
-    /// Post-expansion arguments, argv[0] being the driver name
+    /// Post-expansion arguments, `argv[0]` being the driver name
     /// (`cargo`) or absent-equivalent (empty vec = bare flags).
     pub argv: Vec<String>,
     /// Whether a PTY was requested for this command.

@@ -29,6 +29,21 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use which::which;
 
+/// Outcome of one worker's detection-only mirror-ownership probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MirrorOwnershipProbe {
+    /// Probe intentionally not run (mock mode or Windows worker).
+    Skipped,
+    /// No root-owned entries under the canonical mirror tree.
+    Healthy,
+    /// Root-owned entries that will prevent rsync-as-ssh-user from writing.
+    Drift { count: u64 },
+    /// Passwordless sudo is unavailable, so the worker cannot run the check.
+    CheckUnavailable,
+    /// Unsupported transport, SSH failure, timeout, or unrecognized output.
+    Unprobeable(String),
+}
+
 /// Default socket path (XDG_RUNTIME_DIR -> ~/.cache/rch -> /tmp fallback).
 fn default_socket_path() -> PathBuf {
     PathBuf::from(rch_common::default_socket_path())

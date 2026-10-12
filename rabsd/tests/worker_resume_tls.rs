@@ -138,6 +138,16 @@ struct Certificates {
 impl Certificates {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
+        // Keep host defaults from duplicating the CA extensions on OpenSSL 1.1.1.
+        fs::write(
+            root.path().join("request.cnf"),
+            "[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ca\n\
+             [dn]\nCN=RABS reuse test fixture\n\
+             [ca]\nbasicConstraints=critical,CA:TRUE\n\
+             keyUsage=critical,keyCertSign,cRLSign\n\
+             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n",
+        )
+        .unwrap();
         let openssl = |name: &str, args: &[&str]| {
             let mut command = Command::new("openssl");
             command.current_dir(root.path()).args(args);
@@ -152,6 +162,8 @@ impl Certificates {
             "ca",
             &[
                 "req",
+                "-config",
+                "request.cnf",
                 "-x509",
                 "-newkey",
                 "rsa:2048",
@@ -165,10 +177,6 @@ impl Certificates {
                 "ca.key",
                 "-out",
                 "ca.pem",
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-                "-addext",
-                "keyUsage=critical,keyCertSign,cRLSign",
             ],
         );
         for (name, usage, serial) in [
@@ -184,6 +192,8 @@ impl Certificates {
                 &format!("req-{name}"),
                 &[
                     "req",
+                    "-config",
+                    "request.cnf",
                     "-new",
                     "-newkey",
                     "rsa:2048",
@@ -519,9 +529,11 @@ async fn serve(
                 let receipt: Value =
                     serde_json::from_slice(&fs::read(destination.join("delivery.json")).unwrap())
                         .unwrap();
+                let mut canonical_request = fixture.request.clone();
+                canonical_request.sort_all_objects();
                 assert_eq!(
                     receipt["request_sha256"],
-                    hash(&serde_json::to_vec(&fixture.request).unwrap())
+                    hash(&serde_json::to_vec(&canonical_request).unwrap())
                 );
                 assert_eq!(receipt["transport_authenticated"], true);
                 assert_eq!(receipt["worker_spki_sha256"], pin);

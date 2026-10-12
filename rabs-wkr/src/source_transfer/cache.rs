@@ -114,6 +114,17 @@ struct Entry {
     used: SystemTime,
 }
 
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // An unrelated concurrent fork can briefly inherit the descriptor
+        // before CLOEXEC takes effect. Completion, not its last close, ends
+        // this writer's exclusive access to the optional cache.
+        let _ = self.0.unlock();
+    }
+}
+
 /// A path is only configuration, never an input capability. The cache owns a
 /// dedicated namespace below an explicitly configured private directory.
 #[derive(Debug, Clone)]
@@ -178,7 +189,7 @@ impl SourceCache {
         Some(bytes)
     }
 
-    fn writer(&self) -> io::Result<Option<File>> {
+    fn writer(&self) -> io::Result<Option<WriterLock>> {
         private_directory(&self.root)?;
         let path = self.root.join("lock");
         match fs::symlink_metadata(&path) {
@@ -200,7 +211,7 @@ impl SourceCache {
             return Err(invalid("source cache lock identity changed"));
         }
         match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
+            Ok(()) => Ok(Some(WriterLock(file))),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => Err(error),
         }
@@ -362,8 +373,8 @@ mod tests {
 
     #[test]
     fn reuse_survives_reopen_and_never_aliases_a_staging_inode() {
-        let parent = tempfile::tempdir().unwrap();
-        let input = tempfile::tempdir().unwrap();
+        let parent = crate::private_test_directory();
+        let input = crate::private_test_directory();
         let source = staged(input.path(), &[("lib.rs", b"A\0\xffB")]);
         let expected = source.manifest().files()[0].clone();
         let cache = SourceCache::open(parent.path()).unwrap();
@@ -374,7 +385,7 @@ mod tests {
         projected.executable = true;
         let bytes = cache.load(&projected).unwrap();
         assert_eq!(bytes, b"A\0\xffB");
-        let next = tempfile::tempdir().unwrap();
+        let next = crate::private_test_directory();
         let mut receiver = SourceReceiver::create(
             &next.path().join("workspace"),
             SourceManifest::new(vec![projected.clone()]).unwrap(),
@@ -397,8 +408,8 @@ mod tests {
 
     #[test]
     fn corruption_and_wrong_length_miss_and_a_verified_upload_repairs_the_object() {
-        let parent = tempfile::tempdir().unwrap();
-        let input = tempfile::tempdir().unwrap();
+        let parent = crate::private_test_directory();
+        let input = crate::private_test_directory();
         let source = staged(input.path(), &[("lib.rs", b"good")]);
         let expected = &source.manifest().files()[0];
         let cache = SourceCache::open(parent.path()).unwrap();
@@ -419,8 +430,8 @@ mod tests {
     #[test]
     fn symlinks_and_hardlinks_are_not_reusable_source_objects() {
         for hardlink in [false, true] {
-            let parent = tempfile::tempdir().unwrap();
-            let input = tempfile::tempdir().unwrap();
+            let parent = crate::private_test_directory();
+            let input = crate::private_test_directory();
             let source = staged(input.path(), &[("lib.rs", b"good")]);
             let expected = &source.manifest().files()[0];
             let cache = SourceCache::open(parent.path()).unwrap();
@@ -438,8 +449,8 @@ mod tests {
 
     #[test]
     fn byte_and_entry_limits_evict_cache_objects_not_source_files() {
-        let parent = tempfile::tempdir().unwrap();
-        let input = tempfile::tempdir().unwrap();
+        let parent = crate::private_test_directory();
+        let input = crate::private_test_directory();
         let source = staged(
             input.path(),
             &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")],
@@ -460,12 +471,16 @@ mod tests {
 
     #[test]
     fn writer_contention_does_not_block_and_abandoned_scratch_is_never_a_hit() {
-        let parent = tempfile::tempdir().unwrap();
-        let input = tempfile::tempdir().unwrap();
+        let parent = crate::private_test_directory();
+        let input = crate::private_test_directory();
         let source = staged(input.path(), &[("lib.rs", b"good")]);
         let expected = &source.manifest().files()[0];
         let cache = SourceCache::open(parent.path()).unwrap();
         let lock = cache.writer().unwrap().unwrap();
+        // A concurrent fork can retain this same open file description until
+        // exec even though the descriptor has CLOEXEC. Keep a duplicate alive
+        // through the next upload to exercise that scheduling boundary.
+        let inherited = lock.0.try_clone().unwrap();
         assert_eq!(cache.remember(&source).unwrap(), 0);
         fs::write(cache.root.join(INCOMING), b"torn").unwrap();
         assert!(cache.load(expected).is_none());
@@ -473,12 +488,13 @@ mod tests {
         assert_eq!(cache.remember(&source).unwrap(), 1);
         assert!(!cache.root.join(INCOMING).exists());
         assert_eq!(cache.load(expected).unwrap(), b"good");
+        drop(inherited);
     }
 
     #[test]
     fn unsealed_source_and_nonprivate_configuration_refuse() {
-        let parent = tempfile::tempdir().unwrap();
-        let input = tempfile::tempdir().unwrap();
+        let parent = crate::private_test_directory();
+        let input = crate::private_test_directory();
         let cache = SourceCache::open(parent.path()).unwrap();
         let source = SourceReceiver::create(
             &input.path().join("workspace"),

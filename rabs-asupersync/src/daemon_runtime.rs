@@ -445,11 +445,17 @@ mod tests {
         let receipt = run_daemon(options(30)).expect("daemon runs");
         assert!(receipt.clean(), "{receipt:?}");
         assert_eq!(receipt.subsystems.len(), 4);
-        assert!(receipt.boot_ms < 100, "boot took {}ms", receipt.boot_ms);
+        assert!(
+            receipt.boot_ms < 100,
+            "boot took {}ms; available_parallelism={:?}; receipt={receipt:?}",
+            receipt.boot_ms,
+            std::thread::available_parallelism()
+        );
         assert!(
             receipt.shutdown_ms < 100,
-            "shutdown took {}ms",
-            receipt.shutdown_ms
+            "shutdown took {}ms; available_parallelism={:?}; receipt={receipt:?}",
+            receipt.shutdown_ms,
+            std::thread::available_parallelism()
         );
         let names: Vec<&str> = receipt.subsystems.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, DAEMON_SUBSYSTEMS.to_vec(), "model order held live");

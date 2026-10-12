@@ -454,6 +454,15 @@ mod tests {
         // Neither a rewritten request nor its newly matching source can replace
         // the identity that the daemon accepted earlier.
         fs::write(bundle.join("request.json"), b"not the accepted JSON").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Deliberately tamper with this test-owned sealed source only.
+            let path = bundle.join("source/lib.rs");
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(permissions.mode() | 0o200);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
         fs::write(bundle.join("source/lib.rs"), b"changed source").unwrap();
         let pin = "ab".repeat(32);
         let build = PreparedBuild {

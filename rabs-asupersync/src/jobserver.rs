@@ -66,8 +66,8 @@ pub enum AcquireError {
     /// Pipe-level failure.
     Io(std::io::Error),
     /// No token within the budget; the in-flight read is parked in
-    /// [`AcquireError::Timeout.0`] and its byte returns to the pool when
-    /// satisfied (call [`parked_reclaim`] or drop the error after
+    /// the first field of [`AcquireError::Timeout`] and its byte returns to
+    /// the pool when satisfied (call [`parked_reclaim`] or drop the error after
     /// spawning your own drainer). A timed-out acquire never loses a
     /// token as long as the parked read is eventually reclaimed.
     Timeout(ParkedRead),
@@ -323,6 +323,31 @@ mod tests {
     #[test]
     fn fifo_preload_counts_transferables_not_the_implicit_slot() {
         use std::os::unix::fs::OpenOptionsExt;
+        const CHILD: &str = "RABS_FIFO_PRELOAD_TEST_CHILD";
+        const COMPLETE: &str = "FIFO preload and EOF assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            // CLOEXEC does not prevent an unrelated parallel test's fork from
+            // retaining our writer before exec. Give the immediate EOF check
+            // a process that owns all launches and FIFO descriptors it tests.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "jobserver::tests::fifo_preload_counts_transferables_not_the_implicit_slot",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stderr.contains(COMPLETE),
+                "FIFO child did not complete its assertions: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                stderr
+            );
+            return;
+        }
         for tokens in [0, 1, 3, MAX_FIFO_TOKENS] {
             let directory = tempfile::tempdir().unwrap();
             let (path, mut writer, auth) = mint_fifo_jobserver(tokens, directory.path()).unwrap();
@@ -351,6 +376,7 @@ mod tests {
             drop(writer);
             assert_eq!(reader.read(&mut [0]).unwrap(), 0, "closed FIFO reaches EOF");
         }
+        eprintln!("{COMPLETE}");
     }
 
     #[test]
@@ -426,21 +452,29 @@ mod tests {
 
     #[test]
     fn replacement_closes_client_and_installs_worker() {
-        let js = WorkerJobserver::new(1).expect("pipe");
+        // Keep the real client endpoints open so the worker cannot reuse
+        // their descriptor numbers while the replacement is planned.
+        let client = WorkerJobserver::new(1).expect("client pipe");
+        let worker = WorkerJobserver::new(1).expect("worker pipe");
+        let client_fds = client.auth_fds();
         let plan = replacement_plan(
             Some(InheritedJobserver {
-                read_fd: 5,
-                write_fd: 6,
+                read_fd: client_fds.0,
+                write_fd: client_fds.1,
             }),
-            &js,
+            &worker,
         );
-        assert_eq!(plan.close_fds, vec![5, 6]);
+        assert_eq!(plan.close_fds, vec![client_fds.0, client_fds.1]);
         assert_eq!(plan.env.0, CARGO_MAKEFLAGS_ENV);
         let parsed = parse_makeflags(&plan.env.1).expect("worker env parses");
-        assert_ne!((parsed.read_fd, parsed.write_fd), (5, 6));
+        assert_eq!((parsed.read_fd, parsed.write_fd), worker.auth_fds());
+        assert_ne!((parsed.read_fd, parsed.write_fd), client_fds);
+        assert!(!plan.close_fds.contains(&parsed.read_fd));
+        assert!(!plan.close_fds.contains(&parsed.write_fd));
         // No inherited handle → nothing to close, install only.
-        let bare = replacement_plan(None, &js);
+        let bare = replacement_plan(None, &worker);
         assert!(bare.close_fds.is_empty());
+        assert_eq!(bare.env, plan.env);
     }
 
     #[test]

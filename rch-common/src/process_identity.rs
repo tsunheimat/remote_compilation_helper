@@ -127,7 +127,7 @@ fn observed_owner_presence(
 }
 
 /// Read our own birth marker without accidentally inspecting an unrelated
-/// /proc/<getpid> when procfs belongs to a different PID namespace.
+/// `/proc/<getpid>` when procfs belongs to a different PID namespace.
 pub fn current_process_identity() -> Option<ProcessIdentity> {
     #[cfg(target_os = "linux")]
     let observation = linux_stat(

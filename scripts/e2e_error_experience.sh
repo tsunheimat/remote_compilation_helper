@@ -24,7 +24,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 export PROJECT_ROOT
 VERBOSE="${RCH_E2E_VERBOSE:-0}"
-LOG_FILE="/tmp/rch_e2e_error_experience_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${RCH_E2E_LOG:-/tmp/rch_e2e_error_experience_$(date +%Y%m%d_%H%M%S).jsonl}"
+LOG_FILE="${LOG_FILE%.jsonl}.diagnostics.log"
 
 # Structured JSONL logging
 # shellcheck disable=SC1091
@@ -97,17 +98,26 @@ check_dependencies() {
 }
 
 build_binaries() {
-    log "INFO" "Building rch (release)..."
+    local target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+    RCH_BIN="$target_dir/debug/rch"
+    if [[ ! -x "$RCH_BIN" && -x "$target_dir/release/rch" ]]; then
+        RCH_BIN="$target_dir/release/rch"
+    fi
+    if [[ -x "$RCH_BIN" ]]; then
+        log "INFO" "Using existing rch: $RCH_BIN"
+        return 0
+    fi
+    log "INFO" "Building rch (debug)..."
     cd "$PROJECT_ROOT"
-    if ! cargo build -p rch --release 2>&1 | tee -a "$LOG_FILE" | tail -3; then
+    if ! cargo build -p rch 2>&1 | tee -a "$LOG_FILE" | tail -3; then
         die "Build failed"
     fi
-    [[ -x "$PROJECT_ROOT/target/release/rch" ]] || die "Binary missing: rch"
+    [[ -x "$RCH_BIN" ]] || die "Binary missing: rch"
     log "INFO" "Build OK"
 }
 
 run_tests() {
-    local rch="$PROJECT_ROOT/target/release/rch"
+    local rch="$RCH_BIN"
 
     log "INFO" "=========================================="
     log "INFO" "Starting Error Experience E2E Tests"
@@ -115,25 +125,25 @@ run_tests() {
     log "INFO" "=========================================="
 
     # =========================================================================
-    # Test 1: Network error contains RCH-E error code
+    # Test 1: Missing-worker error contains RCH-E error code
     # =========================================================================
-    log "INFO" "Test 1: Network error format"
+    log "INFO" "Test 1: Missing-worker error format"
     TESTS_RUN=$((TESTS_RUN + 1))
 
     local stderr_file
     stderr_file=$(mktemp)
 
-    # Force a network error by probing nonexistent worker
-    "$rch" workers probe nonexistent-worker 2>"$stderr_file" || true
+    # This lookup fails before any SSH request, independent of fleet state.
+    local probe_exit=0
+    "$rch" workers probe nonexistent-worker 2>"$stderr_file" || probe_exit=$?
 
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "stderr: $(cat "$stderr_file")"
 
-    if grep -q "RCH-E" "$stderr_file"; then
-        log_pass "Network error contains RCH-E code"
+    if [[ "$probe_exit" == 1 ]] && grep -q "RCH-E" "$stderr_file"; then
+        log_pass "Missing-worker error exits 1 and contains RCH-E code"
     else
-        log_fail "Error code missing from network error"
+        log_fail "Expected exit 1 and RCH-E code for missing worker (exit=$probe_exit)"
     fi
-    rm -f "$stderr_file"
 
     # =========================================================================
     # Test 2: Error includes remediation steps
@@ -149,7 +159,6 @@ run_tests() {
     else
         log_fail "No remediation steps in error"
     fi
-    rm -f "$stderr_file"
 
     # =========================================================================
     # Test 3: Error context shows worker/host info
@@ -165,7 +174,6 @@ run_tests() {
     else
         log_fail "Worker name not shown in error context"
     fi
-    rm -f "$stderr_file"
 
     # =========================================================================
     # Test 4: Errors go to stderr, not stdout
@@ -177,26 +185,14 @@ run_tests() {
     stdout_file=$(mktemp)
     stderr_file=$(mktemp)
 
-    "$rch" workers probe nonexistent-worker >"$stdout_file" 2>"$stderr_file" || true
+    probe_exit=0
+    "$rch" workers probe nonexistent-worker >"$stdout_file" 2>"$stderr_file" || probe_exit=$?
 
-    # Non-JSON mode: errors should be in stderr
-    # Check that stdout doesn't have error keywords (unless it's JSON mode which outputs there)
-    local has_error_in_stderr=0
-    if [[ -s "$stderr_file" ]]; then
-        has_error_in_stderr=1
-    fi
-
-    if [[ "$has_error_in_stderr" == "1" ]]; then
+    if [[ "$probe_exit" == 1 && -s "$stderr_file" && ! -s "$stdout_file" ]]; then
         log_pass "Errors correctly go to stderr"
     else
-        # Might be JSON mode output to stdout, which is also valid
-        if grep -q '"error"' "$stdout_file" 2>/dev/null; then
-            log_pass "Errors go to stdout in JSON format (valid)"
-        else
-            log_fail "No error output found in stderr or stdout"
-        fi
+        log_fail "Expected exit 1, nonempty stderr, and empty stdout in human mode"
     fi
-    rm -f "$stdout_file" "$stderr_file"
 
     # =========================================================================
     # Test 5: JSON error format with required fields
@@ -205,15 +201,16 @@ run_tests() {
     TESTS_RUN=$((TESTS_RUN + 1))
 
     local json_output
-    json_output=$("$rch" workers probe nonexistent-worker --json 2>&1 || true)
+    probe_exit=0
+    json_output=$("$rch" workers probe nonexistent-worker --json 2>"$stderr_file") || probe_exit=$?
 
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "JSON: $json_output"
 
     local json_ok=1
 
     # Check it's valid JSON
-    if ! echo "$json_output" | jq -e '.' >/dev/null 2>&1; then
-        log_fail "Output is not valid JSON"
+    if [[ "$probe_exit" != 1 ]] || ! echo "$json_output" | jq -e '.success == false' >/dev/null 2>&1; then
+        log_fail "Expected exit 1 and JSON error envelope (exit=$probe_exit)"
         json_ok=0
     fi
 
@@ -238,17 +235,12 @@ run_tests() {
     log "INFO" "Test 6: JSON remediation array"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if echo "$json_output" | jq -e '.error.remediation' >/dev/null 2>&1; then
+    if echo "$json_output" | jq -e '.error.remediation | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' >/dev/null 2>&1; then
         local remediation_count
         remediation_count=$(echo "$json_output" | jq '.error.remediation | length')
-        if [[ "$remediation_count" -gt 0 ]]; then
-            log_pass "JSON error has $remediation_count remediation steps"
-        else
-            log "WARN" "JSON error has empty remediation array (optional but recommended)"
-            TESTS_PASSED=$((TESTS_PASSED + 1))
-        fi
+        log_pass "JSON error has $remediation_count remediation steps"
     else
-        log_fail "JSON error missing .error.remediation array"
+        log_fail "JSON error must include actionable remediation steps"
     fi
 
     # =========================================================================
@@ -257,21 +249,16 @@ run_tests() {
     log "INFO" "Test 7: NO_COLOR preserves content"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    local no_color_output
-    no_color_output=$(NO_COLOR=1 "$rch" workers probe nonexistent-worker 2>&1 || true)
+    local no_color_output no_color_exit=0
+    no_color_output=$(NO_COLOR=1 "$rch" workers probe nonexistent-worker 2>&1) || no_color_exit=$?
 
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "NO_COLOR output: $no_color_output"
 
-    # Should still have error code
-    if ! echo "$no_color_output" | grep -q "RCH-E"; then
-        log_fail "Error code missing with NO_COLOR"
-    fi
-
-    # Should NOT have ANSI escape codes
-    if echo "$no_color_output" | grep -qP '\x1b\[' 2>/dev/null; then
-        log_fail "ANSI codes present with NO_COLOR"
-    else
+    if [[ "$no_color_exit" == 1 && "$no_color_output" == *RCH-E* ]] \
+        && ! echo "$no_color_output" | grep -Fq $'\033['; then
         log_pass "NO_COLOR disables styling, preserves content"
+    else
+        log_fail "Expected exit 1 and a coded error without ANSI styling under NO_COLOR"
     fi
 
     # =========================================================================
@@ -286,20 +273,18 @@ run_tests() {
     echo 'invalid toml [' > "$invalid_config"
 
     stderr_file=$(mktemp)
-    RCH_CONFIG_DIR="$invalid_config_dir" "$rch" status 2>"$stderr_file" || true
+    local config_exit=0
+    RCH_CONFIG_DIR="$invalid_config_dir" "$rch" config show >"$stdout_file" 2>"$stderr_file" || config_exit=$?
 
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Config error: $(cat "$stderr_file")"
 
-    if grep -qiE "toml|config|line|parse|syntax|invalid" "$stderr_file"; then
+    if [[ "$config_exit" == 1 ]] \
+        && grep -Fq "$invalid_config" "$stderr_file" \
+        && grep -qiE 'line[[:space:]]+[0-9]+' "$stderr_file"; then
         log_pass "Config error shows file/parse info"
     else
-        # Config errors might be handled differently if fallback to default config
-        log "INFO" "Config error not triggered (may use default config fallback)"
-        TESTS_PASSED=$((TESTS_PASSED + 1))
+        log_fail "Expected invalid-config exit 1, config path, and parse line (exit=$config_exit)"
     fi
-
-    rm -f "$invalid_config" "$stderr_file"
-    rmdir "$invalid_config_dir"
 
     # =========================================================================
     # Test 9: Error categories are present
@@ -345,21 +330,18 @@ run_tests() {
     TESTS_RUN=$((TESTS_RUN + 1))
 
     cd "$PROJECT_ROOT"
-    local test_output
+    local test_output error_test_count=0
     if test_output=$(cargo test -p rch-common --lib -- ui::error 2>&1); then
-        local passed_count
-        passed_count=$(echo "$test_output" | grep -oE '[0-9]+ passed' | head -1 || echo "0 passed")
-        log_pass "Error unit tests pass: $passed_count"
-    else
-        if echo "$test_output" | grep -q "passed"; then
-            local passed_count
-            passed_count=$(echo "$test_output" | grep -oE '[0-9]+ passed' | head -1 || echo "unknown")
-            log_pass "Error unit tests pass: $passed_count"
+        error_test_count=$(printf '%s\n' "$test_output" | awk '/^test result: ok\./ {sum += $4} END {print sum+0}')
+        if [[ "$error_test_count" -gt 0 ]]; then
+            log_pass "Error unit tests pass: $error_test_count passed"
         else
-            log_fail "Error unit tests failed"
-            [[ "$VERBOSE" == "1" ]] && log "DEBUG" "$test_output"
+            log_fail "Error unit command ran zero tests"
         fi
+    else
+        log_fail "Error unit tests failed"
     fi
+    printf '%s\n' "$test_output" >"${LOG_FILE%.log}.unit.log"
 
     # =========================================================================
     # Test 12: Minimum test count (15+)
@@ -367,19 +349,10 @@ run_tests() {
     log "INFO" "Test 12: Minimum test count check"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    # Count tests in error-related files
-    local test_count
-    test_count=$(grep -c '#\[test\]' \
-        "$PROJECT_ROOT/rch-common/src/ui/error.rs" \
-        "$PROJECT_ROOT/rch-common/src/ui/errors/network.rs" \
-        "$PROJECT_ROOT/rch-common/src/ui/errors/build.rs" \
-        "$PROJECT_ROOT/rch-common/src/ui/errors/config.rs" 2>/dev/null | \
-        awk -F: '{sum+=$2} END {print sum}')
-
-    if [[ "$test_count" -ge 15 ]]; then
-        log_pass "Test count ($test_count) meets minimum requirement (15+)"
+    if [[ "$error_test_count" -ge 15 ]]; then
+        log_pass "Executed error test count ($error_test_count) meets minimum requirement (15+)"
     else
-        log_fail "Test count ($test_count) below minimum requirement (15+)"
+        log_fail "Executed error test count ($error_test_count) below minimum requirement (15+)"
     fi
 }
 
