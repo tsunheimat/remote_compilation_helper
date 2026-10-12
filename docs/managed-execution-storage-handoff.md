@@ -36,6 +36,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published hook resource diagnostics: `26cda270149e57aefee1fdf245b6b4190b730114`
 - Published isolated warmup and native target contracts: `2960380a9d4821c0180b0c6917e53e1977cd8523`
 - Published buffered edge and workspace fixture repairs: `f9c7ba62c763ee82dfde8be2b1d6c3d473a9b403`
+- Published ownership, native fixture and coverage preparation repairs: `4ea74ded45adf1cefcb6ae0d240a0e4698a00852`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -61,6 +62,130 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Completed CI at `4ea74ded`
+
+Every workflow in this cycle is terminal. The four-platform workspace matrix
+and coverage passed. The source archive from PR merge revision
+`26e456dd3a9f11aef3aa2500571020112760258e` independently matches all 1,391 tracked
+blobs and executable modes at the published feature head.
+
+| Workflow or platform | Result |
+| --- | --- |
+| [Main CI](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38205488944), Linux x64 and ARM64 | Each completed all 225 workspace harnesses: 12,123 passed, zero failed, 31 ignored and zero filtered. |
+| Main CI, macOS ARM64 and Intel | Each completed all 216 workspace harnesses: 10,028 passed, zero failed, 23 ignored and zero filtered. The repaired concurrent-reader, large ownership-closure and completion-marker cases passed on both native platforms. The inherited Mac workspace selection excludes `rchd`. |
+| Main CI, coverage | Test execution, LCOV, HTML, text reporting and the unchanged 65% gate passed. The verified HTML artifact reports 87.08% line coverage: 322,736 / 370,600 lines. Full job-log retrieval failed, so no exact coverage-runtime test count is claimed. |
+| Main CI, core E2E | All 164 Cargo cases passed, with no failures, ignores or filters. Three shell cases passed and installation prompting explicitly skipped; the 30-minute job limit interrupted the path-dependency case during compilation. The remaining shell suite is incomplete. |
+| Main CI, release builds | Linux x64, ARM64, musl and macOS ARM64 passed their full-workspace builds and artifact uploads. The x64 macOS build on an ARM host exceeded 30 minutes and produced no artifact. Windows failed on nine Unix API errors in `rabs-asupersync`, separate from Test Release's RCH errors. |
+| [Standalone E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38205488980) | Ubuntu passed all 41 scripts, with 11 inner passes and two explicit configuration-dependent skips. macOS completed 39 passes and two failures: stale process-record retention and hook timing. Its inner suite recorded 10 passes, one failure and two skips; the hook script stopped after its timing assertion, before later cases. |
+| [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38205489017) | Protocol and release jobs passed: 36 + 8 protocol cases and 13 release cases, none failed, ignored or filtered. The unchanged 60-sample enforcing gate recorded 2.610 ms p95. This is not a paired performance comparison. |
+| [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38205489034) | 64 passed, zero failed or ignored, 3,309 filtered, using rsync 3.2.7. Compiler, format and lint checks passed. |
+| [Test Release](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38205489335) | All five Unix build/smoke/package jobs passed. Every downloaded archive independently passed digest, checksum, member-name and executable-mode checks. Windows reproduced the three deferred import/type errors; aggregate package verification skipped. |
+
+The separate nine-case filesystem and 13-case socket selections passed on every
+workspace platform. Format, workflow and manifest guards, compiler checks,
+strict Clippy, docs, security and benchmark gates passed.
+Main CI's workflow conclusion is canceled, and its aggregate check failed.
+Neither timed-out job is a complete pass. Windows repair remains deferred.
+
+The failing Mac hook measurement used all 50 samples: mean 13.102 ms against the
+unchanged 10 ms limit, median 11.320 ms and mean child CPU time 11.034 ms. The
+preceding revision passed on a different runner. These observations do not
+identify the cause or establish a paired performance regression; the failure
+remains recorded and no timing assertion was changed.
+
+Core E2E spent about 26 minutes preparing release/debug binaries and running its
+Cargo suite before beginning shell cases. The follow-up below removes one
+redundant binary preparation without changing its 30-minute ceiling. The
+additional proposed job-budget increases remain unapplied.
+
+Raw logs, verified archives, source/package proofs, timeout annotations and
+complete/partial outcomes are retained in
+`/mnt/hdd-vibe-coding-share/remote-test-local-fallback-claude1/tmp/rch-ci-head4ea74d-monitor-ar1ynfcr/`.
+The local follow-ups below are not part of this published CI revision.
+
+## Process-observation fixtures and CI preparation after `4ea74ded`
+
+The standalone Mac run at `4ea74ded` failed the stale process-record cleanup
+fixture. The fixture required an absent group's legacy record to disappear,
+but production deliberately preserves that record when process observation is
+unavailable. Darwin's [process-state implementation](https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/tasks.c)
+can emit `?`; the shared identity helper treats such an unknown state as an
+incomplete observation. The failed runner did not retain its exact process
+snapshot, so this is not a confirmed attribution of that historical failure.
+
+A controlled run of the unchanged test binary passed with the native Linux
+snapshot and reproduced the same assertion failure after adding one unknown
+state row. The fixture now supplies explicit complete, unknown-state,
+missing-observer and failed-command observations. It binds the observer row to
+the actual sweep shell and checks the exact `ps` arguments. The production
+cleanup command and shared identity helper are unchanged. Record contents,
+ages, malformed-record removal, fresh-record preservation, directory checks and
+the no-kill assertion remain enforced. The live-group and process-cwd cases
+continue to use native `ps` on Linux.
+
+The complete 44-case cache-cleanup module passed locally, with zero failures or
+ignores and 1,676 other cases filtered. Fault injection changed only the emitted
+command copy: incorrectly permitting deletion after an uncertain observation
+made all three new uncertainty cases fail, and incorrectly retaining records
+after complete observation made the existing absence case fail. This admits
+the valid safe-retention behavior that the old fixture rejected while explicitly
+rejecting unsafe deletion and unjustified retention. No gate or deadline was
+relaxed. Formatting, locked workspace/all-target compiler checks and strict
+Clippy passed with source hashes held fixed.
+
+The unchanged official UBS scan returned exit zero for this Rust file, with
+zero critical, 151 warning and 72 informational records. Four records intersect
+added lines: the intentional test assertion is a warning, and the shebang path
+and two `printf %s` literals are arithmetic false positives. The complete
+inventory and review are retained; no rule or suppression changed.
+
+Core E2E preparation now builds only the debug daemon and worker before the
+unchanged Cargo integration-test command builds `target/debug/rch` with its
+`true-e2e` feature. The original three package selections remain to preserve
+dependency feature resolution. All release binaries, test selections, runtime
+profiles, concurrency settings, the 30-minute job ceiling and assertions are
+unchanged.
+
+Cargo's preparation graph contains 397 units instead of 729. Dependency
+features are unchanged; two crates used only by build tools now receive Cargo's
+ordinary host debug-info setting, accounting for 38 recursive fingerprint
+differences. No compiler setting was manually changed. This is removal of
+redundant preparation, not a paired performance result or proof of CI duration.
+
+Main CI's x64 macOS release build now uses `macos-15-intel`, matching the native
+Intel runner already used by workspace tests and Test Release. Its prior log
+identifies an ARM host cross-compiling for x64 and records the enforced
+30-minute cancellation. This does not establish why compilation took too long.
+The target, whole-workspace build command, release profile, compiler settings,
+artifact paths and deadline are unchanged. A parsed-workflow comparison verifies
+that the runner label is the only additional semantic change and that the
+validated E2E definition remains identical. Native acceptance and CI duration
+still require the next published revision's results.
+
+Local validation used the actual workflow support-binary selection, followed by
+the integration-test preparation and exact unchanged Cargo test command. Cargo
+emitted only the two support executables in the first step, then freshly built
+RCH with `true-e2e` before running all 164 cases successfully, with zero failures,
+ignores or filters. The daemon and worker hashes stayed unchanged. YAML and all
+core E2E Bash steps passed syntax checks. Source hashes remained fixed; CI's mock
+SSH and skip-worker-check settings were retained. A subsequent source-bound
+release build and the unchanged complete shell suite also passed: 11 cases
+passed, none failed, and installation prompting plus opt-in true E2E skipped.
+All 13 discovered cases reached their recorded outcome. Source hashes remained
+fixed throughout; a private mount kept this run's target logs separate from
+earlier evidence. This local run does not prove the CI job's duration or replace
+native Mac acceptance at the next published revision.
+
+Evidence is retained under
+`/mnt/hdd-vibe-coding-share/remote-test-local-fallback-claude1/tmp/` in
+`rch-stale-record-observation-control-6z9ulvyi/`,
+`rch-stale-record-observation-trace-btqy_9zj/`,
+`rch-process-observation-fixture-validation-a21cv2g1/`,
+`rch-core-e2e-support-target-graphs-l8iasfhf/` and
+`rch-core-e2e-support-validation-g6z2vngr/`, with the complete shell run in
+`rch-core-shell-support-validation-kjhhpjpz/`. The scanner inventory and review are
+in `target/managed-storage-validation-20261009/ubs-process-observation-fixture-report-approved.gsvrgotv/`.
 
 ## Completed CI at `f9c7ba62`
 
@@ -98,7 +223,7 @@ The concurrent breaker-reader fixture now explicitly clears nonblocking mode
 on its accepted socket before applying its existing five-second read timeout.
 Darwin inherits that listener flag; Linux does not. A controlled Linux socket
 probe reproduced the inherited-mode failure and verified the same timeout after
-clearing the flag. The complete 34-case wrapper binary unit target, formatting,
+clearing the flag. The complete 36-case wrapper binary unit target, formatting,
 workspace/all-target check and strict Clippy passed locally for this two-line
 fixture change. Fresh native Mac CI is still required.
 

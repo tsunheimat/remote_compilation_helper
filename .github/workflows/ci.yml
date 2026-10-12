@@ -329,10 +329,11 @@ jobs:
         run: |
           cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
           echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
-      - name: Build debug binaries for cargo E2E harness
-        # The fail-open tests explicitly launch target/debug/rch and rchd;
-        # the shared harness also uses debug binaries in this test profile.
-        run: cargo build --locked -p rch -p rchd -p rch-wkr --bins
+      - name: Build debug support binaries for cargo E2E harness
+        # Cargo's integration-test command builds target/debug/rch with its
+        # true-e2e feature set. Prepare only the daemon and worker here, keeping
+        # package selection stable for their dependency feature resolution.
+        run: cargo build --locked -p rch -p rchd -p rch-wkr --bin rchd --bin rch-wkr
       - name: Run cargo-based E2E tests (feature-gated)
         env:
           RCH_MOCK_SSH: '1'
@@ -433,7 +434,8 @@ jobs:
             packages: musl-tools
           - os: ubuntu-24.04-arm  # Native ARM64 runner (10x faster than cross-compile)
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
+          # Match the native Intel runner used by tests and release packaging.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin

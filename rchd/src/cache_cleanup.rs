@@ -1188,6 +1188,31 @@ mod tests {
     #[test]
     fn cleanup_command_deletes_stale_process_records_only() {
         let _guard = test_guard!();
+        assert_process_record_sweep("printf '%s 1 S\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"", false);
+    }
+
+    #[test]
+    fn cleanup_command_keeps_record_when_process_state_is_unknown() {
+        let _guard = test_guard!();
+        assert_process_record_sweep(
+            "printf '%s 1 S\\n2147482000 1 ?\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            true,
+        );
+    }
+
+    #[test]
+    fn cleanup_command_keeps_record_when_observer_is_missing() {
+        let _guard = test_guard!();
+        assert_process_record_sweep("printf '2147482000 1 S\\n'", true);
+    }
+
+    #[test]
+    fn cleanup_command_keeps_record_when_process_observation_fails() {
+        let _guard = test_guard!();
+        assert_process_record_sweep("exit 1", true);
+    }
+
+    fn assert_process_record_sweep(ps_body: &str, retain_vanished: bool) {
         let base = tempfile::tempdir().expect("base");
         let runs = tempfile::tempdir().expect("run root");
         let run = runs.path().join("project-0123456789abcdef");
@@ -1210,12 +1235,31 @@ mod tests {
         let empty_new = runs.path().join("empty-new");
         std::fs::create_dir(&empty_new).expect("empty new");
 
-        let (stdout, stderr, code) = run_sweep_with_runs(base.path(), runs.path(), &[]);
+        // A native process snapshot can legitimately be incomplete: Darwin
+        // emits '?' for an unavailable task state, and the shared identity
+        // helper then refuses to declare any group absent. Exercise both
+        // outcomes explicitly instead of assuming every host observation
+        // succeeds. The live-group and cwd cases below still use native ps.
+        let shim_dir = tempfile::tempdir().expect("process observation shim");
+        write_shim(
+            shim_dir.path(),
+            "ps",
+            &format!(
+                "#!/bin/sh\n[ \"$*\" = '-e -o pid= -o pgid= -o stat=' ] || exit 97\n{ps_body}\n"
+            ),
+        );
+        let (stdout, stderr, code) =
+            run_sweep_with_runs(base.path(), runs.path(), &[shim_dir.path().to_path_buf()]);
         assert_eq!(code, Some(0), "{stdout}{stderr}");
         assert!(stdout.contains("orphans_killed=0"), "{stdout}");
         assert!(
-            !malformed.exists() && !vanished.exists(),
-            "stale records remain"
+            !malformed.exists(),
+            "malformed record remains: {stdout}{stderr}"
+        );
+        assert_eq!(
+            vanished.exists(),
+            retain_vanished,
+            "legacy record retention must match process observability: {stdout}{stderr}"
         );
         assert!(
             fresh.exists(),
@@ -1350,6 +1394,10 @@ mod tests {
         use std::env::{join_paths, split_paths};
         let escaped = format!("'{}'", base.display());
         let command = build_cleanup_command(&escaped, &format!("'{}'", runs.display()), 0, 0);
+        // Give observation fixtures the same shell identity that the shared
+        // process helper requires to appear in a complete snapshot.
+        let command =
+            format!("RCH_CLEANUP_TEST_OBSERVER=$$; export RCH_CLEANUP_TEST_OBSERVER; {command}");
         let mut full_path: Vec<std::path::PathBuf> = prepend_path.to_vec();
         full_path.extend(split_paths(&std::env::var_os("PATH").unwrap_or_default()));
         let output = std::process::Command::new("sh")
