@@ -35,6 +35,7 @@ Windows support; existing Windows jobs have not been disabled.
 - Published live-dependency fixture and timing diagnostics: `a836301151a10f6c4e5efca380fbfa97a8b46779`
 - Published hook resource diagnostics: `26cda270149e57aefee1fdf245b6b4190b730114`
 - Published isolated warmup and native target contracts: `2960380a9d4821c0180b0c6917e53e1977cd8523`
+- Published buffered edge and workspace fixture repairs: `f9c7ba62c763ee82dfde8be2b1d6c3d473a9b403`
 - Integration tree before the fixture repairs below: `5e6708c98abcf5c1c6fe3ca3a375a72d64b31035`
 - Integration worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-storage-integration`
 - Active development worktree: `/mnt/vibe-coding-share/develop/remote_compilation_helper-managed-storage`
@@ -60,6 +61,143 @@ For an existing checkout, inspect its changes before fetching/switching. Preserv
 other work; do not reset, clean, overwrite, or delete it. Read `AGENTS.md` and
 `/data/projects/AGENTS.md` if present locally. That file and `br` remain unavailable
 in this environment. No Beads issues have been closed.
+
+## Completed CI at `f9c7ba62`
+
+Every workflow in this cycle is terminal. The source archive from the PR merge
+revision `ea930f7352c76aca00c06cd7ccfda4763829d9dc` independently matches all
+1,391 tracked blobs and executable modes at the published feature head.
+
+| Workflow or platform | Final result |
+| --- | --- |
+| [Main CI](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38195299355), Linux x64 | All 225 workspace harnesses completed: 12,123 passed, zero failed, 31 ignored, zero filtered. Separate nine-case filesystem and 13-case socket selections also passed. |
+| Main CI, macOS ARM | All 216 workspace harnesses completed: 10,027 passed, one failed, 23 ignored, zero filtered. The failure was the concurrent breaker-reader fixture's accepted socket returning `EAGAIN`. Both native dependency contract cases passed, exercising the unsupported-target refusal branch. Linux-only M4 serving is not native Mac coverage. |
+| Main CI, macOS Intel | Exceeded the 60-minute limit. Completed harnesses recorded 6,346 passes, three failures, three ignores and zero filters. The failures were the same socket fixture, the large ownership-closure fixture's 60-second timeout, and an empty completion marker where `finished` was expected. Remaining targets did not finish. |
+| Main CI, Linux ARM | Exceeded the 60-minute limit. Its 215 completed harnesses recorded 10,322 passes, zero failures, 31 ignores and zero filters. The remaining daemon harness was interrupted during cleanup cases with real elapsed-time requirements. This is not a complete pass. |
+| Main CI, coverage | Failed with runner annotations explicitly reporting `No space left on device`; the 60-minute limit was not reached. No coverage report or 65% threshold result exists. This evidence does not establish the cause of the earlier revision's exit 143. |
+| Main CI, core E2E | All 164 Cargo cases passed, with no failures, ignores or filters. The job then exceeded 30 minutes during shell path-dependency fixture compilation. The shell suite did not complete. |
+| [Standalone E2E](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38195299400) | Both platforms passed all 41 scripts. Each inner suite recorded 11 passes and two explicit configuration-dependent skips. |
+| [RABS](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38195299353) | Protocol and release jobs passed: 36 + 8 protocol cases and 13 release cases, none failed, ignored or filtered. The unchanged 60-sample overhead gate passed at 2.589 ms p95; this single CI measurement is not a paired performance comparison. |
+| [Rsync](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38195299425) | 64 passed, zero failed or ignored, 3,309 filtered, using rsync 3.2.7. |
+| [Test Release](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38195299395) | All five Unix build/smoke/package jobs passed. Downloaded archives independently passed digest, checksum, file-name and executable-mode checks. Windows retained the deferred compiler errors; aggregate package verification skipped. |
+
+Format, workflow and manifest guards, compiler checks, strict Clippy, docs,
+security and benchmark gates passed. Main CI's aggregate failed and its release
+stage skipped. Neither canceled platform job is a passing suite. The proposed
+additional job-budget increases remain unapplied.
+
+Raw logs, verified ZIPs, source/package proofs, timeout and disk-full annotations,
+and parsed complete/partial outcomes are retained in
+`/mnt/hdd-vibe-coding-share/remote-test-local-fallback-claude1/tmp/rch-ci-headf9c7ba-monitor-gz1_qfky/`.
+Local repairs for the current failures are being validated separately; they are
+not part of the published revision described in this section.
+
+## Ownership command, fixture publication and coverage preparation after `f9c7ba62`
+
+The concurrent breaker-reader fixture now explicitly clears nonblocking mode
+on its accepted socket before applying its existing five-second read timeout.
+Darwin inherits that listener flag; Linux does not. A controlled Linux socket
+probe reproduced the inherited-mode failure and verified the same timeout after
+clearing the flag. The complete 34-case wrapper binary unit target, formatting,
+workspace/all-target check and strict Clippy passed locally for this two-line
+fixture change. Fresh native Mac CI is still required.
+
+The daemon-start fixture previously created its completion marker before
+writing `finished`. The Intel Mac observed that empty file. The fixture now
+closes an exclusively created pending file before atomically publishing the
+marker. A controlled pause immediately after opening the writer reproduced the
+old empty marker and showed that the candidate remains unpublished until the
+bytes are complete. Socket behavior, descriptor assertions and all existing
+fixture deadlines are unchanged.
+
+The ownership repair command now stores its quoted root list once as shell
+positional arguments. Detection, repair and verification each iterate the same
+arguments. The existing large-closure fixture still uses all 4,097 roots,
+including its final shell-sensitive path, all five outcomes, the 20-second
+operation limit and the 60-second outer limit. A timeout now reports its mode,
+state and completed privileged-call records. The source-shape assertion follows
+the new representation and additionally requires all three sweeps; outcome,
+payload, quoting and exit-code assertions remain enforced.
+
+A local command-format prototype ran the incumbent and candidate scripts in
+the same invocation, reversing their order in the second pass. All 40 shell
+executions preserved status, stdout, stderr and privileged-call sequences. The
+payload fell from 2,532,434 to 844,739 bytes. GNU Bash 5.2 cases took 2.54–4.32
+seconds for the incumbent and 0.69–0.86 seconds for the candidate; `dash` showed
+mixed small changes around 0.03–0.09 seconds. These observations concern this
+local shell fixture. They do not establish native Mac timing or fleet build
+speed. The rebuilt Rust binary emitted the exact candidate bytes for the same
+fixture inputs, and its embedded marker fixture matches the controlled
+publication prototype exactly.
+
+Final focused validation held all source hashes fixed. The full SSH unit
+module passed 59 cases with 3,314 filtered; the full daemon-update module passed
+18 with 3,355 filtered. Neither had failures or ignores. The same-input command
+check repeats one of those SSH cases and is not additional unique coverage.
+Workspace test preparation compiled successfully, and formatting, locked
+workspace/all-target compiler checks and strict Clippy passed. Preparation alone
+is not a full-workspace runtime pass.
+
+Coverage preparation now owns one fresh instrumented target and uses a separate
+registry-only cache key. It builds binaries and tests together under the test
+profile, then executes the original workspace/rich-ui test selection. Recursive
+Cargo unit-graph comparison matches all 1,026 coverage units, including profile
+settings and dependency edges; the sole additional unit is the standalone
+`rch-wkr` binary required by fixtures. The reports and 65% line threshold remain
+unchanged. YAML and all coverage-step Bash syntax checks passed. The 60-minute
+workspace/coverage and 30-minute core E2E ceilings remain unchanged. A separate
+core E2E preparation proposal did not match its test graph and was not applied.
+
+An intermediate local coverage preparation built successfully, then was
+intentionally interrupted with exit 130 during test compilation so these final
+changes could be validated together. No tests had started and no coverage
+report or threshold result was produced. Its source hashes remained fixed.
+The 75 build-only raw profiles were preserved by rename in a new report
+directory, with names, hashes and inode checks recorded. The final local run
+reuses compiler artifacts with an empty initial raw-profile set. Its disk
+allocation includes retained intermediate artifacts and cannot establish the
+fresh hosted runner's capacity requirement.
+
+The final preparation command passed, and the subsequent coverage test command
+reused it without recompiling: Cargo's freshness check took 7.75 seconds.
+The test run then stopped with exit 101 after 86 completed harnesses: 2,098
+passed, one failed, five ignored and zero filtered. The failure was
+`uploaded_source_is_read_only_while_runtime_and_artifact_output_remain_writable`:
+capturing the installed 1.8 GB toolchain exceeded its unchanged 30-second
+request deadline on the ext4 image backed by NFS. No coverage report or 65%
+threshold result was produced.
+
+A control used the same instrumented three-case fixture and installed toolchain
+on local ext4. Two cases passed; the same case reached execution but still
+expired at the deadline. A subsequent comparison on warm local ext4 completed
+all three cases for both ordinary and instrumented binaries, in 24.70 and
+24.13 seconds respectively. Those diagnostic passes do not replace either
+failed attempt or establish a full coverage pass. Inputs, deadlines, assertions
+and concurrency are unchanged. The CI runner's complete test/report/threshold
+result remains required; there is no established source defect from these
+timing controls alone.
+
+The unchanged official UBS scan returned exit 1: two critical, 467 warning and
+448 informational records across the three changed Rust files. Both critical
+records are in unchanged code: the staging filename timestamp and an
+intentional execution-state shell probe in a Linux-only unit fixture. All eight
+added-line records are informational: six notices for three small reads used
+only after a fixture timeout, and two path-literal/division false positives.
+The complete inventory and review are retained; this is not a green scan, and
+no scanner rule or suppression changed.
+
+Evidence under the native evidence root above is in
+`rch-ownership-shell-diagnostic-tvppo7ek/`,
+`rch-completion-marker-control-_fb3bt6v/`,
+`rch-breaker-fixture-blocking-pcnl_sia/`,
+`rch-coverage-preparation-graphs-lboj1y2n/`,
+`rch-coverage-workflow-validation-azrunfsu/`, and the interrupted
+`rch-coverage-single-tree-ke6ktpoo/`. Completed focused validation is in
+`rch-ownership-marker-final-validation-mmlwj2en/`; the failed full-coverage
+attempt is in `rch-coverage-final-preparation-sqmue3ma/`. Both controls and their
+isolated raw profiles are in `rch-artifact-toolchain-local-disk-control-8emy9knu/`
+and `rch-artifact-toolchain-profile-comparison-vibqv_um/`. The UBS report and review are in
+`target/managed-storage-validation-20261009/ubs-ownership-marker-final-report-approved.uglzw61h/`.
 
 ## Buffered edge reads and concurrent breaker readers after `2960380a`
 
@@ -103,7 +241,7 @@ The combined p95 is 29.65% lower in this controlled overhead fixture. Wrapper
 CPU stayed approximately 0.164 s per variant; daemon CPU uses Linux process
 counters with 10 ms resolution. This is not a fleet throughput or real-project
 build speed claim. The separate, unchanged release gate passed at 4.038 ms p95.
-CI still needs to test the new source.
+The subsequent CI result is recorded above at `f9c7ba62`.
 
 A black-box release comparison also held a real shared file lock in a separate
 process: the incumbent produced no daemon consultation, while the candidate
@@ -236,7 +374,7 @@ native Linux validation is retained in
   passed. Earlier edge/protocol results above bind to the unchanged production
   files; repeated profiles are not additional unique coverage.
 
-Native Mac execution and fresh published-head CI remain required. The first
+The subsequent native Mac and published-head results are recorded above. The first
 failed local run is retained in
 `rch-workspace-daemon-preparation-lxmuks02/`, the trace in
 `rch-wrapper-script-exec-boundary-f_zpbaj4/`, and the deterministic writer

@@ -1459,8 +1459,9 @@ fn build_worker_ownership_repair_cmd(roots: &[PathBuf], ssh_user: &str) -> Strin
         .map(|root| shell_escape::escape(root.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(" ");
+    // Parse the closure once; all three sweeps reuse the same shell arguments.
     format!(
-        "set -e; u={user}; \
+        "set -e; u={user}; set -- {roots}; \
          detect_root() {{ \
            if ! b=$(sudo -n find \"$1\" -xdev -user root -print 2>/dev/null | wc -l); then \
              printf 'RCH_OWNERSHIP_CHECK_UNAVAILABLE\\n' >&2; exit 0; \
@@ -1468,13 +1469,13 @@ fn build_worker_ownership_repair_cmd(roots: &[PathBuf], ssh_user: &str) -> Strin
            echo $((b + 0)); \
          }}; \
          total=0; \
-         for r in {roots}; do \
+         for r; do \
            [ -d \"$r\" ] || continue; \
            total=$((total + $(detect_root \"$r\"))); \
          done; \
          if [ \"$total\" -eq 0 ]; then echo RCH_OWNERSHIP_OK; exit 0; fi; \
          repair_ok=1; \
-         for r in {roots}; do \
+         for r; do \
            [ -d \"$r\" ] || continue; \
            if ! sudo -n find \"$r\" -xdev -user root -exec chown -h \"$u\" {{}} + 2>/dev/null; then \
              repair_ok=0; \
@@ -1484,7 +1485,7 @@ fn build_worker_ownership_repair_cmd(roots: &[PathBuf], ssh_user: &str) -> Strin
            printf 'RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=%s\\n' \"$total\" >&2; exit 46; \
          fi; \
          remaining=0; \
-         for r in {roots}; do \
+         for r; do \
            [ -d \"$r\" ] || continue; \
            remaining=$((remaining + $(detect_root \"$r\"))); \
          done; \
@@ -1899,7 +1900,14 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 .output(),
         )
         .await
-        .expect("isolated ownership regression timed out")
+        .unwrap_or_else(|error| {
+            panic!(
+                "isolated ownership regression timed out: {error}; mode={:?}; state={:?}; calls={:?}",
+                std::fs::read_to_string(dir.path().join("mode")),
+                std::fs::read_to_string(dir.path().join("state")),
+                std::fs::read_to_string(dir.path().join("calls")),
+            )
+        })
         .expect("start isolated ownership regression");
         assert!(
             output.status.success(),
@@ -4139,15 +4147,16 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "sweep must target root-owned entries only: {command}"
         );
         assert!(
-            command.contains("for r in /data/projects /data/projects/franken_node"),
-            "every dispatch closure root binds into the sweep loop: {command}"
+            command.contains("set -- /data/projects /data/projects/franken_node;")
+                && command.matches("for r; do").count() == 3,
+            "every sweep must iterate the stored dispatch closure roots: {command}"
         );
         let spaced = build_worker_ownership_repair_cmd(
             &[PathBuf::from("/data/projects with space")],
             "deploy u",
         );
         assert!(
-            spaced.contains("for r in '/data/projects with space'")
+            spaced.contains("set -- '/data/projects with space';")
                 && spaced.contains("u='deploy u'"),
             "paths or users with shell metacharacters must be single-quote escaped: {spaced}"
         );

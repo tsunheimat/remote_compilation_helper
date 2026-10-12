@@ -1477,6 +1477,8 @@ mod tests {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // Darwin inherits the listener's nonblocking mode on accept.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

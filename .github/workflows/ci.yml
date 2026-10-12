@@ -499,15 +499,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
+          # Keep the ordinary target cache out of this job: coverage owns one
+          # fresh instrumented tree after the previous runner exhausted disk.
+          shared-key: coverage-registry
+          cache-targets: false
           cache-on-failure: true
-      - name: Build binaries for E2E tests
-        run: cargo build --workspace
+      - name: Build instrumented binaries for E2E tests
+        run: |
+          rch_coverage_target="$(mktemp -d "$RUNNER_TEMP/rch-coverage-target.XXXXXX")"
+          rch_coverage_env="$(mktemp "$RUNNER_TEMP/rch-coverage-env.XXXXXX")"
+          export CARGO_TARGET_DIR="$rch_coverage_target"
+          export CARGO_LLVM_COV_TARGET_DIR="$rch_coverage_target"
+          cargo llvm-cov show-env --sh > "$rch_coverage_env"
+          source "$rch_coverage_env"
+          printf 'CARGO_TARGET_DIR=%s\nCARGO_LLVM_COV_TARGET_DIR=%s\nRCH_COVERAGE_ENV=%s\n' \
+            "$CARGO_TARGET_DIR" "$CARGO_LLVM_COV_TARGET_DIR" "$rch_coverage_env" >> "$GITHUB_ENV"
+          # Prepare the same test graph plus the standalone worker binary.
+          # This avoids separate production/test dependency feature variants.
+          cargo build --workspace --features rich-ui --bins --tests --profile test
       - name: Generate LCOV coverage
         env:
           RCH_MOCK_SSH: '1'
           RABS_TEST_WORKSPACE_ARGS: --workspace --features rich-ui
-        # Build debug binaries first for E2E tests that need them
-        run: cargo llvm-cov --features rich-ui --workspace --lcov --output-path lcov.info
+        # Match cargo-llvm-cov's default --tests selection. The fresh target
+        # contains no previous profiles, so no cleanup or second build tree is
+        # needed. All report formats and the threshold consume this execution.
+        run: |
+          source "$RCH_COVERAGE_ENV"
+          cargo test --features rich-ui --workspace --tests
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info
       - name: Generate HTML coverage report
         env:
           RCH_MOCK_SSH: '1'

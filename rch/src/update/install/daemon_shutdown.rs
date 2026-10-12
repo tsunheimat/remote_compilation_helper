@@ -734,8 +734,10 @@ while time.monotonic() < deadline:
             raise ValueError('unexpected mutation: ' + repr(data))
         connection.sendall(b'HTTP/1.1 200 OK\r\n\r\n' + json.dumps(value).encode())
 server.close()
-with open(done, 'w') as output:
+pending = done + '.pending'
+with open(pending, 'x') as output:
     output.write('finished')
+os.rename(pending, done)
 "#;
 
     #[tokio::test]
