@@ -315,7 +315,7 @@ async fn probe_installed_version(
     expected: &str,
     timeout: std::time::Duration,
 ) -> Result<String> {
-    use crate::transfer::read_bounded_output_stream;
+    use crate::process_output::read_bounded_output_stream;
     use std::process::Stdio;
     use tokio::time::{Instant, sleep_until, timeout_at};
 

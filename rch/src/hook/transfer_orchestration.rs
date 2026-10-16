@@ -36,9 +36,9 @@ use super::cargo_target_dir::{
 };
 use super::daemon_ipc::urlencoding_encode;
 use super::dependency_closure::{
-    SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, build_sync_closure_manifest,
-    build_sync_closure_plan, merge_sync_result, verify_remote_dependency_manifests,
-    workspace_metadata_sync_patterns,
+    SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, build_owned_sync_closure_layout,
+    build_sync_closure_manifest, build_sync_closure_plan, merge_sync_result,
+    verify_remote_dependency_manifests, workspace_metadata_sync_patterns,
 };
 use super::formatting::{cache_hit, detect_target_label, emit_job_banner, render_compile_summary};
 use super::progress_reporting::{
@@ -48,13 +48,15 @@ use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
     PreparedSourceContentRoot, bind_build_source_aliases, build_source_commit_env,
-    capture_build_source_stamp, finalize_source_content_receipt, prepare_source_content_root,
-    reconcile_build_source_stamps, verify_source_content_roots,
+    capture_build_source_stamp, finalize_owned_source_content_receipt,
+    finalize_source_content_receipt, guard_owned_source_content_cargo_config,
+    owned_source_content_freshness_identity, prepare_source_content_root,
+    reconcile_build_source_stamps, validate_owned_source_content_closure,
+    verify_owned_source_content_roots, verify_source_content_roots,
 };
 use super::ssh::{
-    acquire_clean_overlay_source_pair, acquire_remote_source_authority_lock,
-    ensure_worker_projects_topology, remote_preflight_topology_policy,
-    worker_projects_topology_requires_initialization,
+    acquire_clean_overlay_source_pair, ensure_worker_projects_topology,
+    remote_preflight_topology_policy, worker_projects_topology_requires_initialization,
 };
 use super::*;
 
@@ -63,6 +65,9 @@ mod cargo_manifest;
 
 #[path = "retrieval_recovery.rs"]
 pub(crate) mod recovery;
+
+#[path = "source_namespace.rs"]
+mod source_namespace;
 
 /// Read the durable completion receipt after the execution SSH session exits.
 ///
@@ -280,6 +285,23 @@ pub(super) fn apply_source_sync_integrity_policy(
     }
 }
 
+/// Select the Cargo families whose build and target directories can be bound
+/// by the owned source route. External drivers keep their existing receipt
+/// path; malformed commands within a supported family still fail admission.
+fn supports_owned_source_content_cargo(kind: Option<CompilationKind>, command: &str) -> bool {
+    matches!(
+        kind,
+        Some(
+            CompilationKind::CargoBuild
+                | CompilationKind::CargoTest
+                | CompilationKind::CargoCheck
+                | CompilationKind::CargoClippy
+                | CompilationKind::CargoDoc
+                | CompilationKind::CargoBench
+        )
+    ) && rch_common::patterns::cargo_xwin_compilation_kind(command).is_none()
+}
+
 pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
     let escaped_worker = shell_escape::escape(worker_id.as_str().into());
     // Use newline instead of semicolon to ensure trailing comments in command
@@ -490,6 +512,36 @@ pub(super) fn foreign_artifact_gate_disabled_from_value(value: Option<String>) -
 /// Environment variable name for [`foreign_artifact_gate_disabled`].
 pub(super) const RCH_ALLOW_FOREIGN_ARTIFACTS_ENV: &str = "RCH_ALLOW_FOREIGN_ARTIFACTS";
 
+/// Prove a mismatch before any artifact payload is downloaded. This is also
+/// used by detached recovery with the original, persisted delivery policy.
+async fn preflight_artifact_platform(
+    pipeline: &TransferPipeline,
+    worker: &WorkerConfig,
+    patterns: &[String],
+    custom_target: bool,
+    expected: &str,
+    pinned: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if super::artifact_triple::expected_binary_format(expected).is_none() {
+        return Ok(None);
+    }
+    let headers = pipeline
+        .artifact_header_probe(worker, patterns, |path| {
+            super::artifact_triple::in_scope_output_path(path, custom_target, pinned).is_some()
+        })
+        .await?;
+    Ok(headers.into_iter().find_map(|(path, header)| {
+        super::artifact_triple::foreign_artifact_header(&header, expected).then(|| {
+            format!(
+                "{}: artifact {path} is incompatible with {expected}; rejected before \
+                 downloading build artifacts; local outputs were not replaced. Pin --target \
+                 or set {RCH_ALLOW_FOREIGN_ARTIFACTS_ENV}=1 for intentional foreign artifacts",
+                ErrorCode::BuildArtifactForeignTarget.code_string(),
+            )
+        })
+    }))
+}
+
 /// Execute a compilation command on a remote worker.
 ///
 /// This function:
@@ -616,6 +668,7 @@ async fn execute_remote_compilation_inner(
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    let caller_command = command;
     // The build is already registered. Source validation and fingerprinting can
     // outlast the stuck detector's deadline before any remote transfer begins.
     // Keep this RAII guard alive across preflight, including every early error;
@@ -670,6 +723,14 @@ async fn execute_remote_compilation_inner(
     // needs drive-letter paths, so their whole remote layout lives under the
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
+    if reporter.cargo_json_stdout {
+        anyhow::ensure!(
+            !worker_is_windows
+                && durable_lease.is_some()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "caller Cargo JSON requires the admitted durable POSIX worker route"
+        );
+    }
 
     let go_build_environment = if kind == Some(CompilationKind::GoBuild) {
         anyhow::ensure!(
@@ -802,7 +863,59 @@ async fn execute_remote_compilation_inner(
     // Windows lacks the POSIX source lease; retain invocation isolation there
     // with a unique target instead of reusing path-bearing artifacts unsafely.
     let reuse_disabled = target_reuse_disabled() || (clean_overlay.is_some() && worker_is_windows);
-    let source_pair_pool = (clean_overlay.is_some()
+    // The explicit source-content route can reuse compiler paths only when the
+    // worker can retire a whole source tree without replacing or deleting it.
+    // Probe before persisting an intent or mutating any worker path. Other Unix
+    // platforms keep invocation-isolated source until their rename protocol is
+    // implemented and qualified; a Linux capability failure is a refusal.
+    let owned_source_content_pair = if source_content_receipt
+        && clean_overlay.is_none()
+        && exact_dependency_closure_sync
+        && supports_owned_source_content_cargo(kind, command)
+        && !reuse_disabled
+    {
+        anyhow::ensure!(
+            durable_lease.is_some()
+                && !super::ssh::should_skip_remote_preflight(&worker_config)
+                && forwarded_cargo_target_dir.is_some(),
+            "owned source-content staging requires a durable Unix Cargo target route"
+        );
+        let probe = format!(
+            "set -eu; if [ \"$(uname -s)\" = Linux ]; then {}; \
+             else printf '%s\\n' RCH_SOURCE_RETENTION_LEGACY_PLATFORM; fi",
+            TransferPipeline::remote_tree_retention_capability_command(),
+        );
+        let output = super::ssh::run_offload_ssh_command_with_stdin(
+            &worker_config,
+            "sh -s",
+            probe.as_bytes(),
+            Duration::from_secs(30),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "owned source retention admission failed on {} (status {:?}): {}",
+            worker_config.id,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+        match output.stdout.as_slice() {
+            b"RCH_SOURCE_RETENTION_CAPABLE\n" => true,
+            b"RCH_SOURCE_RETENTION_LEGACY_PLATFORM\n" => false,
+            _ => anyhow::bail!("owned source retention admission returned an invalid envelope"),
+        }
+    } else {
+        false
+    };
+    if owned_source_content_pair {
+        // A managed build directory must win over ambient Cargo settings and
+        // cannot be added safely to arbitrary shell grammar.
+        super::cargo_target_dir::managed_clean_overlay_cargo_build_dir(
+            command,
+            "/rch-managed-build-dir-validation",
+        )?;
+    }
+    let mut source_pair_pool = (clean_overlay.is_some()
         && forwarded_cargo_target_dir.is_some()
         && !reuse_disabled)
         .then(|| {
@@ -848,9 +961,9 @@ async fn execute_remote_compilation_inner(
             topology_policy,
         )
     };
-    // Proof runs use an invocation-unique remote source root. Without this, a
-    // concurrent ordinary sync of the same project hash could mutate the tree
-    // after verification but before Cargo opens a source file.
+    // Bind receipt provenance to this invocation. The legacy receipt route
+    // also uses it for its isolated path; the owned pair instead preserves
+    // compiler paths under a durable exclusive source/target lease.
     let project_hash = if let Some(proof_build_id) = source_content_build_id {
         blake3::hash(
             format!(
@@ -892,7 +1005,23 @@ async fn execute_remote_compilation_inner(
     // remote lock. Source-content and clean-overlay runs already own isolated
     // source roots and do not need this mutable-authority guard.
     let recovery_identity = uuid::Uuid::new_v4().simple().to_string();
-    if let Some(proof_build_id) = source_content_build_id {
+    let mut overlay_remote_root: Option<String> = None;
+    if owned_source_content_pair {
+        let layout = build_owned_sync_closure_layout(
+            &sync_plan,
+            topology_policy,
+            &transfer_config.remote_base,
+            &remote_cargo_pooled_target_dir_name(
+                &worker_config.id,
+                &normalized_project_root,
+                toolchain,
+                command,
+            ),
+        )?;
+        source_pair_pool = Some(layout.pooled_target_name);
+        overlay_remote_root = Some(layout.source_root);
+        sync_plan = layout.plan;
+    } else if let Some(proof_build_id) = source_content_build_id {
         let proof_base = format!(
             "{}/source-content-{}-{}",
             transfer_config.remote_base.trim_end_matches('/'),
@@ -931,7 +1060,6 @@ async fn execute_remote_compilation_inner(
             .to_string();
         }
     }
-    let mut overlay_remote_root: Option<String> = None;
     if let Some(spec) = clean_overlay {
         anyhow::ensure!(
             sync_plan.iter().filter(|entry| entry.is_primary).count() == 1,
@@ -954,6 +1082,22 @@ async fn execute_remote_compilation_inner(
         }
         overlay_remote_root = Some(container);
     }
+    let retained_source_root = owned_source_content_pair.then(|| {
+        format!(
+            "{}.retained-{recovery_identity}",
+            overlay_remote_root
+                .as_deref()
+                .expect("owned source container")
+        )
+    });
+    let source_freshness_control = owned_source_content_pair.then(|| {
+        format!(
+            "{}.freshness",
+            overlay_remote_root
+                .as_deref()
+                .expect("owned source container")
+        )
+    });
     // Relocate every closure root under the Windows build base so all downstream
     // remote paths (sync target, build cwd, CARGO_TARGET_DIR, manifest
     // verification) use drive-letter paths. Mirrors the clean-overlay remote_root
@@ -982,7 +1126,8 @@ async fn execute_remote_compilation_inner(
     // non-streaming sync/retrieve paths.
     let progress_enabled = output_ctx.supports_rich()
         && reporter.visibility != OutputVisibility::None
-        && !worker_is_windows;
+        && !worker_is_windows
+        && !reporter.cargo_json_stdout;
     let remote_pgid_file = build_id.and_then(|id| {
         sync_plan
             .iter()
@@ -1050,9 +1195,43 @@ async fn execute_remote_compilation_inner(
     let remote_topology_policy = remote_preflight_topology_policy(
         topology_policy,
         clean_overlay.is_some() && !worker_is_windows,
+        source_content_receipt && !worker_is_windows,
         &transfer_config.remote_base,
         &ownership_scan_roots,
     )?;
+    // bd-fbtws: reject live checkouts before ownership repair or repo-updater
+    // convergence can mutate them, not merely when rsync starts. The receiver
+    // repeats the guard immediately before pruning/upload under its grant.
+    if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
+        let guard = sync_plan
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} || exit 73;\n",
+                    crate::transfer::live_checkout_sync_guard(&entry.remote_root)
+                )
+            })
+            .collect::<String>();
+        let output = super::ssh::run_offload_ssh_command_with_stdin(
+            &worker_config,
+            "sh -s",
+            guard.as_bytes(),
+            Duration::from_secs(30),
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::transfer::destination_check_refusal(
+                format!(
+                    "source destination safety check refused on {} (status {:?}): {}",
+                    worker_config.id,
+                    output.status.code(),
+                    stderr.trim(),
+                ),
+                &stderr,
+            ));
+        }
+    }
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
@@ -1098,7 +1277,7 @@ async fn execute_remote_compilation_inner(
     let pooled_store_base = pooled_store_base_for(
         worker_is_windows,
         pooled_target_store_base,
-        clean_overlay.is_some(),
+        clean_overlay.is_some() || owned_source_content_pair,
         &transfer_config.remote_base,
     );
     let pooled_target_dir_override = if reuse_disabled {
@@ -1108,50 +1287,67 @@ async fn execute_remote_compilation_inner(
             .zip(remote_cargo_target_dir_name_override.as_ref())
             .map(|(base, name)| {
                 let stable = stable_pooled_target_dir(base, &project_id, name);
+                let stable = if owned_source_content_pair {
+                    super::ssh::canonical_source_authority_root(&stable)
+                } else {
+                    stable
+                };
                 reporter.verbose(&format!(
                     "[RCH] pooled target store placed outside the project mirror: {stable}"
                 ));
                 stable
             })
     };
-    let durable_sources =
-        !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config);
-    // Initializing a shared alias changes the physical meaning of every path
-    // beneath it. Discover that need without mutation, then include both
-    // topology roots in the same saved grant before creating either path.
-    // Healthy topology needs no parent grant, so sibling builds stay parallel.
-    let initialize_topology = if durable_sources {
-        worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
-            .await?
-    } else {
-        false
-    };
-    let mut mutable_source_authority_roots: Vec<String> = sync_plan
-        .iter()
-        .map(|entry| entry.remote_root.clone())
-        .collect();
-    if initialize_topology {
-        for root in [
-            remote_topology_policy.canonical_root(),
-            remote_topology_policy.alias_root(),
-        ] {
-            mutable_source_authority_roots.push(
-                root.to_str()
-                    .context("worker topology root is not a UTF-8 path")?
-                    .to_owned(),
+    if owned_source_content_pair {
+        let target = Path::new(
+            pooled_target_dir_override
+                .as_deref()
+                .context("owned source staging requires a persistent target outside its source")?,
+        );
+        for source in [
+            overlay_remote_root.as_deref(),
+            retained_source_root.as_deref(),
+            source_freshness_control.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let source = Path::new(source);
+            anyhow::ensure!(
+                !target.starts_with(source) && !source.starts_with(target),
+                "owned source, retained trees, and freshness metadata must be separate from the target pool"
             );
         }
     }
-    if source_pair_pool.is_some()
-        && let Some(root) = overlay_remote_root.as_ref()
-    {
-        // Include the complete pair in the durable claim. Its already-owned
-        // kernel lock is omitted by the source grant using the live pair guard.
-        mutable_source_authority_roots.push(root.clone());
+    let durable_sources =
+        !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config);
+    // Translation bases are metadata, not build-lifetime source authority.
+    // Initialize under the registry mutex before any job intent or pair/source
+    // lock exists. Its bounded wait must not block exact-owner recovery.
+    if durable_sources {
+        durable_lease.context(
+            "remote source ownership requires an admitted durable job lease; use rch exec",
+        )?;
+        if worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
+            .await?
+        {
+            reporter
+                .verbose("[RCH] initializing shared path translation without claiming its bases");
+        }
+        // Confirm the durable postcondition even when both paths already
+        // exist: a prior initializer may have lost its final acknowledgment.
+        source_namespace::initialize_worker_namespace(
+            &worker_config,
+            &remote_topology_policy,
+            &recovery_identity,
+        )
+        .await?;
     }
-    if let Some(primary) = sync_plan.iter().find(|entry| entry.is_primary) {
-        mutable_source_authority_roots.push(pooled_target_dir_override.clone().unwrap_or_else(
-            || {
+    let source_target_root = sync_plan
+        .iter()
+        .find(|entry| entry.is_primary)
+        .map(|primary| {
+            pooled_target_dir_override.clone().unwrap_or_else(|| {
                 format!(
                     "{}/{}",
                     primary.remote_root,
@@ -1159,17 +1355,19 @@ async fn execute_remote_compilation_inner(
                         .as_deref()
                         .unwrap_or(".rch-target")
                 )
-            },
-        ));
-    }
-    // Record and lock the canonical spelling: a trailing-slash project path
-    // used to reach the lease verbatim and was then unlockable and
-    // unrecoverable (bd-4d1hs).
-    for root in &mut mutable_source_authority_roots {
-        *root = super::ssh::canonical_source_authority_root(root);
-    }
-    mutable_source_authority_roots.sort();
-    mutable_source_authority_roots.dedup();
+            })
+        });
+    // Keep the complete dependency closure, any already-locked pair container,
+    // retirement/freshness siblings and target pool in the same immutable grant.
+    let mut mutable_source_authority_roots = source_namespace::build_source_roots(
+        &sync_plan,
+        source_pair_pool
+            .as_ref()
+            .and(overlay_remote_root.as_deref()),
+        retained_source_root.as_deref(),
+        source_freshness_control.as_deref(),
+        source_target_root.as_deref(),
+    );
     if worker_is_windows {
         mutable_source_authority_roots.clear();
     }
@@ -1191,6 +1389,7 @@ async fn execute_remote_compilation_inner(
             mutable_source_authority_roots.clone(),
             planned_pair.clone(),
             overlay_remote_root.clone(),
+            retained_source_root.clone(),
             transfer_config.clone(),
             normalized_project_root.clone(),
             recovery_identity.clone(),
@@ -1198,7 +1397,7 @@ async fn execute_remote_compilation_inner(
     }
     let mut source_pair_lock = if durable_sources {
         if let Some((root, token)) = planned_pair.as_ref() {
-            reporter.verbose("[RCH] waiting for the clean-overlay source/target pair; same-pool jobs serialize through retrieval");
+            reporter.verbose("[RCH] waiting for the owned source/target pair; same-pool jobs serialize through retrieval and source retirement");
             Some(
                 acquire_clean_overlay_source_pair(&worker_config, root, token, command_timeout)
                     .await?,
@@ -1219,7 +1418,7 @@ async fn execute_remote_compilation_inner(
             mutable_source_authority_roots.len(),
             worker_config.id
         ));
-        let guard = acquire_remote_source_authority_lock(
+        let guard = source_namespace::acquire_source_authority_with_retry(
             &worker_config,
             &mutable_source_authority_roots,
             source_pair_lock.as_mut(),
@@ -1241,14 +1440,15 @@ async fn execute_remote_compilation_inner(
         &remote_topology_policy,
         &ownership_scan_roots,
         source_identity,
-        initialize_topology,
+        false, // Namespace creation is separate; a raced disappearance must refuse.
     )
     .await?;
     // Hold source and output authorities through retrieval, not only execution.
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
-    // A clean-overlay run already names an immutable base; mutating repositories
-    // behind that receipt would break the source identity guarantee.
-    if clean_overlay.is_none() {
+    // Both isolated modes already name their complete staged source roots.
+    // Converging canonical worker checkouts would mutate paths outside this
+    // job's source grant and cannot prepare any of its selected destinations.
+    if clean_overlay.is_none() && !source_content_receipt {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
             &sync_roots,
@@ -1256,6 +1456,9 @@ async fn execute_remote_compilation_inner(
             source_identity,
         )
         .await?;
+    } else {
+        reporter
+            .verbose("[RCH] isolated sources selected; canonical repository convergence skipped");
     }
 
     let mut primary_pipeline: Option<TransferPipeline> = None;
@@ -1320,6 +1523,12 @@ async fn execute_remote_compilation_inner(
         if let Some(identity) = source_identity {
             root_pipeline = root_pipeline.with_source_authority(identity.to_owned())?;
         }
+        if owned_source_content_pair {
+            // Acquiring the pair proved that the entire container was absent.
+            // A new source tree never needs a deleting sync or a cache sweep.
+            // No-delta verification still detects surplus selected entries.
+            root_pipeline = root_pipeline.with_owned_source_materialization();
+        }
         if let Some(spec) = root_overlay {
             root_pipeline = root_pipeline
                 .with_sync_include_patterns(clean_overlay_include_patterns(
@@ -1339,12 +1548,15 @@ async fn execute_remote_compilation_inner(
             root_pipeline =
                 root_pipeline.with_sync_include_patterns(workspace_metadata_sync_patterns());
             root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
-            if !layer0_env.is_empty() {
-                root_pipeline = root_pipeline.with_layer0_env(layer0_env.to_vec());
-            }
         }
         if entry.is_primary {
             root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
+            // The primary root's pipeline runs the command, so the Layer 0
+            // pack belongs here. Until bd-hoxgn it rode only on
+            // workspace-metadata roots, which never execute anything.
+            if !layer0_env.is_empty() {
+                root_pipeline = root_pipeline.with_layer0_env(layer0_env.to_vec());
+            }
             if let Some(overrides) = cargo_env_overrides.as_ref() {
                 root_pipeline = root_pipeline.with_env_overrides(overrides.clone());
             }
@@ -1607,17 +1819,51 @@ async fn execute_remote_compilation_inner(
             normalized_project_root.display()
         )
     })?;
-    let managed_target = clean_overlay
-        .filter(|_| clean_overlay_cargo)
-        .map(|_| pipeline.remote_cargo_target_dir());
-    let command_plan =
-        super::cargo_target_dir::ManagedCargoCommand::new(command, managed_target.as_deref())?;
+    let owned_command = if owned_source_content_pair {
+        Some(validate_owned_source_content_closure(
+            &prepared_source_roots,
+            overlay_remote_root
+                .as_deref()
+                .context("missing owned source container")?,
+            &normalized_project_root,
+            explicit_manifest_root.as_deref(),
+            command,
+            topology_policy,
+        )?)
+    } else {
+        None
+    };
+    let owned_freshness_identity = owned_source_content_pair
+        .then(|| owned_source_content_freshness_identity(&prepared_source_roots))
+        .transpose()?;
+    let managed_target = (clean_overlay_cargo || owned_source_content_pair)
+        .then(|| pipeline.remote_cargo_target_dir());
+    let command_plan = super::cargo_target_dir::ManagedCargoCommand::new(
+        owned_command.as_deref().unwrap_or(command),
+        managed_target.as_deref(),
+    )?;
     // Capture output semantics BEFORE build-dir binding and source stamping.
     // Both inject quoted Cargo configuration, which is deliberately outside
     // the classifier's publication grammar. They must not widen archive-only
     // delivery or disable its zero-archive gate (#86, bd-3kskq).
-    let policy_command = command_plan.policy_command();
-    let command = command_plan.execution_command();
+    let policy_command = if owned_source_content_pair {
+        caller_command
+    } else {
+        command_plan.policy_command()
+    };
+    let owned_target_command = if owned_source_content_pair {
+        Some(super::cargo_target_dir::bind_owned_cargo_target_dir(
+            command_plan.execution_command(),
+            managed_target
+                .as_deref()
+                .context("owned Cargo has no granted target")?,
+        )?)
+    } else {
+        None
+    };
+    let command = owned_target_command
+        .as_deref()
+        .unwrap_or_else(|| command_plan.execution_command());
     let mut recovery_session =
         if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
             durable_lease
@@ -1637,6 +1883,7 @@ async fn execute_remote_compilation_inner(
                                 )
                             }),
                         overlay_remote_root.clone(),
+                        retained_source_root.clone(),
                         transfer_config.clone(),
                         normalized_project_root.clone(),
                         forwarded_cargo_target_dir.as_deref(),
@@ -1650,6 +1897,12 @@ async fn execute_remote_compilation_inner(
         } else {
             None
         };
+    if reporter.cargo_json_stdout {
+        recovery_session
+            .as_mut()
+            .context("caller Cargo JSON has no admitted recovery session")?
+            .request_caller_json(Path::new(&pipeline.remote_path()))?;
+    }
     let pipeline = match recovery_session.as_ref() {
         Some(session) => session.completion_pipeline(pipeline),
         None => pipeline,
@@ -1660,6 +1913,14 @@ async fn execute_remote_compilation_inner(
     let cargo_output_capture = recovery_session
         .as_ref()
         .and_then(|_| CargoOutputCapture::for_command(kind, policy_command));
+    if reporter.cargo_json_stdout {
+        anyhow::ensure!(
+            cargo_output_capture
+                .as_ref()
+                .is_some_and(CargoOutputCapture::caller_json_supported),
+            "caller Cargo JSON lost its admitted named-output capture"
+        );
+    }
     let captured_command = cargo_output_capture
         .as_ref()
         .map(|capture| capture.execution_command(command));
@@ -1674,7 +1935,8 @@ async fn execute_remote_compilation_inner(
     // a concurrent build on the same project. The heavy removal is detached on the
     // worker (a backgrounded rm); only a quick SSH dispatch is awaited here.
     // Best-effort; gated to the forwarded-CARGO_TARGET_DIR mode that makes per-job dirs.
-    if clean_overlay.is_none() && forwarded_cargo_target_dir.is_some() {
+    if clean_overlay.is_none() && !owned_source_content_pair && forwarded_cargo_target_dir.is_some()
+    {
         // Cheap, current-project-only reap: only this build's own repo dir is
         // swept for abandoned sibling per-job dirs. The durable cross-project
         // GC (every repo under the worker's sync-root) now runs OFF this
@@ -1735,8 +1997,55 @@ async fn execute_remote_compilation_inner(
         // Admission check immediately before Cargo opens the isolated source
         // tree. The same roots are verified again after Cargo exits, and only
         // then is the single receipt emitted.
-        verify_source_content_roots(&worker_config, &prepared_source_roots, source_identity)
+        if owned_source_content_pair {
+            source_authority_lock
+                .as_mut()
+                .context("owned source freshness requires its full source grant")?
+                .ensure_held()?;
+            source_pair_lock
+                .as_mut()
+                .context("owned source freshness requires its source/target pair")?
+                .ensure_held()?;
+            verify_owned_source_content_roots(
+                &worker_config,
+                &prepared_source_roots,
+                source_identity,
+                false,
+            )
             .await?;
+            let source_container = overlay_remote_root
+                .as_deref()
+                .context("owned source freshness has no source container")?;
+            let control = source_freshness_control
+                .as_deref()
+                .context("owned source freshness has no granted metadata directory")?;
+            // One ledger covers the whole materialized closure. Refreshing
+            // metadata ancestors and their descendants separately can assign
+            // conflicting timestamps to the same source file.
+            pipeline
+                .clone()
+                .with_remote_path_override(source_container.to_owned())
+                .refresh_owned_source_closure(
+                    &worker_config,
+                    owned_freshness_identity
+                        .as_deref()
+                        .context("owned source freshness has no captured identity")?,
+                    source_container,
+                    control,
+                    &recovery_identity,
+                )
+                .await?;
+            verify_owned_source_content_roots(
+                &worker_config,
+                &prepared_source_roots,
+                source_identity,
+                true,
+            )
+            .await?;
+        } else {
+            verify_source_content_roots(&worker_config, &prepared_source_roots, source_identity)
+                .await?;
+        }
     }
     if let Some(lock) = source_authority_lock.as_mut() {
         lock.ensure_held()?;
@@ -1822,9 +2131,16 @@ async fn execute_remote_compilation_inner(
     }));
 
     // Add per-worker CARGO_HOME isolation to prevent cache lock contention
-    let guarded_command = clean_overlay_cargo
-        .then(|| super::cargo_target_dir::guard_clean_overlay_cargo_config(command))
-        .transpose()?;
+    let guarded_command = if owned_source_content_pair {
+        Some(guard_owned_source_content_cargo_config(
+            command,
+            &prepared_source_roots,
+        )?)
+    } else {
+        clean_overlay_cargo
+            .then(|| super::cargo_target_dir::guard_clean_overlay_cargo_config(command))
+            .transpose()?
+    };
     let guarded_command = guarded_command.as_deref().unwrap_or(command);
     let alias_bound_command = build_source_aliases
         .as_ref()
@@ -1852,6 +2168,7 @@ async fn execute_remote_compilation_inner(
         .as_ref()
         .map(BuildHeartbeatLoop::shared_state);
     let mut suppress_telemetry = false;
+    let defer_cargo_stdout = reporter.cargo_json_stdout;
 
     if let Some(session) = recovery_session.as_mut() {
         session.starting_execution()?;
@@ -1871,6 +2188,12 @@ async fn execute_remote_compilation_inner(
             }
             if let Some(state) = heartbeat_state_stdout.as_ref() {
                 mark_heartbeat_progress(state);
+            }
+            // Do not publish worker paths or a successful terminal record
+            // before delivery. The complete supervisor log supplies stdout
+            // later; the streamer's bounded preview is not artifact authority.
+            if defer_cargo_stdout {
+                return;
             }
             if cargo_output_capture
                 .as_ref()
@@ -2004,15 +2327,50 @@ async fn execute_remote_compilation_inner(
     ));
 
     if let Some(proof_build_id) = source_content_build_id {
-        let receipt = finalize_source_content_receipt(
-            &worker_config,
-            proof_build_id,
-            command,
-            result.exit_code,
-            &prepared_source_roots,
-            source_identity,
-        )
-        .await?;
+        let receipt = if owned_source_content_pair {
+            finalize_owned_source_content_receipt(
+                &worker_config,
+                proof_build_id,
+                caller_command,
+                result.exit_code,
+                &prepared_source_roots,
+                source_identity,
+            )
+            .await?
+        } else {
+            finalize_source_content_receipt(
+                &worker_config,
+                proof_build_id,
+                command,
+                result.exit_code,
+                &prepared_source_roots,
+                source_identity,
+            )
+            .await?
+        };
+        if owned_source_content_pair {
+            let source_container = overlay_remote_root
+                .as_deref()
+                .context("owned source verification has no source container")?;
+            // A pre-execution ledger alone cannot qualify a warm cache. If
+            // execution or its post-proof is interrupted, the next owner must
+            // advance all source timestamps beyond any incomplete artifacts.
+            pipeline
+                .clone()
+                .with_remote_path_override(source_container.to_owned())
+                .mark_owned_source_closure_verified(
+                    &worker_config,
+                    owned_freshness_identity
+                        .as_deref()
+                        .context("owned source verification has no captured identity")?,
+                    source_container,
+                    source_freshness_control
+                        .as_deref()
+                        .context("owned source verification has no granted metadata directory")?,
+                    &recovery_identity,
+                )
+                .await?;
+        }
         reporter.summary_critical(&format!(
             "[RCH] source content receipt: {}",
             receipt.canonical_json()?
@@ -2051,16 +2409,28 @@ async fn execute_remote_compilation_inner(
     let mut artifacts_result: Option<SyncResult> = None;
     let mut artifacts_failed = false;
     let mut cargo_evidence_terminal = false;
+    if reporter.cargo_json_stdout {
+        recovery_session
+            .as_mut()
+            .context("caller Cargo diagnostics have no admitted recovery session")?
+            .collect_cargo_stderr(&pipeline, &worker_config)
+            .await?;
+    }
     if result.success()
         && let Some(session) = recovery_session.as_mut()
         && let Some(remote_root) = session.cargo_artifact_remote_root().map(str::to_owned)
     {
-        let evidence = pipeline
-            .read_cargo_artifact_evidence(&worker_config, &remote_root)
-            .await;
-        let installed = evidence.and_then(|evidence| {
-            session.install_cargo_artifact_evidence(&evidence.stdout, &evidence.remote_root)
-        });
+        let evidence = if reporter.cargo_json_stdout {
+            pipeline
+                .read_cargo_stdout_evidence(&worker_config, &remote_root, 0)
+                .await
+        } else {
+            pipeline
+                .read_cargo_artifact_evidence(&worker_config, &remote_root)
+                .await
+        };
+        let installed =
+            evidence.and_then(|evidence| session.install_complete_cargo_evidence(&evidence));
         if let Err(error) = installed {
             // A completed rejection cannot improve on retry. Lost transport
             // and local journal failures retain the exact attempt for recovery.
@@ -2081,6 +2451,23 @@ async fn execute_remote_compilation_inner(
             }
         }
     }
+    if reporter.cargo_json_stdout && !result.success() {
+        let evidence = pipeline
+            .read_cargo_stdout_evidence(&worker_config, &pipeline.remote_path(), result.exit_code)
+            .await?;
+        recovery_session
+            .as_mut()
+            .context("failed Cargo stdout has no admitted recovery session")?
+            .retain_cargo_stdout(
+                &evidence.stdout,
+                &evidence.remote_root,
+                evidence
+                    .remote_project_root
+                    .as_deref()
+                    .context("caller Cargo JSON has no verified source root")?,
+                result.exit_code,
+            )?;
+    }
     // Per-file evidence from the phase that carries the build's `target/`
     // outputs, for the zero-build-output loud-failure gate (bd-mpbav): the
     // matched-file manifest and the rsync-reported matched regular-file count.
@@ -2094,6 +2481,14 @@ async fn execute_remote_compilation_inner(
     // Local directory the retrieval manifest's paths are relative to, so the
     // #65 executable-typing gate can open the files that were actually placed.
     let mut retrieval_local_base: Option<PathBuf> = None;
+    let pinned_triple = explicit_target_triple_for_command(command);
+    let expected_triple = pinned_triple
+        .clone()
+        .unwrap_or_else(default_host_target_triple);
+    let artifact_kind = artifact_delivery_kind(kind, Some(policy_command));
+    let platform_preflight =
+        kind_has_enumerable_output_contract(artifact_kind) && !foreign_artifact_gate_disabled();
+    let mut platform_rejected = false;
     // Step 3: Retrieve artifacts
     if result.success() && !artifacts_failed {
         if let Some(loop_ref) = heartbeat_loop.as_ref() {
@@ -2151,6 +2546,21 @@ async fn execute_remote_compilation_inner(
                 &retrieval_pipeline,
                 durable_lease,
                 async |retrieval_pipeline| {
+                    if platform_preflight
+                        && let Some(rejection) = preflight_artifact_platform(
+                            retrieval_pipeline,
+                            &worker_config,
+                            &artifact_patterns,
+                            false,
+                            &expected_triple,
+                            pinned_triple.as_deref(),
+                        )
+                        .await?
+                    {
+                        platform_rejected = true;
+                        eprintln!("[RCH] {rejection}");
+                        anyhow::bail!(rejection);
+                    }
                     if let Some(progress) = &mut download_progress {
                         retrieval_pipeline
                             .retrieve_artifacts_streaming(
@@ -2318,6 +2728,21 @@ async fn execute_remote_compilation_inner(
                     &target_pipeline,
                     durable_lease,
                     async |target_pipeline| {
+                        if platform_preflight
+                            && let Some(rejection) = preflight_artifact_platform(
+                                target_pipeline,
+                                &worker_config,
+                                &custom_patterns,
+                                true,
+                                &expected_triple,
+                                pinned_triple.as_deref(),
+                            )
+                            .await?
+                        {
+                            platform_rejected = true;
+                            eprintln!("[RCH] {rejection}");
+                            anyhow::bail!(rejection);
+                        }
                         if let Some(progress) = &mut target_progress {
                             let heartbeat_state_target = heartbeat_loop
                                 .as_ref()
@@ -2568,14 +2993,9 @@ async fn execute_remote_compilation_inner(
     // retrieved outputs against the triple the caller's build was actually for.
     // Evidence-only: an unrecognized triple, an unreadable file, or unknown
     // magic yields no findings and never fails a build.
-    let pinned_triple = explicit_target_triple_for_command(command);
-    let expected_triple = pinned_triple
-        .clone()
-        .unwrap_or_else(default_host_target_triple);
     // Build-only test/bench outputs belong to the caller. They require the
     // same transfer-failure, metadata-only and foreign-target checks as builds;
     // the execution kind remains unchanged for telemetry and remote execution.
-    let artifact_kind = artifact_delivery_kind(kind, Some(policy_command));
     // Only the kinds whose contract is "materialize the caller's runnable
     // outputs under the cargo target tree" are typed. Test/bench/coverage kinds
     // retrieve reports and instrumented trees whose binaries are the WORKER's
@@ -2634,6 +3054,10 @@ async fn execute_remote_compilation_inner(
          returning exit {} so the caller knows declared outputs are missing",
             worker_config.id, result.exit_code, EXIT_ARTIFACT_TRANSFER_FAILED
         );
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if result.success() && platform_rejected {
+        // The preflight already reported E327 and preserved the remote output
+        // and durable lease. Do not replace it with a connectivity diagnosis.
         EXIT_ARTIFACT_TRANSFER_FAILED
     } else if result.success()
         && artifacts_failed
@@ -2755,24 +3179,53 @@ async fn execute_remote_compilation_inner(
     if retrieval_complete && let Some(session) = recovery_session.as_mut() {
         session.returned(exit_code)?;
     }
+    let cargo_stdout = if reporter.cargo_json_stdout {
+        let session = recovery_session
+            .as_mut()
+            .context("caller Cargo JSON has no recovery session")?;
+        if exit_code == 0 {
+            Some(session.caller_cargo_json().await?)
+        } else if !result.success() {
+            Some(session.failed_cargo_stdout()?)
+        } else {
+            // The compiler succeeded but delivery failed. Its original
+            // success record stays retained, never advertised as local output.
+            None
+        }
+    } else {
+        None
+    };
 
-    // Retire the materialized clean-overlay source after delivery. The durable
-    // grant remains outstanding on failure so recovery can finish retirement
-    // before a subsequent owner is allowed to write the same source pair.
+    // Retire the materialized source after delivery. Owned source-content
+    // pairs move to their exact retained sibling. The durable grant remains
+    // outstanding on failure so recovery must finish the same retirement
+    // before a subsequent owner can write this source/target pair.
     if retrieval_complete && let Some(overlay_remote_root) = overlay_remote_root.as_deref() {
+        if let Some(lock) = source_authority_lock.as_mut() {
+            lock.ensure_held()?;
+        }
         if let Some(lock) = source_pair_lock.as_mut() {
             lock.ensure_held()?;
         }
-        match pipeline
-            .reap_remote_tree(&worker_config, overlay_remote_root)
-            .await
-        {
+        let retirement = if let Some(session) = recovery_session.as_mut() {
+            session.retire_source_tree(&pipeline).await
+        } else {
+            anyhow::ensure!(
+                retained_source_root.is_none(),
+                "owned source retention requires its persisted recovery session"
+            );
+            pipeline
+                .reap_remote_tree(&worker_config, overlay_remote_root)
+                .await
+        };
+        match retirement {
             Ok(()) => {
-                reporter.verbose(&format!(
-                    "[RCH] clean-overlay remote root {overlay_remote_root} reaped"
-                ));
-                if let Some(session) = recovery_session.as_mut() {
-                    session.tree_retired()?;
+                if let Some(retained) = retained_source_root.as_deref() {
+                    reporter.verbose(&format!("[RCH] source tree retained at {retained}"));
+                } else {
+                    reporter.verbose(&format!(
+                        "[RCH] clean-overlay remote root {overlay_remote_root} reaped"
+                    ));
                 }
             }
             Err(error) => {
@@ -2835,6 +3288,7 @@ async fn execute_remote_compilation_inner(
         timing,
         result_dirs: exec_dir_stats,
         disk_roots,
+        cargo_stdout,
     })
 }
 
@@ -2844,6 +3298,251 @@ mod tests {
     use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
     use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn platform_preflight_uses_real_selection_before_copying() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Substitute only SSH, in an isolated process: real rsync filters,
+        // header scripts and the production platform decision still execute.
+        if std::env::var_os("RCH110_PREFLIGHT_CHILD").is_none() {
+            let root = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let ssh = root.path().join("ssh");
+            std::fs::write(&ssh, concat!(
+                "#!/bin/sh\n",
+                "while [ $# -gt 0 ]; do\n",
+                "  case \"$1\" in fixture.invalid|worker@fixture.invalid) shift; exec sh -c \"$*\";; esac\n",
+                "  shift\n",
+                "done\nexit 99\n",
+            )).unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("platform_preflight_uses_real_selection_before_copying")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env("RCH110_PREFLIGHT_CHILD", "1")
+                .env("RCH_MOCK_SSH", "0")
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        root.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(45), child.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let source = root.path().join("worker");
+        let local = root.path().join("local");
+        std::fs::create_dir_all(source.join("target/debug/deps")).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("sentinel"), b"owned local output").unwrap();
+        for n in 0..1040 {
+            let mut file =
+                std::fs::File::create(source.join(format!("target/debug/deps/test-{n}"))).unwrap();
+            std::io::Write::write_all(&mut file, b"\x7fELF").unwrap();
+            file.set_len(52_000_000).unwrap();
+        }
+        let triple = "x86_64-unknown-linux-gnu";
+        let cross = source.join(format!("target/{triple}/debug/deps/test-cross"));
+        std::fs::create_dir_all(cross.parent().unwrap()).unwrap();
+        std::fs::write(cross, b"\x7fELF").unwrap();
+        let worker = WorkerConfig {
+            id: WorkerId::new("platform-preflight"),
+            host: "fixture.invalid".into(),
+            user: "worker".into(),
+            identity_file: "/unused/test-key".into(),
+            total_slots: 1,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        for custom in [false, true] {
+            let remote = if custom {
+                source.join("target")
+            } else {
+                source.clone()
+            };
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "platform".into(),
+                "platform".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap());
+            let kind = Some(CompilationKind::CargoTest);
+            let patterns = if custom {
+                get_custom_target_artifact_patterns(kind, Some("cargo test --no-run"))
+            } else {
+                get_project_artifact_patterns(kind, Some("cargo test --no-run"), false)
+            };
+            // Retry the same owned output root, as detached recovery does.
+            for _ in 0..2 {
+                let rejection = preflight_artifact_platform(
+                    &pipeline,
+                    &worker,
+                    &patterns,
+                    custom,
+                    "aarch64-apple-darwin",
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("foreign test suite must be rejected");
+                assert!(rejection.contains("RCH-E327"));
+                assert!(rejection.contains("before downloading"));
+            }
+            assert!(
+                preflight_artifact_platform(&pipeline, &worker, &patterns, custom, triple, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                preflight_artifact_platform(
+                    &pipeline,
+                    &worker,
+                    &patterns,
+                    custom,
+                    triple,
+                    Some(triple)
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read(local.join("sentinel")).unwrap(),
+                b"owned local output"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_source_content_cargo_family_preserves_external_driver_receipts() {
+        use rch_common::patterns::{CompilationKind, classify_command};
+
+        let _guard = rch_common::test_guard!();
+        for (command, expected_kind, supported) in [
+            ("cargo build", Some(CompilationKind::CargoBuild), true),
+            ("cargo b", Some(CompilationKind::CargoBuild), true),
+            ("cargo test", Some(CompilationKind::CargoTest), true),
+            ("cargo t", Some(CompilationKind::CargoTest), true),
+            ("cargo check", Some(CompilationKind::CargoCheck), true),
+            ("cargo c", Some(CompilationKind::CargoCheck), true),
+            ("cargo clippy", Some(CompilationKind::CargoClippy), true),
+            ("cargo doc", Some(CompilationKind::CargoDoc), true),
+            ("cargo bench", Some(CompilationKind::CargoBench), true),
+            ("cargo run", Some(CompilationKind::CargoBuild), true),
+            ("cargo package", Some(CompilationKind::CargoBuild), true),
+            (
+                "cargo publish --dry-run",
+                Some(CompilationKind::CargoBuild),
+                true,
+            ),
+            (
+                "env NOTE=xwin cargo +nightly build",
+                Some(CompilationKind::CargoBuild),
+                true,
+            ),
+            (
+                "cargo --config=xwin build",
+                Some(CompilationKind::CargoBuild),
+                true,
+            ),
+            (
+                "cargo --config xwin check",
+                Some(CompilationKind::CargoCheck),
+                true,
+            ),
+            (
+                "cargo nextest run",
+                Some(CompilationKind::CargoNextest),
+                false,
+            ),
+            ("cargo-nextest nextest run", None, false),
+            (
+                "cargo zigbuild",
+                Some(CompilationKind::CargoZigbuild),
+                false,
+            ),
+            (
+                "cargo-zigbuild zigbuild",
+                Some(CompilationKind::CargoZigbuild),
+                false,
+            ),
+            ("cargo xwin build", Some(CompilationKind::CargoBuild), false),
+            ("cargo xwin check", Some(CompilationKind::CargoCheck), false),
+            (
+                "cargo xwin clippy",
+                Some(CompilationKind::CargoClippy),
+                false,
+            ),
+            ("cargo-xwin build", Some(CompilationKind::CargoBuild), false),
+            (
+                "cargo-xwin xwin check",
+                Some(CompilationKind::CargoCheck),
+                false,
+            ),
+            (
+                "cargo-xwin clippy",
+                Some(CompilationKind::CargoClippy),
+                false,
+            ),
+            (
+                "cargo xwin check '--target=x86_64-pc-windows-msvc'",
+                Some(CompilationKind::CargoCheck),
+                false,
+            ),
+        ] {
+            let classification = classify_command(command);
+            assert_eq!(classification.kind, expected_kind, "{command}");
+            assert_eq!(
+                super::supports_owned_source_content_cargo(classification.kind, command),
+                supported,
+                "{command}"
+            );
+        }
+
+        // Family selection must not turn a managed-directory refusal into a
+        // fallback to the legacy receipt route.
+        for command in [
+            "cargo build --build-dir=/unmanaged",
+            "cargo --unknown-global build",
+        ] {
+            let classification = classify_command(command);
+            assert_eq!(classification.kind, Some(CompilationKind::CargoBuild));
+            assert!(super::supports_owned_source_content_cargo(
+                classification.kind,
+                command
+            ));
+            assert!(
+                super::super::cargo_target_dir::managed_clean_overlay_cargo_build_dir(
+                    command,
+                    "/rch-managed-build-dir-validation",
+                )
+                .is_err(),
+                "{command}"
+            );
+        }
+    }
 
     /// A finished build must not be stranded by one transient SSH failure on
     /// its receipt read; a persistent failure still surfaces after 3 tries,

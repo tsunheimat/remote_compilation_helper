@@ -288,22 +288,36 @@ fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
 fn remote_release_faults<'a>(
     result: &'a anyhow::Result<remote_result::RemoteExecutionResult>,
     worker_id: &WorkerId,
-) -> (bool, bool, &'a [String]) {
+) -> daemon_ipc::ReleaseFaults<'a> {
     match result {
-        Ok(result) => (
-            remote_failure_is_worker_fault(&result.stderr, result.exit_code),
-            remote_failure_is_disk_full(&result.stderr, result.exit_code),
-            &result.disk_roots,
-        ),
+        Ok(result) => daemon_ipc::ReleaseFaults {
+            worker_fault: remote_failure_is_worker_fault(&result.stderr, result.exit_code),
+            worker_disk_full: remote_failure_is_disk_full(&result.stderr, result.exit_code),
+            worker_disk_roots: &result.disk_roots,
+            live_checkout_refused: false,
+            source_busy: false,
+        },
         Err(error) if !is_remote_execution_unconfirmed(error) => {
+            let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
+            let source_busy = crate::transfer::source_authority_busy(error);
             match crate::transfer::find_remote_upload_disk_full(error)
                 .filter(|fault| fault.worker_id == worker_id.as_str())
             {
-                Some(fault) => (true, true, &fault.roots),
-                None => (false, false, &[]),
+                Some(fault) => daemon_ipc::ReleaseFaults {
+                    worker_fault: true,
+                    worker_disk_full: true,
+                    worker_disk_roots: &fault.roots,
+                    live_checkout_refused,
+                    source_busy,
+                },
+                None => daemon_ipc::ReleaseFaults {
+                    live_checkout_refused,
+                    source_busy,
+                    ..Default::default()
+                },
             }
         }
-        Err(_) => (false, false, &[]),
+        Err(_) => daemon_ipc::ReleaseFaults::default(),
     }
 }
 
@@ -712,6 +726,47 @@ fn rustup_toolchain_from_command_tokens(tokens: &[String]) -> Option<String> {
     None
 }
 
+/// rchd's select-worker refusal while a restart holds admission closed.
+fn is_restart_barrier_refusal(response: &SelectionResponse) -> bool {
+    response.worker.is_none()
+        && matches!(
+            &response.reason,
+            SelectionReason::SelectionError(reason) if reason == "restart_admission_barrier_active"
+        )
+}
+
+/// Wait (bounded) while a daemon restart holds admission closed, keeping the
+/// durable lease's heartbeat fresh and telling the caller once why it waits.
+async fn await_restart_admission(
+    socket_path: &str,
+    durable_lease: &DurableLeaseWriter,
+    reporter: &HookReporter,
+) -> RestartAdmissionWait {
+    let mut polls: u32 = 0;
+    let outcome = wait_for_restart_admission(
+        async || restart_admission_is_closed(socket_path).await,
+        restart_admission_wait_bound(),
+        std::time::Duration::from_secs(1),
+        || {
+            if polls == 0 {
+                reporter.summary("[RCH] waiting: daemon restart in progress (admission paused)");
+            }
+            if polls.is_multiple_of(10) {
+                let _ = durable_lease.heartbeat("restart_admission_wait");
+            }
+            polls = polls.saturating_add(1);
+        },
+    )
+    .await;
+    // Hand the lease back to admission. The selection query that follows can
+    // sit in the daemon queue for a long time without heartbeating, and a
+    // frozen "restart_admission_wait" would misdescribe a queued wrapper.
+    if outcome == RestartAdmissionWait::Open && polls > 0 {
+        let _ = durable_lease.heartbeat("admission");
+    }
+    outcome
+}
+
 fn exec_requires_remote() -> bool {
     std::env::var(RCH_REQUIRE_REMOTE_ENV).is_ok_and(|value| env_flag_enabled(&value))
 }
@@ -879,6 +934,16 @@ fn selected_worker_is_requested(worker: &WorkerId, requested_workers: &[WorkerId
     requested_workers.is_empty() || requested_workers.contains(worker)
 }
 
+fn exec_worker_preferences(
+    exact_worker: Option<WorkerId>,
+    inherited_preferences: impl FnOnce() -> Vec<WorkerId>,
+) -> Vec<WorkerId> {
+    match exact_worker {
+        Some(worker) => vec![worker],
+        None => inherited_preferences(),
+    }
+}
+
 fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
@@ -948,6 +1013,120 @@ fn exit_with_local_fallback_recording(
     require_remote: bool,
     error: Option<&str>,
 ) -> ! {
+    exit_with_local_run(command, reporter, reason, require_remote, error, None)
+}
+
+/// The Layer 0 pack's env pairs for one remote run (bd-bqu38). A verification
+/// lane (`--clean-overlay`, `--source-content-receipt`) builds exactly what the
+/// project declares, so it never receives the pack (bd-hoxgn).
+///
+/// A pack value never overrides a profile setting the project declares itself:
+/// Cargo env beats the manifest, so `debug_line_tables_only` would otherwise
+/// raise a deliberate `debug = 0` and erase a deliberate full `debug`.
+fn layer0_env_for_lane(
+    layer0: &rch_common::types::Layer0Config,
+    verification_lane: bool,
+    invocation_dir: Option<&Path>,
+) -> Vec<(String, String)> {
+    if verification_lane {
+        return Vec::new();
+    }
+    let pairs = layer0.active_env();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let declared = invocation_dir
+        .map(declared_cargo_profile_settings)
+        .unwrap_or_default();
+    pairs
+        .into_iter()
+        .filter(|(key, _)| {
+            let Some((profile, setting)) = cargo_profile_env_setting(key) else {
+                return true;
+            };
+            // `test` inherits `dev`, so a declared dev value also covers test.
+            !(declared.contains(&(profile.clone(), setting.clone()))
+                || (profile == "test" && declared.contains(&("dev".to_owned(), setting))))
+        })
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// `CARGO_PROFILE_RELEASE_CODEGEN_UNITS` -> ("release", "codegen-units").
+fn cargo_profile_env_setting(key: &str) -> Option<(String, String)> {
+    let rest = key.strip_prefix("CARGO_PROFILE_")?;
+    let (profile, setting) = rest.split_once('_')?;
+    Some((
+        profile.to_ascii_lowercase(),
+        setting.to_ascii_lowercase().replace('_', "-"),
+    ))
+}
+
+/// The `(profile, setting)` pairs the project sets for itself: `[profile.*]`
+/// in the workspace root manifest (Cargo ignores profiles elsewhere) and in
+/// any `.cargo/config.toml` (or legacy `.cargo/config`) from the invocation
+/// directory up to that root. That is the part of the tree the worker gets.
+fn declared_cargo_profile_settings(
+    invocation_dir: &Path,
+) -> std::collections::HashSet<(String, String)> {
+    fn collect(
+        table: Option<&toml::Value>,
+        into: &mut std::collections::HashSet<(String, String)>,
+    ) {
+        let Some(profiles) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|p| p.as_table())
+        else {
+            return;
+        };
+        for (profile, settings) in profiles {
+            if let Some(settings) = settings.as_table() {
+                for setting in settings.keys() {
+                    into.insert((profile.clone(), setting.clone()));
+                }
+            }
+        }
+    }
+    let read = |path: &Path| -> Option<toml::Value> {
+        toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let mut declared = std::collections::HashSet::new();
+    let mut nearest_manifest = None;
+    for dir in invocation_dir.ancestors().take(16) {
+        for name in ["config.toml", "config"] {
+            collect(read(&dir.join(".cargo").join(name)).as_ref(), &mut declared);
+        }
+        let manifest = dir.join("Cargo.toml");
+        let Some(parsed) = read(&manifest) else {
+            continue;
+        };
+        if parsed.get("workspace").is_some() {
+            collect(Some(&parsed), &mut declared);
+            return declared;
+        }
+        nearest_manifest.get_or_insert(parsed);
+    }
+    // No workspace above: the nearest package manifest is the root.
+    collect(nearest_manifest.as_ref(), &mut declared);
+    declared
+}
+
+/// Where a local run's duration is recorded (bd-2spi4 speed gate).
+struct LocalRunTiming<'a> {
+    project: &'a str,
+    kind: Option<CompilationKind>,
+}
+
+/// Run `command` locally and exit with its status. With `timing`, a successful
+/// run's duration is recorded as a local sample and reported in the envelope.
+fn exit_with_local_run(
+    command: &str,
+    reporter: &HookReporter,
+    reason: &str,
+    require_remote: bool,
+    error: Option<&str>,
+    timing: Option<LocalRunTiming<'_>>,
+) -> ! {
     // bd-uoh4x: exactly ONE envelope per invocation, emitted at the
     // TERMINAL path only. A pre-run emit here would double-emit on the
     // completed path (once before the child runs, again below with the
@@ -991,6 +1170,7 @@ fn exit_with_local_fallback_recording(
                 timing: None,
                 result_dirs: None,
                 error_code: None,
+                admission: None,
             });
             if remote_required_refusal_is_retryable(reason) {
                 std::process::exit(EXIT_REMOTE_REQUIRED_REFUSED);
@@ -999,8 +1179,18 @@ fn exit_with_local_fallback_recording(
         }
     };
 
-    match child.status() {
+    let started = std::time::Instant::now();
+    let status = child.status();
+    let duration_ms = timing
+        .as_ref()
+        .map(|_| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    match status {
         Ok(status) => {
+            if let (Some(timing), Some(duration_ms)) = (&timing, duration_ms)
+                && status.success()
+            {
+                record_build_timing(timing.project, timing.kind, duration_ms, false);
+            }
             // A signal death reports 128+N like a shell, not a generic 1 that
             // would hide an OOM kill or interrupt from the caller.
             let code = {
@@ -1018,10 +1208,11 @@ fn exit_with_local_fallback_recording(
                 fallback_reason: Some(reason),
                 worker_id: None,
                 remote_exit_code: Some(code),
-                duration_ms: None,
+                duration_ms,
                 timing: None,
                 result_dirs: None,
                 error_code: None,
+                admission: None,
             });
             std::process::exit(code)
         }
@@ -1039,6 +1230,7 @@ fn exit_with_local_fallback_recording(
                 timing: None,
                 result_dirs: None,
                 error_code: None,
+                admission: None,
             });
             std::process::exit(EXIT_BUILD_ERROR);
         }
@@ -1075,7 +1267,7 @@ fn max_remote_attempts() -> u32 {
 /// violation (the same class the #61 fix closed), so job admission counts as
 /// strict-remote once every remote option is exhausted. The refusal exits
 /// with the retryable [`EXIT_REMOTE_REQUIRED_REFUSED`] code and a `refused`
-/// envelope, so wrappers can back off and retry rather than misreading a
+/// envelope, so wrappers can back off and retry instead of misreading a
 /// local build's exit status as the remote result.
 fn strict_remote_for_exhausted_admission(require_remote: bool, job_admission: bool) -> bool {
     require_remote || job_admission
@@ -1111,6 +1303,24 @@ fn exit_with_gated_local_fallback(
         reporter.summary_critical(&format!(
             "[RCH] refusing local fallback (compilation.allow_local_fallback=false; {reason})"
         ));
+        record_hook_incident(
+            &build_local_fallback_incident(command, reason, true, now_unix_ms(), error)
+                .with_detail("policy", "compilation.allow_local_fallback=false"),
+        );
+        emit_exec_envelope(&ExecResultEnvelope {
+            api_version: "1.0",
+            command,
+            outcome: "refused",
+            location: "local",
+            fallback_reason: Some(reason),
+            worker_id: None,
+            remote_exit_code: None,
+            duration_ms: None,
+            timing: None,
+            result_dirs: None,
+            error_code: None,
+            admission: None,
+        });
         std::process::exit(EXIT_BUILD_ERROR);
     }
     reporter.summary(&format!("[RCH] local ({reason})"));
@@ -1427,11 +1637,48 @@ fn now_unix_ms() -> u64 {
 pub(crate) struct DurableLeaseWriter {
     path: PathBuf,
     lease: Arc<Mutex<DurableJobLease>>,
+    #[cfg(unix)]
+    recovery_ownership:
+        Option<Arc<transfer_orchestration::recovery::recovery_owner::RecoveryOwnership>>,
 }
 
 struct RetrySelectionIntent {
     previous: DurableJobLease,
     pending: DurableJobLease,
+}
+
+#[cfg(unix)]
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "cannot acquire exclusive job recovery: journal is held by another handle; retry the same wrapper"
+)]
+pub(crate) struct JobJournalBusy;
+
+/// Tests only: retry an operation that re-acquires a job-journal gate the test
+/// has just released. While the gate was held, another test in this process
+/// may have spawned a child, which shares every descriptor until it execs
+/// (CLOEXEC only closes them at exec), so the flock'd gate can still look busy
+/// for a moment. Production never re-acquires a gate it released in the same
+/// process. A gate still held after the bound is a real leak and fails.
+#[cfg(all(test, unix))]
+pub(crate) async fn after_gate_release<T, Fut>(
+    mut attempt: impl FnMut() -> Fut,
+) -> anyhow::Result<T>
+where
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match attempt().await {
+            Err(error)
+                if error.downcast_ref::<JobJournalBusy>().is_some()
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn selection_is_pending(lease: &DurableJobLease) -> bool {
@@ -1441,26 +1688,178 @@ fn selection_is_pending(lease: &DurableJobLease) -> bool {
     )
 }
 
+fn absolute_lease_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()
+            .context("resolve relative durable journal root before admission")?
+            .join(path))
+    }
+}
+
 impl DurableLeaseWriter {
     pub(crate) fn load(wrapper_id: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             wrapper_id.starts_with("rchw-") && uuid::Uuid::parse_str(&wrapper_id[5..]).is_ok(),
             "invalid wrapper identity"
         );
-        let path = durable_lease_path(wrapper_id);
-        let lease: DurableJobLease = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let path = absolute_lease_path(durable_lease_path(wrapper_id))?;
+        // Name the lease: a bare ENOENT read as a daemon fault (bd-ilds6).
+        let lease = Self::read_journal(&path, wrapper_id).with_context(|| {
+            format!(
+                "no readable job lease for wrapper {wrapper_id} at {}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            path,
+            lease: Arc::new(Mutex::new(lease)),
+            #[cfg(unix)]
+            recovery_ownership: None,
+        })
+    }
+
+    fn read_journal(path: &Path, wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
+        #[cfg(unix)]
+        let bytes = crate::state::primitives::read_regular_file(path)?;
+        // Detached job recovery is Unix-only; retain the existing non-Unix
+        // reader without claiming descriptor/nofollow parity on that platform.
+        #[cfg(not(unix))]
+        let bytes = std::fs::read(path)?;
+        Self::decode_journal(&bytes, wrapper_id)
+    }
+
+    fn decode_journal(bytes: &[u8], wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
+        let lease: DurableJobLease = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
             lease.schema_version == 1 && lease.identity.local_wrapper_id == wrapper_id,
             "durable lease identity or schema mismatch"
         );
-        Ok(Self {
-            path,
-            lease: Arc::new(Mutex::new(lease)),
-        })
+        Ok(lease)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn claim_recovery(&self) -> anyhow::Result<Self> {
+        transfer_orchestration::recovery::recovery_owner::claim(self).await
     }
 
     pub(crate) fn snapshot(&self) -> DurableJobLease {
         self.lease.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn admission_reference(
+        &self,
+        wrapper_id: &str,
+        build_id: u64,
+        worker_id: &WorkerId,
+    ) -> anyhow::Result<ExecAdmissionReference> {
+        // One consistent committed-state observation, without copying the
+        // potentially large recovery recipe. Transitions publish before the
+        // mutex-protected state advances, including terminal acknowledgement.
+        let lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        self.admission_reference_from_lease(&lease, wrapper_id, build_id, worker_id)
+    }
+
+    fn admission_reference_from_lease(
+        &self,
+        lease: &DurableJobLease,
+        wrapper_id: &str,
+        build_id: u64,
+        worker_id: &WorkerId,
+    ) -> anyhow::Result<ExecAdmissionReference> {
+        anyhow::ensure!(
+            lease.schema_version == 1
+                && !selection_is_pending(lease)
+                && build_id > 0
+                && build_id < (1_u64 << 63)
+                && !worker_id.as_str().trim().is_empty()
+                && self.path.is_absolute()
+                && !wrapper_id.is_empty()
+                && lease.identity.local_wrapper_id == wrapper_id
+                && lease.identity.remote_build_id == Some(build_id)
+                && lease.worker_id.as_deref() == Some(worker_id.as_str()),
+            "compiler admission reference does not match the current durable attempt"
+        );
+        Ok(ExecAdmissionReference {
+            local_wrapper_id: lease.identity.local_wrapper_id.clone(),
+            remote_build_id: build_id.to_string(),
+            worker_id: worker_id.as_str().to_owned(),
+            journal_path: self
+                .path
+                .to_str()
+                .context("admission journal path is not UTF-8")?
+                .to_owned(),
+            terminal_acknowledged: lease.terminal_acknowledged,
+            strict_remote: lease.strict_remote,
+            caller_command_fingerprint: lease.command_fingerprint.clone(),
+        })
+    }
+
+    /// Report one committed terminal observation, including its actual current
+    /// admission reference. Never mix a pre-recovery identity with later exit
+    /// or acknowledgement fields, and never clone the large recovery recipe.
+    pub(crate) fn terminal_job_report(
+        &self,
+        wrapper_id: &str,
+        status: &str,
+        expected_exit: Option<i32>,
+    ) -> anyhow::Result<serde_json::Value> {
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            ownership.verify()?;
+        }
+        let lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            matches!(status, "completed" | "recovered")
+                && lease.schema_version == 1
+                && lease.identity.local_wrapper_id == wrapper_id
+                && lease.terminal_acknowledged
+                && !selection_is_pending(&lease),
+            "job report requires the exact acknowledged terminal journal"
+        );
+        let exit = lease
+            .exit_code
+            .context("terminal job has no observed exit code")?;
+        anyhow::ensure!(
+            expected_exit.is_none_or(|expected| expected == exit),
+            "job recovery exit differs from its committed terminal journal"
+        );
+        let admission = match (lease.identity.remote_build_id, lease.worker_id.as_deref()) {
+            (Some(build), Some(worker)) => Some(self.admission_reference_from_lease(
+                &lease,
+                wrapper_id,
+                build,
+                &WorkerId::new(worker),
+            )?),
+            (None, None) => None,
+            _ => anyhow::bail!("terminal job has an incomplete admission identity"),
+        };
+        let report = serde_json::json!({
+            "status": status,
+            "identity": lease.identity.clone(),
+            "exit_code": exit,
+            "terminal_acknowledged": true,
+            "admission": admission,
+        });
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            ownership.verify()?;
+        }
+        Ok(report)
+    }
+
+    fn machine_admission_reference(
+        &self,
+        wrapper_id: &str,
+        build_id: u64,
+        worker_id: &WorkerId,
+    ) -> anyhow::Result<Option<ExecAdmissionReference>> {
+        if !remote_result::machine_output() {
+            return Ok(None);
+        }
+        self.admission_reference(wrapper_id, build_id, worker_id)
+            .map(Some)
     }
 
     pub(crate) fn set_recovery(&self, recovery: serde_json::Value) -> anyhow::Result<()> {
@@ -1474,12 +1873,21 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
+    /// Record the wrapper's outcome, including a failed delivery after compiler
+    /// success. Once acknowledged, that value is immutable; repeats are read-only.
     pub(crate) fn record_exit(&self, exit_code: i32) -> anyhow::Result<()> {
         let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
         anyhow::ensure!(
             !selection_is_pending(&lease),
             "selection is pending; stale exit update refused"
         );
+        if lease.terminal_acknowledged {
+            anyhow::ensure!(
+                lease.exit_code == Some(exit_code),
+                "recorded exit contradicts the acknowledged terminal result"
+            );
+            return Ok(());
+        }
         let mut next = lease.clone();
         next.exit_code = Some(exit_code);
         self.publish_transition(&mut lease, next)
@@ -1489,8 +1897,23 @@ impl DurableLeaseWriter {
         strict_remote: bool,
         self_healing_enabled: bool,
     ) -> anyhow::Result<Self> {
+        Self::create_in(
+            &default_job_lease_directory(),
+            command,
+            strict_remote,
+            self_healing_enabled,
+        )
+    }
+
+    fn create_in(
+        directory: &Path,
+        command: &str,
+        strict_remote: bool,
+        self_healing_enabled: bool,
+    ) -> anyhow::Result<Self> {
         let identity = JobIdentity::new_local();
-        let path = durable_lease_path(&identity.local_wrapper_id);
+        let path =
+            absolute_lease_path(directory.join(format!("{}.json", identity.local_wrapper_id)))?;
         let command_fingerprint = format!("blake3:{}", blake3::hash(command.as_bytes()).to_hex());
         let process_birth = rch_common::process_identity::current_process_identity();
         let process_start_ticks =
@@ -1513,10 +1936,21 @@ impl DurableLeaseWriter {
             command_fingerprint,
         );
         lease.process_birth = process_birth;
+        #[cfg(unix)]
+        let recovery_ownership = {
+            std::fs::create_dir_all(path.parent().context("job journal has no parent")?)?;
+            let ownership =
+                Arc::new(transfer_orchestration::recovery::recovery_owner::acquire_gate(&path)?);
+            ownership.initialize(&serde_json::to_vec_pretty(&lease)?)?;
+            Some(ownership)
+        };
         let writer = Self {
             path,
             lease: Arc::new(Mutex::new(lease)),
+            #[cfg(unix)]
+            recovery_ownership,
         };
+        #[cfg(not(unix))]
         writer.persist()?;
         Ok(writer)
     }
@@ -1531,6 +1965,12 @@ impl DurableLeaseWriter {
     }
 
     fn admit(&self, remote_build_id: u64, worker_id: &WorkerId) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            remote_build_id > 0
+                && remote_build_id < (1_u64 << 63)
+                && !worker_id.as_str().trim().is_empty(),
+            "daemon admission requires a positive supported build ID and a nonempty worker ID"
+        );
         let mut lease = self
             .lease
             .lock()
@@ -1614,8 +2054,33 @@ impl DurableLeaseWriter {
 
     /// The caller has validated a daemon no-start cancellation receipt. This
     /// is the only terminal transition allowed while selection is uncertain.
-    pub(crate) fn confirm_selection_cancelled(&self) -> anyhow::Result<()> {
+    /// False means the journal acknowledgment is deferred to its held owner;
+    /// it does not retract the daemon's already validated cancellation.
+    pub(crate) fn confirm_selection_cancelled(&self) -> anyhow::Result<bool> {
         let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(unix)]
+        let cancellation_writer = if self.recovery_ownership.is_none() {
+            // A separately loaded cancellation writer must cooperate with the
+            // live wrapper's gate. Never overwrite a live owner's journal or
+            // acknowledge cancellation from a stale cached lease.
+            let ownership =
+                match transfer_orchestration::recovery::recovery_owner::acquire_gate(&self.path) {
+                    Ok(ownership) => Arc::new(ownership),
+                    Err(error) if error.downcast_ref::<JobJournalBusy>().is_some() => {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
+            anyhow::ensure!(
+                ownership.read(&lease.identity.local_wrapper_id)? == *lease,
+                "job journal changed before no-start cancellation; reload the same wrapper"
+            );
+            let mut writer = self.clone();
+            writer.recovery_ownership = Some(ownership);
+            Some(writer)
+        } else {
+            None
+        };
         anyhow::ensure!(
             lease.identity.remote_build_id.is_none()
                 && lease.worker_id.is_none()
@@ -1626,6 +2091,36 @@ impl DurableLeaseWriter {
         let mut next = lease.clone();
         next.exit_code = Some(130);
         next.acknowledge_terminal(now_unix_ms());
+        #[cfg(unix)]
+        if let Some(writer) = cancellation_writer {
+            return writer.publish_transition(&mut lease, next).map(|()| true);
+        }
+        self.publish_transition(&mut lease, next).map(|()| true)
+    }
+
+    /// The daemon answered this attempt's selection without a worker or build
+    /// id (queue timeout, no admissible worker, restart barrier still closed).
+    /// Every such reply is sent after the daemon dropped any queued row for
+    /// this wrapper, so no remote build can start for it. Record that before
+    /// the local run or refusal: a nonterminal lease of a live wrapper blocks
+    /// daemon restart for the whole local fallback, and stays `queued` in
+    /// `rch jobs` forever once the wrapper exits. No exit code is recorded,
+    /// because no remote command ran.
+    pub(crate) fn confirm_failed_before_admission(&self) -> anyhow::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            !selection_is_pending(&lease)
+                && lease.identity.remote_build_id.is_none()
+                && lease.worker_id.is_none()
+                && lease.recovery.is_none()
+                && lease.exit_code.is_none()
+                && !lease.terminal_acknowledged,
+            "a selection refusal cannot retire a pending, admitted or completed lease"
+        );
+        let mut next = lease.clone();
+        next.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
+        next.heartbeat("failed_before_admission", now_unix_ms());
+        next.terminal_acknowledged = true;
         self.publish_transition(&mut lease, next)
     }
 
@@ -1645,7 +2140,8 @@ impl DurableLeaseWriter {
     }
 
     /// A terminal acknowledgement requires observed delivery completion: the
-    /// exact command result is recorded, no validated retrieval recipe is
+    /// exact wrapper result is recorded and agrees with retained delivery,
+    /// no validated retrieval recipe is
     /// outstanding (or it reports fully-returned outputs), and no later
     /// heartbeats are expected. Refuses to fake completion otherwise.
     pub(crate) fn acknowledge_terminal(&self) -> anyhow::Result<()> {
@@ -1653,8 +2149,24 @@ impl DurableLeaseWriter {
             .lease
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::ensure_terminal_evidence(&lease)?;
+        let exit_code = lease
+            .exit_code
+            .or_else(|| {
+                let recovery = lease.recovery.as_ref()?;
+                if recovery.get("retired").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return None;
+                }
+                recovery
+                    .get("returned")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|returned| i32::try_from(returned).ok())
+            })
+            .context("terminal command exit is not observed; acknowledgement refused")?;
+        Self::ensure_terminal_evidence(&lease, exit_code)?;
         let mut next = lease.clone();
+        // A retired delivery receipt is an observed result too. Publish its
+        // exact finite exit and acknowledgement in the same transition.
+        next.exit_code = Some(exit_code);
         next.acknowledge_terminal(now_unix_ms());
         self.publish_transition(&mut lease, next)
     }
@@ -1678,7 +2190,7 @@ impl DurableLeaseWriter {
                 && lease.worker_id == observed.worker_id,
             "observed completion belongs to another admission; acknowledgement refused"
         );
-        Self::ensure_terminal_evidence(&lease)?;
+        Self::ensure_terminal_evidence(&lease, exit_code)?;
         if lease.terminal_acknowledged {
             anyhow::ensure!(
                 lease.exit_code == Some(exit_code),
@@ -1692,10 +2204,14 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
-    fn ensure_terminal_evidence(lease: &DurableJobLease) -> anyhow::Result<()> {
+    fn ensure_terminal_evidence(lease: &DurableJobLease, exit_code: i32) -> anyhow::Result<()> {
         anyhow::ensure!(
             !selection_is_pending(lease),
             "selection is pending; terminal acknowledgement refused"
+        );
+        anyhow::ensure!(
+            lease.exit_code.is_none_or(|observed| observed == exit_code),
+            "daemon completion contradicts the observed wrapper result; acknowledgement refused"
         );
         if let Some(recovery) = lease.recovery.as_ref()
             && (recovery
@@ -1706,6 +2222,13 @@ impl DurableLeaseWriter {
         {
             anyhow::bail!(
                 "durable retrieval or source release evidence is incomplete; terminal acknowledgement refused (state stays recoverable)"
+            );
+        }
+        if let Some(recovery) = lease.recovery.as_ref() {
+            anyhow::ensure!(
+                recovery.get("returned").and_then(serde_json::Value::as_i64)
+                    == Some(i64::from(exit_code)),
+                "terminal command result contradicts durable delivery; acknowledgement refused"
             );
         }
         Ok(())
@@ -1719,23 +2242,45 @@ impl DurableLeaseWriter {
         lease: &mut DurableJobLease,
         next: DurableJobLease,
     ) -> anyhow::Result<()> {
-        atomic_write(&self.path, &serde_json::to_vec_pretty(&next)?)?;
-        let parent = self
-            .path
-            .parent()
-            .context("lease has no parent directory")?;
-        std::fs::File::open(parent)
-            .with_context(|| format!("open lease directory for durability: {}", parent.display()))?
-            .sync_all()
-            .context("sync lease directory before advancing ownership")?;
+        let bytes = serde_json::to_vec_pretty(&next)?;
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            ownership.publish(&bytes)?;
+            *lease = next;
+            return Ok(());
+        }
+        atomic_write(&self.path, &bytes)?;
+        // Unix atomic_write already synchronizes and verifies its held parent;
+        // reopening the pathname here adds no durability to that publication.
+        #[cfg(not(unix))]
+        {
+            let parent = self
+                .path
+                .parent()
+                .context("lease has no parent directory")?;
+            std::fs::File::open(parent)
+                .with_context(|| {
+                    format!("open lease directory for durability: {}", parent.display())
+                })?
+                .sync_all()
+                .context("sync lease directory before advancing ownership")?;
+        }
         *lease = next;
         Ok(())
     }
 
+    // Unix wrappers publish through their journal gate from creation on; a
+    // full-snapshot persist remains for other platforms and test fixtures.
+    #[cfg(any(not(unix), test))]
     fn persist(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            return self.persist_snapshot(|_, bytes| ownership.publish(bytes));
+        }
         self.persist_snapshot(atomic_write)
     }
 
+    #[cfg(any(not(unix), test))]
     fn persist_snapshot(
         &self,
         publish: impl FnOnce(&Path, &[u8]) -> anyhow::Result<()>,
@@ -2885,6 +3430,7 @@ pub async fn run_exec(
     job: bool,
     result_dirs: Vec<PathBuf>,
     required_tools: Vec<String>,
+    exact_worker: Option<WorkerId>,
     command_parts: Vec<String>,
     out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
@@ -2914,13 +3460,36 @@ pub async fn run_exec(
             timing: None,
             result_dirs: None,
             error_code: Some("RCH-E301"),
+            admission: None,
         });
         std::process::exit(EXIT_BUILD_ERROR);
     }
     // A clean-overlay request can never fall back to the ambient local tree,
     // even if the caller omitted RCH_REQUIRE_REMOTE. Doing so would silently
     // defeat the entire peer-dirt exclusion guarantee.
-    let require_remote = exec_requires_remote() || clean_overlay || source_content_receipt;
+    // Opt-in through the canonical Cargo shim without modifying its installed
+    // body. Hook protocol and machine envelopes keep their stdout contracts.
+    let cargo_json_stdout =
+        std::env::var("RCH_CARGO_JSON_STDOUT").is_ok_and(|value| env_flag_enabled(&value));
+    if cargo_json_stdout {
+        anyhow::ensure!(
+            !out_ctx.is_json() && !job,
+            "RCH_CARGO_JSON_STDOUT conflicts with machine envelopes and arbitrary jobs"
+        );
+        let classified = classify_command(&command);
+        anyhow::ensure!(
+            cargo_output_contract::CargoOutputCapture::for_command(classified.kind, &command)
+                .is_some_and(|capture| capture.caller_json_supported()),
+            "RCH_CARGO_JSON_STDOUT requires cargo build --bin, cargo test --no-run --test, or cargo bench --no-run --bench with literal named targets and an explicit JSON message format"
+        );
+    }
+    let exact_worker_requested = exact_worker.is_some();
+    let require_remote = exec_requires_remote()
+        || clean_overlay
+        || source_content_receipt
+        || cargo_json_stdout
+        || exact_worker_requested
+        || !required_tools.is_empty();
 
     // Classify the command. In explicit job-admission mode (`rch exec --job`,
     // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
@@ -2946,6 +3515,7 @@ pub async fn run_exec(
                 timing: None,
                 result_dirs: None,
                 error_code: Some("RCH-E001"),
+                admission: None,
             });
             std::process::exit(2);
         }
@@ -3000,6 +3570,8 @@ pub async fn run_exec(
         }
         tools
     };
+    let required_tools_requested = !required_tools.is_empty();
+    let require_remote = require_remote || required_tools_requested;
 
     // Issue #55: honor the same config knobs the hook honors, so
     // `general.force_local` / `general.enabled` / `execution.allowlist` mean the
@@ -3011,7 +3583,11 @@ pub async fn run_exec(
         let reporter = HookReporter::new(config.output.visibility);
         let reason = policy.reason();
         let refuse_local = if policy.overrides_require_remote() {
-            clean_overlay || source_content_receipt
+            clean_overlay
+                || source_content_receipt
+                || cargo_json_stdout
+                || exact_worker_requested
+                || required_tools_requested
         } else {
             require_remote || role_requires_remote(config.general.role)
         };
@@ -3032,7 +3608,8 @@ pub async fn run_exec(
         info!("role=dispatcher: offloadable build defaults to fail-closed + queue");
     }
 
-    let reporter = HookReporter::new(config.output.visibility);
+    let reporter =
+        HookReporter::new(config.output.visibility).with_cargo_json_stdout(cargo_json_stdout);
 
     // Build path topology policy from loaded config so that any normalization
     // warnings reference the configured roots rather than compiled-in defaults.
@@ -3055,14 +3632,51 @@ pub async fn run_exec(
     // Extract project name honoring configured path topology.
     let project = extract_project_name_with_policy(&topology_policy);
 
+    // bd-2spi4: the speed gate may place a build locally only when the
+    // caller and configuration permit it. Resolved strict admission (including
+    // the canonical shim and dispatcher default) remains remote-only even
+    // when local speed measurements are enabled.
+    let caller_force_remote = std::env::var("RCH_FORCE_REMOTE")
+        .is_ok_and(|value| env_flag_enabled(&value))
+        || config.general.force_remote
+        || require_remote;
+    if let Some((reason, _local_slot)) = speed_gate::evaluate(
+        &config,
+        &project,
+        speed_gate::SpeedGateInputs {
+            local_slots: config.compilation.local_slots,
+            kind: classification.kind,
+            job,
+            strict_remote_mode: clean_overlay
+                || source_content_receipt
+                || cargo_json_stdout
+                || exact_worker_requested
+                || required_tools_requested,
+            caller_force_remote,
+        },
+    ) {
+        // `_local_slot` stays held until this process exits with the build.
+        reporter.summary(&format!("[RCH] local ({reason})"));
+        exit_with_local_run(
+            &command,
+            &reporter,
+            &reason,
+            caller_force_remote,
+            None,
+            Some(LocalRunTiming {
+                project: &project,
+                kind: classification.kind,
+            }),
+        );
+    }
+
     // Layer 0 pack (bd-bqu38): resolve knob env pairs once; empty unless the
     // `[layer0]` section enables the pack.
-    let layer0_env: Vec<(String, String)> = config
-        .layer0
-        .active_env()
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+    let layer0_env = layer0_env_for_lane(
+        &config.layer0,
+        clean_overlay || source_content_receipt,
+        std::env::current_dir().ok().as_deref(),
+    );
 
     // Estimate cores needed
     let estimated_cores =
@@ -3165,7 +3779,10 @@ pub async fn run_exec(
     };
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
-    let preferred_workers = command_parsing::preferred_workers();
+    // A CLI pin is a singleton admission constraint, never the environment /
+    // project preference union. Every retry keeps this same allowed set.
+    let preferred_workers =
+        exec_worker_preferences(exact_worker, command_parsing::preferred_workers);
     let durable_lease = DurableLeaseWriter::create(
         &command,
         require_remote,
@@ -3173,9 +3790,10 @@ pub async fn run_exec(
     )?;
     let wrapper_id = durable_lease.wrapper_id();
 
-    if restart_admission_is_closed(&config.general.socket_path)
-        .await
-        .unwrap_or(false)
+    // A daemon restart closes admission for its drain window. Wait for it
+    // (bounded) instead of failing every build that arrives meanwhile.
+    if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+        == RestartAdmissionWait::StillClosed
     {
         durable_lease.heartbeat("restart_admission_blocked")?;
         return Err(anyhow::anyhow!(
@@ -3240,9 +3858,9 @@ pub async fn run_exec(
                 config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
                 // The original endpoint's restart gate says nothing about
                 // a daemon discovered in another runtime-directory context.
-                if restart_admission_is_closed(&config.general.socket_path)
+                if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter)
                     .await
-                    .unwrap_or(false)
+                    == RestartAdmissionWait::StillClosed
                 {
                     durable_lease.heartbeat("restart_admission_blocked")?;
                     anyhow::bail!(
@@ -3283,23 +3901,26 @@ pub async fn run_exec(
                 // ProceedRemote implies `retry` is Some; fail open defensively
                 // rather than panicking if that invariant is ever violated.
                 DaemonRecoveryAction::ProceedRemote => retry.unwrap_or_else(|| {
-                    reporter.summary("[RCH] local (daemon unavailable)");
-                    exit_with_local_fallback(
+                    exit_with_gated_local_fallback(
                         &command,
                         &reporter,
                         "daemon unavailable",
                         require_remote,
+                        config.compilation.allow_local_fallback,
+                        None,
                     );
                 }),
-                // Fail-open convenience lane: run local. exit_with_local_fallback
-                // records the RCH-I011 incident (bd-qawj7).
+                // Fail-open convenience lane: run local unless the operator set
+                // allow_local_fallback = false (#114). The local run records the
+                // RCH-I011 incident (bd-qawj7).
                 DaemonRecoveryAction::LocalFallback => {
-                    reporter.summary("[RCH] local (daemon unavailable)");
-                    exit_with_local_fallback(
+                    exit_with_gated_local_fallback(
                         &command,
                         &reporter,
                         "daemon unavailable",
                         require_remote,
+                        config.compilation.allow_local_fallback,
+                        None,
                     );
                 }
                 // Proof lane: fail closed. exit_with_local_fallback refuses under
@@ -3343,6 +3964,43 @@ pub async fn run_exec(
     let mut attempt: u32 = 1;
     let mut response = response;
 
+    // bd-5pmwm: the barrier can close after the pre-check, or while this build
+    // waits in the daemon's queue. Before any admission the same wrapper may
+    // simply ask again, as daemon recovery does, so wait for admission to
+    // reopen and re-query instead of failing (or building locally).
+    for _ in 0..3 {
+        if !is_restart_barrier_refusal(&response) {
+            break;
+        }
+        if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+            == RestartAdmissionWait::StillClosed
+        {
+            break;
+        }
+        response = match query_daemon(
+            &config.general.socket_path,
+            &selection_project,
+            estimated_cores,
+            config.compilation.disk_headroom_gib,
+            &remote_command,
+            toolchain.as_ref(),
+            required_runtime,
+            command_priority,
+            0,
+            Some(std::process::id()),
+            Some(&wrapper_id),
+            wait_for_worker,
+            &preferred_workers,
+            classification.kind == Some(CompilationKind::Job),
+            &required_tools,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => return Err(selection_error_for_recovery(error, &durable_lease)?),
+        };
+    }
+
     loop {
         // Retry selection also preserves an explicit no-start cancellation.
         if selection_cancelled_before_start(&response) {
@@ -3373,6 +4031,9 @@ pub async fn run_exec(
             // compiling locally on the orchestrator.
             if job && !require_remote {
                 reason = format!("job admission exhausted: {reason}");
+            }
+            if let Err(error) = durable_lease.confirm_failed_before_admission() {
+                debug!("Durable lease left open after selection refusal: {error:#}");
             }
             exit_with_gated_local_fallback(
                 &command,
@@ -3465,7 +4126,12 @@ pub async fn run_exec(
                     "Failed to release unrequested worker {} after selection refusal: {}",
                     worker.id, error
                 );
-            } else if let Err(error) = durable_lease.acknowledge_terminal() {
+            } else if let Err(error) = durable_lease
+                // This is the explicit pre-execution refusal sent with release,
+                // not an inferred compiler exit. Persist it before acknowledging.
+                .record_exit(EXIT_BUILD_ERROR)
+                .and_then(|_| durable_lease.acknowledge_terminal())
+            {
                 warn!(
                     "Failed to persist acknowledged durable lease terminal state: {}",
                     error
@@ -3478,8 +4144,14 @@ pub async fn run_exec(
             } else {
                 reason
             };
-            reporter.summary(&format!("[RCH] local ({reason})"));
-            exit_with_local_fallback(&command, &reporter, &reason, require_remote);
+            exit_with_gated_local_fallback(
+                &command,
+                &reporter,
+                &reason,
+                require_remote,
+                allow_local_fallback,
+                None,
+            );
         }
 
         info!(
@@ -3555,8 +4227,7 @@ pub async fn run_exec(
         });
         // A worker-caused failure must not warm that worker's cache for the
         // project (review of GH #81), or the next build is routed back to it.
-        let (release_worker_fault, release_worker_disk_full, release_disk_roots) =
-            remote_release_faults(&result, &worker.id);
+        let release_faults = remote_release_faults(&result, &worker.id);
         let release_acknowledged = if retain_unconfirmed_ownership {
             warn!(
                 "Remote completion unconfirmed; retaining build {} ownership",
@@ -3574,9 +4245,7 @@ pub async fn run_exec(
                 None,
                 release_timing.as_ref(),
                 Some(&wrapper_id),
-                release_worker_fault,
-                release_worker_disk_full,
-                release_disk_roots,
+                release_faults,
             )
             .await
             {
@@ -3626,6 +4295,35 @@ pub async fn run_exec(
                         );
                     });
                 }
+                if cargo_json_stdout {
+                    // The compiler-output API never replays a completed
+                    // workload after inspecting its diagnostics. Release and
+                    // durable acknowledgment precede every stdout byte.
+                    if result.exit_code == 0
+                        && let Err(error) =
+                            record_build(&config.general.socket_path, &worker.id, &project, false)
+                                .await
+                    {
+                        warn!("Failed to record build: {}", error);
+                    }
+                    durable_lease.acknowledge_terminal().context(
+                        "compiler stdout remains withheld: durable terminal acknowledgment failed",
+                    )?;
+                    if let Some(bytes) = result.cargo_stdout.as_deref() {
+                        let mut stdout = io::stdout().lock();
+                        stdout
+                            .write_all(bytes)
+                            .context("write verified Cargo stdout")?;
+                        stdout.flush().context("flush verified Cargo stdout")?;
+                    } else {
+                        anyhow::ensure!(
+                            result.exit_code != 0,
+                            "successful Cargo delivery supplied no verified compiler stdout"
+                        );
+                        reporter.summary_critical("[RCH] compiler output retained; artifact delivery failed, so caller-local success records were withheld");
+                    }
+                    std::process::exit(result.exit_code);
+                }
                 if result.exit_code == 0 {
                     reporter.summary(&format!(
                         "[RCH] remote {} ({})",
@@ -3657,6 +4355,16 @@ pub async fn run_exec(
                             error
                         );
                     }
+                    // bd-2spi4: the speed gate compares this end-to-end time
+                    // (queueing, sync and retrieval included) with local runs.
+                    if config.compilation.local_slots > 0 {
+                        record_build_timing(
+                            &project,
+                            classification.kind,
+                            u64::try_from(exec_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            true,
+                        );
+                    }
                     emit_exec_envelope(&ExecResultEnvelope {
                         api_version: "1.0",
                         command: &remote_command,
@@ -3669,6 +4377,11 @@ pub async fn run_exec(
                         timing: Some(&result.timing),
                         result_dirs: Some(&result.result_dirs),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
+                        )?,
                     });
                     std::process::exit(0);
                 // bd-bu3fb: a job's completed remote command is terminal truth.
@@ -3685,6 +4398,10 @@ pub async fn run_exec(
                         "[RCH] remote {} exceeded its configured deadline (exit {}); not retrying",
                         worker.id, result.exit_code
                     ));
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!("Failed to persist acknowledged deadline terminal state: {error}");
+                    }
                     emit_exec_envelope(&ExecResultEnvelope {
                         api_version: "1.0",
                         command: &remote_command,
@@ -3697,11 +4414,12 @@ pub async fn run_exec(
                         timing: exec_timing.as_ref(),
                         result_dirs: exec_dir_stats.as_deref(),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
+                        )?,
                     });
-                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
-                    {
-                        warn!("Failed to persist acknowledged deadline terminal state: {error}");
-                    }
                     std::process::exit(result.exit_code);
                 } else if !job && is_toolchain_failure(&result.stderr, result.exit_code) {
                     // Worker missing the toolchain — another worker may have it.
@@ -3852,6 +4570,19 @@ pub async fn run_exec(
                         },
                     }
                 } else {
+                    // Genuine build/test failure retains its observed status;
+                    // finish the existing ack attempt before exposing state.
+                    reporter.summary(&format!(
+                        "[RCH] remote {} failed (exit {})",
+                        worker.id, result.exit_code
+                    ));
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!(
+                            "Failed to persist acknowledged durable lease terminal state: {}",
+                            error
+                        );
+                    }
                     emit_exec_envelope(&ExecResultEnvelope {
                         api_version: "1.0",
                         command: &remote_command,
@@ -3864,20 +4595,12 @@ pub async fn run_exec(
                         timing: exec_timing.as_ref(),
                         result_dirs: exec_dir_stats.as_deref(),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
+                        )?,
                     });
-                    // Genuine build/test failure — the crate is broken and fails
-                    // identically on every worker, so do NOT retry or flood local.
-                    reporter.summary(&format!(
-                        "[RCH] remote {} failed (exit {})",
-                        worker.id, result.exit_code
-                    ));
-                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
-                    {
-                        warn!(
-                            "Failed to persist acknowledged durable lease terminal state: {}",
-                            error
-                        );
-                    }
                     std::process::exit(result.exit_code);
                 }
             }
@@ -3902,14 +4625,26 @@ pub async fn run_exec(
                     ));
                     let fallback_reason =
                         format!("dependency preflight failed: {evidence_summary}");
-                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    if release_acknowledged
+                        && let Err(error) = durable_lease
+                            // This typed planner refusal precedes execution and
+                            // uses the same failure outcome sent with release.
+                            .record_exit(EXIT_BUILD_ERROR)
+                            .and_then(|_| durable_lease.acknowledge_terminal())
                     {
                         warn!(
                             "Failed to persist acknowledged durable lease terminal state: {}",
                             error
                         );
                     }
-                    exit_with_local_fallback(&command, &reporter, &fallback_reason, require_remote);
+                    exit_with_gated_local_fallback(
+                        &command,
+                        &reporter,
+                        &fallback_reason,
+                        require_remote,
+                        allow_local_fallback,
+                        None,
+                    );
                 }
 
                 // Transfer skip (a "run locally instead" decision, not a failure).
@@ -3918,7 +4653,6 @@ pub async fn run_exec(
                     && let Some(skip_err) = e.downcast_ref::<TransferError>()
                     && let TransferError::TransferSkipped { reason } = skip_err
                 {
-                    reporter.summary(&format!("[RCH] local ({})", reason));
                     if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
                     {
                         warn!(
@@ -3926,11 +4660,13 @@ pub async fn run_exec(
                             error
                         );
                     }
-                    exit_with_local_fallback(
+                    exit_with_gated_local_fallback(
                         &command,
                         &reporter,
-                        "transfer skipped",
+                        &format!("transfer skipped: {reason}"),
                         require_remote,
+                        allow_local_fallback,
+                        None,
                     );
                 }
 
@@ -3973,6 +4709,11 @@ pub async fn run_exec(
                         remote_exit_code: None,
                         duration_ms: Some(exec_start.elapsed().as_millis() as u64),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
+                        )?,
                     });
                     std::process::exit(EXIT_BUILD_ERROR);
                 }
@@ -4085,6 +4826,12 @@ pub async fn run_exec(
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
                 reporter.summary_critical(&summary);
+                if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
+                    warn!(
+                        "Failed to persist acknowledged durable lease terminal state: {}",
+                        error
+                    );
+                }
                 emit_exec_envelope(&ExecResultEnvelope {
                     api_version: "1.0",
                     command: &remote_command,
@@ -4097,13 +4844,12 @@ pub async fn run_exec(
                     timing: exec_timing.as_ref(),
                     result_dirs: exec_dir_stats.as_deref(),
                     error_code: None,
+                    admission: durable_lease.machine_admission_reference(
+                        &wrapper_id,
+                        remote_build_id,
+                        &fault.failed_worker,
+                    )?,
                 });
-                if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
-                    warn!(
-                        "Failed to persist acknowledged durable lease terminal state: {}",
-                        error
-                    );
-                }
                 std::process::exit(code);
             }
             RemoteFaultExhaustAction::ExitWithEnvRemediation {
@@ -4138,6 +4884,11 @@ pub async fn run_exec(
                     timing: exec_timing.as_ref(),
                     result_dirs: exec_dir_stats.as_deref(),
                     error_code: None,
+                    admission: durable_lease.machine_admission_reference(
+                        &wrapper_id,
+                        remote_build_id,
+                        &fault.failed_worker,
+                    )?,
                 });
                 std::process::exit(code);
             }
@@ -4179,11 +4930,20 @@ pub async fn run_exec(
 #[derive(Clone, Copy)]
 struct HookReporter {
     visibility: OutputVisibility,
+    cargo_json_stdout: bool,
 }
 
 impl HookReporter {
     fn new(visibility: OutputVisibility) -> Self {
-        Self { visibility }
+        Self {
+            visibility,
+            cargo_json_stdout: false,
+        }
+    }
+
+    fn with_cargo_json_stdout(mut self, enabled: bool) -> Self {
+        self.cargo_json_stdout = enabled;
+        self
     }
 
     fn summary(&self, message: &str) {
@@ -4232,7 +4992,7 @@ mod progress_reporting;
 // unqualified.
 mod transfer_orchestration;
 use transfer_orchestration::execute_remote_compilation;
-pub(crate) use transfer_orchestration::recovery::recover_job;
+pub(crate) use transfer_orchestration::recovery::{recover_job, recover_job_cargo_json};
 
 // Exact source-byte manifest construction and worker-side re-verification for
 // `rch exec --source-content-receipt` proof runs.
@@ -4343,10 +5103,11 @@ mod source_fidelity;
 // directly from `super::remote_result`.
 mod remote_result;
 use remote_result::{
-    ExecResultDirStat, ExecResultEnvelope, detect_cargo_workspace_inheritance_failure,
-    detect_worker_system_dependency_failure, emit_exec_envelope, is_cpu_capability_signal,
-    is_signal_killed, is_toolchain_failure, remote_failure_is_disk_full,
-    remote_failure_is_worker_fault, set_machine_output, signal_name, wrapped_cpu_capability_signal,
+    ExecAdmissionReference, ExecResultDirStat, ExecResultEnvelope,
+    detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
+    emit_exec_envelope, is_cpu_capability_signal, is_signal_killed, is_toolchain_failure,
+    remote_failure_is_disk_full, remote_failure_is_worker_fault, set_machine_output, signal_name,
+    wrapped_cpu_capability_signal,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster
@@ -4402,6 +5163,11 @@ use selection_response::parse_selection_response;
 mod timing_history;
 use timing_history::record_build_timing;
 
+// bd-2spi4: opt-in, bounded local execution when this machine's measured
+// history says offloading is not faster (`compilation.local_slots`).
+mod speed_gate;
+pub(crate) use speed_gate::diagnose as diagnose_speed_gate;
+
 // RABS B002: redacted invocation recorder — every completed offloaded
 // build emits one B001 corpus record, off the SLO path, fail-open.
 mod rabs_recorder;
@@ -4414,11 +5180,12 @@ use rabs_recorder::record_invocation;
 // `record_build` / `queue_when_busy_enabled` are re-exported for the hook hot
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
+pub(crate) use daemon_ipc::{
+    RestartAdmissionWait, query_daemon, query_daemon_dry_run, release_worker,
+    restart_admission_is_closed, restart_admission_wait_bound, wait_for_restart_admission,
+};
 use daemon_ipc::{
     disable_worker_for_fault, queue_when_busy_enabled, record_build, release_worker_with_fault,
-};
-pub(crate) use daemon_ipc::{
-    query_daemon, query_daemon_dry_run, release_worker, restart_admission_is_closed,
 };
 
 // Command-string parsing utilities (tokenization + cargo flag/env analyzers +
@@ -4453,7 +5220,12 @@ use fallback_selection::{build_capacity_snapshots, pick_bigger_worker};
 fn is_test_kind(kind: Option<CompilationKind>) -> bool {
     matches!(
         kind,
-        Some(CompilationKind::CargoTest | CompilationKind::CargoNextest | CompilationKind::BunTest)
+        Some(
+            CompilationKind::CargoTest
+                | CompilationKind::CargoNextest
+                | CompilationKind::BunTest
+                | CompilationKind::GoTest
+        )
     )
 }
 
@@ -4791,8 +5563,7 @@ async fn handle_selection_response(
         timing.total = Some(remote_elapsed);
         timing
     });
-    let (release_worker_fault, release_worker_disk_full, release_disk_roots) =
-        remote_release_faults(&result, &worker.id);
+    let release_faults = remote_release_faults(&result, &worker.id);
     if retain_unconfirmed_ownership {
         warn!(
             "Remote completion unconfirmed; retaining worker {} ownership",
@@ -4808,9 +5579,7 @@ async fn handle_selection_response(
         None,
         release_timing.as_ref(),
         None,
-        release_worker_fault,
-        release_worker_disk_full,
-        release_disk_roots,
+        release_faults,
     )
     .await
     {
@@ -5515,5 +6284,7 @@ exit 125;; esac; "
     )
 }
 
+#[cfg(test)]
+mod fallback_policy_tests;
 #[cfg(test)]
 mod tests;

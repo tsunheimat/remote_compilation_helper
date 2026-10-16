@@ -223,6 +223,23 @@ impl LiveCas {
     pub fn cas_root(&self) -> &Path {
         &self.cas_root
     }
+
+    /// A pathname replaced after mounting must not redirect physical GC into
+    /// another store. Check the named fencing inode against the held descriptor.
+    pub(super) fn verify_mount_path(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self._mount_lock.0.metadata().map_err(|e| e.to_string())?;
+        let named = std::fs::symlink_metadata(self.cas_root.join(MOUNT_LOCK))
+            .map_err(|e| format!("CAS mount lock disappeared: {e}"))?;
+        if !named.file_type().is_file()
+            || named.nlink() != 1
+            || named.mode() & 0o077 != 0
+            || (named.dev(), named.ino(), named.uid()) != (held.dev(), held.ino(), held.uid())
+        {
+            return Err("CAS mount lock changed after mounting".into());
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for LiveCas {
@@ -268,6 +285,10 @@ pub fn mount_and_reconcile(cas_root: &Path) -> Result<LiveCas, String> {
     let engine = RusqliteEngine::open(&cas_root.join("meta.sqlite"))
         .map_err(|e| format!("metadata engine: {e:?}"))?;
     let mut store = SqlMetadataStore::open(engine).map_err(|e| format!("metadata store: {e:?}"))?;
+    // Secondary read indexes are installed once under exclusive mount ownership,
+    // never lazily on a compiler's consultation or while a writer is admitted.
+    rabs_cas::read_indexes::prepare_serving_indexes(&mut store)
+        .map_err(|e| format!("metadata query indexes: {e:?}"))?;
 
     let filesystem = OsFilesystem::new(vec![layout.root().to_path_buf()]);
     let report =
@@ -364,45 +385,7 @@ pub fn janitor_work_with_gc(
     mounted: Result<Arc<LiveCas>, String>,
     quota_bytes: Option<u64>,
 ) -> SubsystemWork {
-    Box::new(move |cx, mut shutdown| {
-        Box::pin(async move {
-            let mounted = mounted?;
-            println!(
-                "{{\"v\":1,\"kind\":\"janitor-cas-mounted\",\"root\":{:?},\"serving_refused\":{},\"repaired\":{},\"reported\":{}}}",
-                mounted.cas_root().display().to_string(),
-                mounted.serving_refused,
-                mounted.repaired,
-                mounted.reported,
-            );
-            match mounted.gc_sweep(rabs_cas::gc::GcMode::Normal) {
-                Ok(s) => println!(
-                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep\",\"planned\":{},\"reclaimed\":{},\"skipped\":{}}}",
-                    s.planned, s.reclaimed, s.skipped
-                ),
-                Err(reason) => println!(
-                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep-failed\",\"reason\":{:?}}}",
-                    reason
-                ),
-            }
-            let usage = mounted.store_usage_bytes();
-            if let Some(q) = quota_bytes
-                && usage > q
-            {
-                println!(
-                    "{{\"v\":1,\"kind\":\"janitor-quota-exceeded\",\"bytes\":{},\"quota_bytes\":{}}}",
-                    usage, q
-                );
-            }
-            println!(
-                "{{\"v\":1,\"kind\":\"janitor-store-usage\",\"bytes\":{}}}",
-                usage
-            );
-            cx.trace("janitor region up: store mounted, gc swept, quota checked");
-            let _held = mounted;
-            shutdown.wait().await;
-            Ok(())
-        })
-    })
+    super::maintenance::work(mounted, quota_bytes)
 }
 
 #[cfg(test)]
@@ -554,7 +537,8 @@ mod tests {
     /// `create_dir_all` honours the umask, so the mount used to create a
     /// 0775 CAS root and then refuse it for being group-writable: the
     /// daemon declined to mount a directory it had just made itself, and
-    /// no cold start could succeed on a stock host. The whole rabsd test
+    /// no cold start could succeed on a stock Debian/Ubuntu box at all.
+    /// The whole rabsd test
     /// suite failed on exactly those workers too, which is how this was
     /// found.
     #[cfg(unix)]

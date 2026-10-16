@@ -48,8 +48,12 @@ pub mod observation;
 pub mod path_remap;
 pub mod process_context;
 pub mod pseudo_files;
+#[cfg(unix)]
+pub mod regular_input;
 pub mod runtime_path_scanner;
 pub mod snapshot_capture;
+#[cfg(unix)]
+pub mod socket_endpoint;
 pub mod source_capture;
 pub mod source_transfer;
 pub mod toolchain_dataset;

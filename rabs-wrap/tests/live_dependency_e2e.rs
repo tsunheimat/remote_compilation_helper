@@ -642,12 +642,19 @@ fn registry_dependency_lane_preserves_results_on_native_target() {
         let output = world.wrapped("leaf", &out_a, &[], &[]);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let trail = trail(&daemon, mark);
-        if trail.contains(&"committed".to_owned()) {
-            assert_eq!(trail, ["execute", "committed"]);
+        if let Some(prefix) = trail.strip_suffix(&["execute".to_owned(), "committed".to_owned()]) {
+            assert!(
+                prefix
+                    .iter()
+                    .all(|step| matches!(step.as_str(), "toolchain-warming" | "preparing")),
+                "unexpected decisions before commit: {trail:?}"
+            );
             break output;
         }
         assert!(
-            trail.iter().all(|step| step == "toolchain-warming"),
+            trail
+                .iter()
+                .all(|step| matches!(step.as_str(), "toolchain-warming" | "preparing")),
             "unexpected decisions while warming: {trail:?}"
         );
         assert!(
@@ -822,12 +829,21 @@ fn git_workspace_dependency_lane_preserves_results_on_native_target() {
         let output = world.wrapped("leaf", &out_a, &[], &[]);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let decisions = trail(&daemon, mark);
-        if decisions.contains(&"committed".to_owned()) {
-            assert_eq!(decisions, ["execute", "committed"]);
+        if let Some(prefix) =
+            decisions.strip_suffix(&["execute".to_owned(), "committed".to_owned()])
+        {
+            assert!(
+                prefix
+                    .iter()
+                    .all(|step| matches!(step.as_str(), "toolchain-warming" | "preparing")),
+                "unexpected decisions before commit: {decisions:?}"
+            );
             break output;
         }
         assert!(
-            decisions.iter().all(|step| step == "toolchain-warming"),
+            decisions
+                .iter()
+                .all(|step| matches!(step.as_str(), "toolchain-warming" | "preparing")),
             "unexpected decisions while warming: {decisions:?}"
         );
         assert!(

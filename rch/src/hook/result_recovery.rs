@@ -342,6 +342,7 @@ mod tests {
         };
         let writer = DurableLeaseWriter {
             path: directory.path().join("lease.json"),
+            recovery_ownership: None,
             lease: Arc::new(Mutex::new(DurableJobLease::new(
                 JobIdentity::new_local(),
                 0,
@@ -358,6 +359,7 @@ mod tests {
             &writer,
             &worker,
             vec!["/test/source".into()],
+            None,
             None,
             None,
             TransferConfig::default(),
@@ -974,7 +976,7 @@ os.stat = raced_stat
             .unwrap();
         session.writer.acknowledge_terminal().unwrap();
         assert_eq!(
-            recover_job(&session.writer).await.unwrap(),
+            recover_job(&session.writer).await.unwrap().0,
             EXIT_ARTIFACT_TRANSFER_FAILED
         );
         assert_eq!(

@@ -659,7 +659,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
         let bytes = self.outbound(frame)?;
         let budget = self.remaining()?;
         let stream = &mut self.stream;
-        let result = self.runtime.block_on(async {
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(self.runtime, async {
             asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
                 stream
                     .write_all(&bytes)
@@ -683,7 +683,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
         let budget = self.remaining()?;
         let stream = &mut self.stream;
         let buffered = &mut self.buffered;
-        let result = self.runtime.block_on(async {
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(self.runtime, async {
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 budget,
@@ -1628,6 +1628,7 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt;
 
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (upload, mut request, mut script, _) = source_fixture(root);
         let original = root.join("compiler-input");
         std::fs::create_dir(&original).unwrap();

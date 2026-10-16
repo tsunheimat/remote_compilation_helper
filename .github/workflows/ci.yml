@@ -6,7 +6,12 @@ on:
   pull_request:
   schedule:
     - cron: '0 6 * * 1'  # Weekly security scan on Monday 6 AM UTC
-  workflow_dispatch:  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      extended:
+        description: 'Also run documentation, benchmarks and coverage (existing budgets enforced)'
+        type: boolean
+        default: false
 
 # Cancel in-progress runs for the same branch/PR to save resources
 concurrency:
@@ -16,8 +21,6 @@ concurrency:
 # Minimal permissions - only what's needed
 permissions:
   contents: read
-  pull-requests: write  # For benchmark comments
-  checks: write  # For security audit check runs
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,26 +37,34 @@ env:
   RUSTUP_TOOLCHAIN: nightly-2026-08-31
 
 jobs:
-  # Fast syntax and type checking - gate for other jobs
+  # One checkout/cache for formatting and the compiler-backed Clippy check.
+  # Clippy type-checks the same complete target/feature graph as cargo check.
   check:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
       - uses: Swatinem/rust-cache@v2
         with:
-          # Include the virtual workspace root omitted by Cargo package metadata.
           prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
-      - run: cargo check --all-targets --all-features
+      # Collect diagnostics from independent targets in one run. Failed
+      # dependencies still block their consumers; every warning remains fatal.
+      - run: cargo clippy --locked --workspace --all-targets --all-features --keep-going -- -D warnings
 
-  # Validate ACFS manifest sync
+  # Bundle integrity, installer syntax and workflow wiring share one cheap job.
   manifest_sync:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Run manifest sync tests
@@ -77,50 +88,29 @@ jobs:
           chmod +x scripts/check_release_assets.sh
           ./scripts/check_release_assets.sh --self-test
 
-  # Validate GitHub Actions workflow syntax
-  workflow_lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate Dependabot automerge workflow
+      - name: Check installer scripts (retained from notify-acfs)
+        shell: bash
         run: |
-          chmod +x scripts/test_dependabot_automerge_workflow.sh
-          ./scripts/test_dependabot_automerge_workflow.sh
-
-  # Ensure consistent formatting
-  fmt:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+          set -euo pipefail
+          command -v shellcheck
+          for script in install.sh scripts/install.sh; do
+            if [ -f "$script" ]; then
+              shellcheck "$script"
+            fi
+          done
+      - name: Validate all workflow syntax, expressions and reusable calls
+        uses: docker://rhysd/actionlint:1.7.12
         with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  # Lint checks with strict warnings
-  clippy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          cache-on-failure: true
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+          # Embedded script lint is separate from workflow-graph validation.
+          args: -color -shellcheck= -pyflakes=
 
   # Dependency vulnerability scanning - runs on PRs too for immediate feedback
   security:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
@@ -129,6 +119,7 @@ jobs:
 
   # Verify documentation builds without warnings
   docs:
+    if: github.event_name == 'workflow_dispatch' && inputs.extended
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: check
@@ -148,6 +139,7 @@ jobs:
   # Cross-platform test matrix
   # Note: Uses default features only (excludes true-e2e feature which runs in dedicated e2e job)
   test:
+    if: github.event_name != 'schedule'
     name: test (${{ matrix.name }})
     strategy:
       fail-fast: false
@@ -308,72 +300,15 @@ jobs:
             **/test-output.log
           retention-days: 7
 
-  # Integration testing with mock SSH
-  # Runs true E2E tests gated by --features true-e2e
+  # One owner for all shell scenarios and the feature-gated Cargo E2E suite.
   e2e:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    needs: [check, clippy]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          cache-on-failure: true
-      - name: Build release binaries
-        # The Cargo and shell harnesses consume these application binaries.
-        # RABS spine release builds and gates have their own workflow.
-        run: |
-          cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
-          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
-      - name: Build debug support binaries for cargo E2E harness
-        # Cargo's integration-test command builds target/debug/rch with its
-        # true-e2e feature set. Prepare only the daemon and worker here, keeping
-        # package selection stable for their dependency feature resolution.
-        run: cargo build --locked -p rch -p rchd -p rch-wkr --bin rchd --bin rch-wkr
-      - name: Run cargo-based E2E tests (feature-gated)
-        env:
-          RCH_MOCK_SSH: '1'
-          RCH_LOG_LEVEL: debug
-          RCH_E2E_SKIP_WORKER_CHECK: '1'
-          RCH_TEST_LOGGING: '1'
-        run: |
-          set -o pipefail
-          mkdir -p test-results/cargo-e2e
-          # Run E2E tests via cargo test with true-e2e feature
-          cargo test --features true-e2e -p rch --test true_e2e -- --test-threads=1 2>&1 | tee test-results/cargo-e2e/output.log
-      - name: Run shell-based E2E tests
-        env:
-          RCH_MOCK_SSH: '1'
-          RCH_LOG_LEVEL: debug
-          RCH_TEST_LOGGING: '1'
-          E2E_LOG_DIR: test-results/e2e-logs
-          E2E_JUNIT_FILE: test-results/e2e-logs/junit.xml
-        run: |
-          set -o pipefail
-          chmod +x scripts/e2e_test.sh
-          ./scripts/e2e_test.sh 2>&1 | tee e2e-output.log
-      - name: Check test performance regression
-        if: always()
-        run: |
-          python3 scripts/check_test_regression.py --verbose --json-output target/test-regression-report.json || true
-      - name: Upload E2E logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-logs
-          path: |
-            e2e-output.log
-            test-results/
-            target/test-logs/
-            target/test-regression-report.json
-          retention-days: 14
+    if: github.event_name != 'schedule'
+    needs: check
+    uses: ./.github/workflows/e2e.yml
 
   # Performance benchmark - verify latency budgets from AGENTS.md
   benchmark:
+    if: github.event_name == 'workflow_dispatch' && inputs.extended
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: check
@@ -403,82 +338,17 @@ jobs:
           name: benchmark-results
           path: target/criterion/
           retention-days: 30
-      - name: Comment on PR with benchmark results
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            try {
-              const summary = fs.readFileSync('target/criterion/summary.txt', 'utf8');
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: '## Benchmark Results\n```\n' + summary + '\n```'
-              });
-            } catch (e) {
-              console.log('No summary file found, skipping comment');
-            }
 
-  # Build release binaries for all targets (validates cross-compilation)
+  # Validate the actual shipping profiles, versions and packages on all six
+  # platforms once, instead of also compiling a second generic release matrix.
   build-release:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            packages: musl-tools
-          - os: ubuntu-24.04-arm  # Native ARM64 runner (10x faster than cross-compile)
-            target: aarch64-unknown-linux-gnu
-          # Match the native Intel runner used by tests and release packaging.
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    needs: [test, clippy]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          shared-key: release-${{ matrix.target }}
-          cache-on-failure: true
-      - name: Install packages (Linux)
-        if: matrix.packages
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
-      - name: Build release (Unix)
-        if: runner.os != 'Windows'
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Build release (Windows - skip rich-ui)
-        if: runner.os == 'Windows'
-        run: cargo build --release --no-default-features --target ${{ matrix.target }}
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: rch-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/rch
-            target/${{ matrix.target }}/release/rch.exe
-            target/${{ matrix.target }}/release/rchd
-            target/${{ matrix.target }}/release/rchd.exe
-            target/${{ matrix.target }}/release/rch-wkr
-            target/${{ matrix.target }}/release/rch-wkr.exe
-          retention-days: 7
+    if: github.event_name != 'schedule'
+    needs: [check, test]
+    uses: ./.github/workflows/test-release.yml
 
   # Coverage reporting (Linux only)
   coverage:
+    if: github.event_name == 'workflow_dispatch' && inputs.extended
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: check
@@ -567,22 +437,34 @@ jobs:
           path: coverage-summary.md
           retention-days: 30
 
-  # Final status check - useful for branch protection rules
+  # The stable aggregate also fails on skipped/cancelled REQUIRED jobs.
+  # Only intentionally unrequested extended jobs may be skipped on PRs.
   ci-success:
     runs-on: ubuntu-latest
-    needs: [check, fmt, clippy, security, test, e2e, build-release]
+    timeout-minutes: 5
+    needs: [check, manifest_sync, security, test, e2e, build-release, docs, benchmark, coverage]
     if: always()
     steps:
-      - name: Check all jobs passed
+      - name: Check required results for this invocation
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXTENDED: ${{ inputs.extended || false }}
         run: |
-          if [ "${{ needs.check.result }}" != "success" ] || \
-             [ "${{ needs.fmt.result }}" != "success" ] || \
-             [ "${{ needs.clippy.result }}" != "success" ] || \
-             [ "${{ needs.security.result }}" != "success" ] || \
-             [ "${{ needs.test.result }}" != "success" ] || \
-             [ "${{ needs.e2e.result }}" != "success" ] || \
-             [ "${{ needs.build-release.result }}" != "success" ]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          echo "All required CI checks passed!"
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ['JOB_RESULTS'])
+          required = {'security'}
+          if os.environ['EVENT_NAME'] != 'schedule':
+              required.update({'check', 'manifest_sync', 'test', 'e2e', 'build-release'})
+          if os.environ['EVENT_NAME'] == 'workflow_dispatch' and os.environ['EXTENDED'] == 'true':
+              required.update({'docs', 'benchmark', 'coverage'})
+          failed = {job: results.get(job, {}).get('result', 'missing')
+                    for job in sorted(required)
+                    if results.get(job, {}).get('result') != 'success'}
+          print(json.dumps({'required': sorted(required), 'failed': failed}, indent=2))
+          sys.exit(1 if failed else 0)
+          PY

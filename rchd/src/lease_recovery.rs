@@ -86,11 +86,17 @@ fn verify_recovery_completion(
             .as_i64()
             .and_then(|code| i32::try_from(code).ok())
     });
+    // A long-dead build the daemon no longer knew held no reservation; the
+    // client accepts that absence only after the 24h stuck cap (bd-ey7fr).
+    let daemon_record_absent = after
+        .recovery
+        .as_ref()
+        .is_some_and(|recipe| recipe["daemon_record_absent"].as_bool() == Some(true));
     if !after.terminal_acknowledged
         || after.state != rch_common::job_identity::JobLifecycleState::Finished
         || retired_delivery(after).is_none()
         || retired_delivery(after) != after.exit_code
-        || daemon_exit.is_none()
+        || (daemon_exit.is_none() && !daemon_record_absent)
     {
         return Err(
             "recovery command exited without durable daemon/delivery acknowledgement".into(),
@@ -458,6 +464,33 @@ mod tests {
     use super::*;
     use rch_common::job_identity::JobIdentity;
 
+    /// A fake `rch` for recovery: a hard link to one shim written once per
+    /// process, whose behavior is the data file `body` beside the link.
+    /// Writing a fresh executable and exec'ing it at once fails with ETXTBSY
+    /// when a concurrent test forks while the write fd is open (the child holds
+    /// a copy until it execs); see `launchd_singleton_tests` in main.rs.
+    #[cfg(unix)]
+    fn fake_rch(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        static SHIM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let shim = SHIM.get_or_init(|| {
+            let shim = tempfile::tempdir().unwrap().keep().join("rch-shim");
+            std::fs::write(
+                &shim,
+                "#!/bin/sh\nexec /bin/sh \"$(dirname \"$0\")/body\" \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+            shim
+        });
+        std::fs::write(dir.join("body"), body).unwrap();
+        let child = dir.join("rch");
+        if !child.exists() {
+            std::fs::hard_link(shim, &child).unwrap();
+        }
+        child
+    }
+
     fn recoverable_lease_ids(
         directory: &Path,
         now: u64,
@@ -617,7 +650,9 @@ mod tests {
             sender.shutdown().await.unwrap();
         };
         let consumer = drain_recovery_stderr(&mut receiver, &mut tail);
-        let ((), drained) = tokio::time::timeout(Duration::from_secs(10), async {
+        // Only a hang guard: 2 MiB through a 128-byte pipe is ~16k wakeups,
+        // which exceeded 10 s on a Mac at load 64.
+        let ((), drained) = tokio::time::timeout(Duration::from_secs(60), async {
             tokio::join!(producer, consumer)
         })
         .await
@@ -860,6 +895,13 @@ mod tests {
         let mut no_daemon_receipt = complete.clone();
         no_daemon_receipt.recovery.as_mut().unwrap()["daemon_exit_code"] = serde_json::Value::Null;
         assert!(verify_recovery_completion(&before, &no_daemon_receipt).is_err());
+        // bd-ey7fr: a long-dead build the daemon no longer knew settles on
+        // the client's recorded absence instead of a terminal receipt.
+        let mut forgotten = no_daemon_receipt.clone();
+        forgotten.recovery.as_mut().unwrap()["daemon_record_absent"] = serde_json::json!(true);
+        verify_recovery_completion(&before, &forgotten).unwrap();
+        forgotten.recovery.as_mut().unwrap()["daemon_record_absent"] = serde_json::json!("true");
+        assert!(verify_recovery_completion(&before, &forgotten).is_err());
         let mut false_success = complete.clone();
         false_success.exit_code = Some(0);
         assert!(verify_recovery_completion(&before, &false_success).is_err());
@@ -895,15 +937,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn child_exit_zero_without_journal_completion_is_not_auto_recovery_success() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let pending = handoff_lease(0, 11, 102);
         let id = &pending.identity.local_wrapper_id;
         let path = dir.path().join(format!("{id}.json"));
         std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-        let child = dir.path().join("rch");
-        std::fs::write(&child, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let child = fake_rch(dir.path(), "exit 0\n");
         let error = recover_in(
             &child,
             &dir.path().join("unused.sock"),
@@ -921,15 +960,14 @@ mod tests {
         std::fs::write(&receipt, serde_json::to_vec(&complete).unwrap()).unwrap();
         // The test-owned child simulates writing the final durable journal;
         // the daemon must inspect that journal rather than its exit alone.
-        std::fs::write(
-            &child,
-            format!(
-                "#!/bin/sh\ncp -- {} {}\n",
+        fake_rch(
+            dir.path(),
+            &format!(
+                "cp -- {} {}\n",
                 shell_escape::escape(receipt.to_str().unwrap().into()),
                 shell_escape::escape(path.to_str().unwrap().into())
             ),
-        )
-        .unwrap();
+        );
         recover_in(
             &child,
             &dir.path().join("unused.sock"),
@@ -944,7 +982,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recovery_scan_uses_canonical_regular_journals_and_oldest_owner_first() {
-        let dir = tempfile::tempdir().unwrap();
+        // The socket fixture's path must fit sockaddr_un (104 bytes on macOS,
+        // where the default TMPDIR alone is ~49).
+        let dir = tempfile::Builder::new()
+            .prefix("rch-lease-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let now = 100 * 60 * 60 * 1000;
         let oldest = handoff_lease(0, 11, 102);
         let newer = handoff_lease(now - 30 * 60 * 1000, 11, 102);

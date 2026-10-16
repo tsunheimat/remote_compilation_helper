@@ -23,6 +23,12 @@
 //!   No writer or execution was admitted here. The wrapper may retry the
 //!   identical request on this connection under its own bounded backoff.
 //!   Each retry reobserves inputs and rechecks every serving/sampling gate;
+//! - `{"kind":"rustc-decision","decision":"preparing",…}` — also only
+//!   with `wait_for_inflight: true`: shared input facts are warming. There
+//!   is no action identity or execution/install ownership yet. Retrying
+//!   allows the FIRST cold build to populate the cache instead of requiring
+//!   throwaway builds. Preparation and keyed waits share the wrapper's one
+//!   deadline and retry quota. Older wrappers can decline before any writes;
 //! - anything else — run the compiler as if RABS were absent.
 //!
 //! Requests outside the live class keep the shadow plane's observation, so
@@ -36,8 +42,7 @@ use crate::edge::live_facts::{FactsMiss, LiveFacts};
 use rabs_cas::metadata_store::digest_key;
 use rabs_key::build_script_directives::bind_rustc_environment;
 use rabs_key::live_dependency::{
-    ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment, live_dependency_key,
-    plan_dependency_action,
+    ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment,
 };
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
@@ -47,6 +52,15 @@ use rabs_protocol::result_identity::ObjectId;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
+
+#[path = "admission_preflight.rs"]
+mod admission_preflight;
+#[path = "build_script_reuse.rs"]
+mod build_script_reuse;
+#[path = "directory_source.rs"]
+mod directory_source;
+#[path = "input_preparation.rs"]
+mod input_preparation;
 
 /// Largest completion frame: a bounded transcript in hex plus envelope.
 pub(super) const MAX_COMPLETION_FRAME_BYTES: usize = 2 * MAX_TRANSCRIPT_BYTES + 64 * 1024;
@@ -59,6 +73,7 @@ const MAX_ENV: usize = 4096;
 pub struct LiveEdge {
     lane: LiveDependencyLane,
     facts: Arc<LiveFacts>,
+    reuse_empty_out_dir: bool,
 }
 
 impl LiveEdge {
@@ -68,6 +83,7 @@ impl LiveEdge {
         Self {
             lane,
             facts: LiveFacts::new(),
+            reuse_empty_out_dir: build_script_reuse::enabled(),
         }
     }
 }
@@ -96,6 +112,42 @@ fn pass_through(reason: &str) -> String {
         "compiler_skip_authorized": false,
     })
     .to_string()
+}
+
+/// A pending observation is not an action key or a reserved dispatch. Keep
+/// this vocabulary separate from coordinator decisions: readiness cannot
+/// acquire execution, publication or output-install authority.
+#[derive(Clone, Copy)]
+enum PendingFacts {
+    Toolchain,
+    Package,
+    Dependencies,
+}
+
+impl PendingFacts {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Toolchain => "toolchain-facts-pending",
+            Self::Package => "package-facts-pending",
+            Self::Dependencies => "dependency-facts-pending",
+        }
+    }
+}
+
+fn preparing(unit: &str, facts: PendingFacts) -> Decided {
+    let reason = facts.reason();
+    log("preparing", &[("crate", unit), ("reason", reason)]);
+    // Returning Reply releases the blocking lane. The existing bounded
+    // warmer owns the observation; this connection retains no waiter task,
+    // action reservation or writable output. Its next request reobserves
+    // everything through decide, rather than adopting a stale descriptor.
+    Decided::Reply(
+        json!({
+            "kind": "rustc-decision", "decision": "preparing", "reason": reason,
+            "compiler_skip_authorized": false, "materialization_started": false,
+        })
+        .to_string(),
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -197,12 +249,32 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         return Decided::Reply(pass_through("malformed-request"));
     };
     let unit = crate_name(&parsed.argv);
+    let may_wait = request.get("wait_for_inflight").and_then(Value::as_bool) == Some(true);
     // Every refusal below is logged with its reason: an unexplained miss is
     // indistinguishable from a lane that never saw the request.
     let refuse = |reason: &str| {
         log("pass-through", &[("crate", unit), ("reason", reason)]);
         Decided::Reply(pass_through(reason))
     };
+    // Compiler probes and primary packages cannot be admitted, even once
+    // the sysroot is warm. Do not delay Cargo (or occupy a warmer) for them.
+    // Passing preflight grants no authority: the observed-host planner below
+    // still checks the entire source/output class and all serving gates.
+    if let Some(refusal) = admission_preflight::rejection(LiveRustcRequest {
+        argv: &parsed.argv,
+        cwd: &parsed.cwd,
+        env: &parsed.env,
+    }) {
+        log(
+            "shadow",
+            &[
+                ("crate", unit),
+                ("reason", refusal.code()),
+                ("detail", &refusal.to_string()),
+            ],
+        );
+        return Decided::Shadow(observation(&parsed));
+    }
     let constructed = constructed_environment(&parsed.env);
     let toolchain = match live
         .facts
@@ -214,6 +286,9 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 "toolchain-warming",
                 &[("crate", unit), ("compiler", &parsed.argv[0])],
             );
+            if may_wait {
+                return preparing(unit, PendingFacts::Toolchain);
+            }
             return Decided::Shadow(observation(&parsed));
         }
         Err(FactsMiss::Refused(reason)) => {
@@ -235,7 +310,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         );
         return Decided::Shadow(observation(&parsed));
     };
-    let mut plan = match plan_dependency_action(
+    let mut plan = match directory_source::plan_dependency_action(
         LiveRustcRequest {
             argv: &parsed.argv,
             cwd: &parsed.cwd,
@@ -259,13 +334,26 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             return Decided::Shadow(observation(&parsed));
         }
     };
-    let package = match live.facts.package(
-        Path::new(&plan.source_root),
-        plan.source_kind,
-        plan.generated_root.as_deref().map(Path::new),
-    ) {
-        Ok(package) => package,
-        Err(miss) => {
+    // Keep the original observation through the entire request lifecycle.
+    // Later cache refreshes must not substitute another toolchain generation
+    // after this invocation has been keyed or its compiler has started.
+    let toolchain_guard = match live
+        .facts
+        .toolchain_guard(Path::new(&plan.compiler), &toolchain)
+    {
+        Ok(guard) => guard,
+        Err(FactsMiss::Pending) if may_wait => return preparing(unit, PendingFacts::Toolchain),
+        Err(miss) => return refuse(&miss.to_string()),
+    };
+    let (package, dependencies) = match input_preparation::observe(&live.facts, &plan, may_wait) {
+        Ok(observed) => observed,
+        Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Package);
+        }
+        Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Dependencies);
+        }
+        Err(input_preparation::InputMiss::Package(miss)) => {
             log(
                 "pass-through",
                 &[
@@ -277,6 +365,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             );
             return Decided::Reply(pass_through(&miss.to_string()));
         }
+        Err(input_preparation::InputMiss::Dependencies(miss)) => return refuse(&miss.to_string()),
     };
     if let Err(reason) = package.verify_generated_disjoint(&plan) {
         return refuse(&reason);
@@ -321,10 +410,6 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }),
     );
     let mut externs = Vec::new();
-    let dependencies = match live.facts.dependencies(&plan) {
-        Ok(dependencies) => dependencies,
-        Err(miss) => return refuse(&miss.to_string()),
-    };
     for planned in &plan.externs {
         if let PlannedExtern::File { path, .. } = planned {
             match live.facts.file_digest(Path::new(path)) {
@@ -336,13 +421,14 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }
         }
     }
-    let key = match live_dependency_key(
-        &plan,
+    let key = match build_script_reuse::key(
+        &mut plan,
         &toolchain,
         &externs,
         &dependencies.directories,
-        package.build_script_output.as_deref(),
+        &package,
         &inputs,
+        live.reuse_empty_out_dir,
     ) {
         Ok(key) => key,
         Err(refusal) => {
@@ -364,17 +450,13 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         inputs,
         package,
         dependencies,
+        toolchain: toolchain_guard,
         externs: externs
             .into_iter()
             .map(|fact| (fact.path, fact.content_digest))
             .collect(),
     });
-    decision_reply(
-        decision,
-        &key_text,
-        unit,
-        request.get("wait_for_inflight").and_then(Value::as_bool) == Some(true),
-    )
+    decision_reply(decision, &key_text, unit, may_wait)
 }
 
 fn decision_reply(
@@ -547,8 +629,9 @@ fn completion_not_published(key: &str, detail: &str) -> String {
     .to_string()
 }
 
-/// No CAS lock or blocking-worker permit is retained while waiting for the
-/// wrapper. A lost, truncated, malformed or expired ACK is non-publication.
+/// No CAS lock or worker thread is retained while waiting for the wrapper.
+/// The caller keeps its completion capacity reservation across this bounded
+/// exchange. A lost, truncated, malformed or expired ACK is non-publication.
 async fn acknowledge_capture(
     stream: &mut super::EdgeStream,
     attempt: &str,
@@ -578,16 +661,24 @@ pub(super) async fn complete_on_lane(
     stream: &mut super::EdgeStream,
 ) -> String {
     let key_text = digest_key(attempt.action_key());
-    let prepared = match lane.spawn(move || {
+    // Reserve ONCE for capture -> acknowledgment -> publication/cleanup.
+    // A fresh burst must not steal the publication slot after we told Cargo
+    // that its outputs were captured. This permit grants capacity only: the
+    // exact acknowledgment and every coordinator publication gate still apply.
+    let Some(reservation) = lane.acquire() else {
+        return completion_not_published(&key_text, &super::WorkError::Saturated.to_string());
+    };
+    let prepared = match reservation.stage(move || {
         let report = completion_report(&frame, &attempt.attempt_hex())
             .ok_or_else(|| "malformed or unversioned completion".to_owned())?;
         (*attempt).capture(&report)
     }) {
-        Ok(mut work) => match work.wait().await {
-            Ok(result) => result,
-            Err(error) => Err(error.to_string()),
-        },
+        Ok(mut work) => work.wait().await.map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
+    };
+    let (prepared, reservation) = match prepared {
+        Ok(result) => result,
+        Err(detail) => return completion_not_published(&key_text, &detail),
     };
     let captured = match prepared {
         Ok(captured) => captured,
@@ -595,8 +686,10 @@ pub(super) async fn complete_on_lane(
     };
     let attempt_hex = captured.attempt_hex();
     let ack = acknowledge_capture(stream, &attempt_hex, captured.manifest_key()).await;
+    // Capture's worker has been joined; acknowledgment held no thread or CAS
+    // lock. Consume the same non-clone reservation, never race a second acquire.
     let completion_key = key_text.clone();
-    let finished = lane.spawn(move || {
+    let finished = reservation.finish(move || {
         let Some(ack) = ack else {
             drop(captured);
             return completion_not_published(
@@ -712,33 +805,37 @@ mod completion_capture_tests {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
                 .unwrap();
-            let acknowledged = runtime.block_on(async {
-                let listener = asupersync::net::unix::UnixListener::bind(&path)
-                    .await
-                    .unwrap();
-                let peer = std::thread::spawn(move || {
-                    let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(5)))
+            let acknowledged =
+                rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
+                    let listener = asupersync::net::unix::UnixListener::bind(&path)
+                        .await
                         .unwrap();
-                    let mut socket = BufReader::new(socket);
-                    let mut line = String::new();
-                    socket.read_line(&mut line).unwrap();
-                    let receipt: Value = serde_json::from_str(&line).unwrap();
-                    assert_eq!(receipt["kind"], "rustc-captured");
-                    assert_eq!(receipt["attempt"], "a");
-                    assert_eq!(receipt["capture"], "c");
-                    assert_eq!(receipt["publication_authorized"], false);
-                    if let Some(reply) = reply {
-                        socket.get_mut().write_all(reply.as_bytes()).unwrap();
-                    }
+                    let peer = std::thread::spawn(move || {
+                        let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut socket = BufReader::new(socket);
+                        let mut line = String::new();
+                        socket.read_line(&mut line).unwrap();
+                        let receipt: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(receipt["kind"], "rustc-captured");
+                        assert_eq!(receipt["attempt"], "a");
+                        assert_eq!(receipt["capture"], "c");
+                        assert_eq!(receipt["publication_authorized"], false);
+                        if let Some(reply) = reply {
+                            socket.get_mut().write_all(reply.as_bytes()).unwrap();
+                        }
+                    });
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = super::super::EdgeStream::with_capacity(
+                        super::super::FRAME_READ_BUFFER_BYTES,
+                        socket,
+                    );
+                    let acknowledged = acknowledge_capture(&mut socket, "a", "c").await.is_some();
+                    peer.join().unwrap();
+                    acknowledged
                 });
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut socket = super::super::EdgeStream::new(socket);
-                let acknowledged = acknowledge_capture(&mut socket, "a", "c").await.is_some();
-                peer.join().unwrap();
-                acknowledged
-            });
             assert_eq!(
                 acknowledged,
                 reply.is_some_and(|reply| reply.ends_with('\n') && !reply.contains("other"))
@@ -750,6 +847,31 @@ mod completion_capture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparing_facts_has_neither_action_identity_nor_execution_or_install_authority() {
+        for (facts, reason) in [
+            (PendingFacts::Toolchain, "toolchain-facts-pending"),
+            (PendingFacts::Package, "package-facts-pending"),
+            (PendingFacts::Dependencies, "dependency-facts-pending"),
+        ] {
+            let Decided::Reply(reply) = preparing("leaf", facts) else {
+                panic!("preparation must release the request lane without ownership");
+            };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["kind"], "rustc-decision");
+            assert_eq!(reply["decision"], "preparing");
+            assert_eq!(reply["reason"], reason);
+            assert_eq!(reply["compiler_skip_authorized"], false);
+            assert_eq!(reply["materialization_started"], false);
+            for absent in ["action_key", "attempt", "env"] {
+                assert!(
+                    reply.get(absent).is_none(),
+                    "{absent} is not a readiness fact"
+                );
+            }
+        }
+    }
 
     #[test]
     fn request_parsing_is_strict_and_hex_round_trips() {
