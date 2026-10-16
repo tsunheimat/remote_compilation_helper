@@ -152,7 +152,7 @@ mod tests {
                 "budget {milliseconds}: {elapsed:?}"
             );
         }
-        assert!(MAX_RETRIES + 1 < 64);
+        const { assert!(MAX_RETRIES + 1 < 64) };
     }
 
     #[test]

@@ -26,7 +26,7 @@ const INPUTS: &[&str] = &[
 ];
 
 fn fixture() -> (PathBuf, Vec<(String, PathBuf)>) {
-    let retained = tempfile::tempdir().unwrap().keep();
+    let retained = crate::private_test_directory().unwrap().keep();
     let roots: Vec<_> = ["workspace", "dependency"]
         .into_iter()
         .map(|id| (id.to_owned(), retained.join(id)))
@@ -173,7 +173,7 @@ fn excluded_directories_are_not_enumerated_even_with_opaque_or_unreadable_childr
             let path = root.join(directory);
             let opaque = std::ffi::OsString::from_vec(b"invalid-\xff-name".to_vec());
             fs::write(path.join(opaque), b"private opaque filename").unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         }
     }
     // Root can read mode-000 directories; the invalid filename separately

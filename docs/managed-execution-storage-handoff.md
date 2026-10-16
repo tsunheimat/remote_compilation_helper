@@ -90,6 +90,17 @@ uses `--keep-going` to collect independent target diagnostics in one run, while
 retaining `--locked`, all targets/features and fatal warnings. A failed dependency
 still blocks its consumers; this is not error suppression or a new CI job.
 
+On `654c9ee8c38308c517bc6305cad455039afb1a33`,
+[CI 38910363670](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38910363670)
+collected the independent target graph and reported three further test-only
+findings: an unused private-directory helper, a non-octal zero permission literal
+and a runtime assertion on a constant retry bound. The snapshot fixture now uses
+the existing private-directory helper; unreadable directories retain exactly mode
+`0o000`; the retry bound is enforced at compile time. No test or assertion is
+removed. This run passed pinned formatting and bundle/workflow integrity. The
+corresponding RABS run passed both native installer jobs and release spine build;
+its later Rust gates were still running when these findings were recorded.
+
 The real coordinator/edge SPRT suite also gets a regression for a newer reset or
 malformed checkpoint alongside an older 99-install qualification. It must refuse
 replay without touching the destination or overwriting the older receipt, and a
