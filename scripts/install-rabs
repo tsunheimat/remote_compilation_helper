@@ -135,17 +135,17 @@ def source_files(bundle, build):
 
 
 class ReleaseMember(tarfile.TarInfo):
-    @classmethod
-    def frombuf(cls, buf, encoding, errors):
-        member = super().frombuf(buf, encoding, errors)
-        # Refuse extension headers BEFORE tarfile reads their payloads. A
-        # post-parse size check cannot bound a compressed PAX/longname record.
+    def _proc_member(self, archive):
+        # Validate at the member-processing boundary, before any extension
+        # payload is read. Patched CPython versions parse headers via _frombuf
+        # and bypass a subclass's public frombuf override; _proc_member remains
+        # the dispatch point on both parser implementations.
         # Release jobs deliberately emit flat GNU/ustar regular-file entries.
-        if member.name not in ARCHIVE_MEMBERS or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
-            raise InstallError("unsupported release archive header: " + member.name)
-        if not 0 < member.size <= MAX_FILE_BYTES:
+        if self.name not in ARCHIVE_MEMBERS or self.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
+            raise InstallError("unsupported release archive header: " + self.name)
+        if not 0 < self.size <= MAX_FILE_BYTES:
             raise InstallError("release member exceeds its byte limit")
-        return member
+        return super()._proc_member(archive)
 
 
 def unpack_archive(path, destination, reserve_bytes=0):

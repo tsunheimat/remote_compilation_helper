@@ -2044,7 +2044,8 @@ mod tests {
             observe_with_breaker(
                 socket.to_str().unwrap(),
                 path,
-                &["/tc/bin/rustc".to_owned()]
+                &["/tc/bin/rustc".to_owned()],
+                None,
             ),
             Live::PassThrough
         ));
@@ -2068,7 +2069,7 @@ mod tests {
         store_state(path, &state).unwrap();
         let _reader = try_read_breaker(path).unwrap();
 
-        observe_with_breaker(socket.to_str().unwrap(), path, &[]);
+        observe_with_breaker(socket.to_str().unwrap(), path, &[], None);
 
         assert_eq!(load_state(path), state);
         assert_eq!(

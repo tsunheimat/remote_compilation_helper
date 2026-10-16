@@ -593,6 +593,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 
     // bd-2spi4: what the speed gate would decide for this project and kind,
     // before its local-slot and free-memory checks.
+    #[cfg(unix)]
     let speed_gate = would_intercept.then(|| {
         crate::hook::diagnose_speed_gate(
             &config,
@@ -600,6 +601,14 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             details.classification.kind,
         )
     });
+    // The non-Unix hook has no local/remote speed gate. Preserve the portable
+    // response schema, but never fabricate timing samples or an admission.
+    #[cfg(not(unix))]
+    let speed_gate: Option<SpeedGateDiagnosis> = None;
+    #[cfg(not(unix))]
+    if would_intercept && config.compilation.local_slots > 0 {
+        capabilities_warnings.push("Local speed gate unavailable on this platform".to_owned());
+    }
 
     if ctx.is_json() {
         let response = DiagnoseResponse {

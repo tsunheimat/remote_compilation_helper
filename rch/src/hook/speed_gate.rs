@@ -24,6 +24,7 @@
 //!   compressor-segment headroom and bounded CPU-normalized load. Unknown or
 //!   invalid pressure metrics never admit a local build.
 use super::timing_history::{ProjectTimingData, TimingRecord, timing_cache};
+use crate::commands::types::{MacOsPressure, SpeedGateDiagnosis};
 use rch_common::CompilationKind;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -42,14 +43,6 @@ const LOCAL_MAX_COMPRESSOR_SEGMENT_PCT: u8 = 50;
 /// Refuse at or above two runnable tasks per logical CPU, on either the one-
 /// or five-minute window. A quiet short window cannot hide sustained pressure.
 const LOCAL_MAX_LOAD_PER_CPU: f64 = 2.0;
-
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub(crate) struct MacOsPressure {
-    pub compressor_segments: u64,
-    pub compressor_segment_limit: u64,
-    pub load_average: [f64; 3],
-    pub logical_cpus: u32,
-}
 
 /// Parse the four outputs of the fixed, ordered sysctl query below. Do not
 /// substitute compressed-page utilization for segment utilization: they can
@@ -515,29 +508,6 @@ pub(super) fn evaluate(
         return None;
     }
     Some((reason, slot))
-}
-
-/// What `rch diagnose` reports about the gate for this project and kind.
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
-pub(crate) struct SpeedGateDiagnosis {
-    pub enabled: bool,
-    pub local_slots: u32,
-    pub remote_speedup_threshold: f64,
-    pub min_local_time_ms: u64,
-    pub local_samples: usize,
-    pub remote_samples: usize,
-    pub local_median_ms: Option<u64>,
-    pub remote_median_ms: Option<u64>,
-    /// `local` or `remote`, before the placement, slot and resource checks.
-    pub decision: Option<String>,
-    pub reason: Option<String>,
-    pub free_memory_pct: Option<u8>,
-    pub min_free_memory_pct: u8,
-    pub macos_pressure: Option<MacOsPressure>,
-    pub max_compressor_segment_pct: u8,
-    pub max_load_per_cpu: f64,
-    /// Resource admission only; this does not grant a slot or override placement.
-    pub resources_allow_local: bool,
 }
 
 pub(crate) fn diagnose(

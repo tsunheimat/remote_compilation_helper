@@ -449,6 +449,39 @@ pub struct ConfigDiffResponse {
 // Diagnose Response Types
 // =============================================================================
 
+/// Observed macOS resource pressure; representation is portable even though
+/// collection and local-execution admission are platform-specific.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct MacOsPressure {
+    pub compressor_segments: u64,
+    pub compressor_segment_limit: u64,
+    pub load_average: [f64; 3],
+    pub logical_cpus: u32,
+}
+
+/// What `rch diagnose` reports about a supported local-execution speed gate.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SpeedGateDiagnosis {
+    pub enabled: bool,
+    pub local_slots: u32,
+    pub remote_speedup_threshold: f64,
+    pub min_local_time_ms: u64,
+    pub local_samples: usize,
+    pub remote_samples: usize,
+    pub local_median_ms: Option<u64>,
+    pub remote_median_ms: Option<u64>,
+    /// `local` or `remote`, before the placement, slot and resource checks.
+    pub decision: Option<String>,
+    pub reason: Option<String>,
+    pub free_memory_pct: Option<u8>,
+    pub min_free_memory_pct: u8,
+    pub macos_pressure: Option<MacOsPressure>,
+    pub max_compressor_segment_pct: u8,
+    pub max_load_per_cpu: f64,
+    /// Resource admission only; this does not grant a slot or override placement.
+    pub resources_allow_local: bool,
+}
+
 /// Diagnose command response for JSON output.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseResponse {
@@ -475,7 +508,7 @@ pub struct DiagnoseResponse {
     /// bd-2spi4: the speed gate's view of this build (intercepted builds only):
     /// measured local/remote medians, the threshold and the decision.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub speed_gate: Option<crate::hook::SpeedGateDiagnosis>,
+    pub speed_gate: Option<SpeedGateDiagnosis>,
     /// Dry-run summary showing the full pipeline (only present when --dry-run is used).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<DryRunSummary>,

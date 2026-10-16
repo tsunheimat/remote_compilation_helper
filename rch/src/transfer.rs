@@ -215,7 +215,7 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::Instant as TokioInstant;
 use tokio::time::sleep;
@@ -274,40 +274,7 @@ fn is_windows_drive_abs_path(path: &str) -> bool {
         && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
-pub(crate) async fn read_bounded_output_stream<R>(
-    mut reader: R,
-    max_bytes: usize,
-) -> std::io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut output = Vec::new();
-    // Heap, not an inline array: an array is part of this future, and two of
-    // these (stdout and stderr) made every future that runs a remote command
-    // ~33 KB. In debug builds each await of one costs a stack slot that size,
-    // which put `execute_remote_compilation_inner`'s poll frame at 1.7 MB and
-    // overflowed the 2 MiB test-thread stack (bd-uz82c, again).
-    let mut chunk = vec![0_u8; 16 * 1024];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(output);
-        }
-        let next_len = output.len().checked_add(read).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "command output size overflow",
-            )
-        })?;
-        if next_len > max_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("command output exceeded {max_bytes} bytes"),
-            ));
-        }
-        output.extend_from_slice(&chunk[..read]);
-    }
-}
+pub(crate) use crate::process_output::read_bounded_output_stream;
 
 async fn run_source_content_rsync_capture(
     mut cmd: Command,

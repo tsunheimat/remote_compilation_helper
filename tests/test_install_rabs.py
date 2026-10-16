@@ -316,6 +316,28 @@ class InstallTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 installer.unpack_archive(alias, Path(destination))
 
+    def test_member_dispatch_rejects_unsafe_headers_without_frombuf_override(self):
+        # Exercise the production dispatch boundary independently of whether
+        # this Python release parses through frombuf() or its private helper.
+        # No archive interface is available: any payload processing must fail
+        # the test instead of silently being treated as a successful refusal.
+        cases = [
+            ("../escaped", tarfile.REGTYPE, 1, "unsupported release archive header"),
+            ("unexpected", tarfile.REGTYPE, 1, "unsupported release archive header"),
+            ("rch", tarfile.XHDTYPE, 1, "unsupported release archive header"),
+            ("rch", tarfile.XGLTYPE, 1, "unsupported release archive header"),
+            ("rch", tarfile.GNUTYPE_LONGNAME, 1, "unsupported release archive header"),
+            ("rch", tarfile.GNUTYPE_SPARSE, 1, "unsupported release archive header"),
+            ("rabsd", tarfile.REGTYPE, installer.MAX_FILE_BYTES + 1, "byte limit"),
+        ]
+        for name, kind, size, message in cases:
+            with self.subTest(name=name, kind=kind, size=size):
+                member = installer.ReleaseMember(name)
+                member.type = kind
+                member.size = size
+                with self.assertRaisesRegex(installer.InstallError, message):
+                    member._proc_member(object())
+
     def test_extension_headers_are_refused_before_payload_decoding(self):
         for kind in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME,
                      tarfile.GNUTYPE_SPARSE):

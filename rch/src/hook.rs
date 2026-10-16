@@ -1303,6 +1303,24 @@ fn exit_with_gated_local_fallback(
         reporter.summary_critical(&format!(
             "[RCH] refusing local fallback (compilation.allow_local_fallback=false; {reason})"
         ));
+        record_hook_incident(
+            &build_local_fallback_incident(command, reason, true, now_unix_ms(), error)
+                .with_detail("policy", "compilation.allow_local_fallback=false"),
+        );
+        emit_exec_envelope(&ExecResultEnvelope {
+            api_version: "1.0",
+            command,
+            outcome: "refused",
+            location: "local",
+            fallback_reason: Some(reason),
+            worker_id: None,
+            remote_exit_code: None,
+            duration_ms: None,
+            timing: None,
+            result_dirs: None,
+            error_code: None,
+            admission: None,
+        });
         std::process::exit(EXIT_BUILD_ERROR);
     }
     reporter.summary(&format!("[RCH] local ({reason})"));
@@ -5148,7 +5166,7 @@ use timing_history::record_build_timing;
 // bd-2spi4: opt-in, bounded local execution when this machine's measured
 // history says offloading is not faster (`compilation.local_slots`).
 mod speed_gate;
-pub(crate) use speed_gate::{SpeedGateDiagnosis, diagnose as diagnose_speed_gate};
+pub(crate) use speed_gate::diagnose as diagnose_speed_gate;
 
 // RABS B002: redacted invocation recorder — every completed offloaded
 // build emits one B001 corpus record, off the SLO path, fail-open.
@@ -6266,5 +6284,7 @@ exit 125;; esac; "
     )
 }
 
+#[cfg(test)]
+mod fallback_policy_tests;
 #[cfg(test)]
 mod tests;

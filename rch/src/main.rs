@@ -19,6 +19,7 @@ pub mod fleet;
 #[cfg_attr(not(unix), path = "hook_windows.rs")]
 mod hook;
 pub mod local_builds;
+mod process_output;
 mod self_healing_overrides;
 pub mod state;
 mod status_display;
