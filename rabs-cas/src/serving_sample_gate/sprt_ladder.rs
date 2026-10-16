@@ -139,23 +139,69 @@ struct Checkpoint {
 }
 
 impl Checkpoint {
-    fn load(store: &mut dyn RabsMetadataStore) -> Result<Self, StoreError> {
-        let Some((passes, cursor)) = receipt(store, STATE, CLASS, 0)? else {
-            return Ok(Self::default());
-        };
-        let passes = number(&passes)?;
-        let cursor = i64::try_from(number(&cursor)?).map_err(|_| corrupt("cursor overflow"))?;
-        if passes > FINAL_PASSES || passes > cursor as u64 {
-            return Err(corrupt("inconsistent checkpoint"));
+    /// The receipt sequence is the snapshot revision, not the journal cursor.
+    /// The existing (kind, subject, seq) index bounds this lookup independently
+    /// of journal size. A malformed newest snapshot must not fall back to an
+    /// older, more permissive policy.
+    fn latest(store: &mut dyn RabsMetadataStore) -> Result<Option<(i64, Self)>, StoreError> {
+        let rows = store.query(
+            "SELECT seq, decision, reason FROM decision_receipts \
+             WHERE kind = ?1 AND subject = ?2 ORDER BY seq DESC LIMIT 1",
+            &[SqlValue::Text(STATE.into()), SqlValue::Text(CLASS.into())],
+        )?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => {
+                let [
+                    SqlValue::Int(revision),
+                    SqlValue::Text(passes),
+                    SqlValue::Text(cursor),
+                ] = row.as_slice()
+                else {
+                    return Err(corrupt("checkpoint row shape"));
+                };
+                if *revision < 0 {
+                    return Err(corrupt("negative checkpoint revision"));
+                }
+                let checkpoint = Self {
+                    passes: number(passes)?,
+                    cursor: i64::try_from(number(cursor)?)
+                        .map_err(|_| corrupt("cursor overflow"))?,
+                };
+                checkpoint.validate()?;
+                Ok(Some((*revision, checkpoint)))
+            }
+            _ => Err(corrupt("ambiguous checkpoint")),
         }
-        Ok(Self { cursor, passes })
     }
 
+    fn validate(self) -> Result<(), StoreError> {
+        if self.cursor < 0 || self.passes > FINAL_PASSES || self.passes > self.cursor as u64 {
+            return Err(corrupt("inconsistent checkpoint"));
+        }
+        Ok(())
+    }
+
+    fn load(store: &mut dyn RabsMetadataStore) -> Result<Self, StoreError> {
+        Ok(Self::latest(store)?.map_or_else(Self::default, |(_, checkpoint)| checkpoint))
+    }
+
+    /// Append a new immutable snapshot under the caller's existing CAS lock.
+    /// Retrying the same state does not grow the journal. A conservative reset
+    /// can lose positive credit, but cannot remove consumed-attempt markers.
     fn persist(self, store: &mut dyn RabsMetadataStore) -> Result<(), StoreError> {
+        self.validate()?;
+        let revision = match Self::latest(store)? {
+            Some((_, checkpoint)) if checkpoint == self => return Ok(()),
+            Some((revision, _)) => revision
+                .checked_add(1)
+                .ok_or_else(|| corrupt("checkpoint revision exhausted"))?,
+            None => 0,
+        };
         store.record_decision_receipt(
             STATE,
             CLASS,
-            0,
+            revision as u64,
             &self.passes.to_string(),
             &self.cursor.to_string(),
         )
@@ -438,10 +484,10 @@ mod replay_budget_tests {
     use crate::serving_sample_gate::SamplingPolicy;
     use crate::serving_sample_gate::tests::{action, published, samples};
 
-    fn fixture(store: &mut dyn RabsMetadataStore) -> String {
+    fn fixture(store: &mut dyn RabsMetadataStore, class: &str) -> String {
         let key = published(store, 1, 10);
         store
-            .record_decision_receipt(CLASS_KIND, &key, 0, CLASS, "synthetic descriptor binding")
+            .record_decision_receipt(CLASS_KIND, &key, 0, class, "synthetic descriptor binding")
             .unwrap();
         samples(store, 1, 10, 3, 0);
         store.record_attempt(20_001, 10, "verifier", 100).unwrap();
@@ -490,7 +536,7 @@ mod replay_budget_tests {
         for (stage, limit) in [(0, 0), (1, 3), (2, 19), (3, 99)] {
             let mut store =
                 SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-            let key = fixture(&mut store);
+            let key = fixture(&mut store, CLASS);
             // Deliberately inject the checkpoint to isolate the consumer of a
             // qualified boundary. This is NOT evidence that trials were earned;
             // the reducer/attribution tests above exercise those independently.
@@ -532,7 +578,7 @@ mod replay_budget_tests {
     #[test]
     fn advanced_checkpoint_cannot_override_class_safety_or_current_policy() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        fixture(&mut store);
+        fixture(&mut store, CLASS);
         Checkpoint {
             cursor: FINAL_PASSES as i64,
             passes: FINAL_PASSES,
@@ -565,10 +611,9 @@ mod replay_budget_tests {
     fn unbound_and_private_classes_cannot_borrow_a_promoted_dependency_ceiling() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), None);
-        let key = fixture(&mut store);
-        store
-            .record_decision_receipt(CLASS_KIND, &key, 0, "private-only", "not a dependency")
-            .unwrap();
+        // Bind the private class at submission, not by rewriting a previously
+        // admitted dependency's immutable class receipt.
+        fixture(&mut store, "private-only");
         Checkpoint {
             cursor: FINAL_PASSES as i64,
             passes: FINAL_PASSES,
@@ -583,11 +628,19 @@ mod replay_budget_tests {
     #[test]
     fn malformed_checkpoint_or_conflicting_promotion_never_falls_back_to_fixed() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        fixture(&mut store);
+        fixture(&mut store, CLASS);
         store
             .record_decision_receipt(STATE, CLASS, 0, "not-a-counter", "100")
             .unwrap();
         assert!(ceiling(&mut store, Mode::Sprt).is_err());
+        let before = store.differential_snapshot().unwrap();
+        assert!(Checkpoint::default().persist(&mut store).is_err());
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+
+        // Promotion corruption is an independent fixture; a normal checkpoint
+        // append must never "repair" or conceal the malformed newest snapshot.
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        fixture(&mut store, CLASS);
         Checkpoint {
             cursor: FINAL_PASSES as i64,
             passes: FINAL_PASSES,
@@ -603,7 +656,7 @@ mod replay_budget_tests {
     #[test]
     fn empty_worker_identity_cannot_earn_positive_class_credit() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        let key = fixture(&mut store);
+        let key = fixture(&mut store, CLASS);
         store.record_attempt(20_002, 10, "", 101).unwrap();
         store
             .record_verification_sample(&action(1), 20_002, true, 101)

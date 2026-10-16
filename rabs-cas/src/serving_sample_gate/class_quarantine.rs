@@ -202,48 +202,54 @@ mod tests {
             .unwrap();
     }
 
-    fn interrupted_and_completed_scenarios(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+    fn interrupted_and_completed_scenarios(
+        store: &mut dyn RabsMetadataStore,
+        disposition: Option<&str>,
+    ) -> Vec<String> {
         let requested = healthy(store, 1, 10);
         let culprit = healthy(store, 2, 11);
         assert_eq!(decide(store, 1), SampleGateDecision::ServeFromCache);
 
-        // process_offer's first accepted divergence write is sufficient. No
-        // feedback sample, incident receipt or post-commit callback is needed.
-        for disposition in ["quarantined", "presentation-quarantined"] {
+        // Each terminal quarantine starts from an independent clean store.
+        // An ordinary disposition setter is not an incident repair operation.
+        if let Some(disposition) = disposition {
             store
                 .set_serving_disposition_key(&culprit, disposition)
                 .unwrap();
             assert_hold(store, 1, &culprit, "serving-quarantine");
-        }
-        store
-            .set_serving_disposition_key(&culprit, "servable")
-            .unwrap();
-        assert_eq!(decide(store, 1), SampleGateDecision::ServeFromCache);
-
-        // K008 instead writes the action-entry quarantine first.
-        store
-            .add_quarantine(QuarantineScope::ActionEntry, &culprit, "interrupted K008")
-            .unwrap();
-        assert_hold(store, 1, &culprit, "action-quarantine");
-        assert!(
+            let before = store.differential_snapshot().unwrap();
+            assert!(matches!(
+                store.set_serving_disposition_key(&culprit, "servable"),
+                Err(StoreError::QuarantineRequiresRepair)
+            ));
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+            assert_hold(store, 1, &culprit, "serving-quarantine");
+        } else {
+            // K008 instead writes the action-entry quarantine first.
             store
-                .list_divergence_incidents(&culprit)
-                .unwrap()
-                .is_empty()
-        );
-        // Failed observations are adverse even without an attributable attempt.
-        store
-            .record_verification_sample(&action(2), 999_999, false, 99)
-            .unwrap();
-        assert_hold(store, 1, &culprit, "adverse-verification");
-        store
-            .record_verification_sample(&action(2), 999_999, true, 100)
-            .unwrap();
-        samples(store, 2, 11, 4, 0);
-        assert_hold(store, 1, &culprit, "adverse-verification");
+                .add_quarantine(QuarantineScope::ActionEntry, &culprit, "interrupted K008")
+                .unwrap();
+            assert_hold(store, 1, &culprit, "action-quarantine");
+            assert!(
+                store
+                    .list_divergence_incidents(&culprit)
+                    .unwrap()
+                    .is_empty()
+            );
+            // Failed observations are adverse even without an attributable attempt.
+            store
+                .record_verification_sample(&action(2), 999_999, false, 99)
+                .unwrap();
+            assert_hold(store, 1, &culprit, "adverse-verification");
+            store
+                .record_verification_sample(&action(2), 999_999, true, 100)
+                .unwrap();
+            samples(store, 2, 11, 4, 0);
+            assert_hold(store, 1, &culprit, "adverse-verification");
 
-        incident(store, &culprit, "semantic");
-        assert_hold(store, 1, &culprit, "divergence-incident");
+            incident(store, &culprit, "semantic");
+            assert_hold(store, 1, &culprit, "divergence-incident");
+        }
         // The requested key's own publication, serving state and evidence
         // stay unchanged. Demoting a class does not fabricate N divergences.
         assert_eq!(
@@ -268,8 +274,11 @@ mod tests {
 
     #[test]
     fn class_demotion_is_enforced_by_the_existing_sample_gate() {
-        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        interrupted_and_completed_scenarios(&mut store);
+        for disposition in [None, Some("quarantined"), Some("presentation-quarantined")] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            interrupted_and_completed_scenarios(&mut store, disposition);
+        }
     }
 
     #[test]
@@ -292,14 +301,16 @@ mod tests {
 
     #[test]
     fn class_demotion_matches_the_frankensqlite_backend() {
-        let reference_engine = RusqliteEngine::open(&fresh_path("class-ref")).unwrap();
-        let candidate_engine = FsqliteEngine::open(&fresh_path("class-fsq")).unwrap();
-        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
-        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
-        assert_eq!(
-            interrupted_and_completed_scenarios(&mut reference),
-            interrupted_and_completed_scenarios(&mut candidate)
-        );
+        for disposition in [None, Some("quarantined"), Some("presentation-quarantined")] {
+            let reference_engine = RusqliteEngine::open(&fresh_path("class-ref")).unwrap();
+            let candidate_engine = FsqliteEngine::open(&fresh_path("class-fsq")).unwrap();
+            let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+            let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+            assert_eq!(
+                interrupted_and_completed_scenarios(&mut reference, disposition),
+                interrupted_and_completed_scenarios(&mut candidate, disposition)
+            );
+        }
     }
 
     #[test]

@@ -50,6 +50,42 @@ Keep the integration PR draft until its exact-revision checks and required
 worker acceptance are complete. No main-branch update or deployment is part
 of this checkpoint.
 
+### CI follow-up after workflow consolidation
+
+Observed on `1b9a330fe0b4123bc16134edbc88ddbaee54c268`:
+[CI 38889175124](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38889175124)
+passed security, bundle/workflow integrity and pinned formatting. Compiler-backed
+Clippy stopped at an oversized staging error and fixed-size journal chunking;
+the aggregate correctly failed and downstream native/E2E/package jobs did not run.
+[RABS 38889174619](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38889174619)
+built the release spine and passed the worker-cache, prepared-build, stream-drain,
+output/session and wrapper-size gates. Its sample-gate suite reported 19 passes
+and 8 failures, so later gates in that step were not executed.
+
+The follow-up fixes the observed causes rather than relaxing CI:
+
+- Keep the cold corruption attribution in a boxed payload, preserving the
+  original typed failure and exact replica quarantine settlement. Remove the
+  existing large-error suppression and add a Result-footprint regression.
+- Use fixed-size array chunks for the digest journal while retaining its torn
+  final-record handling and all existing byte-integrity checks.
+- Persist SPRT checkpoints as append-only, increasing receipt revisions instead
+  of overwriting the immutable `(kind, subject, seq=0)` record. Read the latest
+  revision through the existing primary-key index; refuse malformed latest state
+  and exhausted revision counters. Exact retries do not append, and consumed
+  attempt markers survive conservative checkpoint rollback and database reopen.
+- Initialize private-class and corruption cases independently rather than
+  replacing immutable evidence. Exercise both terminal serving quarantines in
+  fresh stores on both metadata backends and assert ordinary reset is rejected.
+- Add regressions for successive checkpoint history, immutable conflicting
+  writes, no self-generated journal churn, sequence exhaustion and invalid state.
+
+The generic receipt immutability and quarantine-repair rules are unchanged. No
+workflow, feature flag, assertion threshold or ignored-test list is relaxed.
+The follow-up passed remote formatting and diff checks; its new Rust regressions
+must still be evaluated by exact-revision pinned-toolchain CI. No successful
+real-worker/Nexus/private-mount acceptance is implied by these fixture results.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

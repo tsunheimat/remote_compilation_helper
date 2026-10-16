@@ -9,6 +9,11 @@ use std::time::Duration;
 
 type Store = SqlMetadataStore<RusqliteEngine>;
 
+#[test]
+fn preparation_failure_keeps_cold_quarantine_attribution_off_the_result_stack() {
+    assert!(std::mem::size_of::<PreparationFailure>() <= 128);
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     layout: BlobStoreLayout,

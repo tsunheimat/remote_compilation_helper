@@ -223,7 +223,9 @@ pub struct SelectedActionOutputs {
 #[derive(Debug)]
 pub struct PreparationFailure {
     error: MaterializeError,
-    corrupt: Option<(TypedDigest, String)>,
+    // Only corruption failures carry this attribution. Keep the cold payload
+    // off the success-path Result without discarding its quarantine identity.
+    corrupt: Option<Box<(TypedDigest, String)>>,
 }
 
 impl PreparationFailure {
@@ -231,7 +233,7 @@ impl PreparationFailure {
     /// An unavailable quarantine write takes precedence over an ordinary error.
     pub fn settle(self, store: &mut dyn RabsMetadataStore) -> ActionMaterializeFailure {
         let mut error = self.error;
-        if let Some((object, path)) = self.corrupt
+        if let Some((object, path)) = self.corrupt.map(|attribution| *attribution)
             && let Err(failure) = store.set_location_quarantined(&object, &path, true)
         {
             error = MaterializeError::Store(format!("{failure:?}"));
@@ -295,9 +297,6 @@ impl SelectedActionOutputs {
     /// Copy, hash, derive and freshness-stamp private files WITHOUT metadata
     /// access. The existing materializer is the sole byte-verification/CoW path.
     /// Retain the returned owner until the caller rechecks action authority.
-    // The failure carries the typed error plus the corrupt location that
-    // `settle` must quarantine; it is returned once, on the failure path.
-    #[allow(clippy::result_large_err)]
     pub fn stage(
         self,
         prepare: &impl Fn(&PlannedActionOutput, &File) -> std::io::Result<()>,
@@ -354,7 +353,7 @@ impl SelectedActionOutputs {
                     Err(error @ MaterializeError::ContentMismatch { .. }) => {
                         return Err(PreparationFailure {
                             error,
-                            corrupt: Some((output.object.clone(), source)),
+                            corrupt: Some(Box::new((output.object.clone(), source))),
                         });
                     }
                     Err(error) => last = error,

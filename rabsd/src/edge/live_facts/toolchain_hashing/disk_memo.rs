@@ -240,7 +240,7 @@ impl DiskMemo {
             return Ok((memo, Entries::new()));
         }
         let mut entries = Entries::new();
-        for record in bytes[HEADER_BYTES..].chunks_exact(RECORD_BYTES) {
+        for record in bytes[HEADER_BYTES..].as_chunks::<RECORD_BYTES>().0 {
             let Some((sig, digest)) = decode_record(&memo.header, record) else {
                 memo.reset()?;
                 return Ok((memo, Entries::new()));

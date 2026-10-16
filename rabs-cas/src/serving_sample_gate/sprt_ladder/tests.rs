@@ -194,8 +194,8 @@ fn checkpoint_and_attempt_identity_survive_real_database_reopening() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
     store.intern_domain("rabs.result-manifest.sha256.v1");
     let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
-    // Reinsert the same receipt: some stores implement this API as an upsert,
-    // so the rowid may change. The stable attempt marker must still win.
+    // An identical receipt retry is idempotent; the stable attempt marker
+    // must still prevent credit after reopening the database.
     store
         .record_decision_receipt(VERIFIED, &key, 1, &format!("{:032x}", 10_001), &manifest)
         .unwrap();
@@ -270,9 +270,76 @@ fn negative_evidence_vetoes_before_any_sprt_credit_or_checkpoint_write() {
 }
 
 #[test]
-fn invalid_checkpoints_and_conflicting_attempt_markers_refuse() {
+fn successive_checkpoints_append_without_rewriting_evidence_or_self_churn() {
     let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-    let key = bound(&mut store, 1, 10);
+    bound(&mut store, 1, 10);
+    proof(&mut store, 1, 10, 10_001, 1);
+    assert_eq!(drain(&mut store).passes, 1);
+    let (first_revision, first) = Checkpoint::latest(&mut store).unwrap().unwrap();
+    let first_receipt = receipt(&mut store, STATE, CLASS, first_revision as u64).unwrap();
+
+    proof(&mut store, 1, 10, 10_002, 2);
+    assert_eq!(drain(&mut store).passes, 2);
+    let (revision, current) = Checkpoint::latest(&mut store).unwrap().unwrap();
+    assert!(revision > first_revision);
+    assert_eq!(current.passes, 2);
+    assert!(current.cursor > first.cursor);
+    assert_eq!(
+        receipt(&mut store, STATE, CLASS, first_revision as u64).unwrap(),
+        first_receipt
+    );
+
+    let before = store.differential_snapshot().unwrap();
+    current.persist(&mut store).unwrap();
+    for _ in 0..4 {
+        assert_eq!(drain(&mut store).passes, 2);
+    }
+    assert!(matches!(
+        store.record_decision_receipt(STATE, CLASS, first_revision as u64, "99", "999"),
+        Err(StoreError::AppendConflict(_))
+    ));
+    assert_eq!(store.differential_snapshot().unwrap(), before);
+}
+
+#[test]
+fn checkpoint_revision_exhaustion_and_invalid_local_state_are_fail_closed() {
+    let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+    store
+        .record_decision_receipt(STATE, CLASS, i64::MAX as u64, "0", "0")
+        .unwrap();
+    let before = store.differential_snapshot().unwrap();
+    // Exact retries do not need another revision, even at the sequence bound.
+    Checkpoint::default().persist(&mut store).unwrap();
+    assert_eq!(Checkpoint::load(&mut store).unwrap(), Checkpoint::default());
+    assert!(
+        Checkpoint {
+            cursor: 1,
+            passes: 1
+        }
+        .persist(&mut store)
+        .is_err()
+    );
+    for checkpoint in [
+        Checkpoint {
+            cursor: -1,
+            passes: 0,
+        },
+        Checkpoint {
+            cursor: 0,
+            passes: 1,
+        },
+        Checkpoint {
+            cursor: i64::MAX,
+            passes: FINAL_PASSES + 1,
+        },
+    ] {
+        assert!(checkpoint.persist(&mut store).is_err());
+    }
+    assert_eq!(store.differential_snapshot().unwrap(), before);
+}
+
+#[test]
+fn invalid_checkpoints_and_conflicting_attempt_markers_refuse() {
     for (passes, cursor) in [
         ("01", "10"),
         ("1", "0"),
@@ -280,11 +347,21 @@ fn invalid_checkpoints_and_conflicting_attempt_markers_refuse() {
         ("1", "-1"),
         ("1", "9223372036854775808"),
     ] {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        bound(&mut store, 1, 10);
+        // Even with a valid older state, the malformed newest record must
+        // refuse. A conflicting immutable receipt is not a mutation API.
+        Checkpoint::default().persist(&mut store).unwrap();
         store
-            .record_decision_receipt(STATE, CLASS, 0, passes, cursor)
+            .record_decision_receipt(STATE, CLASS, 1, passes, cursor)
             .unwrap();
+        let before = store.differential_snapshot().unwrap();
         assert!(Checkpoint::load(&mut store).is_err());
+        assert!(Checkpoint::default().persist(&mut store).is_err());
+        assert_eq!(store.differential_snapshot().unwrap(), before);
     }
+    let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+    let key = bound(&mut store, 1, 10);
     Checkpoint::default().persist(&mut store).unwrap();
     proof(&mut store, 1, 10, 10_001, 1);
     store
