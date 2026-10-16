@@ -67,11 +67,6 @@ const LIVE_COMPLETION_WORKERS: usize = 8;
 /// frame must arrive (the attempt lease is longer still).
 const LOCAL_EXECUTION_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Retain read-ahead for the entire admitted connection: hello, requests,
-/// completion and capture acknowledgments may arrive in the same socket read.
-/// Buffering avoids a kernel read for every byte without changing frame bounds.
-type EdgeStream = BufReader<UnixStream>;
-
 #[derive(Clone)]
 struct EdgeLimits {
     sessions: Limit,

@@ -973,7 +973,7 @@ mod tests {
         let owner = acquire_gate(&writer.path).unwrap();
         // This duplicate models the shared open-file description retained by
         // a concurrent fork before its CLOEXEC descriptors are closed.
-        let inherited = owner.gate.try_clone().unwrap();
+        let inherited = owner._gate.try_clone().unwrap();
         let inode = inherited.metadata().unwrap().ino();
         assert!(acquire_gate(&writer.path).is_err());
         drop(owner);
