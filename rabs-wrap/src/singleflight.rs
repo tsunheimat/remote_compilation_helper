@@ -1,54 +1,169 @@
-//! Bounded, non-owning followers for the live dependency singleflight.
+//! Bounded, non-owning readiness and live dependency singleflight waits.
 //!
 //! Waiting never grants execution or materialization authority. The same
 //! request bytes are resubmitted on the same connection, so the daemon
 //! reobserves inputs and reruns its ordinary serving gates. A follower stops
 //! before the edge's 64-request quota and one absolute wait deadline bounds
-//! all sleeps, writes and reads. No connect threads, extra dependencies or
-//! daemon blocking workers are retained between retries.
+//! all sleeps, writes and reads. The original caller must remain alive across
+//! every wait and protocol transition; cancellation never authorizes fallback.
+//!
+//! Cold facts have no action key yet: `preparing` may precede a keyed `wait`,
+//! but never follow it. Readiness and singleflight share ONE deadline and retry
+//! quota. Once an action key is bound it cannot change, even after more facts
+//! need warming. Unknown peers/frames remain ordinary pre-acceptance failures.
+//! An explicit decision-capacity hint is different from a facts observation:
+//! no decision ran, so it may pause (but never erase) an already bound flight.
+//! Its wire decision remains pass-through for older wrappers. Only the versioned
+//! hint and explicit non-owning flags opt this wrapper into another bounded poll.
+
+#[path = "singleflight_policy.rs"]
+mod policy;
 
 use super::reply_json::{self, Value};
 use super::{
-    ConsultStream, Live, MAX_LIVE_REPLY_BYTES, consult_succeeded, live_outcome, read_reply_bounded,
+    ConsultStream, HELLO, Live, MAX_LIVE_REPLY_BYTES, MAX_REPLY_BYTES, connect_owned,
+    consult_succeeded, live_outcome,
 };
-use std::io::{BufReader, Write};
+use policy::WaitPolicy;
+use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-const MAX_RETRIES: u32 = 60;
-const MAX_WAIT_MS: u64 = 60_000;
+const OWNER_POLL: Duration = Duration::from_millis(100);
 
-#[derive(Clone, Copy)]
-struct WaitPolicy {
-    budget: Duration,
-    retries: u32,
-    initial_delay: Duration,
-    maximum_delay: Duration,
+fn check_owner(owned: &impl Fn() -> bool) -> io::Result<()> {
+    if owned() {
+        Ok(())
+    } else {
+        // Not Interrupted: generic Read/Write helpers retry that error. A
+        // cancelled caller is terminal, even when the daemon is still healthy.
+        Err(io::Error::other(
+            "compiler caller disappeared during RABS consultation",
+        ))
+    }
 }
 
-impl WaitPolicy {
-    fn from_environment() -> Self {
-        let milliseconds = std::env::var("RABS_SINGLEFLIGHT_WAIT_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(MAX_WAIT_MS)
-            .min(MAX_WAIT_MS);
-        Self {
-            budget: Duration::from_millis(milliseconds),
-            retries: MAX_RETRIES,
-            initial_delay: Duration::from_millis(50),
-            maximum_delay: Duration::from_secs(1),
+fn prepare_io(
+    reader: &mut BufReader<ConsultStream>,
+    deadline: Instant,
+    owned: &impl Fn() -> bool,
+) -> io::Result<()> {
+    check_owner(owned)?;
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "RABS consult deadline elapsed",
+        ));
+    }
+    reader.get_mut().deadline = now
+        .checked_add(OWNER_POLL)
+        .unwrap_or(deadline)
+        .min(deadline);
+    Ok(())
+}
+
+fn retryable_slice(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
+/// Write only the unsent suffix across ownership-poll timeouts. All protocol
+/// phases share the caller's absolute deadline, not a fresh per-byte budget.
+pub(super) fn write_owned(
+    reader: &mut BufReader<ConsultStream>,
+    mut bytes: &[u8],
+    deadline: Instant,
+    owned: &impl Fn() -> bool,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        prepare_io(reader, deadline, owned)?;
+        match reader.get_mut().write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "RABS peer stopped accepting bytes",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if retryable_slice(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    prepare_io(reader, deadline, owned)?;
+    reader.get_mut().deadline = deadline;
+    Ok(())
+}
+
+/// Retain partial frame bytes across socket timeouts. A normal read_line retry
+/// would discard its prefix; a normal write_all retry could duplicate consent.
+/// Check ownership even for bytes already buffered by an earlier phase.
+pub(super) fn read_owned_reply(
+    reader: &mut BufReader<ConsultStream>,
+    max_bytes: u64,
+    deadline: Instant,
+    owned: &impl Fn() -> bool,
+) -> io::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        prepare_io(reader, deadline, owned)?;
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if retryable_slice(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "RABS reply ended before frame delimiter",
+            ));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |at| at + 1);
+        if (line.len() as u64).saturating_add(count as u64) > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RABS reply exceeds frame limit",
+            ));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            prepare_io(reader, deadline, owned)?;
+            reader.get_mut().deadline = deadline;
+            return String::from_utf8(line)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
         }
     }
 }
 
+fn sleep_owned(delay: Duration, owned: &impl Fn() -> bool) -> io::Result<()> {
+    let wake = Instant::now()
+        .checked_add(delay)
+        .ok_or_else(|| io::Error::other("RABS wait deadline overflow"))?;
+    loop {
+        check_owner(owned)?;
+        let remaining = wake.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(OWNER_POLL));
+    }
+}
+
 /// Read the initial response, following only explicitly negotiated waits.
-/// Before accepting a hit, timeout/disconnection still permits local execution.
-/// Once a hit is accepted, `live_outcome` owns the existing fail-closed protocol.
+/// Before accepting a hit, timeout/disconnection permits local execution ONLY
+/// while the original caller is still owned. After acceptance, uncertainty
+/// always follows live_outcome's existing fail-closed delivery protocol.
 pub(super) fn read_decision(
     reader: BufReader<ConsultStream>,
     frame: &str,
     decision_budget: Duration,
     may_wait: bool,
+    socket: &str,
+    connect_timeout: Duration,
+    owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
     read_with_policy(
         reader,
@@ -56,10 +171,31 @@ pub(super) fn read_decision(
         decision_budget,
         may_wait,
         WaitPolicy::from_environment(),
+        Some((socket, connect_timeout)),
+        owned,
     )
 }
 
-fn wait_key(reply: &Value) -> Option<&str> {
+#[derive(Debug, PartialEq, Eq)]
+enum WaitFor<'a> {
+    Facts,
+    Action(&'a str),
+    Capacity,
+}
+
+fn action_key(reply: &Value) -> Option<&str> {
+    reply
+        .get("action_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty() && key.len() <= 256)
+}
+
+fn wait_for(reply: &Value) -> Option<WaitFor<'_>> {
+    // get() deliberately conflates absent and duplicate fields. Neither a
+    // single nor a repeated execution grant belongs on a non-owning wait.
+    let Value::Object(fields) = reply else {
+        return None;
+    };
     if reply
         .get("compiler_skip_authorized")
         .and_then(Value::as_bool)
@@ -68,15 +204,70 @@ fn wait_key(reply: &Value) -> Option<&str> {
             .get("materialization_started")
             .and_then(Value::as_bool)
             != Some(false)
-        || reply.get("attempt").is_some()
-        || reply.get("env").is_some()
+        || fields
+            .iter()
+            .any(|(name, _)| name == "attempt" || name == "env")
     {
         return None;
     }
-    reply
-        .get("action_key")
-        .and_then(Value::as_str)
-        .filter(|key| !key.is_empty() && key.len() <= 256)
+    match reply.get("decision").and_then(Value::as_str) {
+        Some("wait") => action_key(reply).map(WaitFor::Action),
+        Some("pass-through")
+            if reply.get("retry").and_then(Value::as_str) == Some("decision-capacity-v1")
+                && reply.get("reason").and_then(Value::as_str) == Some("edge-capacity")
+                && !fields.iter().any(|(name, _)| name == "action_key") =>
+        {
+            Some(WaitFor::Capacity)
+        }
+        Some("preparing")
+            if !fields.iter().any(|(name, _)| name == "action_key")
+                && matches!(
+                    reply.get("reason").and_then(Value::as_str),
+                    Some(
+                        "toolchain-facts-pending"
+                            | "package-facts-pending"
+                            | "dependency-facts-pending"
+                    )
+                ) =>
+        {
+            Some(WaitFor::Facts)
+        }
+        _ => None,
+    }
+}
+
+/// Start an entirely new, unowned consultation only after the prior
+/// non-owning response was completely parsed. No hit consent or execution
+/// grant can reach this path. A failed/ambiguous handshake never authorizes
+/// output writes or another compiler attempt.
+fn reconnect_waiter(
+    socket: &str,
+    connect_timeout: Duration,
+    decision_budget: Duration,
+    absolute_deadline: Instant,
+    owned: &impl Fn() -> bool,
+) -> io::Result<BufReader<ConsultStream>> {
+    check_owner(owned)?;
+    let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "RABS wait expired"));
+    }
+    let stream = connect_owned(socket, connect_timeout.min(remaining), owned)?;
+    let deadline = Instant::now()
+        .checked_add(decision_budget)
+        .ok_or_else(|| io::Error::other("RABS consult deadline overflow"))?
+        .min(absolute_deadline);
+    let mut reader = BufReader::new(ConsultStream { stream, deadline });
+    write_owned(&mut reader, HELLO.as_bytes(), deadline, owned)?;
+    write_owned(&mut reader, b"\n", deadline, owned)?;
+    let hello = read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, owned)?;
+    if !hello.contains("hello-ok") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RABS reconnect handshake rejected",
+        ));
+    }
+    Ok(reader)
 }
 
 fn read_with_policy(
@@ -84,12 +275,24 @@ fn read_with_policy(
     frame: &str,
     decision_budget: Duration,
     may_wait: bool,
-    policy: WaitPolicy,
+    mut policy: WaitPolicy,
+    rollover: Option<(&str, Duration)>,
+    owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
-    let mut following: Option<(String, Instant)> = None;
+    let mut following_key: Option<String> = None;
+    let mut wait_deadline = None;
     let mut retries = 0;
+    // The first request was sent by consult(). Each reconnect starts a new
+    // edge connection with its own quota; retries and the absolute deadline
+    // remain owned by this logical consultation.
+    let mut requests_on_connection = 1_u32;
+    // Count reconnects separately from retries: a malicious or broken peer
+    // cannot turn the per-connection quota into unlimited socket attempts.
+    let mut rollovers = 0_u32;
     loop {
-        let line = read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES).map_err(|_| ())?;
+        let response_deadline = reader.get_ref().deadline;
+        let line = read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, response_deadline, owned)
+            .map_err(|_| ())?;
         let reply = reply_json::parse(&line).ok_or(())?;
         if reply.get("kind").and_then(Value::as_str) != Some("rustc-decision") {
             return if consult_succeeded(&line) {
@@ -99,223 +302,105 @@ fn read_with_policy(
             };
         }
         let decision = reply.get("decision").and_then(Value::as_str);
-        if decision != Some("wait") {
+        // A bare/legacy edge-capacity reason is NOT a retry grant: older
+        // daemons also used it for panics and thread-start failures. Detect
+        // duplicate hint fields as present here so wait_for rejects ambiguity.
+        let capacity_hint = decision == Some("pass-through")
+            && matches!(&reply, Value::Object(fields) if fields.iter().any(|(name, _)| name == "retry"));
+        if !matches!(decision, Some("wait" | "preparing")) && !(may_wait && capacity_hint) {
             // A changing action identity is not the flight we followed. Drop
             // before accepting a hit or executing an admitted attempt. Any
             // reserved attempt is released by the daemon's connection guard.
-            if matches!(decision, Some("hit" | "execute"))
-                && following.as_ref().is_some_and(|(key, _)| {
-                    reply.get("action_key").and_then(Value::as_str) != Some(key.as_str())
-                })
-            {
-                return Err(());
+            if matches!(decision, Some("hit" | "execute")) && wait_deadline.is_some() {
+                let key = action_key(&reply).ok_or(())?;
+                if following_key
+                    .as_deref()
+                    .is_some_and(|expected| expected != key)
+                {
+                    return Err(());
+                }
             }
-            return live_outcome(&reply, reader);
+            return live_outcome(&reply, reader, owned);
         }
         if !may_wait {
             return Err(());
         }
-        let key = wait_key(&reply).ok_or(())?;
-        let now = Instant::now();
-        let deadline = if let Some((expected, deadline)) = &following {
-            if expected != key {
-                return Err(());
+        match wait_for(&reply).ok_or(())? {
+            WaitFor::Capacity => {
+                // Saturation did not observe facts or mint an action. Preserve
+                // the previous key and deadline across the gap. Before any
+                // observation, use the existing cold-readiness budget once.
+                if wait_deadline.is_none() {
+                    policy = policy.for_preparation();
+                }
             }
-            *deadline
-        } else {
-            let deadline = now.checked_add(policy.budget).ok_or(())?;
-            following = Some((key.to_owned(), deadline));
-            deadline
+            WaitFor::Facts => {
+                // Do not turn a keyed flight back into an unkeyed readiness
+                // wait: that could disguise changed inputs or a new action.
+                if following_key.is_some() {
+                    return Err(());
+                }
+                if wait_deadline.is_none() {
+                    policy = policy.for_preparation();
+                }
+            }
+            WaitFor::Action(key) => match &following_key {
+                Some(expected) if expected != key => return Err(()),
+                Some(_) => {}
+                None => following_key = Some(key.to_owned()),
+            },
+        }
+        let now = Instant::now();
+        // Preparing -> waiting must not buy a second timeout window. Nor
+        // may changing preparation stages reset retries or backoff.
+        let deadline = match wait_deadline {
+            Some(deadline) => deadline,
+            None => {
+                let deadline = now.checked_add(policy.budget).ok_or(())?;
+                wait_deadline = Some(deadline);
+                deadline
+            }
         };
-        let delay = policy
-            .initial_delay
-            .saturating_mul(1_u32 << retries.min(5))
-            .min(policy.maximum_delay);
+        let delay = policy.delay_for(retries);
+        check_owner(owned).map_err(|_| ())?;
         if retries >= policy.retries || delay >= deadline.saturating_duration_since(now) {
-            // Healthy contention, not a broken daemon. No request in this
-            // branch ever accepted installation or started our compiler.
+            // Healthy preparation/contention, not a broken daemon. Nothing
+            // here accepted installation or started our compiler.
             return Ok(Live::PassThrough);
         }
-        std::thread::sleep(delay);
+        sleep_owned(delay, owned).map_err(|_| ())?;
         let now = Instant::now();
         if now >= deadline {
             return Ok(Live::PassThrough);
         }
-        reader.get_mut().deadline = now.checked_add(decision_budget).ok_or(())?.min(deadline);
-        reader
-            .get_mut()
-            .write_all(frame.as_bytes())
-            .map_err(|_| ())?;
-        reader.get_mut().write_all(b"\n").map_err(|_| ())?;
+        if requests_on_connection >= 60 {
+            let (socket, connect_timeout) = rollover.ok_or(())?;
+            if rollovers >= 16 {
+                return Ok(Live::PassThrough);
+            }
+            rollovers += 1;
+            // Drop the old follower connection before opening a new one. The
+            // edge releases any connection-scoped flight accounting on drop.
+            drop(reader);
+            reader = reconnect_waiter(socket, connect_timeout, decision_budget, deadline, owned)
+                .map_err(|_| ())?;
+            requests_on_connection = 0;
+        }
+        let request_deadline = Instant::now()
+            .checked_add(decision_budget)
+            .ok_or(())?
+            .min(deadline);
+        write_owned(&mut reader, frame.as_bytes(), request_deadline, owned).map_err(|_| ())?;
+        write_owned(&mut reader, b"\n", request_deadline, owned).map_err(|_| ())?;
+        requests_on_connection += 1;
         retries += 1;
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{BufRead, Read};
-    use std::os::unix::net::UnixStream;
+#[path = "singleflight_tests.rs"]
+mod tests;
 
-    const WAIT: &str = "{\"kind\":\"rustc-decision\",\"decision\":\"wait\",\"action_key\":\"key\",\"compiler_skip_authorized\":false,\"materialization_started\":false}\n";
-
-    fn policy(retries: u32) -> WaitPolicy {
-        WaitPolicy {
-            budget: Duration::from_secs(2),
-            retries,
-            initial_delay: Duration::ZERO,
-            maximum_delay: Duration::ZERO,
-        }
-    }
-
-    fn reader(stream: UnixStream) -> BufReader<ConsultStream> {
-        BufReader::new(ConsultStream {
-            stream,
-            deadline: Instant::now() + Duration::from_secs(2),
-        })
-    }
-
-    #[test]
-    fn retry_count_bounds_even_a_peer_that_answers_immediately() {
-        let (stream, peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let daemon = std::thread::spawn(move || {
-            let mut peer = BufReader::new(peer);
-            let mut requests = 0;
-            loop {
-                peer.get_mut().write_all(WAIT.as_bytes()).unwrap();
-                let mut line = String::new();
-                if peer.read_line(&mut line).unwrap() == 0 {
-                    break;
-                }
-                assert_eq!(line, "original bytes\n");
-                requests += 1;
-            }
-            requests
-        });
-        assert!(matches!(
-            read_with_policy(
-                reader(stream),
-                "original bytes",
-                Duration::from_secs(1),
-                true,
-                policy(3)
-            ),
-            Ok(Live::PassThrough)
-        ));
-        assert_eq!(daemon.join().unwrap(), 3);
-        const {
-            assert!(
-                MAX_RETRIES + 1 < 64,
-                "leave room below the edge request quota"
-            );
-        }
-    }
-
-    #[test]
-    fn zero_wait_budget_never_sends_a_retry_or_acceptance() {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        peer.write_all(WAIT.as_bytes()).unwrap();
-        let mut settings = policy(3);
-        settings.budget = Duration::ZERO;
-        assert!(matches!(
-            read_with_policy(
-                reader(stream),
-                "original",
-                Duration::from_secs(1),
-                true,
-                settings
-            ),
-            Ok(Live::PassThrough)
-        ));
-        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
-    }
-
-    #[test]
-    fn malformed_authority_or_unnegotiated_waits_are_not_followed() {
-        for (line, negotiated) in [
-            (WAIT.to_owned(), false),
-            (
-                WAIT.replace(
-                    "\"compiler_skip_authorized\":false",
-                    "\"compiler_skip_authorized\":true",
-                ),
-                true,
-            ),
-            (
-                WAIT.replace(
-                    "\"materialization_started\":false",
-                    "\"materialization_started\":true",
-                ),
-                true,
-            ),
-            (
-                WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"\""),
-                true,
-            ),
-            (
-                WAIT.replace(
-                    "\"action_key\":\"key\"",
-                    "\"action_key\":\"key\",\"action_key\":\"other\"",
-                ),
-                true,
-            ),
-            (
-                WAIT.replace(
-                    "\"materialization_started\":false",
-                    "\"attempt\":\"admitted\"",
-                ),
-                true,
-            ),
-        ] {
-            let (stream, mut peer) = UnixStream::pair().unwrap();
-            peer.write_all(line.as_bytes()).unwrap();
-            assert!(
-                read_with_policy(
-                    reader(stream),
-                    "original",
-                    Duration::from_secs(1),
-                    negotiated,
-                    policy(3)
-                )
-                .is_err()
-            );
-            assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
-        }
-    }
-
-    #[test]
-    fn trickling_peer_cannot_hold_a_follower_past_its_wait_budget() {
-        let (stream, peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let daemon = std::thread::spawn(move || {
-            let mut peer = BufReader::new(peer);
-            peer.get_mut().write_all(WAIT.as_bytes()).unwrap();
-            let mut line = String::new();
-            assert!(peer.read_line(&mut line).unwrap() > 0);
-            // Without an absolute wait bound these valid partial JSON bytes
-            // can keep a per-read idle timeout alive indefinitely.
-            for _ in 0..300 {
-                if peer.get_mut().write_all(b" ").is_err() {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            false
-        });
-        let mut settings = policy(60);
-        settings.budget = Duration::from_millis(100);
-        let outcome = read_with_policy(
-            reader(stream),
-            "original",
-            Duration::from_secs(10),
-            true,
-            settings,
-        );
-        assert!(outcome.is_err());
-        assert!(
-            daemon.join().unwrap(),
-            "follower must close before the trickle ends"
-        );
-    }
-}
+#[cfg(test)]
+#[path = "capacity_wait_tests.rs"]
+mod capacity_wait_tests;

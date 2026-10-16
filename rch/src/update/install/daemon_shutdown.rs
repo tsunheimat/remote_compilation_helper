@@ -488,6 +488,9 @@ mod tests {
                     "" => continue,
                     STATUS => &status,
                     ADMISSION_STATUS => &admission,
+                    // The client's deadline can drop a connection before it
+                    // sends a request. An empty request mutates nothing.
+                    "" => continue,
                     other => panic!("readiness must not mutate daemon state: {other}"),
                 };
                 // A deadline may drop the client's socket while this fixture

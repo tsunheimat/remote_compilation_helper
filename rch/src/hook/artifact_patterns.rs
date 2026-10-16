@@ -39,6 +39,7 @@
 //! module and stays private.
 
 pub(super) mod cargo_bins;
+pub(super) mod clean_overlay;
 pub(super) mod direct_compiler;
 
 use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};
@@ -126,7 +127,11 @@ pub(super) fn get_artifact_patterns(
         | Some(CompilationKind::Make)
         | Some(CompilationKind::CmakeBuild)
         | Some(CompilationKind::Ninja)
-        | Some(CompilationKind::Meson) => default_c_cpp_artifact_patterns(),
+        | Some(CompilationKind::Meson) => {
+            let mut patterns = default_c_cpp_artifact_patterns();
+            clean_overlay::exclude_source_archive(&mut patterns);
+            patterns
+        }
         // Nix outputs live in the worker's `/nix/store` behind a `result`
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
@@ -820,9 +825,9 @@ mod profile_artifact_tests {
                 false,
             ),
         ] {
-            // Cargo reports physical executable paths, including macOS's
-            // /private/var identity for a tempdir reached through /var.
-            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            // Cargo reports artifact paths under its canonical cwd; on macOS
+            // the temp dir is reached through the /var -> /private/var link.
+            let root = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
             let source = root.join("source project");
             let local_project = root.join("local project");
             std::fs::create_dir_all(source.join("src")).unwrap();

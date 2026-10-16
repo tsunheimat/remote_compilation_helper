@@ -1331,8 +1331,10 @@ mod tests {
         );
         assert_eq!(store.differential_snapshot().unwrap(), before);
 
-        // Even a newer record that omits ALL references must be refused:
-        // only explicit repair may remove the durable quarantine.
+        // Direct store writes that try to downgrade the quarantined
+        // disposition or omit its blocking references are refused with
+        // QuarantineRequiresRepair, leaving revision 3 intact and the
+        // renewal gate blocked.
         let before = store.differential_snapshot().unwrap();
         assert_eq!(
             store.put_serving_record(
@@ -1345,8 +1347,17 @@ mod tests {
             ),
             Err(StoreError::QuarantineRequiresRepair)
         );
-        assert_eq!(store.differential_snapshot().unwrap(), before);
-        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            store.put_serving_record(
+                &active,
+                &action_key,
+                "quarantined",
+                4,
+                &validity(1_080_000, Some(DEFAULT_REVALIDATION_TTL_MICROS), 0, 1),
+                &[],
+            ),
+            Err(StoreError::QuarantineRequiresRepair)
+        );
         assert_eq!(
             apply_revalidation(
                 store,

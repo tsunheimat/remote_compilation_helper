@@ -36,7 +36,8 @@ use crate::coord::live::{
     load_manifest,
 };
 use crate::edge::live_facts::{
-    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, read_stable,
+    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard,
+    digest_stable, read_stable,
 };
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
@@ -68,6 +69,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod capture_pins;
+mod output_capture;
+use capture_pins::CapturePins;
+
 /// Decision-receipt kind binding an action key to its canonical
 /// transcript object. The binding is verified against the committed
 /// observable digest on every read; it is an index, never authority.
@@ -97,8 +102,17 @@ pub struct LiveDependencyRequest {
     pub package: Arc<PackageFacts>,
     /// Exact dependency candidate inventory and identities.
     pub dependencies: Arc<DependencyFacts>,
+    /// The toolchain observation used for this request's key, not a later memo.
+    pub toolchain: ToolchainGuard,
     /// `(path, digest)` of every extern the key covers.
     pub externs: Vec<(String, TypedDigest)>,
+}
+
+impl LiveDependencyRequest {
+    fn verify_toolchain(&self) -> Result<(), String> {
+        self.toolchain
+            .verify_unchanged(Path::new(&self.plan.compiler))
+    }
 }
 
 /// One output now present in the subscriber's out-dir with known bytes.
@@ -110,6 +124,27 @@ pub struct KnownOutput {
     pub sig: FileSig,
     /// CAS object id of the bytes.
     pub digest: TypedDigest,
+}
+
+/// The materializer has returned, so another writer may already have replaced
+/// an output. A fresh metadata signature alone cannot be paired with the old
+/// committed digest: doing so would poison the edge's file-digest memo and key
+/// a later compiler invocation against bytes it never received. Establish both
+/// through the same stable read, or refuse this hit without publishing a memo.
+fn known_installed_output(path: &Path, expected: &TypedDigest) -> Result<KnownOutput, String> {
+    let (sig, digest) = digest_stable(path)
+        .map_err(|error| format!("installed output {}: {error}", path.display()))?;
+    if &digest != expected {
+        return Err(format!(
+            "installed output {} no longer matches its committed object",
+            path.display()
+        ));
+    }
+    Ok(KnownOutput {
+        path: path.to_path_buf(),
+        sig,
+        digest,
+    })
 }
 
 /// The lane's answer to one request.
@@ -170,8 +205,12 @@ impl PendingServe {
         let plan = &self.request.plan;
         if let Err(reason) = self
             .request
-            .package
-            .verify_unchanged(Path::new(&plan.source_root))
+            .verify_toolchain()
+            .and_then(|()| {
+                self.request
+                    .package
+                    .verify_unchanged(Path::new(&plan.source_root))
+            })
             .and_then(|()| self.request.package.verify_generated_disjoint(plan))
             .and_then(|()| self.request.dependencies.verify_unchanged())
         {
@@ -204,13 +243,16 @@ impl PendingServe {
                     if committed.role == OutputRole::DepInfo {
                         continue;
                     }
-                    if let Ok(meta) = std::fs::symlink_metadata(path) {
-                        installed.push(KnownOutput {
-                            path: path.clone(),
-                            sig: FileSig::of(&meta),
-                            digest: committed.object.0.clone(),
-                        });
+                    match known_installed_output(path, &committed.object.0) {
+                        Ok(output) => installed.push(output),
+                        Err(reason) => return InstallResult::Fault(reason),
                     }
+                }
+                // The synchronous writer has returned. A toolchain update
+                // during installation cannot authorize a skip under the old
+                // key; report a settled failure, never uncertain fallback.
+                if let Err(reason) = self.request.verify_toolchain() {
+                    return InstallResult::Fault(reason);
                 }
                 InstallResult::Served {
                     transcript: render_placements(&self.canonical_transcript, plan),
@@ -301,6 +343,8 @@ struct CapturedLocalResult {
     transcript: ObjectId,
     manifest_key: String,
     known: Vec<KnownOutput>,
+    // Retain every captured object while the wrapper acknowledges the handoff.
+    pins: CapturePins,
 }
 
 impl CapturedLocalAttempt {
@@ -367,10 +411,15 @@ fn object_id(bytes: &[u8]) -> Result<TypedDigest, String> {
         .map_err(|error| format!("digest: {error:?}"))
 }
 
-/// Durably store one object. The store lock is held for this object only.
-fn put_bytes(cas: &crate::janitor::store::LiveCas, bytes: &[u8]) -> Result<ObjectId, String> {
+/// Durably store and pin one object under the same per-object store lock.
+fn put_bytes(
+    cas: &crate::janitor::store::LiveCas,
+    bytes: &[u8],
+    pins: &mut CapturePins,
+) -> Result<ObjectId, String> {
     let id = object_id(bytes)?;
     let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+    pins.protect(&mut *store, &id)?;
     put_if_absent(
         cas.layout(),
         &mut *store,
@@ -392,6 +441,7 @@ fn put_bytes(cas: &crate::janitor::store::LiveCas, bytes: &[u8]) -> Result<Objec
 fn put_bundle_root(
     cas: &crate::janitor::store::LiveCas,
     outputs: &[LogicalOutput],
+    pins: &mut CapturePins,
 ) -> Result<(), String> {
     use std::io::Write;
     let bytes = rabs_key::logical_output_map::bundle_root_bytes(outputs)
@@ -401,6 +451,7 @@ fn put_bundle_root(
     // Held through the write and the location record: a concurrent
     // completion of the same result must not race the staging name.
     let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+    pins.protect(&mut *store, &root.0)?;
     if store
         .object_durably_located(&root.0)
         .map_err(|error| format!("{error:?}"))?
@@ -549,6 +600,9 @@ impl LiveDependencyLane {
     /// and sampling gate, including any additional private verification run.
     #[must_use]
     pub fn decide(&self, request: LiveDependencyRequest) -> LiveDecision {
+        if let Err(reason) = request.verify_toolchain() {
+            return LiveDecision::PassThrough(reason);
+        }
         let request = match self.preview(request) {
             Ok(Ok(pending)) => return LiveDecision::Hit(pending),
             Ok(Err(request)) => request,
@@ -796,6 +850,7 @@ impl LocalAttempt {
         if report.stderr.len() > MAX_TRANSCRIPT_BYTES {
             return Err("transcript exceeds the class bound".into());
         }
+        self.request.verify_toolchain()?;
         let plan = &self.request.plan;
         self.request
             .package
@@ -803,13 +858,26 @@ impl LocalAttempt {
         self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
         let input_roots = mappings_for_plan(plan);
-        // Harvest every declared output (and nothing else).
+        let transcript = canonicalize_placements(&report.stderr, plan)?;
+        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
+        let authority = self.authority.clone().ok_or("attempt not admitted")?;
+        let mut pins = CapturePins::new(Arc::clone(cas), &authority);
+        let mut logical_outputs = Vec::with_capacity(plan.outputs.declarations.len());
+        let mut known = Vec::new();
+        // Lock order is submissions -> store: never advance while holding
+        // the store. Each output is retained before the next one is read.
+        self.advance(AttemptState::HarvestingOutputs)?;
+        self.advance(AttemptState::UploadingOutputs)?;
+        // Keep only signatures and CAS identities, not a Vec containing every
+        // complete rlib/rmeta. Native outputs stream through private staging
+        // outside the metadata lock. Dep-info still needs the existing bounded
+        // parse/placement rewrite; its bytes are released after that one put.
         let mut harvested = Vec::new();
         for declaration in &plan.outputs.declarations {
             let path = Path::new(&plan.out_dir).join(&declaration.virtual_path);
-            let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
-                .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
-            let committed_bytes = if declaration.class == OutputClass::DepInfo {
+            let (sig, object) = if declaration.class == OutputClass::DepInfo {
+                let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
+                    .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
                 if let Some(violation) = dep_info_closure_violation(plan, &raw, |virtual_path| {
                     input_roots.iter().any(|(logical, visible)| {
                         virtual_path.strip_prefix(&format!("{visible}/")).is_some_and(|relative| {
@@ -821,13 +889,31 @@ impl LocalAttempt {
                 }) {
                     return Err(format!("closure: {violation}"));
                 }
-                canonicalize_placements(&raw, plan)?
+                let bytes = canonicalize_placements(&raw, plan)?;
+                (sig, put_bytes(cas, &bytes, &mut pins)?)
             } else {
-                raw
+                let captured = output_capture::put_output(cas, &path, MAX_OUTPUT_BYTES, &mut pins)?;
+                let object = ObjectId(captured.digest.clone());
+                let sig = captured.sig;
+                known.push(captured);
+                (sig, object)
             };
-            harvested.push((declaration, path, sig, committed_bytes));
+            harvested.push((path, sig));
+            logical_outputs.push(LogicalOutput {
+                role: output_role(declaration.class),
+                virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
+                object,
+            });
         }
-        let transcript = canonicalize_placements(&report.stderr, plan)?;
+        // Streaming a later artifact must not silently accept a replacement
+        // of an earlier output. This check retains the original identities,
+        // including dep-info, without rereading or retaining the artifact bytes.
+        for (path, sig) in &harvested {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() || FileSig::of(&metadata) != *sig {
+                return Err(format!("output {} changed during capture", path.display()));
+            }
+        }
         // The complete capture must be from one stable input generation, not
         // just start with one. After this barrier publication uses CAS only.
         self.request
@@ -835,36 +921,15 @@ impl LocalAttempt {
             .verify_unchanged(Path::new(&plan.source_root))?;
         self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
-        self.advance(AttemptState::HarvestingOutputs)?;
-
-        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
-        let authority = self.authority.clone().ok_or("attempt not admitted")?;
-        let mut logical_outputs = Vec::with_capacity(harvested.len());
-        let mut known = Vec::new();
-        // Lock order is submissions -> store everywhere in the coordinator:
-        // never advance the attempt while holding the store.
-        self.advance(AttemptState::UploadingOutputs)?;
+        self.request.verify_toolchain()?;
         // Each put takes the store lock for itself only: decisions for other
         // compiles must not queue behind a whole completion's fsyncs. The
-        // commit transaction re-verifies the complete durable closure.
+        // pin installed by each put protects the object between those locks
+        // and across the asynchronous acknowledgment. The commit transaction
+        // still re-verifies the complete durable closure.
         let (transcript_id, evidence_parts) = {
-            for (declaration, path, sig, bytes) in &harvested {
-                let object = put_bytes(cas, bytes)?;
-                if declaration.class != OutputClass::DepInfo {
-                    known.push(KnownOutput {
-                        path: path.clone(),
-                        sig: *sig,
-                        digest: object.0.clone(),
-                    });
-                }
-                logical_outputs.push(LogicalOutput {
-                    role: output_role(declaration.class),
-                    virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
-                    object,
-                });
-            }
-            put_bundle_root(cas, &logical_outputs)?;
-            let transcript_id = put_bytes(cas, &transcript)?;
+            put_bundle_root(cas, &logical_outputs, &mut pins)?;
+            let transcript_id = put_bytes(cas, &transcript, &mut pins)?;
             let hex =
                 |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
             let snapshot = serde_json::to_vec(&serde_json::json!({
@@ -911,10 +976,10 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())?;
             let parts = [
-                put_bytes(cas, &snapshot)?,
-                put_bytes(cas, &observed)?,
-                put_bytes(cas, &process)?,
-                put_bytes(cas, &provenance)?,
+                put_bytes(cas, &snapshot, &mut pins)?,
+                put_bytes(cas, &observed, &mut pins)?,
+                put_bytes(cas, &process, &mut pins)?,
+                put_bytes(cas, &provenance, &mut pins)?,
             ];
             (transcript_id, parts)
         };
@@ -971,8 +1036,8 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())
         };
-        let manifest_id = put_bytes(cas, &manifest_bytes)?;
-        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?)?;
+        let manifest_id = put_bytes(cas, &manifest_bytes, &mut pins)?;
+        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?, &mut pins)?;
         let offer = OfferPreparedActionResult::build(
             authority,
             stamped.manifest,
@@ -993,6 +1058,7 @@ impl LocalAttempt {
             transcript: transcript_id,
             manifest_key: digest_key(&manifest_id.0),
             known,
+            pins,
         })
     }
 
@@ -1004,6 +1070,9 @@ impl LocalAttempt {
             offer,
             transcript,
             known,
+            // Keep the owner through commit AND transcript indexing. The
+            // publication/evidence pins are independent of these capture pins.
+            pins: _pins,
             ..
         } = captured;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
@@ -1045,5 +1114,75 @@ impl LocalAttempt {
 impl Drop for LocalAttempt {
     fn drop(&mut self) {
         self.settle();
+    }
+}
+
+#[cfg(test)]
+mod installed_output_tests {
+    use super::*;
+
+    #[test]
+    fn installed_output_digest_and_signature_describe_the_same_bytes() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        for bytes in [b"".as_slice(), b"compiler output\0\xff\n".as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            let expected = object_id(bytes).unwrap();
+            let known = known_installed_output(&path, &expected).unwrap();
+            assert_eq!(known.path, path);
+            assert_eq!(known.digest, expected);
+            assert_eq!(
+                known.sig,
+                FileSig::of(&std::fs::symlink_metadata(&path).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_after_materialization_cannot_seed_the_old_digest() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = object_id(b"original").unwrap();
+        // Same length, different inode/bytes after materialization returned.
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"replaced").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        assert!(known_installed_output(&path, &object_id(b"replaced").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn in_place_write_after_materialization_cannot_seed_the_old_digest() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rmeta");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = object_id(b"original").unwrap();
+        std::fs::write(&path, b"mutated!").unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        let actual = object_id(b"mutated!").unwrap();
+        assert_eq!(
+            known_installed_output(&path, &actual).unwrap().digest,
+            actual
+        );
+    }
+
+    #[test]
+    fn vanished_and_non_regular_outputs_refuse_instead_of_becoming_served() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        std::fs::write(&path, b"output").unwrap();
+        let expected = object_id(b"output").unwrap();
+        let retained = dir.path().join("retained-output");
+        std::fs::rename(&path, &retained).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        std::fs::create_dir(&path).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("linked-output");
+            std::os::unix::fs::symlink(&retained, &alias).unwrap();
+            assert!(known_installed_output(&alias, &expected).is_err());
+        }
     }
 }

@@ -47,9 +47,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Commit one action whose materializable output really is `artifact`,
-/// into the store under `state_dir`. Returns when the store handle is
-/// released, so the daemon can mount it.
-fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8]) {
+/// into the store under `state_dir`. When `verified` is true, also enroll
+/// the action class and record the two independent verification comparisons
+/// required by the live edge's verification floor before serving.
+/// Returns when the store handle is released, so the daemon can mount it.
+fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8], verified: bool) {
     let cas = Arc::new(mount_and_reconcile(&state_dir.join("cas")).expect("mount"));
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord
@@ -79,15 +81,17 @@ fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8]) {
         let mut store = cas.store().lock().expect("store lock");
         install_admission_world(&mut *store, &authority);
         install_offer_closure(&mut *store, &offer);
-        store
-            .record_decision_receipt(
-                "rabs-live-action-class-v1",
-                &digest_key(&sample_action_key()),
-                0,
-                "rustc-dependency-compile",
-                "synthetic fixture classification",
-            )
-            .expect("fixture class enrollment");
+        if verified {
+            store
+                .record_decision_receipt(
+                    "rabs-live-action-class-v1",
+                    &digest_key(&sample_action_key()),
+                    0,
+                    "rustc-dependency-compile",
+                    "synthetic fixture enrollment",
+                )
+                .expect("record action class receipt");
+        }
     }
     let outcome = coord
         .commit_offer(&offer, &sample_expected_descriptor())
@@ -96,29 +100,29 @@ fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8]) {
         matches!(outcome, PublicationOutcome::Committed(_)),
         "expected a commit, got {outcome:?}"
     );
-    // These two fixture-seeded comparisons satisfy the real serving policy;
-    // they are not independent compiler verification.
-    for number in 1..=2_u128 {
-        let ids = FixtureAttemptIds {
-            generation: 11 + number,
-            attempt: 20 + number,
-            lease: 30 + number,
-        };
-        install_admission_world_with_ids(
-            &mut *cas.store().lock().expect("store lock"),
-            &authority,
-            ids,
-        );
-        let mut comparison = offer.clone();
-        comparison.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
-        comparison.authority.attempt_id = AttemptId(ids.attempt);
-        comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
-        assert_eq!(
-            coord
-                .commit_offer(&comparison, &sample_expected_descriptor())
-                .expect("commit fixture comparison"),
-            PublicationOutcome::IdempotentEvidenceAppended
-        );
+    if verified {
+        for n in 1..=2_u128 {
+            let ids = FixtureAttemptIds {
+                generation: 11 + n,
+                attempt: 20 + n,
+                lease: 30 + n,
+            };
+            install_admission_world_with_ids(
+                &mut *cas.store().lock().expect("store lock"),
+                &authority,
+                ids,
+            );
+            let mut compared = offer.clone();
+            compared.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
+            compared.authority.attempt_id = AttemptId(ids.attempt);
+            compared.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
+            assert_eq!(
+                coord
+                    .commit_offer(&compared, &sample_expected_descriptor())
+                    .expect("independent verification comparison"),
+                PublicationOutcome::IdempotentEvidenceAppended
+            );
+        }
     }
 }
 
@@ -182,7 +186,7 @@ fn the_running_daemon_serves_a_committed_hit_over_the_socket() {
     let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let state_dir = dir.path().to_path_buf();
     let artifact = b"the committed rlib, served over the wire".repeat(32);
-    commit_one_action(&state_dir, &artifact);
+    commit_one_action(&state_dir, &artifact, true);
 
     let mut daemon = spawn_daemon(&state_dir);
     let mut stream = connect(&state_dir.join("rabsd.sock"));
@@ -290,4 +294,41 @@ fn the_running_daemon_serves_a_committed_hit_over_the_socket() {
         Some(0),
         "daemon must exit clean after serving"
     );
+}
+
+#[test]
+fn the_running_daemon_refuses_an_unverified_commit_until_the_verification_floor_is_met() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().to_path_buf();
+    let artifact = b"single unverified commit must not serve".repeat(16);
+    commit_one_action(&state_dir, &artifact, false);
+
+    let mut daemon = spawn_daemon(&state_dir);
+    let mut stream = connect(&state_dir.join("rabsd.sock"));
+    let hello = round_trip(&mut stream, HELLO);
+    assert!(hello.contains("hello-ok"), "{hello}");
+
+    let worktree = dir.path().join("worktree");
+    let key = hex(&sample_action_key().bytes);
+    let reply = round_trip(
+        &mut stream,
+        &format!(
+            "{{\"kind\":\"serve\",\"action_key\":\"{key}\",\"destination_root\":\"{}\"}}",
+            worktree.display()
+        ),
+    );
+    assert!(
+        reply.contains("\"outcome\":\"execute-privately\"")
+            && reply.contains("Sampling(ElevatedClassRisk)"),
+        "expected Sampling(ElevatedClassRisk) refusal for unverified commit, got {reply}"
+    );
+    assert!(!worktree.exists(), "refused serve must not write anything");
+
+    drop(stream);
+    Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status()
+        .expect("SIGTERM");
+    let status = daemon.wait().expect("daemon exit");
+    assert_eq!(status.code(), Some(0));
 }

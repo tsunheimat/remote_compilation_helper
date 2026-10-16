@@ -651,6 +651,7 @@ mod tests {
                 confidence_threshold: 0.85,
                 min_local_time_ms: 2000,
                 remote_speedup_threshold: 1.2,
+                local_slots: 0,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,
@@ -662,6 +663,8 @@ mod tests {
                 remote_build_jobs: "auto".to_string(),
             },
             transfer: ConfigTransferSection {
+                retrieval_staging_dir: None,
+                retrieval_min_free_bytes: 0,
                 compression_level: 3,
                 exclude_patterns: vec!["target/".to_string()],
                 remote_base: "/tmp/rch".to_string(),
@@ -699,11 +702,18 @@ mod tests {
                 auto_start_cooldown_secs: 30,
                 auto_start_timeout_secs: 3,
             },
+            layer0: rch_common::types::Layer0Config {
+                enabled: true,
+                debug_line_tables_only: true,
+                ..Default::default()
+            },
             sources: vec!["~/.config/rch/config.toml".to_string()],
             value_sources: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(json["general"]["enabled"].as_bool().unwrap());
+        assert!(json["layer0"]["debug_line_tables_only"].as_bool().unwrap());
+        assert!(!json["layer0"]["release_lto_thin"].as_bool().unwrap());
         assert_eq!(json["compilation"]["confidence_threshold"], 0.85);
         assert_eq!(json["compilation"]["build_timeout_sec"], 300);
         assert_eq!(json["compilation"]["external_timeout_enabled"], true);
@@ -892,6 +902,7 @@ mod tests {
             capabilities_warnings: Vec::new(),
             worker_selection: None,
             placement: rch_common::resolve_placement(|_| None),
+            speed_gate: None,
             dry_run: None,
         };
 
@@ -1371,6 +1382,7 @@ mod tests {
             capabilities_warnings: Vec::new(),
             worker_selection: Some(worker_selection),
             placement: rch_common::resolve_placement(|_| None),
+            speed_gate: None,
             dry_run: Some(dry_run),
         };
 

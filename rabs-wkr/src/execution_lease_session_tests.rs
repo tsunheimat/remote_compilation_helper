@@ -311,9 +311,16 @@ fn terminal(peer: &Wire) -> Option<Value> {
         .find(|frame| frame["kind"] == "exec-result")
 }
 
+fn private_root() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    root
+}
+
 #[test]
 fn lease_selection_checks_session_boot_bounds_and_exact_shape() {
-    let root = crate::private_test_directory();
+    let root = private_root();
     let journal = WorkerJournal::open(root.path(), "lease-session-test", "coordinator").unwrap();
     let original = grant_frame(&journal, &request());
     selection(&journal, &request());
@@ -361,7 +368,7 @@ fn lease_selection_checks_session_boot_bounds_and_exact_shape() {
 #[test]
 fn mismatched_request_and_missing_authenticated_lease_never_reach_journal_admission() {
     for missing_lease in [false, true] {
-        let root = crate::private_test_directory();
+        let root = private_root();
         let mut journal =
             WorkerJournal::open(root.path(), "lease-session-test", "coordinator").unwrap();
         let before = std::fs::read(root.path().join("requests.json")).unwrap();
@@ -420,7 +427,7 @@ fn mismatched_request_and_missing_authenticated_lease_never_reach_journal_admiss
 
 #[test]
 fn valid_renewals_keep_the_real_child_alive_and_foreign_or_replayed_renewals_refuse() {
-    let root = crate::private_test_directory();
+    let root = private_root();
     let mut journal =
         WorkerJournal::open(root.path(), "lease-session-test", "coordinator").unwrap();
     let selected = selection(&journal, &request());
@@ -498,7 +505,7 @@ fn valid_renewals_keep_the_real_child_alive_and_foreign_or_replayed_renewals_ref
 
 #[test]
 fn silent_connection_expires_drains_and_recovers_the_retained_result_without_rerun() {
-    let root = crate::private_test_directory();
+    let root = private_root();
     let original = request();
     let mut journal =
         WorkerJournal::open(root.path(), "lease-session-test", "coordinator").unwrap();
@@ -591,7 +598,7 @@ fn silent_connection_expires_drains_and_recovers_the_retained_result_without_rer
 
 #[test]
 fn blocked_renewal_reply_cannot_prevent_worker_local_expiry_and_process_cleanup() {
-    let root = crate::private_test_directory();
+    let root = private_root();
     let mut journal =
         WorkerJournal::open(root.path(), "lease-session-test", "coordinator").unwrap();
     let selected = selection(&journal, &request());
@@ -642,7 +649,7 @@ fn blocked_renewal_reply_cannot_prevent_worker_local_expiry_and_process_cleanup(
 
 #[test]
 fn partial_renewal_survives_completion_cancelling_the_pending_frame_read() {
-    let root = crate::private_test_directory();
+    let root = private_root();
     let mut journal =
         WorkerJournal::open(root.path(), "lease-session-test", "coordinator").unwrap();
     let selected = selection(&journal, &request());

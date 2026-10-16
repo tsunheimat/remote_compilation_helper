@@ -1270,6 +1270,14 @@ impl WorkerSelector {
         let worker_id = WorkerId::new(&fallback_id);
         let worker = pool.get(&worker_id).await?;
 
+        // Last-success history is only a preference, never capability evidence.
+        // In particular, an exact runtime or named-tool requirement must not
+        // disappear when the normal eligibility pass finds no usable worker.
+        let capabilities = worker.capabilities().await;
+        if required_tool_capability_mismatch(request, &capabilities).is_some() {
+            return None;
+        }
+
         if self
             .disk_headroom_failure(&worker, &fallback_id, request)
             .await
@@ -4017,6 +4025,14 @@ fn record_no_worker_outcome(got_worker: bool) {
 
 fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
     metrics::observe_reliability_decision("selection", selection_outcome_label(reason), duration);
+    // A busy pool is saturation, not a local fallback: capable workers exist,
+    // and the request queues by default. Every queued waiter re-selects each
+    // second, so counting busy rounds kept the fleet-degraded alarm latched and
+    // inflated the local-fallback metrics whenever anything queued. A queue
+    // timeout that does fall back is counted where it happens (api.rs).
+    if *reason == SelectionReason::AllWorkersBusy {
+        return;
+    }
     let got_worker = matches!(
         reason,
         SelectionReason::Success
@@ -4175,6 +4191,13 @@ fn required_tool_capability_mismatch(
     capabilities: &WorkerCapabilities,
 ) -> Option<String> {
     request.required_tools.iter().find_map(|tool| {
+        if let Some(check) = rch_common::tool_requirement::check_exact_runtime(
+            tool,
+            capabilities.node_version.as_deref(),
+            capabilities.bun_version.as_deref(),
+        ) {
+            return check.err();
+        }
         (!capabilities.tools_present.iter().any(|t| t == tool)).then(|| {
             if capabilities.tools_absent.iter().any(|t| t == tool) {
                 format!("capability_missing:tool:{tool}:probe_failed")
@@ -4184,6 +4207,9 @@ fn required_tool_capability_mismatch(
         })
     })
 }
+
+#[cfg(test)]
+mod exact_runtime_tests;
 
 fn rustup_component_capability_mismatch(
     request: &SelectionRequest,
@@ -4809,6 +4835,20 @@ mod tests {
 
         assert!(decision_after > decision_before);
         assert!(fallback_after > fallback_before);
+    }
+
+    #[test]
+    fn busy_selection_rounds_are_not_local_fallbacks() {
+        let busy = || {
+            crate::metrics::LOCAL_FALLBACK_REASON_TOTAL
+                .with_label_values(&["all_workers_busy"])
+                .get()
+        };
+        let before = busy();
+        for _ in 0..(NO_WORKER_WINDOW * 2) {
+            record_selection_metrics(&SelectionReason::AllWorkersBusy, Duration::from_millis(1));
+        }
+        assert_eq!(busy(), before);
     }
 
     #[tokio::test]
@@ -5514,6 +5554,72 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         let selected = result.worker.expect("Expected a worker");
         assert_eq!(selected.config.read().await.id.as_str(), "windows-worker");
+    }
+
+    #[tokio::test]
+    async fn test_native_apple_job_selects_only_declared_darwin_worker() {
+        for command in [
+            "xcodebuild -scheme App -jobs 1 build",
+            "/usr/bin/xcrun --sdk macosx xcodebuild -scheme App test",
+        ] {
+            let (pool, selector, mut request) = os_gate_fixture(command).await;
+            request.job_mode = true;
+            assert!(
+                selector.select(&pool, &request).await.worker.is_none(),
+                "Linux and Windows cannot execute native Apple tools: {command}"
+            );
+            pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
+                .await;
+            let result = selector.select(&pool, &request).await;
+            let selected = result
+                .worker
+                .expect("native Apple job should select the Mac");
+            assert_eq!(selected.config.read().await.id.as_str(), "mac-worker");
+
+            let diagnostics = selector
+                .build_selection_diagnostics(&pool, &request, &HashSet::new())
+                .await;
+            for worker in diagnostics
+                .workers
+                .iter()
+                .filter(|w| w.worker_id.as_str() != "mac-worker")
+            {
+                assert_eq!(
+                    worker.final_decision,
+                    WorkerSelectionDiagnosticDecision::Deny
+                );
+                assert!(
+                    worker
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "os.declared_mismatch")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_apple_job_mentions_do_not_claim_darwin_worker() {
+        for command in [
+            "./run_shards.sh",
+            "echo 'xcodebuild build'",
+            "env NOTE=xcrun bun test",
+        ] {
+            let (pool, selector, mut request) = os_gate_fixture(command).await;
+            request.job_mode = true;
+            pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
+                .await;
+            let selected = selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .expect("ordinary job still runs on Linux");
+            assert_eq!(
+                selected.config.read().await.id.as_str(),
+                "linux-worker",
+                "{command}"
+            );
+        }
     }
 
     #[tokio::test]

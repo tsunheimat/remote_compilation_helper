@@ -8,8 +8,9 @@
 
 use std::sync::OnceLock;
 
+mod remote_scoped_launch;
 /// Shared Linux launch and cancellation protocol; callers select their receipt.
-pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = include_str!("remote_process.sh");
+pub use remote_scoped_launch::REMOTE_PROCESS_IDENTITY_SCRIPT;
 
 pub mod admission_recommendation;
 pub mod admission_rejection;
@@ -45,6 +46,7 @@ pub mod gc_roots;
 pub mod hooks;
 pub mod incident;
 pub mod incident_ledger;
+pub mod isolated_staging;
 pub mod job_identity;
 pub mod job_recovery;
 pub mod log_retention;
@@ -57,6 +59,7 @@ pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
 pub mod placement;
+pub mod pnpm_workspace;
 pub mod pooled_target_key;
 pub mod process_identity;
 pub mod proof_handoff;
@@ -89,6 +92,7 @@ pub mod telemetry_explain;
 pub mod telemetry_freshness;
 pub mod test_change;
 pub mod testing;
+pub mod tool_requirement;
 pub mod toolchain;
 pub mod transfer_hardening;
 pub mod types;

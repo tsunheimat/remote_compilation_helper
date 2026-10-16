@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, environment.remote.<KEY>, execution.storage.root, execution.storage.cache_root, execution.storage.tmp_root, execution.storage.home_root, execution.storage.tmp_mode, execution.storage.tmp_retention_hours, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, environment.remote.<KEY>, execution.storage.root, execution.storage.cache_root, execution.storage.tmp_root, execution.storage.home_root, execution.storage.tmp_mode, execution.storage.tmp_retention_hours, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -123,6 +123,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 confidence_threshold: config.compilation.confidence_threshold,
                 min_local_time_ms: config.compilation.min_local_time_ms,
                 remote_speedup_threshold: config.compilation.remote_speedup_threshold,
+                local_slots: config.compilation.local_slots,
                 build_slots: config.compilation.build_slots,
                 test_slots: config.compilation.test_slots,
                 check_slots: config.compilation.check_slots,
@@ -134,6 +135,8 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 remote_build_jobs: config.compilation.remote_build_jobs.to_string(),
             },
             transfer: ConfigTransferSection {
+                retrieval_staging_dir: config.transfer.retrieval_staging_dir.clone(),
+                retrieval_min_free_bytes: config.transfer.retrieval_min_free_bytes,
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
                 remote_base: config.transfer.remote_base.clone(),
@@ -175,10 +178,11 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 auto_start_cooldown_secs: config.self_healing.auto_start_cooldown_secs,
                 auto_start_timeout_secs: config.self_healing.auto_start_timeout_secs,
             },
+            layer0: config.layer0.clone(),
             sources,
             value_sources,
         };
-        let _ = ctx.json(&ApiResponse::ok("config show", response));
+        ctx.json(&ApiResponse::ok("config show", response))?;
         return Ok(());
     }
 
@@ -268,6 +272,15 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "compilation.remote_speedup_threshold",
             &style.value(&config.compilation.remote_speedup_threshold.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("local_slots"),
+        format_with_source(
+            "compilation.local_slots",
+            &style.value(&config.compilation.local_slots.to_string()),
             &value_sources
         )
     );
@@ -385,6 +398,14 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             &style.value(&format!("\"{}\"", config.transfer.remote_base)),
             &value_sources
         )
+    );
+    println!(
+        "  retrieval_staging_dir = {:?}",
+        config.transfer.retrieval_staging_dir
+    );
+    println!(
+        "  retrieval_min_free_bytes = {}",
+        config.transfer.retrieval_min_free_bytes
     );
 
     println!("\n{}", style.highlight("[environment]"));
@@ -577,6 +598,45 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         )
     );
 
+    // Layer 0 profile pack (bd-bqu38, bd-hoxgn).
+    println!("\n{}", style.highlight("[layer0]"));
+    println!(
+        "  {} = {}",
+        style.key("enabled"),
+        format_with_source(
+            "layer0.enabled",
+            &style.value(&config.layer0.enabled.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("release_lto_thin"),
+        format_with_source(
+            "layer0.release_lto_thin",
+            &style.value(&config.layer0.release_lto_thin.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("release_codegen_units_1"),
+        format_with_source(
+            "layer0.release_codegen_units_1",
+            &style.value(&config.layer0.release_codegen_units_1.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("debug_line_tables_only"),
+        format_with_source(
+            "layer0.debug_line_tables_only",
+            &style.value(&config.layer0.debug_line_tables_only.to_string()),
+            &value_sources
+        )
+    );
+
     // Tailnet status API (bd-2f5ms). The token value is never printed.
     println!("\n{}", style.highlight("[api]"));
     println!(
@@ -710,7 +770,7 @@ pub fn config_get(key: &str, show_sources: bool, ctx: &OutputContext) -> Result<
             value: entry.value.clone(),
             source: show_sources.then(|| entry.source.clone()),
         };
-        let _ = ctx.json(&ApiResponse::ok("config get", response));
+        ctx.json(&ApiResponse::ok("config get", response))?;
         return Ok(());
     }
 
@@ -787,6 +847,12 @@ pub(super) fn collect_value_sources(
         &mut values,
         "compilation.remote_speedup_threshold",
         config.compilation.remote_speedup_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.local_slots",
+        config.compilation.local_slots.to_string(),
         sources,
     );
     push_value_source(
@@ -984,6 +1050,32 @@ pub(super) fn collect_value_sources(
         sources,
     );
 
+    // Layer 0 profile pack (bd-bqu38, bd-hoxgn).
+    push_value_source(
+        &mut values,
+        "layer0.enabled",
+        config.layer0.enabled.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "layer0.release_lto_thin",
+        config.layer0.release_lto_thin.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "layer0.release_codegen_units_1",
+        config.layer0.release_codegen_units_1.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "layer0.debug_line_tables_only",
+        config.layer0.debug_line_tables_only.to_string(),
+        sources,
+    );
+
     // Tailnet status API and dashboard URL (bd-2f5ms). The token itself is
     // never echoed: `config get api.token` reports only whether one is set.
     push_value_source(&mut values, "api.bind", config.api.bind.clone(), sources);
@@ -1099,7 +1191,7 @@ pub fn config_validate(ctx: &OutputContext) -> Result<()> {
                     warnings: vec![],
                     valid: false,
                 };
-                let _ = ctx.json(&ApiResponse::ok("config validate", response));
+                ctx.json(&ApiResponse::ok("config validate", response))?;
                 std::process::exit(1);
             }
             println!(
@@ -1157,7 +1249,7 @@ pub fn config_validate(ctx: &OutputContext) -> Result<()> {
             warnings: warning_items,
             valid,
         };
-        let _ = ctx.json(&ApiResponse::ok("config validate", response));
+        ctx.json(&ApiResponse::ok("config validate", response))?;
         if !valid {
             std::process::exit(1);
         }
@@ -1232,14 +1324,14 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
     };
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "config set",
             ConfigSetResponse {
                 key: key.to_string(),
                 value: value.to_string(),
                 config_path: config_path.display().to_string(),
             },
-        ));
+        ))?;
     } else {
         println!("Updated {:?}: {} = {}", config_path, key, value);
     }
@@ -1320,6 +1412,9 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
                 .into());
             }
             config.compilation.remote_speedup_threshold = threshold;
+        }
+        "compilation.local_slots" => {
+            config.compilation.local_slots = parse_u32(value, key)?;
         }
         "compilation.build_slots" => {
             config.compilation.build_slots = parse_u32(value, key)?;
@@ -1450,6 +1545,18 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         }
         "path_topology.alias_root" => {
             config.path_topology.alias_root = Some(parse_topology_root(value, key)?);
+        }
+        "layer0.enabled" => {
+            config.layer0.enabled = parse_bool(value, key)?;
+        }
+        "layer0.release_lto_thin" => {
+            config.layer0.release_lto_thin = parse_bool(value, key)?;
+        }
+        "layer0.release_codegen_units_1" => {
+            config.layer0.release_codegen_units_1 = parse_bool(value, key)?;
+        }
+        "layer0.debug_line_tables_only" => {
+            config.layer0.debug_line_tables_only = parse_bool(value, key)?;
         }
         // Tailnet status API (bd-2f5ms) and the dashboard URL `rch web` opens.
         "api.bind" => {
@@ -1604,6 +1711,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
                 defaults.compilation.remote_speedup_threshold;
             config.compilation.remote_speedup_threshold.to_string()
         }
+        "compilation.local_slots" => {
+            config.compilation.local_slots = defaults.compilation.local_slots;
+            config.compilation.local_slots.to_string()
+        }
         "compilation.build_slots" => {
             config.compilation.build_slots = defaults.compilation.build_slots;
             config.compilation.build_slots.to_string()
@@ -1678,6 +1789,22 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             config.path_topology.alias_root = None;
             rch_common::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string()
         }
+        "layer0.enabled" => {
+            config.layer0.enabled = defaults.layer0.enabled;
+            config.layer0.enabled.to_string()
+        }
+        "layer0.release_lto_thin" => {
+            config.layer0.release_lto_thin = defaults.layer0.release_lto_thin;
+            config.layer0.release_lto_thin.to_string()
+        }
+        "layer0.release_codegen_units_1" => {
+            config.layer0.release_codegen_units_1 = defaults.layer0.release_codegen_units_1;
+            config.layer0.release_codegen_units_1.to_string()
+        }
+        "layer0.debug_line_tables_only" => {
+            config.layer0.debug_line_tables_only = defaults.layer0.debug_line_tables_only;
+            config.layer0.debug_line_tables_only.to_string()
+        }
         "api.bind" => {
             config.api.bind = String::new();
             "(off)".to_string()
@@ -1731,14 +1858,14 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         .with_context(|| format!("Failed to write {:?}", config_path))?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "config reset",
             ConfigResetResponse {
                 key: key.to_string(),
                 value,
                 config_path: config_path.display().to_string(),
             },
-        ));
+        ))?;
     } else {
         println!("Reset {:?}: {} = {}", config_path, key, value);
     }
@@ -1848,7 +1975,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
         }
         "json" => {
             // JSON format (ignore ctx.is_json() since user explicitly requested JSON)
-            let _ = ctx.json_force(&ApiResponse::ok(
+            ctx.json_force(&ApiResponse::ok(
                 "config export",
                 serde_json::json!({
                     "general": {
@@ -1886,7 +2013,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     "remediation": serde_json::to_value(config.remediation.redacted())
                         .unwrap_or(serde_json::Value::Null),
                 }),
-            ));
+            ))?;
         }
         _ => {
             return Err(ConfigError::InvalidValue {
@@ -2498,6 +2625,30 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         "self_healing.daemon_installs_hooks"
     );
     diff_field!(
+        "layer0.enabled",
+        config.layer0.enabled,
+        defaults.layer0.enabled,
+        "layer0.enabled"
+    );
+    diff_field!(
+        "layer0.release_lto_thin",
+        config.layer0.release_lto_thin,
+        defaults.layer0.release_lto_thin,
+        "layer0.release_lto_thin"
+    );
+    diff_field!(
+        "layer0.release_codegen_units_1",
+        config.layer0.release_codegen_units_1,
+        defaults.layer0.release_codegen_units_1,
+        "layer0.release_codegen_units_1"
+    );
+    diff_field!(
+        "layer0.debug_line_tables_only",
+        config.layer0.debug_line_tables_only,
+        defaults.layer0.debug_line_tables_only,
+        "layer0.debug_line_tables_only"
+    );
+    diff_field!(
         "self_healing.auto_start_cooldown_secs",
         config.self_healing.auto_start_cooldown_secs,
         defaults.self_healing.auto_start_cooldown_secs,
@@ -3048,6 +3199,38 @@ mod tests {
         let config: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(config.execution.storage.root.is_none());
         assert!(config.environment.remote.is_empty());
+    }
+
+    /// `[layer0]` keys are settable, resettable and readable from the CLI, so
+    /// operators can toggle the pack without hand-editing TOML (bd-hoxgn).
+    #[test]
+    fn config_set_and_reset_layer0_knobs() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+        for key in ["layer0.enabled", "layer0.debug_line_tables_only"] {
+            config_set_at(&config_path, key, "true", &ctx).expect("set layer0 key");
+        }
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.layer0.enabled && config.layer0.debug_line_tables_only);
+        assert!(!config.layer0.release_lto_thin);
+        assert_eq!(
+            config.layer0.active_env(),
+            vec![
+                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
+            ]
+        );
+        assert!(config_set_at(&config_path, "layer0.enabled", "maybe", &ctx).is_err());
+
+        config_reset_at(&config_path, "layer0.debug_line_tables_only", &ctx)
+            .expect("reset layer0 key");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.layer0.enabled && !config.layer0.debug_line_tables_only);
+        assert!(config.layer0.active_env().is_empty());
     }
 
     /// GH #38 regression: `rch config set path_topology.canonical_root <path>`

@@ -12,19 +12,24 @@
 //! Wire format: newline-delimited JSON, one request per line, 64 KiB bound.
 //! Malformed input never grants execution, publication, or fallback authority.
 //!
-//! Stale-socket takeover: never a blind unlink. If the socket path
-//! exists, LIVENESS-PROBE it (connect): a live daemon means this boot
-//! REFUSES (typed); only a probe-dead socket file (stale runtime state
-//! from a dead incarnation) is removed and taken over, and the takeover
-//! is logged.
+//! Endpoint ownership spans the listener AND every admitted session. A
+//! permanent endpoint lock, private namespace and exact socket generation
+//! fence takeover and teardown independently of the configured CAS root.
+//! Only an unchanged socket whose bounded connect was refused is retired;
+//! timeout, permissions, wrong type and replacement never prove death.
 
+mod backpressure;
+mod endpoint;
+mod frame_read;
 mod liveness;
 mod rustc_outputs;
 mod rustc_request;
 
 use asupersync::cx::Cx;
-use asupersync::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use asupersync::net::unix::{UnixListener, UnixStream};
+use asupersync::io::{AsyncWriteExt, BufReader};
+#[cfg(test)]
+use asupersync::net::unix::UnixListener;
+use asupersync::net::unix::UnixStream;
 use asupersync::signal::ShutdownReceiver;
 use liveness::{Limit, WorkError};
 use rabs_asupersync::daemon_runtime::SubsystemWork;
@@ -32,7 +37,6 @@ use rabs_protocol::socket_admission::{
     AdmissionPolicy, ConnectionEvidence, PeerCredentials, SocketMetadata, TokenContext, admit,
 };
 use rabs_protocol::version_negotiation::{Negotiation, VersionHello, VersionRange, negotiate};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -42,12 +46,17 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTIONS: usize = 128;
 pub const MAX_REQUESTS_PER_CONNECTION: usize = 64;
 const FRAME_IO_BUDGET: Duration = Duration::from_secs(5);
+/// One buffer survives every phase, including completion and capture ACK.
+/// The connection cap bounds total read-ahead storage to 2 MiB per listener.
+const FRAME_READ_BUFFER_BYTES: usize = 16 * 1024;
+type EdgeStream = BufReader<UnixStream>;
 const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
 const MATERIALIZATION_WORKERS: usize = 2;
 const PREPARED_ADMISSION_WORKERS: usize = 2;
 /// Live dependency decisions and hit installs: a compiler is waiting on
-/// each. Saturation answers pass-through, never waits.
+/// each. Pre-decision saturation may carry a bounded wrapper retry hint;
+/// no work is queued or capacity retained while that wrapper backs off.
 const LIVE_DECISION_WORKERS: usize = 8;
 /// Live dependency completions (capture, durable uploads, publication).
 /// Wrappers retain their outputs until capture is acknowledged, but do not
@@ -161,46 +170,18 @@ async fn serve(
     mut shutdown: ShutdownReceiver,
     config: EdgeServerConfig,
 ) -> Result<(), String> {
-    // Stale-socket takeover: liveness probe, never blind unlink.
-    if config.socket_path.exists() {
-        match UnixStream::connect(&config.socket_path).await {
-            Ok(_) => {
-                return Err(format!(
-                    "another rabsd is alive at {} — refusing to take over",
-                    config.socket_path.display()
-                ));
-            }
-            Err(_) => {
-                log_line(
-                    "rabsd-socket-takeover",
-                    &[("stale", &config.socket_path.display().to_string())],
-                );
-                std::fs::remove_file(&config.socket_path)
-                    .map_err(|e| format!("stale socket removal failed: {e}"))?;
-            }
-        }
-    }
-    if let Some(parent) = config.socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let listener = UnixListener::bind(&config.socket_path)
-        .await
-        .map_err(|e| format!("bind {}: {e}", config.socket_path.display()))?;
-    std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("socket chmod: {e}"))?;
-
-    // Admission evidence baseline: the socket we just created. The
-    // daemon's own uid is the socket owner's uid (we created it).
-    let socket_meta = std::fs::metadata(&config.socket_path).map_err(|e| e.to_string())?;
-    let expected_uid = socket_meta.uid();
+    let listener = endpoint::bind(&config.socket_path, FRAME_IO_BUDGET).await?;
+    // The endpoint owner just checked the exact bound inode, kernel UID and
+    // mode. Socket metadata never chooses a different user's admission policy.
+    let expected_uid = listener.owner_uid();
     let policy = AdmissionPolicy {
         expected_uid,
         require_token_on_unix: false,
         tcp_enabled: false,
     };
     let socket_evidence = SocketMetadata {
-        owner_uid: socket_meta.uid(),
-        mode: socket_meta.mode() & 0o777,
+        owner_uid: expected_uid,
+        mode: 0o600,
     };
     log_line(
         "rabsd-edge-listening",
@@ -233,15 +214,15 @@ async fn serve(
 
     shutdown.wait().await;
     acceptor.abort();
-    // The socket file is this incarnation's runtime state: remove it on
-    // clean shutdown so the next boot needs no takeover.
-    let _ = std::fs::remove_file(&config.socket_path);
+    // The acceptor and its admitted sessions retain endpoint ownership.
+    // Their final drop, after joined writers return, retires only the exact
+    // bound generation. Never unlink here while a session may still own work.
     Ok(())
 }
 
 async fn accept_loop(
     cx: Cx,
-    listener: UnixListener,
+    listener: endpoint::ListenerOwner,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     services: EdgeServices,
@@ -249,7 +230,7 @@ async fn accept_loop(
 ) {
     let mut connection_id: u64 = 0;
     loop {
-        match listener.accept().await {
+        match listener.listener.accept().await {
             Ok((stream, _addr)) => {
                 // Refuse before task allocation. Do not attempt a potentially
                 // blocking refusal write to a peer we have not admitted.
@@ -265,7 +246,12 @@ async fn accept_loop(
                 connection_id = id;
                 let services = services.clone();
                 let limits = limits.clone();
+                let endpoint_owner = std::sync::Arc::clone(&listener.owner);
                 let spawned = cx.spawn(move |cx| async move {
+                    // Outlives handle_connection, including cancellation that
+                    // drops its joined blocking-work owners. A replacement
+                    // daemon cannot acquire this endpoint during that cleanup.
+                    let _endpoint_owner = endpoint_owner;
                     if cx.checkpoint().is_ok() {
                         handle_connection(id, stream, policy, socket_evidence, services, limits)
                             .await;
@@ -299,31 +285,17 @@ async fn read_frame_with_budget(stream: &mut EdgeStream, budget: Duration) -> Op
 
 /// [`read_frame_with_budget`] with an explicit frame bound, for the one
 /// frame kind (a live completion carrying its transcript) that may exceed
-/// the ordinary request bound.
+/// the ordinary request bound. Retain read-ahead across every protocol phase.
 async fn read_frame_bounded(
     stream: &mut EdgeStream,
     budget: Duration,
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
-    asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
-        let mut frame = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match stream.read(&mut byte).await {
-                Ok(0) => return None,
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        return Some(frame);
-                    }
-                    if frame.len() == max_bytes {
-                        return None;
-                    }
-                    frame.push(byte[0]);
-                }
-                Err(_) => return None,
-            }
-        }
-    })
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        budget,
+        frame_read::read_frame(stream, max_bytes),
+    )
     .await
     .ok()
     .flatten()
@@ -374,7 +346,7 @@ async fn handle_connection(
     services: EdgeServices,
     limits: EdgeLimits,
 ) {
-    let mut stream = EdgeStream::new(stream);
+    let mut stream = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, stream);
     let EdgeServices {
         shadow,
         coord,
@@ -527,14 +499,7 @@ async fn handle_connection(
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("rustc-request") => {
                 let decided = match &live {
                     Some(live) => {
-                        let live = std::sync::Arc::clone(live);
-                        match limits
-                            .live
-                            .spawn(move || rustc_request::decide(&live, &value))
-                        {
-                            Ok(mut work) => work.wait().await,
-                            Err(error) => Err(error),
-                        }
+                        backpressure::decide(&limits.live, std::sync::Arc::clone(live), value).await
                     }
                     None => Ok(rustc_request::shadow_observation(&value).map_or_else(
                         || {
@@ -1478,12 +1443,15 @@ mod edge_liveness_tests {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("untouched");
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        let reply = runtime.block_on(serve_on_lane(
-            &lane,
-            coord.edge_subscriber(),
-            serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
-                "destination_root":destination.to_str().unwrap()}),
-        ));
+        let reply = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            serve_on_lane(
+                &lane,
+                coord.edge_subscriber(),
+                serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
+                    "destination_root":destination.to_str().unwrap()}),
+            ),
+        );
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["outcome"], "error");
         assert_eq!(reply["materialization_started"], false);
@@ -1544,8 +1512,10 @@ mod edge_liveness_tests {
             release.send(()).unwrap();
             holder.join().unwrap();
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
-            let reply: serde_json::Value =
-                serde_json::from_str(&runtime.block_on(request)).unwrap();
+            let reply: serde_json::Value = serde_json::from_str(
+                &rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, request),
+            )
+            .unwrap();
             assert_eq!(reply["kind"], "serve-result");
             assert_ne!(reply["outcome"], "served");
             assert!(!dir.path().join("outputs").exists());
@@ -1638,7 +1608,7 @@ mod edge_liveness_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edge.sock");
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
+        rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
             let listener = UnixListener::bind(&path).await.unwrap();
             let path = path.clone();
             let writer = std::thread::spawn(move || {
@@ -1651,7 +1621,7 @@ mod edge_liveness_tests {
                 }
             });
             let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = EdgeStream::new(stream);
+            let mut stream = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, stream);
             let frame = read_frame_with_budget(&mut stream, Duration::from_millis(30)).await;
             assert!(frame.is_none());
             drop(stream);

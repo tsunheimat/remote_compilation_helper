@@ -350,6 +350,19 @@ pub struct SelectionConfig {
         deserialize_with = "deserialize_disk_gb_per_slot"
     )]
     pub disk_gb_per_slot: f64,
+    /// Free-disk ratio at or below which rchd marks a worker Critical and
+    /// gives it no slots (bd-xxck3). Read by rchd at startup.
+    #[serde(default = "default_disk_critical_free_ratio")]
+    pub disk_critical_free_ratio: f64,
+    /// When set, the ratio rule above trips only while free space is also at
+    /// or below this many GB, so a large disk is judged by absolute headroom
+    /// (5% of 900 GB is 45 GB). Unset keeps the ratio rule unconditional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_critical_ratio_cap_gb: Option<f64>,
+}
+
+fn default_disk_critical_free_ratio() -> f64 {
+    0.05
 }
 
 impl Default for SelectionConfig {
@@ -363,6 +376,8 @@ impl Default for SelectionConfig {
             max_load_per_core: default_max_load_per_core(),
             min_free_gb: default_min_free_gb(),
             disk_gb_per_slot: default_disk_gb_per_slot(),
+            disk_critical_free_ratio: default_disk_critical_free_ratio(),
+            disk_critical_ratio_cap_gb: None,
         }
     }
 }
@@ -715,6 +730,15 @@ pub struct ReleaseRequest {
     /// Recovery must measure these filesystems as well as configured roots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_disk_roots: Vec<String>,
+    /// The worker's source receiver refused the sync because its copy of the
+    /// project is a declared live checkout (`RCH_SYNC_LIVE_CHECKOUT_REFUSED`,
+    /// bd-fbtws). The daemon keeps that project off the worker for a while.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_live_checkout_refused: bool,
+    /// Another owner held this worker's source past the admission wait
+    /// (bd-p3kuz). The daemon keeps the project off the worker briefly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_source_busy: bool,
 }
 
 /// Build execution phase for daemon heartbeat tracking.
@@ -1509,6 +1533,9 @@ pub struct FleetConfig {
     #[serde(default = "default_fleet_min_disk_space_mb")]
     pub min_disk_space_mb: u64,
     /// Maximum acceptable load average for worker health.
+    ///
+    /// Not read anywhere yet: setting it changes nothing. Selection already
+    /// accounts for load through telemetry pressure and SpeedScore.
     #[serde(default = "default_fleet_max_load_average")]
     pub max_load_average: f64,
     /// Maximum number of concurrent SSH connections.
@@ -1828,6 +1855,9 @@ pub struct SelfHealingConfig {
     pub auto_start_timeout_secs: u64,
     /// Log level for self-healing diagnostic events. Default: info.
     /// Override via `RCH_SELF_HEALING_LOG_LEVEL=debug|info|warn|error`.
+    ///
+    /// Parsed but not applied yet: self-healing events log at their own
+    /// levels under the normal `RUST_LOG` / `general.log_level` filter.
     #[serde(default)]
     pub self_healing_log_level: SelfHealingLogLevel,
 }
@@ -2523,14 +2553,22 @@ pub struct CompilationConfig {
     /// Minimum confidence score to intercept (0.0-1.0).
     #[serde(default = "default_confidence")]
     pub confidence_threshold: f64,
-    /// Skip interception if estimated local time < this (ms).
+    /// Run locally when this build's measured local median is below this (ms).
+    /// Consulted only by the speed gate, i.e. when `local_slots > 0`.
     #[serde(default = "default_min_local_time")]
     pub min_local_time_ms: u64,
-    /// Minimum expected speedup ratio (local_time / remote_time) to offload.
-    /// If predicted speedup < threshold, run locally. Default: 1.2 (20% faster).
-    /// Set to 1.0 to always offload when other criteria are met.
+    /// Minimum measured speedup ratio (local_time / remote_time) to offload.
+    /// If the measured speedup < threshold, run locally. Default: 1.2 (20% faster).
+    /// Consulted only by the speed gate, i.e. when `local_slots > 0`.
     #[serde(default = "default_speedup_threshold")]
     pub remote_speedup_threshold: f64,
+    /// Speed gate (bd-2spi4): how many offloadable builds may run concurrently
+    /// on THIS machine because its own measured build history says remote is
+    /// not worth it. Zero (default) disables the gate, so every offloadable
+    /// build is offloaded as before. Set it only on a dispatcher that is faster
+    /// than its workers; local runs also need free memory (see the hook).
+    #[serde(default)]
+    pub local_slots: u32,
     /// Default slot estimate for build commands (cargo build, gcc, etc.).
     #[serde(default = "default_build_slots")]
     pub build_slots: u32,
@@ -2576,9 +2614,13 @@ pub struct CompilationConfig {
     /// whole fleet, so it is a genuine last resort and can flood that box. This
     /// flag gates it. Default `true` preserves the historical fail-open behavior
     /// (local only when no worker can serve); set to `false` on an orchestrator
-    /// to refuse local fallback and fail the build closed instead. `force_remote`
-    /// / proof mode / `RCH_REQUIRE_REMOTE` still override this by refusing local
-    /// unconditionally.
+    /// to refuse local fallback and fail the build closed instead. It covers
+    /// every local exit after remote placement was attempted: no admissible
+    /// worker, daemon unavailable, dependency preflight failure, transfer skip,
+    /// an unrequested worker, and retry exhaustion (#114). Proof mode,
+    /// `RCH_REQUIRE_REMOTE` and `general.role = "dispatcher"` refuse local
+    /// unconditionally. `force_remote` only skips local-time gating; it still
+    /// fails open.
     #[serde(default = "default_allow_local_fallback")]
     pub allow_local_fallback: bool,
     /// Per-job rustc parallelism cap applied on the WORKER (issue #49).
@@ -2692,6 +2734,7 @@ impl Default for CompilationConfig {
             confidence_threshold: 0.85,
             min_local_time_ms: 2000,
             remote_speedup_threshold: default_speedup_threshold(),
+            local_slots: 0,
             build_slots: default_build_slots(),
             test_slots: default_test_slots(),
             check_slots: default_check_slots(),
@@ -2789,7 +2832,7 @@ impl CompilationConfig {
 /// Bump when a knob is added, removed, or its meaning changes; consumers
 /// record the version alongside emitted baselines so regressions are
 /// attributable to a specific pack revision.
-pub const LAYER0_PACK_VERSION: &str = "1";
+pub const LAYER0_PACK_VERSION: &str = "2";
 
 /// Layer 0 configuration pack knobs (bd-bqu38).
 ///
@@ -2798,8 +2841,10 @@ pub const LAYER0_PACK_VERSION: &str = "1";
 /// representative p95, output equivalence, debugger behavior, or
 /// compatibility). Knobs are injected into remote cargo builds as
 /// `CARGO_PROFILE_*` environment variables, so enabling one never mutates any
-/// user-owned `.cargo/config.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// user-owned `.cargo/config.toml`. Verification lanes (`--clean-overlay`,
+/// `--source-content-receipt`) build exactly what the project declares and
+/// never receive the pack.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(default)]
 pub struct Layer0Config {
     /// Master switch: nothing is injected unless this is on.
@@ -2809,6 +2854,13 @@ pub struct Layer0Config {
     /// `profile.release.codegen-units = 1` via
     /// `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
     pub release_codegen_units_1: bool,
+    /// `debug = "line-tables-only"` for the dev and test profiles, via
+    /// `CARGO_PROFILE_{DEV,TEST}_DEBUG` (bd-hoxgn). Full DWARF was about 77%
+    /// of fleet debug/test binaries (2026-09-25 sweep), so this is the main
+    /// lever on worker target size. Backtraces keep file and line; debuggers
+    /// lose local variables. A host-level `.cargo/config.toml` cannot carry
+    /// it: clean-overlay builds refuse any ancestor Cargo config (RCH-E413).
+    pub debug_line_tables_only: bool,
 }
 
 impl Layer0Config {
@@ -2829,12 +2881,24 @@ impl Layer0Config {
         if self.release_codegen_units_1 {
             env.push(("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"));
         }
+        if self.debug_line_tables_only {
+            env.push(("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"));
+            env.push(("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"));
+        }
         env
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferConfig {
+    /// Durable controller retrieval staging base. Unset uses the job-lease
+    /// directory's retrieval subtree. Must be absolute; TMPDIR is not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_staging_dir: Option<PathBuf>,
+    /// Free bytes to retain on the staging filesystem in addition to selected
+    /// uncompressed output bytes. The preflight never deletes retained data.
+    #[serde(default)]
+    pub retrieval_min_free_bytes: u64,
     /// zstd compression level (1-19).
     #[serde(default = "default_compression")]
     pub compression_level: u32,
@@ -2889,9 +2953,10 @@ pub struct TransferConfig {
     pub retry: RetryConfig,
     /// Verify artifact integrity using blake3 hashes after transfer (bd-377q).
     ///
-    /// When enabled, computes blake3 hashes of key artifacts (binaries, test outputs)
-    /// on the worker after build, then verifies them locally after download.
-    /// Disabled by default to avoid extra overhead.
+    /// Not wired: no transfer path calls `artifact_verify`, so enabling this
+    /// has no effect. rsync already checks each transferred file against a
+    /// whole-file checksum, and recovery publication verifies delivered
+    /// outputs, which is why the extra pass was never connected.
     #[serde(default)]
     pub verify_artifacts: bool,
     /// Maximum file size (bytes) for artifact verification (bd-377q).
@@ -2978,6 +3043,8 @@ pub struct TransferConfig {
 impl Default for TransferConfig {
     fn default() -> Self {
         Self {
+            retrieval_staging_dir: None,
+            retrieval_min_free_bytes: 0,
             compression_level: 3,
             exclude_patterns: default_excludes(),
             ssh_server_alive_interval_secs: None,
@@ -3474,8 +3541,15 @@ fn default_excludes() -> Vec<String> {
         ".nuxt/".to_string(),
         ".turbo/".to_string(),
         ".parcel-cache/".to_string(),
-        // Beads runtime state (local issue DB + lock/temp files); not needed remotely.
+        // Agent/session state, not ordinary compilation inputs (issue #109).
+        // Directory-only basenames cover nested copies, not similarly named
+        // files or directories. .beads/ also covers .beads/.br_recovery/.
         ".beads/".to_string(),
+        ".ntm/".to_string(),
+        ".beads-recovery/".to_string(),
+        // Do not exclude scratch/, data/, artifacts/ or project configuration:
+        // they may contain required build inputs. .rchignore adds project-local
+        // exclusions; an explicit exclude_patterns list replaces these defaults.
         // Local diagnostic runs may contain host-specific symlinks and are not build inputs.
         ".doctor/".to_string(),
         // Coverage reports (generated during tests)
@@ -4432,6 +4506,7 @@ retry_max = 2
             enabled: false,
             release_lto_thin: true,
             release_codegen_units_1: true,
+            debug_line_tables_only: true,
         };
         assert!(cfg.active_env().is_empty());
         assert!(knobs_on.active_env().is_empty());
@@ -4443,22 +4518,37 @@ retry_max = 2
         let lto_only = Layer0Config {
             enabled: true,
             release_lto_thin: true,
-            release_codegen_units_1: false,
+            ..Layer0Config::default()
         };
         assert_eq!(
             lto_only.active_env(),
             vec![("CARGO_PROFILE_RELEASE_LTO", "thin")]
         );
-        let both = Layer0Config {
+        let debug_only = Layer0Config {
+            enabled: true,
+            debug_line_tables_only: true,
+            ..Layer0Config::default()
+        };
+        assert_eq!(
+            debug_only.active_env(),
+            vec![
+                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
+            ]
+        );
+        let all = Layer0Config {
             enabled: true,
             release_lto_thin: true,
             release_codegen_units_1: true,
+            debug_line_tables_only: true,
         };
         assert_eq!(
-            both.active_env(),
+            all.active_env(),
             vec![
                 ("CARGO_PROFILE_RELEASE_LTO", "thin"),
                 ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"),
+                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
             ],
             "emission order must stay stable for deterministic baselines"
         );

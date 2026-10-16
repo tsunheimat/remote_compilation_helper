@@ -231,6 +231,8 @@ pub struct ConfigShowResponse {
     pub circuit: ConfigCircuitSection,
     pub output: ConfigOutputSection,
     pub self_healing: ConfigSelfHealingSection,
+    /// Layer 0 profile pack knobs (bd-bqu38, bd-hoxgn).
+    pub layer0: rch_common::types::Layer0Config,
     pub sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_sources: Option<Vec<ConfigValueSourceInfo>>,
@@ -277,6 +279,7 @@ pub struct ConfigCompilationSection {
     pub confidence_threshold: f64,
     pub min_local_time_ms: u64,
     pub remote_speedup_threshold: f64,
+    pub local_slots: u32,
     pub build_slots: u32,
     pub test_slots: u32,
     pub check_slots: u32,
@@ -292,6 +295,8 @@ pub struct ConfigCompilationSection {
 /// Transfer configuration section.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigTransferSection {
+    pub retrieval_staging_dir: Option<std::path::PathBuf>,
+    pub retrieval_min_free_bytes: u64,
     pub compression_level: u32,
     pub exclude_patterns: Vec<String>,
     pub remote_base: String,
@@ -467,6 +472,10 @@ pub struct DiagnoseResponse {
     /// control diagnostics. This is the surface agents should read before
     /// forcing local/remote behavior (bd-...remediation-ocv9i.13.5).
     pub placement: PlacementPlan,
+    /// bd-2spi4: the speed gate's view of this build (intercepted builds only):
+    /// measured local/remote medians, the threshold and the decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_gate: Option<crate::hook::SpeedGateDiagnosis>,
     /// Dry-run summary showing the full pipeline (only present when --dry-run is used).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<DryRunSummary>,

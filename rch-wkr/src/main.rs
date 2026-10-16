@@ -10,7 +10,7 @@ mod executor;
 mod prepare;
 mod toolchain;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rch_common::{DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, WorkerCapabilities};
 use rch_common::{LogConfig, init_logging};
@@ -34,6 +34,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Read a Darwin kernel birth/group witness for remote lifecycle control.
+    ProcessIdentity {
+        /// Process to inspect; no signals are sent.
+        pid: u32,
+    },
     /// Run a compilation command
     Execute {
         /// Working directory
@@ -163,10 +168,55 @@ enum OutputFormat {
     Pretty,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    exit_quietly_when_stdout_reader_is_gone();
     let cli = Cli::parse();
+    // This bounded control-plane probe is called by watchdogs and recovery.
+    // Do not start a thread pool or initialize optional logging sinks for it:
+    // neither is needed to read a kernel identity, and both can delay/refuse
+    // cleanup independently of the actual process observation.
+    if let Commands::ProcessIdentity { pid } = &cli.command {
+        return print_process_identity(*pid);
+    }
+    run_worker(cli)
+}
 
+/// Rust ignores SIGPIPE, so a write to a reader that already left (an rchd
+/// capability probe that timed out at 25 s while the inventory scan ran on)
+/// makes `println!` panic. Under `panic = "abort"` that became SIGABRT, and
+/// apport wrote a ~288 MB core for each: 72+ on trj in one afternoon
+/// (2026-10-15). Nobody is left to read the output, so exit as a SIGPIPE
+/// death would (141) instead of aborting. Every other panic is unchanged.
+fn exit_quietly_when_stdout_reader_is_gone() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if is_lost_reader_panic(info.payload()) {
+            std::process::exit(141);
+        }
+        default_hook(info);
+    }));
+}
+
+fn is_lost_reader_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    // std's own wording (library/std/src/io/stdio.rs); EPIPE is 32 on Linux
+    // and macOS. The errno, not its locale-dependent text, is the evidence.
+    message.starts_with("failed printing to std") && message.ends_with("(os error 32)")
+}
+
+fn print_process_identity(pid: u32) -> Result<()> {
+    let witness = rch_common::process_identity::remote_process_witness(pid)
+        .context("kernel process identity unavailable")?;
+    println!("{witness}");
+    Ok(())
+}
+
+#[tokio::main]
+async fn run_worker(cli: Cli) -> Result<()> {
     // Initialize logging
     let mut log_config = LogConfig::from_env("info").with_stderr();
     if cli.verbose {
@@ -175,6 +225,7 @@ async fn main() -> Result<()> {
     let _logging_guards = init_logging(&log_config)?;
 
     match cli.command {
+        Commands::ProcessIdentity { pid } => print_process_identity(pid),
         Commands::Execute {
             workdir,
             command,
@@ -185,35 +236,14 @@ async fn main() -> Result<()> {
                 // Parse toolchain string and ensure it's available
                 let tc_info = toolchain::parse_toolchain_string(&tc_str);
 
-                // Ensure toolchain is available (install if needed)
-                match toolchain::ensure_toolchain(&tc_info) {
-                    Ok(()) => {
-                        info!("Toolchain {} ready", tc_str);
-                    }
-                    Err(e) => {
-                        // Log but continue - fail-open behavior
-                        tracing::warn!(
-                            "Failed to ensure toolchain {}: {}. Continuing with default.",
-                            tc_str,
-                            e
-                        );
-                        // Fall through to execute without toolchain wrapping
-
-                        // Touch the project cache to prevent cleanup
-                        cache::touch_project(std::path::Path::new(&workdir));
-
-                        return match executor::execute(&workdir, &command).await {
-                            Ok(()) => Ok(()),
-                            Err(err) => {
-                                if let Some(failure) = err.downcast_ref::<executor::CommandFailed>()
-                                {
-                                    std::process::exit(failure.exit_code);
-                                }
-                                Err(err)
-                            }
-                        };
-                    }
-                }
+                // Toolchain selection is part of the requested build, not a
+                // best-effort optimization. A worker must never substitute its
+                // default compiler when preparation fails. No user command or
+                // project-cache touch has happened yet; report the error upstream.
+                toolchain::ensure_toolchain(&tc_info).with_context(|| {
+                    format!("Required toolchain {tc_str} is unavailable; command was not run")
+                })?;
+                info!("Toolchain {} ready", tc_str);
 
                 // Wrap command with rustup run
                 rch_common::wrap_command_with_toolchain(&command, Some(&tc_info))
@@ -2208,7 +2238,12 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
         results = results.with_compilation(c.clone());
     }
 
-    let score = rch_telemetry::speedscore::calculate_speedscore(&results);
+    // Score the same complete evidence that the daemon receives. A report
+    // without any measurements is a failed benchmark, not a zero-speed worker.
+    let report = rch_telemetry::benchmarks::report::BenchmarkReport::from_results(&results);
+    let score = report
+        .recalculate()
+        .context("No usable worker benchmark evidence")?;
     let elapsed = start.elapsed();
     let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
 
@@ -2230,6 +2265,7 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
             // `score` stays a top-level f64 for backward compatibility: rchd's
             // `execute_benchmark_on_worker` parses exactly that field.
             let payload = serde_json::json!({
+                "benchmark_report": report,
                 "score": round1(score.total),
                 "elapsed_secs": (elapsed.as_secs_f64() * 100.0).round() / 100.0,
                 "cores": cores,
@@ -2243,6 +2279,7 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
                 "raw": {
                     "cpu_ops_per_second": finite(cpu.ops_per_second),
                     "memory_seq_bandwidth_gbps": finite(memory.seq_bandwidth_gbps),
+                    "memory_random_latency_ns": finite(memory.random_latency_ns),
                     "disk_seq_read_mbps": finite(disk.seq_read_mbps),
                     "disk_seq_write_mbps": finite(disk.seq_write_mbps),
                     "disk_random_read_iops": finite(disk.random_read_iops),
@@ -2281,6 +2318,22 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn only_std_print_failures_on_a_closed_pipe_count_as_a_lost_reader() {
+        let lost = String::from("failed printing to stdout: Broken pipe (os error 32)");
+        assert!(is_lost_reader_panic(&lost));
+        let lost_stderr = "failed printing to stderr: Broken pipe (os error 32)";
+        assert!(is_lost_reader_panic(&lost_stderr));
+        for other in [
+            "failed printing to stdout: No space left on device (os error 28)",
+            "called `Option::unwrap()` on a `None` value",
+            "Broken pipe (os error 32)",
+        ] {
+            assert!(!is_lost_reader_panic(&other.to_string()), "{other}");
+        }
+        assert!(!is_lost_reader_panic(&42_u32));
+    }
 
     fn approx_eq(lhs: f64, rhs: f64) -> bool {
         (lhs - rhs).abs() < 1e-9

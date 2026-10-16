@@ -7,7 +7,7 @@
 use crate::DaemonContext;
 use crate::alerts::AlertInfo;
 use crate::events::EventBus;
-use crate::history::{QueueSelectionContract, QueuedWaiterClaim};
+use crate::history::{BuildHistory, QueueSelectionContract, QueuedWaiterClaim};
 use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
 use crate::reload;
@@ -1670,6 +1670,8 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut worker_fault = false;
         let mut worker_disk_full = false;
         let mut worker_disk_roots = Vec::new();
+        let mut worker_live_checkout_refused = false;
+        let mut worker_source_busy = false;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1689,6 +1691,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "local_wrapper_id" => local_wrapper_id = Some(percent_unescape_query_value(value)),
                 "worker_fault" => worker_fault = matches!(value, "1" | "true"),
                 "worker_disk_full" => worker_disk_full = matches!(value, "1" | "true"),
+                "worker_live_checkout_refused" => {
+                    worker_live_checkout_refused = matches!(value, "1" | "true")
+                }
+                "worker_source_busy" => worker_source_busy = matches!(value, "1" | "true"),
                 "worker_disk_roots" => {
                     worker_disk_roots =
                         serde_json::from_str::<Vec<String>>(&percent_unescape_query_value(value))
@@ -1713,6 +1719,8 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             worker_fault,
             worker_disk_full,
             worker_disk_roots,
+            worker_live_checkout_refused,
+            worker_source_busy,
         }));
     }
 
@@ -1939,15 +1947,29 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }
     }
 
-    let Some((query, resume_queued, disk_budget_route)) = [
-        ("/select-worker", false, false),
-        ("/select-worker/resume-queued", true, false),
-        ("/select-worker/disk-budget", false, true),
-        ("/select-worker/resume-queued/disk-budget", true, true),
+    let Some((query, resume_queued, disk_budget_route, tools_route)) = [
+        ("/select-worker", false, false, false),
+        ("/select-worker/resume-queued", true, false, false),
+        ("/select-worker/disk-budget", false, true, false),
+        (
+            "/select-worker/resume-queued/disk-budget",
+            true,
+            true,
+            false,
+        ),
+        ("/select-verified-tools", false, false, true),
+        ("/select-verified-tools/resume-queued", true, false, true),
+        ("/select-verified-tools/disk-budget", false, true, true),
+        (
+            "/select-verified-tools/resume-queued/disk-budget",
+            true,
+            true,
+            true,
+        ),
     ]
     .into_iter()
-    .find_map(|(route, resume, disk_budget)| {
-        query_for_exact_route(path, route).map(|query| (query, resume, disk_budget))
+    .find_map(|(route, resume, disk_budget, tools)| {
+        query_for_exact_route(path, route).map(|query| (query, resume, disk_budget, tools))
     }) else {
         return Err(anyhow!("Unknown endpoint: {}", path));
     };
@@ -2061,6 +2083,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     anyhow::ensure!(
         disk_budget_route == (disk_headroom_gib > 0),
         "A positive disk_headroom_gib requires the exact disk-budget selection route"
+    );
+    anyhow::ensure!(
+        !tools_route || !required_tools.is_empty(),
+        "The verified-tools selection route requires explicit tool requirements"
     );
     if resume_queued
         && (dry_run || !wait_for_worker || local_wrapper_id.is_none() || hook_pid.is_none())
@@ -2510,7 +2536,7 @@ async fn handle_select_worker_dry_run(
 ) -> SelectionResponse {
     // Same exclusions as a real request: a worker already building this
     // project would not be handed a second build of it.
-    let excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
+    let excluded_worker_ids = project_excluded_workers(ctx, &request.project);
     let result = ctx
         .worker_selector
         .preview_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
@@ -2601,15 +2627,22 @@ async fn handle_select_worker_mode(
         let wrapper = local_wrapper_id
             .as_deref()
             .ok_or_else(|| anyhow!("missing queued owner"))?;
-        Some(
-            ctx.history.resume_queued_build(
-                wrapper,
-                request
-                    .hook_pid
-                    .ok_or_else(|| anyhow!("missing queued process"))?,
-                &queue_selection_digest(&request, wait_timeout_secs)?,
-            )?,
-        )
+        let resumed = ctx.history.resume_queued_build(
+            wrapper,
+            request
+                .hook_pid
+                .ok_or_else(|| anyhow!("missing queued process"))?,
+            &queue_selection_digest(&request, wait_timeout_secs)?,
+        )?;
+        // One line per reattached waiter, so a restart can be checked for
+        // queued rows that resumed versus refused (bd-w2qrp).
+        info!(
+            queue_id = resumed.0.id,
+            project_id = %resumed.0.project_id,
+            wrapper,
+            "Queued waiter resumed its recovered row"
+        );
+        Some(resumed)
     } else {
         anyhow::ensure!(
             !local_wrapper_id
@@ -2712,7 +2745,12 @@ async fn handle_select_worker_mode(
             // Retry loop to handle race conditions where slots are taken between selection and reservation.
             let mut reservation_attempts = 0;
             const MAX_ATTEMPTS: u32 = 3;
-            let mut excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
+            let mut excluded_worker_ids = project_excluded_workers(ctx, &request.project);
+            // bd-decdd: a worker held for an older starving waiter is busy for
+            // this request. Steer off it only when selection actually picks it,
+            // so a request the worker would refuse anyway keeps its own reason.
+            let held_worker = ctx.history.queue_hold_against(waiter);
+            let mut steered_off_hold = false;
 
             loop {
                 // Use the configured worker selector.
@@ -2733,7 +2771,12 @@ async fn handle_select_worker_mode(
                     debug!("No worker selected: {}", selection_reason);
                     return Ok(SelectionResponse {
                         worker: None,
-                        reason: selection_reason,
+                        // The held worker would have taken it: busy, so it can queue.
+                        reason: if steered_off_hold {
+                            SelectionReason::AllWorkersBusy
+                        } else {
+                            selection_reason
+                        },
                         build_id: None,
                         diagnostics: selection_diagnostics,
                     });
@@ -2741,6 +2784,11 @@ async fn handle_select_worker_mode(
 
                 let selected_endpoint = worker.endpoint_snapshot().await;
                 let selected_worker_id = selected_endpoint.config.id.clone();
+                if held_worker.as_deref() == Some(selected_worker_id.as_str()) {
+                    steered_off_hold = true;
+                    excluded_worker_ids.insert(selected_worker_id.as_str().to_string());
+                    continue;
+                }
 
                 // Reserve the slots.
                 //
@@ -2937,11 +2985,8 @@ async fn handle_select_worker_mode(
         .clone()
         .unwrap_or_else(|| "<unknown>".to_string());
 
-    let daemon_queue_timeout_secs = ctx.queue_timeout_secs.max(1);
-    let effective_queue_timeout_secs = wait_timeout_secs
-        .filter(|secs| *secs > 0)
-        .map(|client_secs| client_secs.min(daemon_queue_timeout_secs))
-        .unwrap_or(daemon_queue_timeout_secs);
+    let effective_queue_timeout_secs =
+        queue_wait_secs(request.job_mode, wait_timeout_secs, ctx.queue_timeout_secs);
     let selection_digest = queue_selection_digest(&request, wait_timeout_secs)?;
     let admission = ctx.admission_barrier.read().await;
     if *admission || ctx.history.ownership_failed() {
@@ -3019,6 +3064,12 @@ async fn handle_select_worker_mode(
             .timeout_secs
             .min(effective_queue_timeout_secs),
     );
+    // Every exit from the wait, including errors and a dropped future,
+    // releases a hold this waiter took.
+    let _hold_release = QueueHoldRelease {
+        history: &ctx.history,
+        queue_id: queued.id,
+    };
 
     loop {
         if local_wrapper_id
@@ -3044,6 +3095,7 @@ async fn handle_select_worker_mode(
             ctx.history.update_queue_estimates();
             if !cfg!(test) {
                 metrics::set_build_queue_depth(ctx.history.queue_depth());
+                metrics::inc_local_fallback_reason("queue_timeout");
             }
             ctx.events.emit(
                 "build_queue_removed",
@@ -3134,8 +3186,106 @@ async fn handle_select_worker_mode(
             return Ok(response);
         }
 
+        if request.job_mode
+            && queued.slots_needed > 1
+            && queued.queued_at_mono.elapsed() >= QUEUE_HOLD_AFTER
+        {
+            let current = ctx.history.queue_hold_of(queued.id);
+            match response
+                .diagnostics
+                .as_ref()
+                .and_then(|diagnostics| queue_hold_candidate(diagnostics, current.as_deref()))
+            {
+                Some(worker_id) => {
+                    if ctx.history.claim_queue_hold(
+                        queued.id,
+                        queued.queued_at_mono,
+                        worker_id.clone(),
+                    ) {
+                        info!(
+                            queue_id = queued.id,
+                            project = %queued.project_id,
+                            worker = %worker_id,
+                            slots = queued.slots_needed,
+                            waited_secs = queued.queued_at_mono.elapsed().as_secs(),
+                            "Queue hold: draining a worker for a starving multi-slot job"
+                        );
+                    }
+                }
+                None => ctx.history.release_queue_hold(queued.id),
+            }
+        }
+
         tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
     }
+}
+
+/// Longest admission wait the daemon grants a `--job` request (bd-decdd).
+const JOB_QUEUE_WAIT_CEILING_SECS: u64 = 24 * 3600;
+
+/// How long a queued request waits: the client's wait, capped at the daemon's
+/// queue timeout. A job never falls back to local (bd-decdd), so that cap only
+/// turned its wait into a refusal and a resubmission at the back of the queue;
+/// a job's longer wait is honoured up to a ceiling. The hook-exit check still
+/// drops a dead waiter's row.
+fn queue_wait_secs(job_mode: bool, client_secs: Option<u64>, daemon_secs: u64) -> u64 {
+    let daemon_secs = daemon_secs.max(1);
+    let cap = if job_mode {
+        daemon_secs.max(JOB_QUEUE_WAIT_CEILING_SECS)
+    } else {
+        daemon_secs
+    };
+    client_secs
+        .filter(|secs| *secs > 0)
+        .map_or(daemon_secs, |secs| secs.min(cap))
+}
+/// How long a multi-slot job waits before it may hold a worker (bd-decdd).
+const QUEUE_HOLD_AFTER: Duration = Duration::from_secs(120);
+
+struct QueueHoldRelease<'a> {
+    history: &'a BuildHistory,
+    queue_id: u64,
+}
+
+impl Drop for QueueHoldRelease<'_> {
+    fn drop(&mut self) {
+        self.history.release_queue_hold(self.queue_id);
+    }
+}
+
+/// A worker that refused this request only for `slots.insufficient`: it
+/// passed every other gate and can hold the request once its slots free.
+/// Keeps the current hold while it still qualifies; otherwise prefers the
+/// worker closest to fitting.
+fn queue_hold_candidate(
+    diagnostics: &rch_common::SelectionDiagnostics,
+    current: Option<&str>,
+) -> Option<String> {
+    let candidates = diagnostics.workers.iter().filter(|worker| {
+        worker.total_slots >= diagnostics.estimated_cores
+            && worker
+                .reason_codes
+                .iter()
+                .map(String::as_str)
+                .eq(["slots.insufficient"])
+    });
+    let mut best: Option<&rch_common::WorkerSelectionDiagnostic> = None;
+    for worker in candidates {
+        if current == Some(worker.worker_id.as_str()) {
+            return current.map(str::to_string);
+        }
+        let rank = |w: &rch_common::WorkerSelectionDiagnostic| {
+            (
+                w.available_slots,
+                w.total_slots,
+                std::cmp::Reverse(w.worker_id.as_str().to_string()),
+            )
+        };
+        if best.is_none_or(|b| rank(worker) > rank(b)) {
+            best = Some(worker);
+        }
+    }
+    best.map(|worker| worker.worker_id.as_str().to_string())
 }
 
 /// Close admission before a restart and report the daemon-owned build/queue
@@ -3305,6 +3455,25 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// overlapping build on that worker (bd-dmg2k: 69 such claims fleet-wide).
 /// Only a recipe that names worker-side ownership (source roots, a source
 /// pair, or a tree to retire) needs keeping.
+/// Workers this project must not be placed on: one running build per project
+/// per worker, workers whose failed build's client lease still owns worker
+/// source (their registry would refuse the same root, bd-jqhno), and workers
+/// whose live checkout of the project refused a recent sync (bd-fbtws), and
+/// workers where another owner recently kept the project's source (bd-p3kuz).
+fn project_excluded_workers(
+    ctx: &DaemonContext,
+    project: &str,
+) -> std::collections::HashSet<String> {
+    let mut excluded = ctx.history.active_workers_for_project(project);
+    excluded.extend(
+        ctx.history
+            .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
+    );
+    excluded.extend(ctx.history.live_checkout_fenced_workers(project));
+    excluded.extend(ctx.history.source_busy_fenced_workers(project));
+    excluded
+}
+
 pub(crate) fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
     lease.recovery.as_ref().is_some_and(|recipe| {
         let owns = recipe
@@ -3417,6 +3586,31 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
     let slots_done = started.elapsed();
 
     if let Some(ref rec) = record {
+        // The owner-validated worker refused this project's source because it
+        // is a live checkout there; every later sync would be refused too.
+        if exit_code != 0 && request.worker_live_checkout_refused {
+            ctx.history
+                .fence_live_checkout(&rec.project_id, release_worker_id.as_str());
+            info!(
+                project_id = %rec.project_id,
+                worker_id = %release_worker_id,
+                hours = crate::history::LIVE_CHECKOUT_FENCE_MAX_AGE.as_secs() / 3600,
+                "Keeping project off worker: its live checkout refused the source sync (bd-fbtws)"
+            );
+        }
+        // Another owner, often a stopped client whose build rchd already
+        // retired, holds this project's source there; every placement would
+        // wait out the admission timeout and be refused (bd-p3kuz).
+        if exit_code != 0 && request.worker_source_busy {
+            ctx.history
+                .fence_source_busy(&rec.project_id, release_worker_id.as_str());
+            info!(
+                project_id = %rec.project_id,
+                worker_id = %release_worker_id,
+                minutes = crate::history::SOURCE_BUSY_FENCE_MAX_AGE.as_secs() / 60,
+                "Keeping project off worker: another owner holds its source there (bd-p3kuz)"
+            );
+        }
         if !cfg!(test) {
             metrics::dec_active_builds("remote");
             let outcome = if exit_code == 0 { "success" } else { "failure" };
@@ -4101,7 +4295,11 @@ fn worker_issue(
             summary: format!(
                 "Worker '{worker_id}' is administratively disabled ({reason}); its slots are withheld, it is not polled for telemetry, and the disable is durable — restarting the daemon re-applies it"
             ),
-            remediation: Some(format!("rch workers enable {worker_id}")),
+            // Agents act on this line. An operator disable can protect a
+            // production host, so name the condition, not just the command.
+            remediation: Some(format!(
+                "only once the recorded reason no longer applies (an operator decision): rch workers enable {worker_id}"
+            )),
         });
     }
     if status == WorkerStatus::Drained {
@@ -5036,6 +5234,57 @@ mod tests {
     }
 
     #[test]
+    fn verified_tools_routes_bind_requirements_to_selection_and_queue_recovery() {
+        for (route, resume, budget) in [
+            ("/select-verified-tools", false, 0),
+            ("/select-verified-tools/resume-queued", true, 0),
+            ("/select-verified-tools/disk-budget", false, 64),
+            ("/select-verified-tools/resume-queued/disk-budget", true, 64),
+        ] {
+            let disk = if budget == 0 {
+                String::new()
+            } else {
+                format!("&disk_headroom_gib={budget}")
+            };
+            let base = format!(
+                "GET {route}?project=p&command=cargo%20xwin%20build&wait=1&local_wrapper_id=rchw-owner&hook_pid=123{disk}"
+            );
+            assert!(parse_request(&base).is_err(), "missing tools: {base}");
+            let ApiRequest::SelectWorker {
+                mut request,
+                resume_queued,
+                ..
+            } = parse_request(&format!(
+                "{base}&require_tool=cargo-xwin&require_tool=llvm-ar&require_tool=cargo-xwin"
+            ))
+            .expect("explicit verified tool requirements")
+            else {
+                panic!("expected selection")
+            };
+            assert_eq!(request.required_tools, vec!["cargo-xwin", "llvm-ar"]);
+            assert_eq!(request.command.as_deref(), Some("cargo xwin build"));
+            assert_eq!(request.disk_headroom_gib, budget);
+            assert_eq!(resume_queued, resume);
+            assert!(!request.job_mode);
+            let constrained = queue_selection_digest(&request, Some(30)).unwrap();
+            request.required_tools.pop();
+            assert_ne!(
+                constrained,
+                queue_selection_digest(&request, Some(30)).unwrap()
+            );
+        }
+        for line in [
+            "GET /select-verified-tools-extra?project=p&require_tool=cargo-xwin",
+            "GET /select-verified-tools?project=p&require_tool=&require_tool=%20",
+            "GET /select-verified-tools?project=p&require_tool=cargo-xwin&disk_headroom_gib=64",
+            "GET /select-verified-tools/disk-budget?project=p&require_tool=cargo-xwin",
+            "GET /select-verified-tools/resume-queued?project=p&require_tool=cargo-xwin",
+        ] {
+            assert!(parse_request(line).is_err(), "accepted {line}");
+        }
+    }
+
+    #[test]
     fn disk_headroom_routes_require_explicit_valid_budget_and_preserve_resume() {
         for (route, resume) in [
             ("/select-worker/disk-budget", false),
@@ -5183,6 +5432,8 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
         assert!(
@@ -6453,6 +6704,29 @@ mod tests {
     }
 
     #[test]
+    fn test_lease_blocks_restart_refused_before_admission_never_blocks() {
+        // A wrapper refused before admission keeps running the command
+        // locally under the same PID; its retired lease must not hold a drain.
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let mut lease = DurableJobLease::new(
+            rch_common::job_identity::JobIdentity::new_local(),
+            1,
+            None,
+            None,
+            now,
+            false,
+            true,
+            "blake3:test".to_string(),
+        );
+        lease.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
+        lease.heartbeat("failed_before_admission", now);
+        lease.terminal_acknowledged = true;
+        assert!(!lease_blocks_restart(&lease, now, || unreachable!(
+            "a retired refusal must not probe liveness"
+        )));
+    }
+
+    #[test]
     fn test_lease_blocks_restart_fresh_heartbeat_blocks_without_liveness_probe() {
         let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
         let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS + 1, 1);
@@ -6609,6 +6883,8 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             },
         )
@@ -6623,6 +6899,142 @@ mod tests {
         assert_eq!(recent[0].worker_id.as_deref(), Some("worker1"));
         assert_eq!(recent[0].exit_code, 0);
         assert_eq!(recent[0].location, rch_common::BuildLocation::Remote);
+    }
+
+    #[test]
+    fn queue_wait_honours_a_jobs_long_wait_but_caps_compilations() {
+        assert_eq!(queue_wait_secs(false, Some(329), 300), 300);
+        assert_eq!(queue_wait_secs(false, Some(60), 300), 60);
+        assert_eq!(queue_wait_secs(false, None, 300), 300);
+        assert_eq!(queue_wait_secs(true, Some(21_599), 300), 21_599);
+        assert_eq!(
+            queue_wait_secs(true, Some(u64::MAX), 300),
+            JOB_QUEUE_WAIT_CEILING_SECS
+        );
+        assert_eq!(queue_wait_secs(true, None, 300), 300);
+        assert_eq!(queue_wait_secs(true, Some(0), 0), 1);
+    }
+
+    fn hold_diagnostic(
+        id: &str,
+        available: u32,
+        total: u32,
+        codes: &[&str],
+    ) -> rch_common::WorkerSelectionDiagnostic {
+        rch_common::WorkerSelectionDiagnostic {
+            worker_id: WorkerId::new(id),
+            status: "healthy".into(),
+            circuit_state: "closed".into(),
+            pressure_state: "healthy".into(),
+            pressure_reason_code: "none".into(),
+            success_rate: None,
+            min_success_rate: 0.0,
+            fallback_min_success_rate: 0.0,
+            required_runtime: RequiredRuntime::default(),
+            runtime_available: true,
+            available_slots: available,
+            total_slots: total,
+            estimated_cores: 3,
+            active_project_excluded: false,
+            final_decision: rch_common::WorkerSelectionDiagnosticDecision::Deny,
+            final_reason: String::new(),
+            reason_codes: codes.iter().map(|code| (*code).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn queue_hold_candidate_is_a_worker_short_only_of_slots() {
+        let diagnostics = rch_common::SelectionDiagnostics {
+            required_runtime: RequiredRuntime::default(),
+            estimated_cores: 3,
+            min_success_rate: 0.0,
+            fallback_min_success_rate: 0.0,
+            active_project_exclusion_count: 1,
+            workers: vec![
+                hold_diagnostic("busy-a", 1, 3, &["slots.insufficient"]),
+                hold_diagnostic("busy-b", 2, 3, &["slots.insufficient"]),
+                hold_diagnostic("small", 2, 2, &["slots.request_exceeds_capacity"]),
+                hold_diagnostic("excluded", 3, 3, &["active_project_exclusion"]),
+                hold_diagnostic("critical", 3, 8, &["pressure.critical"]),
+            ],
+        };
+        // Closest to fitting first; an existing hold is kept while it qualifies.
+        assert_eq!(
+            queue_hold_candidate(&diagnostics, None).as_deref(),
+            Some("busy-b")
+        );
+        assert_eq!(
+            queue_hold_candidate(&diagnostics, Some("busy-a")).as_deref(),
+            Some("busy-a")
+        );
+        assert_eq!(
+            queue_hold_candidate(&diagnostics, Some("excluded")).as_deref(),
+            Some("busy-b")
+        );
+        let mut none_fit = diagnostics.clone();
+        none_fit
+            .workers
+            .retain(|w| !w.worker_id.as_str().starts_with("busy"));
+        assert_eq!(queue_hold_candidate(&none_fit, None), None);
+    }
+
+    #[tokio::test]
+    async fn queue_hold_steers_younger_requests_off_the_held_worker() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("held", 3)).await;
+        let ctx = make_test_context(pool);
+        let request = |hook_pid| SelectionRequest {
+            job_mode: false,
+            project: "other-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            required_tools: Vec::new(),
+            hook_pid: Some(hook_pid),
+        };
+
+        // An older 3-slot job waiter holds the only worker.
+        let (queued, _claim) = ctx
+            .history
+            .enqueue_selection_build(
+                "gate-project".into(),
+                "bash job.sh -j 3".into(),
+                std::process::id(),
+                3,
+                None,
+                QueueSelectionContract {
+                    digest: [1; 32],
+                    timeout_secs: 3600,
+                },
+            )
+            .unwrap();
+        assert!(
+            ctx.history
+                .claim_queue_hold(queued.id, queued.queued_at_mono, "held".to_string())
+        );
+
+        // A request the held worker would take is busy, so it can queue.
+        let blocked = handle_select_worker(&ctx, request(2001), false, None)
+            .await
+            .unwrap();
+        assert!(blocked.worker.is_none());
+        assert_eq!(blocked.reason, SelectionReason::AllWorkersBusy);
+        assert!(ctx.history.active_builds().is_empty());
+
+        // Once the waiter leaves the queue, the worker is selectable again.
+        ctx.history.release_queue_hold(queued.id);
+        let admitted = handle_select_worker(&ctx, request(2002), false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            admitted.worker.as_ref().map(|w| w.id.as_str()),
+            Some("held")
+        );
     }
 
     #[tokio::test]
@@ -8347,6 +8759,113 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_checkout_refusal_keeps_the_project_off_the_owner_worker() {
+        // bd-fbtws: (exit, flag, owner, fenced)
+        for (exit, flag, wrapper, fenced) in [
+            (101, true, "owner", true),
+            (0, true, "owner", false),
+            (101, false, "owner", false),
+            (101, true, "wrong-owner", false),
+        ] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            let ctx = make_test_context(pool.clone());
+            let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let build = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    "live-project".into(),
+                    "worker1".into(),
+                    "cargo build".into(),
+                    12345,
+                    Some("owner".into()),
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(worker.reserve_slots(2).await);
+            let request = parse_request(&format!(
+                "POST /release-worker?worker=worker1&build_id={}&local_wrapper_id={wrapper}&exit_code={exit}&worker_live_checkout_refused={}",
+                build.id,
+                u8::from(flag)
+            ))
+            .unwrap();
+            let ApiRequest::ReleaseWorker(request) = request else {
+                panic!("release request expected")
+            };
+            assert_eq!(request.worker_live_checkout_refused, flag);
+            let result = handle_release_worker(&ctx, request).await;
+            assert_eq!(result.is_ok(), wrapper == "owner", "{result:?}");
+            // A refused release keeps the build active, which excludes the
+            // worker on its own; the fence is what outlives completion.
+            assert_eq!(
+                ctx.history
+                    .live_checkout_fenced_workers("live-project")
+                    .contains("worker1"),
+                fenced
+            );
+            if fenced {
+                assert!(project_excluded_workers(&ctx, "live-project").contains("worker1"));
+            }
+            assert!(project_excluded_workers(&ctx, "other-project").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn source_busy_release_keeps_the_project_off_that_worker() {
+        // bd-p3kuz: (exit, flag, fenced)
+        for (exit, flag, fenced) in [(101, true, true), (0, true, false), (101, false, false)] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            let ctx = make_test_context(pool.clone());
+            let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let build = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    "held-project".into(),
+                    "worker1".into(),
+                    "cargo test".into(),
+                    12345,
+                    Some("owner".into()),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(worker.reserve_slots(1).await);
+            let request = parse_request(&format!(
+                "POST /release-worker?worker=worker1&build_id={}&local_wrapper_id=owner&exit_code={exit}&worker_source_busy={}",
+                build.id,
+                u8::from(flag)
+            ))
+            .unwrap();
+            let ApiRequest::ReleaseWorker(request) = request else {
+                panic!("release request expected")
+            };
+            assert_eq!(request.worker_source_busy, flag);
+            assert!(!request.worker_live_checkout_refused);
+            handle_release_worker(&ctx, request).await.unwrap();
+            assert_eq!(
+                project_excluded_workers(&ctx, "held-project").contains("worker1"),
+                fenced
+            );
+            assert!(
+                ctx.history
+                    .live_checkout_fenced_workers("held-project")
+                    .is_empty()
+            );
+            assert!(project_excluded_workers(&ctx, "other-project").is_empty());
+        }
+    }
+
     fn disk_fault_release_request(build_id: u64) -> ReleaseRequest {
         ReleaseRequest {
             local_wrapper_id: Some("disk-owner".into()),
@@ -8359,6 +8878,8 @@ mod tests {
             timing: None,
             worker_fault: true,
             worker_disk_full: true,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: vec!["/build-volume/rch".into()],
         }
     }
@@ -8731,6 +9252,8 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -8782,6 +9305,8 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -8905,6 +9430,8 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             };
             handle_release_worker(&ctx, release.clone()).await.unwrap();
@@ -8969,6 +9496,8 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9008,6 +9537,8 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
         handle_release_worker(&ctx, release()).await.unwrap();
@@ -9055,6 +9586,8 @@ mod tests {
                         timing: None,
                         worker_fault: false,
                         worker_disk_full: false,
+                        worker_live_checkout_refused: false,
+                        worker_source_busy: false,
                         worker_disk_roots: Vec::new(),
                     },
                 )
@@ -9093,6 +9626,8 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             },
         )
@@ -9140,6 +9675,8 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9255,6 +9792,8 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9639,6 +10178,8 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             },
         )

@@ -1,5 +1,57 @@
 # Managed execution storage: local Codex handoff
 
+## Upstream v2.1.34 integration — 2026-10-16
+
+This section supersedes the checkout/status statements below; older evidence
+remains historical. PR #2 was merged into `main` on October 12.
+
+Integration branch: `feat/upstream-v2.1.34-integration`. Its starting fork commit
+is `21c680abc36a07d1edbaf7c9e4c8f4e794165d9b`; its pinned upstream parent is
+`ff152a046086f26845cbd4e9b0541a7b782fc64f` (annotated release `v2.1.34`).
+The tag contributes 591 upstream-only commits. The moving upstream `main` was
+not used. Development is isolated in a CodePier worktree; unpublished edits in
+the original checkout, including new command-routing work, are not included.
+
+The integration retains configurable package-cache/scratch/HOME placement,
+private-workload `/tmp`, and persistent remote environment defaults. Source
+claims, Cargo target pools, process ownership and durable completion remain
+with their native RCH owners. Conflict reconciliation specifically combines:
+
+- Managed configuration keys with upstream local-slot and Layer-0 controls.
+- Upstream worker dependency preparation inside the managed environment,
+  timeout and process group, without the old duplicate bootstrap path.
+- Descriptor-relative recovery ownership with explicit lock release on drop.
+- RABS capture/publication capacity reservations with per-action diagnostics.
+- Upstream cold-build and package-verification tests instead of obsolete
+  fixture expectations, while preserving private-path and cleanup observations.
+- Both new RABS CI gates and the fork's existing resource diagnostics.
+
+The dependency-preparation regression now invokes the production preparation
+shell with a worker double. It checks exact argv/runtime, one preparation per
+invocation, cache/proxy/scratch inheritance, dependency executable PATH, clean
+workload stdout, refusal before workload start, and scratch removal on both
+success and refusal. This is not a real package-install or fleet acceptance claim.
+
+Validation at the initial integration checkpoint:
+
+| Check | Observed result |
+| --- | --- |
+| Git conflict index and conflict-marker scan | Clear |
+| `git diff --check` | Passed |
+| Remote `cargo fmt --all -- --check` after formatting | Passed on the runner's installed formatter |
+| Remote `cargo check --workspace --all-targets --locked` | Blocked before compilation: runner selects stable Rust 1.93 and rejects `-Z threads=4`; no rustup is installed |
+| Pinned-nightly compiler, Clippy and Rust regressions | Pending GitHub CI on the integration revision |
+| Real worker SSH, private-mount success, Nexus and fleet acceptance | Not performed |
+
+All commands that execute tests or compilation are sent to remote/CI tooling.
+Do not change the repository's `nightly-2026-08-31` pin to accommodate the
+remote runner. The formatter result does not establish pinned-toolchain parity.
+Keep the integration PR draft until its exact-revision checks and required
+worker acceptance are complete. No main-branch update or deployment is part
+of this checkpoint.
+
+## Historical October 12 handoff
+
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR
 reviewer and the user's next local session. The user requested continued
 development and said they will deploy later. Keep PR #2 draft. Deployment and

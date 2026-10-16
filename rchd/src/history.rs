@@ -103,6 +103,48 @@ impl PartialEq for PendingDiskFault {
 impl Eq for PendingDiskFault {}
 
 /// Terminal result supplied by completion or cancellation; ownership stays separate.
+/// A failed remote build's slot is released at completion, but its client
+/// lease keeps the worker's source claim until lease recovery retires it
+/// (exit 102 retrieval incomplete, 130 interrupted: 15-21 min on css). The
+/// worker's source registry refuses the same project meanwhile, so selection
+/// must not keep choosing it (bd-jqhno).
+#[derive(Debug, Clone)]
+struct SourceFence {
+    project_id: String,
+    worker_id: String,
+    wrapper: String,
+    created: Instant,
+}
+
+/// Lease recovery acts after 15 min of heartbeat staleness and scans every
+/// 5 min; a fence never outlives that window by much, whatever the lease says.
+pub(crate) const SOURCE_FENCE_MAX_AGE: Duration = Duration::from_secs(25 * 60);
+const SOURCE_FENCE_LIMIT: usize = 1024;
+
+/// A dual-role worker refuses every sync into its live checkout of a project
+/// (bd-fbtws), so selection skips that pair for hours rather than paying a
+/// reservation and a refused sync per build. Expiry lets a host that stopped
+/// declaring the checkout come back; another refusal fences it again.
+pub(crate) const LIVE_CHECKOUT_FENCE_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Another owner held a project's source on a worker past the admission wait
+/// (bd-p3kuz). A stopped client can hold it for hours after rchd retired its
+/// build; without a fence every placement there waits 60 s and is refused.
+/// The fence is short because most holders finish: a worker still held when
+/// it lapses costs one more probe, whose refusal fences it again.
+pub(crate) const SOURCE_BUSY_FENCE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+fn canonical_local_wrapper(wrapper: &str) -> bool {
+    wrapper
+        .strip_prefix(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
+        .and_then(|suffix| {
+            uuid::Uuid::parse_str(suffix)
+                .ok()
+                .map(|id| id.to_string() == suffix)
+        })
+        .unwrap_or(false)
+}
+
 pub struct BuildCompletion {
     pub exit_code: i32,
     pub duration_ms: Option<u64>,
@@ -293,6 +335,22 @@ pub struct QueuedWaiterClaim {
     nonce: u64,
 }
 
+/// One worker reserved for a starving queued waiter (bd-decdd). While the hold
+/// is live, younger requests are not placed on that worker, so it drains until
+/// the waiter's slots fit instead of being refilled by single-slot jobs.
+/// Transient: a restart drops it, and the waiter claims again once eligible.
+#[derive(Debug, Clone)]
+struct QueueHold {
+    queue_id: u64,
+    worker_id: String,
+    /// The holder's `queued_at_mono`; with `queue_id`, the age order.
+    since: Instant,
+    refreshed: Instant,
+}
+
+/// A hold not refreshed for this long is ignored (its waiter polls every second).
+const QUEUE_HOLD_STALE: Duration = Duration::from_secs(30);
+
 /// Build history manager.
 ///
 /// Thread-safe ring buffer of recent builds with optional persistence.
@@ -306,9 +364,21 @@ pub struct BuildHistory {
     /// Transient: startup loads history before probing workers, and WorkerState
     /// never restores capacity observations from disk.
     disk_budget_completed_at: Mutex<HashMap<String, Instant>>,
+    /// Failed remote builds whose client lease may still own worker source
+    /// (bd-jqhno). Transient: selection consults them for the same project.
+    source_fences: Mutex<Vec<SourceFence>>,
+    /// (project, worker) pairs whose live checkout refused a source sync, and
+    /// when (bd-fbtws). Transient, like `source_fences`.
+    live_checkout_fences: Mutex<HashMap<(String, String), Instant>>,
+    /// (project, worker) pairs whose source another owner held past the
+    /// admission wait, and when (bd-p3kuz). Transient.
+    source_busy_fences: Mutex<HashMap<(String, String), Instant>>,
     /// Queued builds (waiting for workers). Membership changes take `active`
     /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
+    /// At most one worker reserved for the oldest starving waiter (bd-decdd).
+    /// Never held while taking `queued`.
+    queue_hold: Mutex<Option<QueueHold>>,
     /// Maximum capacity for history.
     capacity: usize,
     /// Maximum queue depth (0 = unlimited).
@@ -354,7 +424,11 @@ impl BuildHistory {
             records: RwLock::new(VecDeque::with_capacity(capacity)),
             active: RwLock::new(HashMap::new()),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
+            source_fences: Mutex::new(Vec::new()),
+            live_checkout_fences: Mutex::new(HashMap::new()),
+            source_busy_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(VecDeque::new()),
+            queue_hold: Mutex::new(None),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
@@ -1100,6 +1174,103 @@ impl BuildHistory {
             .collect()
     }
 
+    /// Workers fenced for `project_id` by a failed build whose client lease
+    /// still owns worker source. `owns_source(wrapper)` reads that lease; a
+    /// fence ends when it answers no, or after [`SOURCE_FENCE_MAX_AGE`].
+    pub fn source_fenced_workers(
+        &self,
+        project_id: &str,
+        owns_source: impl Fn(&str) -> bool,
+    ) -> HashSet<String> {
+        let candidates: Vec<SourceFence> = {
+            let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
+            fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
+            fences
+                .iter()
+                .filter(|fence| fence.project_id == project_id)
+                .cloned()
+                .collect()
+        };
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+        // Lease reads happen outside the lock.
+        let (held, released): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|fence| owns_source(&fence.wrapper));
+        if !released.is_empty() {
+            self.source_fences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|fence| {
+                    !released.iter().any(|gone| {
+                        gone.wrapper == fence.wrapper && gone.worker_id == fence.worker_id
+                    })
+                });
+        }
+        held.into_iter().map(|fence| fence.worker_id).collect()
+    }
+
+    /// Keep `project_id` off `worker_id`: its live checkout refused a sync.
+    pub fn fence_live_checkout(&self, project_id: &str, worker_id: &str) {
+        let mut fences = self
+            .live_checkout_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < LIVE_CHECKOUT_FENCE_MAX_AGE);
+        if fences.len() >= SOURCE_FENCE_LIMIT {
+            return;
+        }
+        fences.insert(
+            (project_id.to_owned(), worker_id.to_owned()),
+            Instant::now(),
+        );
+    }
+
+    /// Workers whose live checkout of `project_id` refused a recent sync.
+    pub fn live_checkout_fenced_workers(&self, project_id: &str) -> HashSet<String> {
+        let mut fences = self
+            .live_checkout_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < LIVE_CHECKOUT_FENCE_MAX_AGE);
+        fences
+            .keys()
+            .filter(|(project, _)| project == project_id)
+            .map(|(_, worker)| worker.clone())
+            .collect()
+    }
+
+    /// Keep `project_id` off `worker_id` while another owner holds its source.
+    pub fn fence_source_busy(&self, project_id: &str, worker_id: &str) {
+        let mut fences = self
+            .source_busy_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < SOURCE_BUSY_FENCE_MAX_AGE);
+        if fences.len() >= SOURCE_FENCE_LIMIT {
+            return;
+        }
+        fences.insert(
+            (project_id.to_owned(), worker_id.to_owned()),
+            Instant::now(),
+        );
+    }
+
+    /// Workers where another owner recently held `project_id`'s source.
+    pub fn source_busy_fenced_workers(&self, project_id: &str) -> HashSet<String> {
+        let mut fences = self
+            .source_busy_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < SOURCE_BUSY_FENCE_MAX_AGE);
+        fences
+            .keys()
+            .filter(|(project, _)| project == project_id)
+            .map(|(_, worker)| worker.clone())
+            .collect()
+    }
+
     // =========================================================================
     // Queue Management
     // =========================================================================
@@ -1415,6 +1586,81 @@ impl BuildHistory {
             .any(|row| {
                 row.id == claim.queue_id && row.waiter_claim == Some(claim.nonce) && !row.recovered
             })
+    }
+
+    fn live_queue_hold(&self) -> std::sync::MutexGuard<'_, Option<QueueHold>> {
+        let mut hold = self.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+        if hold
+            .as_ref()
+            .is_some_and(|h| h.refreshed.elapsed() >= QUEUE_HOLD_STALE)
+        {
+            *hold = None;
+        }
+        hold
+    }
+
+    /// The worker a live hold reserves against this caller: a fresh request
+    /// (no waiter) or a waiter younger than the holder. `None` for the holder
+    /// itself, for older waiters, and when no hold is live.
+    pub fn queue_hold_against(&self, waiter: Option<&QueuedWaiterClaim>) -> Option<String> {
+        let caller = waiter.map(|claim| {
+            let since = self
+                .queued
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|row| row.id == claim.queue_id)
+                .map(|row| row.queued_at_mono);
+            (claim.queue_id, since)
+        });
+        let hold = self.live_queue_hold();
+        let hold = hold.as_ref()?;
+        match caller {
+            Some((queue_id, _)) if queue_id == hold.queue_id => None,
+            Some((queue_id, Some(since))) if (since, queue_id) < (hold.since, hold.queue_id) => {
+                None
+            }
+            _ => Some(hold.worker_id.clone()),
+        }
+    }
+
+    /// The worker `queue_id` holds, while its hold is live.
+    pub fn queue_hold_of(&self, queue_id: u64) -> Option<String> {
+        self.live_queue_hold()
+            .as_ref()
+            .filter(|hold| hold.queue_id == queue_id)
+            .map(|hold| hold.worker_id.clone())
+    }
+
+    /// Claim, move or refresh `queue_id`'s hold on `worker_id`. A live hold
+    /// owned by an older waiter is never displaced; a younger one is. Returns
+    /// whether the hold changed hands or workers (a refresh returns false).
+    pub fn claim_queue_hold(&self, queue_id: u64, since: Instant, worker_id: String) -> bool {
+        let mut hold = self.live_queue_hold();
+        if let Some(current) = hold.as_ref()
+            && current.queue_id != queue_id
+            && (current.since, current.queue_id) < (since, queue_id)
+        {
+            return false;
+        }
+        let changed = hold
+            .as_ref()
+            .is_none_or(|h| h.queue_id != queue_id || h.worker_id != worker_id);
+        *hold = Some(QueueHold {
+            queue_id,
+            worker_id,
+            since,
+            refreshed: Instant::now(),
+        });
+        changed
+    }
+
+    /// Drop `queue_id`'s hold, if it has one.
+    pub fn release_queue_hold(&self, queue_id: u64) {
+        let mut hold = self.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+        if hold.as_ref().is_some_and(|h| h.queue_id == queue_id) {
+            *hold = None;
+        }
     }
 
     /// Dequeue the next build (FIFO).
@@ -1960,7 +2206,11 @@ impl BuildHistory {
             records: RwLock::new(records),
             active: RwLock::new(active),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
+            source_fences: Mutex::new(Vec::new()),
+            live_checkout_fences: Mutex::new(HashMap::new()),
+            source_busy_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(queued),
+            queue_hold: Mutex::new(None),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
@@ -2304,6 +2554,25 @@ impl BuildHistory {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(state.worker_id.clone(), Instant::now());
         }
+        if exit_code != 0
+            && state.location == BuildLocation::Remote
+            && let Some(wrapper) = state
+                .local_wrapper_id
+                .as_deref()
+                .filter(|wrapper| canonical_local_wrapper(wrapper))
+        {
+            let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
+            fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
+            if fences.len() >= SOURCE_FENCE_LIMIT {
+                fences.remove(0);
+            }
+            fences.push(SourceFence {
+                project_id: state.project_id.clone(),
+                worker_id: state.worker_id.clone(),
+                wrapper: wrapper.to_owned(),
+                created: Instant::now(),
+            });
+        }
         let state = active.remove(&build_id).expect("locked ownership exists");
         self.learn_footprint(&state, exit_code);
         self.record(record.clone());
@@ -2402,12 +2671,16 @@ impl BuildHistory {
             .unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         let temporary = path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&temporary)?;
-        serde_json::to_writer(&mut file, &snapshot)?;
+        // Unbuffered, serde_json issues one write(2) per JSON token (~50k for
+        // a 280 KB snapshot) while the caller holds the `active` write lock.
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &snapshot)?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         std::fs::rename(&temporary, &path)?;
         #[cfg(test)]
@@ -2495,6 +2768,144 @@ mod tests {
     use rch_common::{WorkerId, test_guard};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    #[test]
+    fn live_checkout_fences_are_per_project_and_expire() {
+        let history = BuildHistory::new(10);
+        assert!(history.live_checkout_fenced_workers("music").is_empty());
+        history.fence_live_checkout("music", "hz2");
+        history.fence_live_checkout("music", "hz2");
+        history.fence_live_checkout("music", "ts1");
+        assert_eq!(
+            history.live_checkout_fenced_workers("music"),
+            HashSet::from(["hz2".to_owned(), "ts1".to_owned()])
+        );
+        assert!(history.live_checkout_fenced_workers("other").is_empty());
+        *history
+            .live_checkout_fences
+            .lock()
+            .unwrap()
+            .get_mut(&("music".to_owned(), "hz2".to_owned()))
+            .unwrap() = Instant::now() - LIVE_CHECKOUT_FENCE_MAX_AGE;
+        assert_eq!(
+            history.live_checkout_fenced_workers("music"),
+            HashSet::from(["ts1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn source_busy_fences_are_per_project_refresh_and_expire() {
+        let history = BuildHistory::new(10);
+        assert!(history.source_busy_fenced_workers("mtdt").is_empty());
+        history.fence_source_busy("mtdt", "vmi1293453");
+        history.fence_source_busy("mtdt", "vmi1264463");
+        assert_eq!(
+            history.source_busy_fenced_workers("mtdt"),
+            HashSet::from(["vmi1293453".to_owned(), "vmi1264463".to_owned()])
+        );
+        assert!(history.source_busy_fenced_workers("other").is_empty());
+        // Live-checkout fences are a separate verdict with a longer life.
+        assert!(history.live_checkout_fenced_workers("mtdt").is_empty());
+        let expired = Instant::now() - SOURCE_BUSY_FENCE_MAX_AGE;
+        for worker in ["vmi1293453", "vmi1264463"] {
+            *history
+                .source_busy_fences
+                .lock()
+                .unwrap()
+                .get_mut(&("mtdt".to_owned(), worker.to_owned()))
+                .unwrap() = expired;
+        }
+        // A worker still held when its fence lapses is fenced again by the
+        // next refusal.
+        history.fence_source_busy("mtdt", "vmi1293453");
+        assert_eq!(
+            history.source_busy_fenced_workers("mtdt"),
+            HashSet::from(["vmi1293453".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_failed_remote_build_fences_its_worker_until_its_lease_releases_source() {
+        let history = BuildHistory::new(10);
+        let held = "rchw-10000000-0000-4000-8000-0000000000f1";
+        let start = |worker: &str, wrapper: &str, location| {
+            history.start_active_build_with_wrapper(
+                "music".into(),
+                worker.into(),
+                "cargo test".into(),
+                0,
+                Some(wrapper.into()),
+                1,
+                location,
+            )
+        };
+        let failed = start("w1", held, BuildLocation::Remote);
+        let succeeded = start(
+            "w2",
+            "rchw-10000000-0000-4000-8000-0000000000f2",
+            BuildLocation::Remote,
+        );
+        let unkeyed = start("w3", "not-a-wrapper", BuildLocation::Remote);
+        let local = start(
+            "w4",
+            "rchw-10000000-0000-4000-8000-0000000000f4",
+            BuildLocation::Local,
+        );
+        for (build, exit_code) in [
+            (&failed, 102),
+            (&succeeded, 0),
+            (&unkeyed, 130),
+            (&local, 1),
+        ] {
+            history
+                .complete_durable(
+                    build.id,
+                    &build.worker_id,
+                    build.local_wrapper_id.as_deref(),
+                    BuildCompletion {
+                        exit_code,
+                        duration_ms: Some(1),
+                        bytes_transferred: None,
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap();
+        }
+        // The slot is gone, but the worker still refuses this project's root.
+        assert!(history.active_workers_for_project("music").is_empty());
+        let fenced = history.source_fenced_workers("music", |_| true);
+        assert_eq!(fenced, HashSet::from(["w1".to_owned()]));
+        assert!(history.source_fenced_workers("other", |_| true).is_empty());
+        // Once the lease no longer owns source the fence is gone for good.
+        assert!(
+            history
+                .source_fenced_workers("music", |wrapper| wrapper != held)
+                .is_empty()
+        );
+        assert!(history.source_fenced_workers("music", |_| true).is_empty());
+
+        // An unanswered lease cannot hold a worker past the recovery window.
+        let again = start("w1", held, BuildLocation::Remote);
+        history
+            .complete_durable(
+                again.id,
+                "w1",
+                Some(held),
+                BuildCompletion {
+                    exit_code: 130,
+                    duration_ms: Some(1),
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(history.source_fenced_workers("music", |_| true).len(), 1);
+        history.source_fences.lock().unwrap()[0].created =
+            Instant::now().checked_sub(SOURCE_FENCE_MAX_AGE).unwrap();
+        assert!(history.source_fenced_workers("music", |_| true).is_empty());
+    }
 
     fn disk_budget_admit(
         history: &BuildHistory,
@@ -3027,6 +3438,52 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn queue_hold_reserves_against_younger_requests_only() {
+        let history = BuildHistory::new(10);
+        let (old, old_claim) = queue_resume_enqueue(&history, Some("old"));
+        let (young, young_claim) = queue_resume_enqueue(&history, Some("young"));
+        assert!(old.queued_at_mono <= young.queued_at_mono && old.id < young.id);
+        assert_eq!(history.queue_hold_against(None), None);
+
+        // The younger waiter claims first; the older one displaces it.
+        assert!(history.claim_queue_hold(young.id, young.queued_at_mono, "w1".into()));
+        assert_eq!(history.queue_hold_against(None).as_deref(), Some("w1"));
+        assert_eq!(history.queue_hold_against(Some(&young_claim)), None);
+        assert_eq!(history.queue_hold_against(Some(&old_claim)), None);
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w2".into()));
+        assert_eq!(history.queue_hold_of(young.id), None);
+        assert_eq!(history.queue_hold_of(old.id).as_deref(), Some("w2"));
+        assert_eq!(
+            history.queue_hold_against(Some(&young_claim)).as_deref(),
+            Some("w2")
+        );
+        assert_eq!(history.queue_hold_against(Some(&old_claim)), None);
+
+        // A younger waiter cannot take it back; a refresh is not a change.
+        assert!(!history.claim_queue_hold(young.id, young.queued_at_mono, "w1".into()));
+        assert!(!history.claim_queue_hold(old.id, old.queued_at_mono, "w2".into()));
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w3".into()));
+
+        // Only the holder's release drops it.
+        history.release_queue_hold(young.id);
+        assert_eq!(history.queue_hold_of(old.id).as_deref(), Some("w3"));
+        history.release_queue_hold(old.id);
+        assert_eq!(history.queue_hold_against(None), None);
+
+        // An unrefreshed hold goes stale.
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w1".into()));
+        history
+            .queue_hold
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .refreshed -= QUEUE_HOLD_STALE;
+        assert_eq!(history.queue_hold_against(None), None);
+        assert!(history.claim_queue_hold(young.id, young.queued_at_mono, "w4".into()));
     }
 
     #[test]
