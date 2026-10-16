@@ -54,7 +54,7 @@ fn joined(flights: &Flights, signature: FileSig, readers: usize) -> bool {
         .lock()
         .unwrap()
         .get(&signature)
-        .is_some_and(|flight| Arc::strong_count(flight) >= readers + 1)
+        .is_some_and(|flight| Arc::strong_count(flight) > readers)
 }
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, FileSig, TypedDigest) {

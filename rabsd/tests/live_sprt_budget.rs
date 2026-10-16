@@ -8,7 +8,7 @@
 
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
-use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
+use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue, digest_key};
 use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome};
 use rabs_cas::test_support::{
     FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
@@ -307,6 +307,65 @@ fn live_sprt_concurrent_installers_share_one_qualified_budget() {
         "final coordinator ceiling must not truncate SPRT to 16"
     );
     exhausted(&coord, &dir.path().join("no-extra-permit"));
+}
+
+#[test]
+fn live_sprt_newest_checkpoint_cannot_fall_back_to_older_replay_budget() {
+    const TEST: &str = "live_sprt_newest_checkpoint_cannot_fall_back_to_older_replay_budget";
+    if !in_child(TEST) {
+        run_child(TEST, "on", None);
+        return;
+    }
+    for (passes, cursor, malformed) in [("0", "0", false), ("not-a-counter", "100", true)] {
+        // Start with the old 99-install qualification intact, then append a
+        // newer conservative reset or malformed snapshot. This exercises the
+        // real coordinator/edge consumer, not just the CAS checkpoint loader.
+        let (dir, cas, coord) = fixture(3);
+        cas.store()
+            .lock()
+            .unwrap()
+            .record_decision_receipt("rabs-sprt-checkpoint-v1", CLASS, 1, passes, cursor)
+            .unwrap();
+        let before = cas.store().lock().unwrap().differential_snapshot().unwrap();
+        let destination = dir.path().join("no-stale-replay");
+        if malformed {
+            let result = coord.edge_subscriber().serve_action(
+                &sample_action_key(),
+                &destination,
+                &ExpectedOutputs::WhateverWasCommitted,
+                now(),
+                0,
+            );
+            assert!(
+                result.is_err(),
+                "malformed latest state must not grant old or fixed replay"
+            );
+            assert!(!destination.exists());
+            assert_eq!(
+                cas.store().lock().unwrap().differential_snapshot().unwrap(),
+                before
+            );
+        } else {
+            exhausted(&coord, &destination);
+        }
+        let old = cas.store().lock().unwrap().query(
+            "SELECT decision, reason FROM decision_receipts WHERE kind = ?1 AND subject = ?2 AND seq = 0",
+            &[SqlValue::Text("rabs-sprt-checkpoint-v1".into()), SqlValue::Text(CLASS.into())],
+        ).unwrap();
+        assert_eq!(
+            old,
+            vec![vec![
+                SqlValue::Text((3 * STEP).to_string()),
+                SqlValue::Text((3 * STEP).to_string())
+            ]]
+        );
+        if !malformed {
+            drop(coord);
+            drop(cas);
+            let (_cas, coord) = open(dir.path());
+            exhausted(&coord, &dir.path().join("no-stale-replay-after-reopen"));
+        }
+    }
 }
 
 #[test]

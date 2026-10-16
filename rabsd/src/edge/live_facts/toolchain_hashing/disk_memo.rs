@@ -401,8 +401,9 @@ mod tests {
                 reads.fetch_add(1, Ordering::Relaxed);
                 digest_stable_at(path, sig).map(|(_, digest)| digest)
             })
-            .unwrap(),
-            [expected.clone()]
+            .unwrap()
+            .as_slice(),
+            std::slice::from_ref(&expected)
         );
         assert_eq!(reads.load(Ordering::Relaxed), 1);
         drop(memo);

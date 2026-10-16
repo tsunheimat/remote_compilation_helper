@@ -56,7 +56,9 @@ jobs:
         with:
           prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      # Collect diagnostics from independent targets in one run. Failed
+      # dependencies still block their consumers; every warning remains fatal.
+      - run: cargo clippy --locked --workspace --all-targets --all-features --keep-going -- -D warnings
 
   # Bundle integrity, installer syntax and workflow wiring share one cheap job.
   manifest_sync:

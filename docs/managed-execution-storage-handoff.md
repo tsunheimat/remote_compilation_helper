@@ -80,8 +80,24 @@ The follow-up fixes the observed causes rather than relaxing CI:
 - Add regressions for successive checkpoint history, immutable conflicting
   writes, no self-generated journal churn, sequence exhaustion and invalid state.
 
+On follow-up `97fdb6b29aaa79804f2b301375c8ebc110eabf49`,
+[CI 38909444638](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38909444638)
+passed the previously failing production checks and reached two additional
+upstream test-only lints: a reference-count `>= readers + 1` comparison and an
+unnecessary cloned one-element expectation. Their repairs preserve the same
+reader admission and digest equality assertions. The main Clippy invocation now
+uses `--keep-going` to collect independent target diagnostics in one run, while
+retaining `--locked`, all targets/features and fatal warnings. A failed dependency
+still blocks its consumers; this is not error suppression or a new CI job.
+
+The real coordinator/edge SPRT suite also gets a regression for a newer reset or
+malformed checkpoint alongside an older 99-install qualification. It must refuse
+replay without touching the destination or overwriting the older receipt, and a
+conservative refusal must survive coordinator/database reopening. These are real
+CAS/filesystem fixture operations, not a fleet or compiler performance claim.
+
 The generic receipt immutability and quarantine-repair rules are unchanged. No
-workflow, feature flag, assertion threshold or ignored-test list is relaxed.
+feature flag, assertion threshold or ignored-test list is relaxed.
 The follow-up passed remote formatting and diff checks; its new Rust regressions
 must still be evaluated by exact-revision pinned-toolchain CI. No successful
 real-worker/Nexus/private-mount acceptance is implied by these fixture results.
