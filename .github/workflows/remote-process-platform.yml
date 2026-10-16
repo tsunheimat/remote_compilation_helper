@@ -19,6 +19,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: remote-process-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_BUILD_JOBS: 2
+
 jobs:
   native-identity:
     strategy:
@@ -31,10 +40,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-06
-          components: rustfmt, clippy
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Compile native worker identity helper
         run: cargo build --locked -p rch-wkr
@@ -59,8 +67,5 @@ jobs:
         run: |
           cargo test --locked -p rch-common process_identity
           cargo test --locked -p rch-common --test remote_process_escalation
-      - name: Check workspace compilation, lints and formatting
-        run: |
-          cargo check --locked --workspace --all-targets
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo fmt --check
+      # Full-workspace compilation, Clippy and formatting belong to ci.yml;
+      # this lane owns the distinct native shell/process identity checks.

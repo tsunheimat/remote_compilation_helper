@@ -10,27 +10,28 @@ on:
   push:
     branches: [main]
     paths:
-      - 'rabsd/**'
-      - 'rabs-wrap/**'
-      - 'rabs-wkr/**'
-      - 'rabs-asupersync/**'
-      - 'rabs-cas/**'
-      - 'rabs-sandbox/**'
-      - 'rch-common/src/toolchain.rs'
-      - 'rch-common/src/toolchain/**'
-      - 'scripts/cargo-rabs'
-      - 'scripts/tests/test_cargo_rabs.py'
-      - 'scripts/tests/test_cargo_rabs_canonical.py'
-      - 'scripts/install-rabs'
-      - 'tests/test_install_rabs*.py'
-      - 'tests/test_rabs_sprt_evidence.py'
-      - 'tests/test_rabs_worker_cache.py'
-      - 'tests/test_rabs_worker_cache_diagnostics.py'
-      - 'tests/test_rabs_capture_recovery.py'
-      - 'tests/test_rabs_evidence_queries.py'
+      - 'rabs*/**'
+      - 'rch*/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
       - '.github/workflows/release.yml'
       - '.github/workflows/rabs-binaries.yml'
   pull_request:
+    paths:
+      - 'rabs*/**'
+      - 'rch*/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/rabs-binaries.yml'
   workflow_dispatch:
 
 concurrency:
@@ -73,39 +74,22 @@ jobs:
       - name: Indexed evidence queries (native SQLite, not Rust execution)
         run: python3 tests/test_rabs_evidence_queries.py -v
 
-  # Exercise the accepted-hit delivery frontier independently of the slower
-  # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
-  # these tests must still run unchanged on a native runner.
-  delivery-protocol:
-    name: accepted-hit delivery protocol
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      RUSTUP_TOOLCHAIN: nightly-2026-08-31
-      CARGO_BUILD_JOBS: 2
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      CARGO_INCREMENTAL: 0
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned test toolchain
-        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
-      - name: Check changed wrapper formatting
-        run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
-      - name: Run wrapper unit and real socket delivery regressions
-        run: cargo test -p rabs-wrap --bin rabs-wrap --test live_protocol --locked
-      - name: Lint the tested wrapper targets
-        run: cargo clippy -p rabs-wrap --bin rabs-wrap --test live_protocol --locked -- -D warnings
-
+  # Wrapper unit/live_protocol tests and their Clippy/fmt checks are already
+  # in ci.yml's full-workspace graph. Keep the distinct release-only gates here.
   build:
     name: release build + gates
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
       # Two concurrent release rustc processes nearly exhausted RAM and swap
       # before a shutdown. Serialize compilation; retain every gate.
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
