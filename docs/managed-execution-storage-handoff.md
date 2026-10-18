@@ -160,6 +160,29 @@ conservative cleanup observability, the obsolete automerge workflow contract
 and native shell E2E. This patch is not a full-suite, fleet or deployment claim.
 Keep PR #3 draft and do not update main or deploy workers.
 
+### ZIP audit follow-up after `08875a2c`
+
+At `08875a2c932661d77a45996298c544e26567c71f`, pinned formatting, workflow
+integrity and both native RABS installer jobs passed. The audit database updated
+on October 17 then reported three vulnerabilities in `zip 8.6.0`:
+[RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367.html),
+[RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368.html) and
+[RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369.html).
+The older October 16 audit pass does not qualify the current revision.
+
+Upgrade the workspace and lock entry to patched `zip 9.0.0`. The registry's
+checksum was independently matched against the downloaded crate bytes; the
+selected no-default/deflate-flate2 dependency requirements are unchanged. No
+unrelated dependency was upgraded or advisory ignored. Final Cargo `--locked`
+and audit validation still belong to exact-revision CI, not this metadata check.
+The updater explicitly rejects symlinks before directory-name classification.
+Native extraction regressions preserve external bytes and permissions for both
+relative and absolute link targets, including directory-shaped link names, and
+prove archived SUID/SGID/sticky bits are present in the input but absent from
+extracted ordinary files/directories. Existing safe regular ZIP extraction stays
+covered. The unmaintained unsafe-libyaml and yanked yoke-derive warnings are
+separate unresolved dependency-maintenance findings, not hidden exclusions.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

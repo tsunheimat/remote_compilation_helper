@@ -531,6 +531,15 @@ fn extract_zip_archive(archive_file: fs::File, dest: &Path) -> Result<(), Update
         let relative_path = safe_archive_entry_path(Path::new(&entry_name))?;
         let destination = dest.join(&relative_path);
 
+        // Reject links before the trailing-slash directory classification. The
+        // updater extracts only ordinary bytes/directories and never applies
+        // archive-supplied modes or follows an entry's link target.
+        if entry.is_symlink() {
+            return Err(UpdateError::InstallFailed(format!(
+                "Unsupported update zip symlink for {}",
+                relative_path.display()
+            )));
+        }
         if entry.is_dir() {
             fs::create_dir_all(&destination).map_err(|e| {
                 UpdateError::InstallFailed(format!(
@@ -1588,6 +1597,89 @@ mod tests {
             std::fs::read_to_string(dest.join(optional_update_binary())).unwrap(),
             "optional binary"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_zip_rejects_links_without_changing_external_bytes_or_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in ["rch", "directory-link/"] {
+            for relative in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let archive_path = temp.path().join("rch.zip");
+                let dest = temp.path().join("extract");
+                let outside = temp.path().join("outside");
+                fs::write(&outside, b"retain external bytes").unwrap();
+                fs::set_permissions(&outside, fs::Permissions::from_mode(0o640)).unwrap();
+                let before = fs::metadata(&outside).unwrap().permissions().mode();
+                let target = if relative {
+                    "../outside".to_owned()
+                } else {
+                    outside.to_str().unwrap().to_owned()
+                };
+                let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+                writer
+                    .add_symlink(name, target, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.finish().unwrap();
+                let mut observed =
+                    zip::ZipArchive::new(fs::File::open(&archive_path).unwrap()).unwrap();
+                assert!(observed.by_index(0).unwrap().is_symlink());
+                drop(observed);
+
+                assert!(matches!(
+                    extract_archive(&archive_path, &dest),
+                    Err(UpdateError::InstallFailed(_))
+                ));
+                assert!(fs::symlink_metadata(dest.join(name.trim_end_matches('/'))).is_err());
+                assert_eq!(fs::read(&outside).unwrap(), b"retain external bytes");
+                assert_eq!(fs::metadata(&outside).unwrap().permissions().mode(), before);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_zip_never_preserves_privileged_archive_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.zip");
+        let dest = temp.path().join("extract");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+        let entries = [("rch", 0o106755_u32), ("nested/", 0o047777_u32)];
+        for (name, mode) in entries {
+            // unix_permissions() deliberately masks these bits. Use the raw
+            // ZIP attributes so this fixture actually carries hostile modes.
+            let options =
+                zip::write::SimpleFileOptions::default().external_attributes(mode << 16);
+            if name.ends_with('/') {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(b"ordinary update bytes").unwrap();
+            }
+        }
+        writer.finish().unwrap();
+        let mut observed = zip::ZipArchive::new(fs::File::open(&archive_path).unwrap()).unwrap();
+        for (name, mode) in entries {
+            assert_eq!(
+                observed.by_name(name).unwrap().unix_mode().unwrap() & 0o7000,
+                mode & 0o7000
+            );
+        }
+        drop(observed);
+
+        extract_archive(&archive_path, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("rch")).unwrap(), b"ordinary update bytes");
+        assert!(dest.join("nested").is_dir());
+        for (name, _) in entries {
+            assert_eq!(
+                fs::metadata(dest.join(name)).unwrap().permissions().mode() & 0o7000,
+                0
+            );
+        }
     }
 
     #[test]
