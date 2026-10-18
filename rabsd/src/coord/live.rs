@@ -2173,6 +2173,20 @@ impl CoordLive {
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
+        // Preview and install must consult the same durable replay budget.
+        // Otherwise preview advertises a hit whose installation can only fail,
+        // instead of directing the caller to a fresh compiler comparison. This
+        // is a read-only precheck, not a permit reservation: final installation
+        // rechecks and spends under the metadata lock after private staging.
+        if sampling.is_some()
+            && live_replay_permit(&mut *store, action_key, &manifest_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                .is_none()
+        {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::FreshVerificationRequired,
+            ));
+        }
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.
@@ -2737,6 +2751,131 @@ mod tests {
         coord.acquire_boot_authority("submission-tests").unwrap();
         coord.mark_up();
         (state, coord)
+    }
+
+    #[test]
+    fn replay_preview_observes_the_install_budget_without_spending_or_creating_outputs() {
+        use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+        use rabs_cas::test_support::{
+            FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
+            install_offer_closure, offer_serving_object, sample_action_key,
+        };
+        use rabs_protocol::generation::ActionGenerationId;
+
+        let (state, coord) = submission_coordinator();
+        let cas = coord.cas.as_ref().unwrap();
+        let authority = coord.authority().unwrap();
+        let put = |bytes: &[u8]| {
+            let object = digest_set(bytes, DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id;
+            put_if_absent(
+                cas.layout(),
+                &mut *cas.store().lock().unwrap(),
+                &object,
+                &mut &bytes[..],
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap();
+            ObjectId(object)
+        };
+        let artifact = put(b"verified preview artifact");
+        {
+            let mut store = cas.store().lock().unwrap();
+            install_admission_world(&mut *store, &authority);
+            store
+                .record_decision_receipt(
+                    "rabs-live-action-class-v1",
+                    &digest_key(&sample_action_key()),
+                    0,
+                    "rustc-dependency-compile",
+                    "synthetic descriptor binding",
+                )
+                .unwrap();
+        }
+        let (offer, bytes) = offer_serving_object(&authority, &artifact);
+        assert_eq!(put(&bytes), offer.manifest_id);
+        install_offer_closure(&mut *cas.store().lock().unwrap(), &offer);
+        assert!(matches!(
+            coord
+                .commit_offer(&offer, &sample_expected_descriptor())
+                .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        for number in 1..=2 {
+            let ids = FixtureAttemptIds {
+                generation: 11 + number,
+                attempt: 20 + number,
+                lease: 30 + number,
+            };
+            install_admission_world_with_ids(&mut *cas.store().lock().unwrap(), &authority, ids);
+            let mut comparison = offer.clone();
+            comparison.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
+            comparison.authority.attempt_id = AttemptId(ids.attempt);
+            comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
+            assert_eq!(
+                coord
+                    .commit_offer(&comparison, &sample_expected_descriptor())
+                    .unwrap(),
+                PublicationOutcome::IdempotentEvidenceAppended
+            );
+        }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+        )
+        .unwrap();
+        let destination = state.path().join("preview-only");
+        for used in 0..=LIVE_REPLAY_INSTALL_LIMIT {
+            let before = cas.store().lock().unwrap().differential_snapshot().unwrap();
+            let expected = if used < LIVE_REPLAY_INSTALL_LIMIT {
+                ServeOutcome::Servable
+            } else {
+                ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired)
+            };
+            // Repeated previews cannot reserve, consume, or replenish allowance.
+            for _ in 0..3 {
+                assert_eq!(
+                    coord
+                        .serve_for_subscriber(
+                            &sample_action_key(),
+                            &destination,
+                            &ExpectedOutputs::WhateverWasCommitted,
+                            now,
+                            ServeMode::Preview,
+                        )
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert!(!destination.exists());
+            assert_eq!(
+                cas.store().lock().unwrap().differential_snapshot().unwrap(),
+                before
+            );
+            if used < LIVE_REPLAY_INSTALL_LIMIT {
+                let installed = state.path().join(format!("install-{used}"));
+                assert!(matches!(
+                    coord
+                        .serve_for_subscriber(
+                            &sample_action_key(),
+                            &installed,
+                            &ExpectedOutputs::WhateverWasCommitted,
+                            now,
+                            ServeMode::Install,
+                        )
+                        .unwrap(),
+                    ServeOutcome::Served { .. }
+                ));
+                assert_eq!(
+                    std::fs::read(installed.join("out/lib.rlib")).unwrap(),
+                    b"verified preview artifact"
+                );
+            }
+        }
     }
 
     #[test]

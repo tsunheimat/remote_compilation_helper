@@ -418,25 +418,63 @@ fn expected_output_interlock_includes_metadata_and_dep_info() {
 }
 
 #[test]
-fn corrupted_tail_reports_the_metadata_prefix_instead_of_an_untouched_tree() {
+fn corrupted_tail_is_quarantined_before_any_subscriber_output_is_exposed() {
     use std::os::unix::fs::PermissionsExt;
-    let fixture = Fixture::new(&[
-        (OutputRole::Materializable, "a.rlib", b"library"),
-        (OutputRole::ProvisionalMetadata, "z.rmeta", b"metadata"),
-    ]);
-    let tail = fixture.location("a.rlib");
-    std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::write(tail, b"corrupt").unwrap();
-    let root = fixture.dir.path().join("partial");
-    let Err(ServeError::Materialize(failure)) =
-        fixture.serve(&root, &ExpectedOutputs::Exactly(fixture.names()))
-    else {
-        panic!("must report partial materialization");
-    };
-    assert_eq!(failure.installed.len(), 1);
-    assert_eq!(failure.installed[0].destination, root.join("z.rmeta"));
-    assert_eq!(std::fs::read(root.join("z.rmeta")).unwrap(), b"metadata");
-    assert!(!root.join("a.rlib").exists());
+    for existing in [false, true] {
+        let fixture = Fixture::new(&[
+            (OutputRole::Materializable, "a.rlib", b"library"),
+            (OutputRole::ProvisionalMetadata, "z.rmeta", b"metadata"),
+        ]);
+        let tail = fixture.location("a.rlib");
+        std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&tail, b"corrupt").unwrap();
+        let root = fixture.dir.path().join("subscriber");
+        if existing {
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("z.rmeta"), b"old metadata").unwrap();
+            std::fs::write(root.join("a.rlib"), b"old library").unwrap();
+        }
+        let Err(ServeError::Materialize(failure)) =
+            fixture.serve(&root, &ExpectedOutputs::Exactly(fixture.names()))
+        else {
+            panic!("must report corrupt private staging");
+        };
+        // Split-phase delivery verifies the whole bundle before installation.
+        // A later rename error still reports its real installed prefix (covered
+        // by materialization::staged), but corruption cannot expose the head.
+        assert!(matches!(
+            failure.error,
+            rabs_cas::materialization::MaterializeError::ContentMismatch { .. }
+        ));
+        assert!(failure.installed.is_empty());
+        if existing {
+            assert_eq!(
+                std::fs::read(root.join("z.rmeta")).unwrap(),
+                b"old metadata"
+            );
+            assert_eq!(std::fs::read(root.join("a.rlib")).unwrap(), b"old library");
+        } else {
+            assert!(!root.exists());
+        }
+        assert_eq!(std::fs::read(&tail).unwrap(), b"corrupt");
+        let tail_object = &fixture
+            .outputs
+            .iter()
+            .find(|output| output.virtual_path.as_bytes() == b"a.rlib")
+            .unwrap()
+            .object
+            .0;
+        assert!(
+            fixture
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .object_locations(tail_object)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[test]

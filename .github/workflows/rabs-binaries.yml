@@ -168,7 +168,8 @@ jobs:
           cargo test --release -p rabs-cas --lib materialization::staged --locked
           cargo test --release -p rabs-cas --lib read_indexes --locked
           cargo test --release -p rabs-cas --lib trust_evidence --locked
-          cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --locked
+          cargo test --release -p rabsd --lib coord::live:: --locked
+          cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --test complete_output_serving --no-fail-fast --locked
           cargo test --release -p rabsd --lib edge::server --locked
           cargo test --release -p rabs-wrap --test live_dependency_e2e --locked
       - name: Shared endpoint ownership and restart fences

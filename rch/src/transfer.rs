@@ -4585,11 +4585,17 @@ impl TransferPipeline {
         if !env_plan.env_prefix.rejected.is_empty() {
             warn!("Skipping env vars: {:?}", env_plan.env_prefix.rejected);
         }
-        let env_command = if env_plan.env_prefix.prefix.is_empty() {
-            toolchain_command
-        } else {
-            format!("{}{}", env_plan.env_prefix.prefix, toolchain_command)
-        };
+        // Apply the environment before the workload shell parses expansions,
+        // redirections, pipelines or compound commands. Prefixing raw source
+        // with NAME=value affects only its first simple command and expands
+        // "$NAME" against the wrong shell environment. An explicit shell also
+        // keeps builtins and authored assignments valid under color/timeout's
+        // env(1) wrappers. Authored assignments inside the workload still win.
+        let env_command = format!(
+            "{}sh -c {}",
+            env_plan.env_prefix.prefix,
+            escape(Cow::Owned(toolchain_command)),
+        );
 
         // Apply color mode environment variables
         let colored_command = wrap_command_with_color(&env_command, self.color_mode);
@@ -14381,6 +14387,47 @@ Number of files transferred: 42
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn remote_environment_reaches_compound_shells_before_expansion_without_reparsing_values() {
+        let _guard = test_guard!();
+        let source = tempfile::tempdir().unwrap();
+        let literal = "space 'quote\" $dollar $(not-a-command); `not-a-command`";
+        let pipeline = cargo_home_boundary_pipeline(source.path())
+            .with_env_allowlist(vec!["RCH_TEST_PROXY".into(), "RCH_TEST_LITERAL".into()])
+            .with_env_overrides(HashMap::from([
+                ("RCH_TEST_PROXY".into(), "forwarded".into()),
+                ("RCH_TEST_LITERAL".into(), literal.into()),
+            ]))
+            .with_execution_environment(
+                ExecutionStorageConfig::default(),
+                std::collections::BTreeMap::from([("RCH_TEST_PROXY".into(), "default".into())]),
+            )
+            .unwrap();
+        let probe = r#"
+            printf '%s\n' "$RCH_TEST_PROXY";
+            false || printf '%s\n' "$RCH_TEST_PROXY";
+            printf '%s\n' "$RCH_TEST_PROXY" | sh -c 'test "$RCH_TEST_PROXY" = forwarded && cat';
+            RCH_TEST_PROXY=authored sh -c 'printf "%s\n" "$RCH_TEST_PROXY"';
+            printf '%s\n' "$RCH_TEST_PROXY";
+            printf '%s\0' "$RCH_TEST_LITERAL";
+            printf '%s' "$RCH_TEST_LITERAL" >&2;
+            exit 37
+        "#;
+        let output = std::process::Command::new("sh")
+            .args(["-c", &pipeline.build_remote_command(probe, None)])
+            .env("RCH_TEST_PROXY", "controller")
+            .env("RCH_TEST_LITERAL", "controller")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(37), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            format!("forwarded\nforwarded\nforwarded\nauthored\nforwarded\n{literal}\0").as_bytes()
+        );
+        assert_eq!(output.stderr, literal.as_bytes());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn managed_storage_dependency_prepare_uses_profile_and_scratch() {
         let _guard = test_guard!();
         use std::os::unix::fs::PermissionsExt;
@@ -16985,9 +17032,8 @@ fn main() {
             Some(&ToolchainInfo::new("nightly", None, "")),
         );
 
-        assert!(
-            command.contains("RUSTFLAGS='-C target-cpu=native' rustup run nightly cargo build")
-        );
+        let workload = "RUSTFLAGS='-C target-cpu=native' rustup run nightly cargo build";
+        assert!(command.contains(&format!("sh -c {}", escape(Cow::Borrowed(workload)))));
         assert!(!command.contains("rustup run nightly RUSTFLAGS="));
     }
 

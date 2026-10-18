@@ -445,6 +445,12 @@ pub(super) fn install_prepared(
     plan: &PreparedOutputs,
     prepared: PreparedActionOutputs,
 ) -> Result<Vec<PathBuf>, ServeError> {
+    // Destination components can change while private bytes are staged without
+    // the metadata lock. Recheck the complete namespace before any public mkdir
+    // or rename, not just the path of whichever output happens to install first.
+    for output in &plan.outputs {
+        preflight_destination(&output.destination)?;
+    }
     let receipt = prepared.install(store).map_err(ServeError::Materialize)?;
     for (destination, derived) in &plan.dep_info {
         // Digests distinguish canonical identity from subscriber derivation.
@@ -681,6 +687,68 @@ mod tests {
         ] {
             assert!(validate_output_namespace(&outputs_named(&[path]), root).is_err());
         }
+    }
+
+    #[test]
+    fn post_staging_symlink_replacement_refuses_the_entire_output_plan() {
+        use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+        use rabs_cas::digest_set::{DigestRequest, digest_set};
+        use rabs_protocol::result_identity::ObjectId;
+
+        let directory = crate::test_util::private_tempdir();
+        let cas =
+            crate::janitor::store::mount_and_reconcile(&directory.path().join("cas")).unwrap();
+        let root = directory.path().join("outputs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("head.rmeta"), b"old metadata").unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("tail.rlib"), b"unrelated library").unwrap();
+        let bytes = b"verified new output";
+        let object = digest_set(bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let mut manifest = outputs_named(&[b"head.rmeta", b"late/tail.rlib"]);
+        manifest.logical_outputs[0].role = OutputRole::ProvisionalMetadata;
+        manifest.logical_outputs[1].role = OutputRole::Materializable;
+        for output in &mut manifest.logical_outputs {
+            output.object = ObjectId(object.clone());
+        }
+        let (plan, selected) = {
+            let mut store = cas.store().lock().unwrap();
+            put_if_absent(
+                cas.layout(),
+                &mut *store,
+                &object,
+                &mut &bytes[..],
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap();
+            let plan = prepare(
+                &mut *store,
+                &manifest,
+                &root,
+                &ExpectedOutputs::WhateverWasCommitted,
+            )
+            .unwrap()
+            .unwrap();
+            let selected = select_for_install(&mut *store, &plan).unwrap();
+            (plan, selected)
+        };
+        let prepared = stage_for_install(selected, &plan).unwrap();
+        assert!(!root.join("late").exists());
+        std::os::unix::fs::symlink(&outside, root.join("late")).unwrap();
+        assert!(matches!(
+            install_prepared(&mut *cas.store().lock().unwrap(), &plan, prepared),
+            Err(ServeError::Preparation { .. })
+        ));
+        assert_eq!(std::fs::read(root.join("head.rmeta")).unwrap(), b"old metadata");
+        assert_eq!(
+            std::fs::read(outside.join("tail.rlib")).unwrap(),
+            b"unrelated library"
+        );
+        assert_eq!(std::fs::read_link(root.join("late")).unwrap(), outside);
     }
 
     #[test]

@@ -149,7 +149,11 @@ impl Fixture {
                 })
                 .unwrap();
             store
-                .create_generation(&authority_digest(&coordinator), self.serial, action)
+                .create_bound_generation(
+                    &authority_digest(&coordinator),
+                    &offer.authority.action_generation,
+                    action,
+                )
                 .unwrap();
             store
                 .record_decision_receipt(

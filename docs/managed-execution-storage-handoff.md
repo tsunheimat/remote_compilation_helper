@@ -113,6 +113,53 @@ The follow-up passed remote formatting and diff checks; its new Rust regressions
 must still be evaluated by exact-revision pinned-toolchain CI. No successful
 real-worker/Nexus/private-mount acceptance is implied by these fixture results.
 
+### Replay and managed-shell continuation after `2f812efa`
+
+The completed runs for `2f812efa63d979b11ebd3980004affc87ac96f60` are no longer
+pending: CI `38911081979` passed pinned formatting, full-workspace/all-target/
+all-feature Clippy and security/integrity checks. Native Linux/macOS tests and
+shell E2E failed; shipping validation was consequently skipped. RABS
+`38911081769` passed both installer jobs, release spine compilation and the
+worker-cache/preparation/output gates, then failed in replay verification.
+
+The next patch addresses observed runtime defects rather than changing replay
+budgets or accepting failed executions:
+
+- Preview now consults the same durable replay allowance as installation. An
+  exhausted fixed budget must request fresh verification, not advertise a hit
+  followed by `serve-failed`. Repeated preview is tested against actual CAS
+  publication and installation without consuming receipts or creating outputs.
+- Private staging uses an existing destination ancestor on the same filesystem;
+  it does not create the subscriber's missing parent directories. Only final
+  authorized installation creates those parents. Quarantine, abandonment and
+  concurrent budget exhaustion must leave an absent subscriber tree absent.
+  Exact-inode staging cleanup and partial-rename receipts remain intact.
+- The live installer rechecks every destination after the staging lock handoff.
+  A newly introduced symlink in a later output's parent must refuse the complete
+  plan before replacing its earlier metadata output or touching unrelated files.
+- Class-safety fixtures create bound generations before requesting live leases.
+  The corruption test follows the existing whole-bundle staging contract: both
+  fresh and populated subscriber trees remain untouched and the corrupt source
+  is quarantined. A separate actual rename-collision test retains prefix coverage.
+- Remote environment assignments now apply to a shell running the entire
+  authored workload, before its variable expansion or pipeline parsing. This
+  repairs the managed proxy/cache precedence failure. Tests retain inline
+  overrides, pipeline inheritance, literal shell metacharacters, NUL output,
+  stderr and nonzero status; no environment values are reparsed as source.
+
+New coordinator and output-install tests are included in the existing RABS job,
+not a new workflow. No warning, quarantine, lease, retry or replay limit is relaxed.
+The final remote formatting attempt was blocked by SSH public-key authentication;
+its fallback found no real Cargo executable and performed no build or test on
+this source host. Diff checks passed; pinned formatting and compiler-backed
+regressions must be assessed on the newly pushed revision by GitHub CI.
+
+Unrelated failures remain open, including runtime-entry policy coverage,
+platform-specific path/socket/process fixtures, Cargo package selection fixtures,
+conservative cleanup observability, the obsolete automerge workflow contract
+and native shell E2E. This patch is not a full-suite, fleet or deployment claim.
+Keep PR #3 draft and do not update main or deploy workers.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

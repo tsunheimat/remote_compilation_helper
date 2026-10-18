@@ -76,16 +76,26 @@ impl Fixture {
     }
 
     fn stages(&self) -> usize {
-        std::fs::read_dir(self.root.path().join("subscriber"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .as_encoded_bytes()
-                    .starts_with(b".rabs-stage-")
-            })
-            .count()
+        fn count(directory: &Path) -> usize {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    if entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".rabs-stage-")
+                    {
+                        1
+                    } else if entry.file_type().unwrap().is_dir() {
+                        count(&entry.path())
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+        count(self.root.path())
     }
 }
 
@@ -138,6 +148,62 @@ fn selection_and_staging_do_not_install_and_final_outputs_are_private_and_ordere
         std::fs::write(&output.destination, b"subscriber mutation").unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
     }
+}
+
+#[test]
+fn abandoned_or_quarantined_staging_leaves_missing_subscriber_parents_absent() {
+    for quarantine in [false, true] {
+        let mut fixture = Fixture::new();
+        let output = fixture.add("nested/a.rlib", OutputRole::Materializable, b"codegen");
+        let subscriber = fixture.root.path().join("subscriber");
+        let neighbor = fixture.root.path().join("unrelated");
+        std::fs::write(&neighbor, b"retain neighbor").unwrap();
+        let prepared = fixture
+            .select()
+            .stage(&|_, _| {
+                assert!(!subscriber.exists());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fixture.stages(), 1);
+        assert!(!subscriber.exists());
+        if quarantine {
+            fixture
+                .store
+                .add_quarantine(
+                    QuarantineScope::LogicalObject,
+                    &digest_key(&output.object),
+                    "after staging before installation",
+                )
+                .unwrap();
+            let failure = prepared.install(&mut fixture.store).unwrap_err();
+            assert!(failure.installed.is_empty());
+            assert!(matches!(
+                failure.error,
+                MaterializeError::QuarantinedObject { .. }
+            ));
+        } else {
+            drop(prepared);
+        }
+        assert!(!subscriber.exists());
+        assert_eq!(fixture.stages(), 0);
+        assert_eq!(std::fs::read(&neighbor).unwrap(), b"retain neighbor");
+    }
+}
+
+#[test]
+fn authorized_installation_creates_missing_parents_only_after_private_staging() {
+    let mut fixture = Fixture::new();
+    let output = fixture.add("nested/a.rlib", OutputRole::Materializable, b"codegen");
+    let subscriber = fixture.root.path().join("subscriber");
+    let prepared = fixture.select().stage(&|_, _| Ok(())).unwrap();
+    assert!(!subscriber.exists());
+    assert_eq!(fixture.stages(), 1);
+    let receipt = prepared.install(&mut fixture.store).unwrap();
+    assert_eq!(receipt.installed.len(), 1);
+    assert_eq!(receipt.installed[0].destination, output.destination);
+    assert_eq!(std::fs::read(&output.destination).unwrap(), b"codegen");
+    assert_eq!(fixture.stages(), 0);
 }
 
 #[test]
@@ -358,7 +424,8 @@ fn final_rename_failure_reports_the_exact_already_installed_prefix() {
     let head = fixture.add("a.rmeta", OutputRole::ProvisionalMetadata, b"metadata");
     let tail = fixture.add("a.rlib", OutputRole::Materializable, b"codegen");
     let prepared = fixture.select().stage(&|_, _| Ok(())).unwrap();
-    std::fs::create_dir(&tail.destination).unwrap();
+    // Inject a real rename collision; staging no longer creates public parents.
+    std::fs::create_dir_all(&tail.destination).unwrap();
     let failure = prepared.install(&mut fixture.store).unwrap_err();
     assert_eq!(failure.installed.len(), 1);
     assert_eq!(failure.installed[0].destination, head.destination);

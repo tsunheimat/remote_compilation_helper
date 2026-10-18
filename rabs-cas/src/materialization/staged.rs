@@ -50,9 +50,10 @@ impl Identity {
     }
 }
 
-/// One unexposed sibling directory. Only its exact owned file and directory
-/// generations can be cleaned; a replacement is retained, never recursively
-/// removed. A same-user hostile writer is not isolated by this ownership check.
+/// One unexposed directory in an existing destination ancestor. Only its exact
+/// owned file and directory generations can be cleaned; a replacement is retained,
+/// never recursively removed. A same-user hostile writer is not isolated by this
+/// ownership check.
 #[derive(Debug)]
 struct PrivateStage {
     directory: PathBuf,
@@ -64,7 +65,29 @@ struct PrivateStage {
 
 impl PrivateStage {
     fn create(parent: &Path) -> Result<Self, MaterializeError> {
-        std::fs::create_dir_all(parent).map_err(io_err("create-destination-dir"))?;
+        // Staging is not installation authority. In particular, an exhausted
+        // replay budget discovered after the lock handoff must leave an absent
+        // subscriber tree absent. Use its nearest existing ancestor so staging
+        // stays on the destination filesystem without creating public parents.
+        let mut parent = std::env::current_dir()
+            .map_err(io_err("stage-working-directory"))?
+            .join(parent);
+        loop {
+            match std::fs::metadata(&parent) {
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => {
+                    return Err(MaterializeError::UnsafeDestination {
+                        path: parent.to_string_lossy().into_owned(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if !parent.pop() {
+                        return Err(io_err("find-stage-parent")(error));
+                    }
+                }
+                Err(error) => return Err(io_err("find-stage-parent")(error)),
+            }
+        }
         for _ in 0..8 {
             let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
             let directory = parent.join(format!(".rabs-stage-{}-{sequence}", std::process::id()));
@@ -417,6 +440,14 @@ impl PreparedActionOutputs {
             }
             let began = Instant::now();
             if let Err(error) = prepared.stage.verify().and_then(|()| {
+                // Only the final, authorized installation may create the
+                // subscriber namespace. Failed renames retain the exact prefix.
+                let parent = prepared.output.destination.parent().ok_or_else(|| {
+                    MaterializeError::UnsafeDestination {
+                        path: prepared.output.destination.to_string_lossy().into_owned(),
+                    }
+                })?;
+                std::fs::create_dir_all(parent).map_err(io_err("create-destination-dir"))?;
                 std::fs::rename(&prepared.stage.path, &prepared.output.destination)
                     .map_err(io_err("rename-into-place"))
             }) {
