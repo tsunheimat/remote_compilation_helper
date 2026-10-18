@@ -743,7 +743,10 @@ mod tests {
             install_prepared(&mut *cas.store().lock().unwrap(), &plan, prepared),
             Err(ServeError::Preparation { .. })
         ));
-        assert_eq!(std::fs::read(root.join("head.rmeta")).unwrap(), b"old metadata");
+        assert_eq!(
+            std::fs::read(root.join("head.rmeta")).unwrap(),
+            b"old metadata"
+        );
         assert_eq!(
             std::fs::read(outside.join("tail.rlib")).unwrap(),
             b"unrelated library"

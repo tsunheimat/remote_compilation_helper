@@ -2176,7 +2176,7 @@ impl CoordLive {
         // Preview and install must consult the same durable replay budget.
         // Otherwise preview advertises a hit whose installation can only fail,
         // instead of directing the caller to a fresh compiler comparison. This
-        // is a read-only precheck, not a permit reservation: final installation
+        // is a non-spending precheck, not a permit reservation: final installation
         // rechecks and spends under the metadata lock after private staging.
         if sampling.is_some()
             && live_replay_permit(&mut *store, action_key, &manifest_key)
@@ -2811,7 +2811,8 @@ mod tests {
             };
             install_admission_world_with_ids(&mut *cas.store().lock().unwrap(), &authority, ids);
             let mut comparison = offer.clone();
-            comparison.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
+            comparison.authority.action_generation.generation_id =
+                ActionGenerationId(ids.generation);
             comparison.authority.attempt_id = AttemptId(ids.attempt);
             comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
             assert_eq!(
