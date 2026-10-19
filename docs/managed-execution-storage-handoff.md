@@ -529,6 +529,58 @@ These working-tree results do not qualify a later commit automatically. Keep PR
 RABS release gates and all six shipping platforms. Main and the original
 checkout's unrelated edits remain untouched.
 
+### Diagnostic rendering and publication-timer qualification after `63f591cb`
+
+The full remote RCH unit run exposed a reproducible presentation-test defect:
+the default runner socket path wraps across two graphical diagnostic lines.
+The underlying error still contains the complete path. The regression now
+checks the exact unwrapped diagnostic for both the default and an explicitly
+long quoted path, then checks the rendered code, cause and all recovery commands.
+Production formatting and socket selection are unchanged.
+
+A controlled default-concurrency run (96 visible/affined CPUs) also isolated a
+publication-test false attribution: its timer fired after 26.818 ms, but the
+one-second timeout later cancelled durable publication (1.103 s overall). The
+revised test polls both actual publishers against an independently held output
+lock and retains the SAME one-second responsiveness limit and two-second owner
+watchdog. It rejects any publisher completing before release, verifies untouched
+outputs at the timer, then finishes both original publication futures and checks
+all exact bytes, complete journals and removed stages. Slow subsequent fsyncs
+are not misreported as a blocked lock-wait reactor. The production publisher,
+lock budget and cancellation custody are unchanged.
+
+Negative control: temporarily restoring a blocking `File::lock` before the real
+lock loop made this revised test fail with `runtime timer stalled: 2.043 s`.
+The mutation was removed, and the restored file's SHA-256 exactly matched the
+previously passing source. No intentionally broken implementation is committed.
+The local-build-alarm ordering test only gains explicit state-error diagnostics;
+its deadline, failure assertions and scan/transition policy remain unchanged.
+
+Pinned remote validation after restoration passed formatting, workspace/all-target
+`cargo check --locked`, complete workspace/all-target/all-feature Clippy with
+`--keep-going -- -D warnings`, and all 3,736 RCH unit tests (zero failed, one
+pre-existing ignored). The full unit target also passed before the mutation;
+all 29 diagnostic tests and 65 SSH/source-ownership tests passed independently.
+No CI parallelism, workflow, test-selection or production setting was altered.
+Evidence is under `target/remote-pinned-validation/`:
+`resume-phase-observation-tu3133xe`, `resume-causal-publication-cw6sJu61`,
+`publication-blocking-negative-k6gma2w2.log`, and
+`resume-final-validation-7z68ie4n`.
+
+The auxiliary UBS scan returned exit 1 on eight critical-labelled findings in
+unchanged code; the baseline scan of the same three files returned those exact
+eight findings too (`resume-static-baseline-5voyf58x`). Context review identifies
+seven comparisons of public exit codes, counts or fixture state strings, not
+secret authentication values, and one execution of a fixed, freshly compiled
+Go fixture beneath its owned temporary directory. No critical finding was
+introduced, no comparison was obscured, and no scanner rule was suppressed.
+This is a recorded false-positive review, NOT a clean scanner exit claim.
+
+The running hosted native/E2E/release validation remains tied to its published
+revision; these local results cannot qualify a later commit by themselves.
+Keep the integration draft until the final published revision's required checks
+complete. Main, the original checkout and deployed workers remain unchanged.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

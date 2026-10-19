@@ -5177,23 +5177,43 @@ mod tests {
         }
         let lock = lock_output_root(&local).await.unwrap();
         let (release, holder) = hold_publication_lock(lock);
-        let publications = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(first.publish("project"), second.publish("project"), async {
-                // A heartbeat/recovery timer must still run while both jobs
-                // wait. Neither may touch the shared output before ownership.
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                assert_eq!(
-                    std::fs::read(local.join("build/app")).unwrap(),
-                    b"before both jobs"
-                );
-                release.send(()).unwrap();
+        let (first_result, second_result) = {
+            let first_publication = first.publish("project");
+            let second_publication = second.publish("project");
+            tokio::pin!(first_publication, second_publication);
+            let started = std::time::Instant::now();
+            let responsive = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    // Poll BOTH actual publishers against the held root. A
+                    // skipped lock or blocking wait must not become a pass
+                    // merely because the watchdog eventually releases it.
+                    biased;
+                    result = &mut first_publication => Err(format!("first publisher completed before release: {result:?}")),
+                    result = &mut second_publication => Err(format!("second publisher completed before release: {result:?}")),
+                    () = tokio::time::sleep(Duration::from_millis(25)) => Ok(started.elapsed()),
+                }
             })
-        })
-        .await;
-        drop(release);
-        holder.join().unwrap();
-        let (first_result, second_result, ()) = publications
-            .expect("contended publication prevented the timer from releasing its owner");
+            .await;
+            let unchanged = std::fs::read(local.join("build/app")).unwrap();
+            // Join the independent owner even when the regression fires.
+            let released = release.send(());
+            drop(release);
+            holder.join().unwrap();
+            let elapsed = responsive
+                .expect("contended publication prevented the runtime timer")
+                .expect("a publisher bypassed output-root ownership");
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "runtime timer stalled: {elapsed:?}"
+            );
+            released.unwrap();
+            assert_eq!(unchanged, b"before both jobs");
+            // The one-second contract is reactor responsiveness while waiting,
+            // not the latency of subsequent fsyncs on a shared filesystem.
+            // Retain the original futures: both real publications must finish
+            // successfully with their complete journals and exact bytes.
+            tokio::join!(first_publication, second_publication)
+        };
         first_result.unwrap();
         second_result.unwrap();
         assert!(first.recipe.phases[0].complete);

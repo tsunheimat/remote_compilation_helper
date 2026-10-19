@@ -536,10 +536,13 @@ mod tests {
         let first = first.join().unwrap();
         let second = second.join().unwrap();
         assert!(!scanned_before_unlock);
+        assert!(first.state_error.is_none(), "first observation: {first:?}");
+        assert!(
+            second.state_error.is_none(),
+            "second observation: {second:?}"
+        );
         assert_eq!(first.transition, Some(AlarmTransition::Started));
         assert_eq!(second.transition, Some(AlarmTransition::Recovered));
-        assert!(first.state_error.is_none());
-        assert!(second.state_error.is_none());
     }
 
     #[test]
