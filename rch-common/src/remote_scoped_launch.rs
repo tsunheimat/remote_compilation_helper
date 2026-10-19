@@ -51,6 +51,27 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // -n parses the outer heredoc, not the functions loaded by eval. That
+        // missed a Bash 3.2 parse failure in rch_control_capture and made every
+        // cleanup consumer quietly abandon its orphan-record sweep on macOS.
+        // Load the actual bytes both directly and inside the cleanup subshell;
+        // definitions must preserve the caller's opaque positional arguments.
+        let body = format!(
+            "set -- 'first quoted value' 'second ) value'\n{REMOTE_PROCESS_IDENTITY_SCRIPT}\n\
+             [ \"$#\" -eq 2 ] && [ \"$1\" = 'first quoted value' ] && [ \"$2\" = 'second ) value' ] || exit 90\n\
+             rch_valid_pgid 42 && ! rch_valid_pgid 1 || exit 91\n"
+        );
+        for script in [body.clone(), format!("(\n{body}\n)")] {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script, "rch-protocol-validation"])
+                .output()
+                .expect("load the actual process-control protocol");
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                output.stdout.is_empty() && output.stderr.is_empty(),
+                "{output:?}"
+            );
+        }
     }
 
     #[test]

@@ -685,11 +685,13 @@ rch_control_capture() {
 
     rm -f -- "$rch_control_pipe"
 
+    # Balanced case patterns keep Bash 3.2's substitution parser from treating
+    # a pattern's closing parenthesis as the end of this command substitution.
     rch_control_metadata=$(
         case "$(uname -s)" in
-            Darwin) LC_ALL=C stat -f '%Lp:%l:%z' "$rch_control_file";;
-            Linux) LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file";;
-            *) exit 125;;
+            (Darwin) LC_ALL=C stat -f '%Lp:%l:%z' "$rch_control_file";;
+            (Linux) LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file";;
+            (*) exit 125;;
         esac
     ) || {
         rm -f -- "$rch_control_file"

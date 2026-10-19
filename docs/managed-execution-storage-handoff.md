@@ -373,6 +373,65 @@ release job had reached the real layout tests at this checkpoint. Final revision
 CI must still qualify the FIFO portability correction and all remaining gates.
 Main, original-checkout edits and deployed workers remain unchanged; PR is draft.
 
+### Native shell loading, UUID authority and heartbeat observation after `63425131`
+
+Baseline `634251316f056f347ac9b206ba02be27b45df6c9` completed the entire RABS
+release workflow `39216702473`, including actual Cargo reuse and final overhead
+checks. CI `39216702477` passed pinned formatting, fatal-warning Clippy, security,
+integrity and the complete Linux E2E job. The four native workspace rows and
+macOS shell E2E still failed, so packaging was skipped and the PR was not ready.
+
+The next batch fixes an actual Bash 3.2 loading defect in both shared control
+scripts: unbalanced case patterns inside command substitutions break when the
+literal protocol is evaluated, although `sh -n` on the outer heredoc passes.
+Balanced POSIX case patterns preserve the existing stat commands, error status,
+receipt checks and permissions. The existing syntax regression now actually
+loads the compiled protocol directly and in a cleanup subshell, retaining opaque
+caller arguments. Cleanup now reports a failed protocol bootstrap as an error
+instead of swallowing stderr and presenting zero removals as a successful scan.
+Its new negative case leaves the original aged process record untouched.
+
+The macOS source-sweep fixture incorrectly assumed missing Linux procfs meant
+ownership was unavailable, despite the existing native uuidgen fallback. It now
+exercises failed, malformed and valid native UUID generation with exact directory,
+claim and byte checks. Production also checks the generator's exit status before
+normalization: a failed uuidgen that emits a plausible UUID must never acquire
+authority just because the final tr process succeeds. A separate Unix regression
+exercises that exact failure and success boundary without deleting its sentinel.
+
+The preflight heartbeat test accounts for its independently scheduled executor:
+Drop cannot retract a complete immediate heartbeat already in the socket. The
+explicit preflight flush is still required before rejection; at most two startup
+messages may arrive across two subsequent production intervals. A leaked periodic
+sender exceeds that bound. The positive control compares two post-transition
+periodic snapshots and still forbids invented progress. Production heartbeat
+periods and cancellation behavior are unchanged.
+
+Verification on `u25-agent-test`, pinned nightly-2026-08-31:
+
+- `cargo fmt --all -- --check` and full-workspace/all-target/all-feature Clippy
+  with `--locked --keep-going -- -D warnings` passed.
+- The new UUID-status test, three protocol/quoting tests, preflight-heartbeat
+  regression and all 14 cleanup-command tests passed. Evidence is retained under
+  `target/remote-pinned-validation/{uuid-fallback-current,parser-regression-current,
+  heartbeat-current,cleanup-commands-current,current-full-clippy}.log`.
+- In one before/after invocation, 12 parser comparisons covered dash, modern
+  Bash and a private Linux build of GNU Bash 3.2, with direct and subshell loading.
+  Both old-Bash baseline cases failed with exit 125; the patched cases and both
+  baseline/current modern-shell cases passed with unchanged arguments. This is
+  actual shell-parser reproduction, not native macOS execution or fleet proof.
+  Evidence: `target/remote-pinned-validation/bash32-parser-comparison.log`.
+- The unchanged capture suite passed once and in eight fixed CPU-constrained,
+  traced repetitions of all eight tests. That non-reproduction does not resolve
+  the earlier CI exit-1-versus-122 failure. No assertion or deadline was relaxed.
+
+The ARM cold-Cargo refusal remains unexplained; the fixture now preserves the
+actual daemon refusal detail when it fails instead of destroying the log after
+printing only a tally. The macOS full-hook 10 ms performance gate also remains
+unchanged and unresolved. The final native CI revision must qualify these changes;
+no former run is relabeled as a new-revision pass. All 12 workflow owners remain,
+and main, original-checkout work and deployed workers are untouched.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

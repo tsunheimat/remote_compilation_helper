@@ -562,9 +562,15 @@ __gc_source_begin() {
     if [ "$__gc_retention_status" -ne 1 ]; then
         __gc_source_end; return 2;
     fi;
-    __gc_token=fc-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr 'A-F' 'a-f') || { __gc_source_end; return 2; };
+    # Validate the generator's own status BEFORE normalization. A pipeline
+    # ending in tr can hide uuidgen failure, even if it emitted plausible bytes.
+    if __gc_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null); then :;
+    elif __gc_uuid=$(uuidgen); then :;
+    else __gc_source_end; return 2; fi;
+    __gc_token=fc-$(printf '%s' "$__gc_uuid" | tr 'A-F' 'a-f') || { __gc_source_end; return 2; };
     case "$__gc_token" in *[!a-f0-9-]*) __gc_source_end; return 2;; esac;
-    [ "${#__gc_token}" -eq 39 ] || { __gc_source_end; return 2; };
+    case "$__gc_token" in fc-????????-????-????-????-????????????) ;;
+        *) __gc_source_end; return 2;; esac;
     for __gc_previous in "$__gc_source_registry/$__gc_token."* \
         "$__gc_source_registry/released/$__gc_token."* "$__gc_source_registry/cancelled/$__gc_token."* \
         "$__gc_source_registry/quarantine/$__gc_token."*; do
@@ -3290,9 +3296,71 @@ mod tests {
         assert_eq!(removed, 2, "exactly the two idle dirs; stdout: {stdout}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn source_gc_uuid_fallback_checks_generator_status_before_creating_authority() {
+        for (body, expected) in [
+            ("return 1", 2),
+            (
+                "printf '%s\\n' 12345678-1234-1234-1234-123456789ABC; return 1",
+                2,
+            ),
+            ("printf '%s\\n' 12345678123412341234123456789abcdef012", 2),
+            ("printf '%s\\n' 12345678-1234-1234-1234-123456789ABC", 0),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let candidate = root.join("candidate");
+            std::fs::create_dir(&candidate).unwrap();
+            std::fs::write(candidate.join("sentinel"), b"not a deletion test").unwrap();
+            let registry = root.join("claims");
+            let guard = source_claim_gc_guard_fragment_with_registry(registry.to_str().unwrap());
+            let script = format!(
+                "cat() {{ if [ \"$#\" -eq 1 ] && [ \"$1\" = /proc/sys/kernel/random/uuid ]; then return 1; fi; command cat \"$@\"; }}\n\
+                 uuidgen() {{ {body}; }}\n{guard}\n\
+                 if __gc_source_begin \"$1\"; then status=0; else status=$?; fi;\n\
+                 if [ \"$status\" -eq 0 ]; then\n\
+                     rch_claim_record_valid \"$__gc_reservation\" || exit 90;\n\
+                     [ \"$(cat \"$__gc_reservation\")\" = \"$1\" ] || exit 91;\n\
+                     __gc_source_end || exit 92;\n\
+                 fi;\nexit \"$status\""
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "uuid-fallback"])
+                .arg(&candidate)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{body}: {output:?}");
+            assert_eq!(
+                std::fs::read(candidate.join("sentinel")).unwrap(),
+                b"not a deletion test"
+            );
+            let names: Vec<_> = std::fs::read_dir(&registry)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(
+                names
+                    .iter()
+                    .all(|name| name == "metadata.lock" || name == "released"),
+                "{names:?}"
+            );
+            if expected == 0 {
+                assert_eq!(
+                    std::fs::read_dir(registry.join("released"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(!registry.join("released").exists());
+            }
+        }
+    }
+
     #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
-    fn worker_sweep_refuses_unavailable_source_ownership_on_non_linux_unix() {
+    fn worker_sweep_requires_a_successful_native_uuid_fallback() {
         use std::process::Command;
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -3328,35 +3396,65 @@ mod tests {
             None,
             root.join("claims-v1").to_str().unwrap(),
         );
+        // Darwin intentionally falls back to native uuidgen. Missing procfs
+        // alone is not a refusal. Exercise actual failed/invalid generators,
+        // including plausible output followed by failure, before the live tool.
+        for generator in [
+            "return 1",
+            "printf '%s\\n' 12345678-1234-1234-1234-123456789ABC; return 1",
+            "printf '%s\\n' malformed-token",
+        ] {
+            let out = Command::new("sh")
+                .args(["-c", &format!("uuidgen() {{ {generator}; }}\n{cmd}")])
+                .env("TMPDIR", &tmpbase)
+                .output()
+                .expect("actual worker sweep should execute");
+            assert!(out.status.success(), "{out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(parse_worker_reap_metrics(&stdout), Some((0, 0)), "{out:?}");
+            assert!(parse_reap_events(&stdout).is_empty(), "{out:?}");
+            let skips = parse_gc_skips(&stdout);
+            assert!(
+                skips.iter().any(|skip| skip.trigger == "ttl"
+                    && skip.reason == "source-ownership"
+                    && std::path::Path::new(&skip.path) == stale_job),
+                "unavailable source ownership must be reported: {out:?}"
+            );
+            assert!(
+                skips.iter().any(|skip| skip.trigger == "pooled-ttl"
+                    && ["gate", "source-ownership"].contains(&skip.reason.as_str())
+                    && std::path::Path::new(&skip.path) == stale_pool),
+                "stale pooled ownership refusal must be reported: {out:?}"
+            );
+            for path in [&stale_job, &active_job, &stale_pool, &active_pool] {
+                assert!(path.is_dir(), "owned directory was removed: {path:?}");
+                assert_eq!(
+                    std::fs::read(path.join("artifact.o")).unwrap(),
+                    b"owned artifact"
+                );
+            }
+        }
         let out = Command::new("sh")
             .args(["-c", &cmd])
             .env("TMPDIR", &tmpbase)
             .output()
-            .expect("actual worker sweep should execute");
+            .expect("native uuidgen-backed sweep");
         assert!(out.status.success(), "{out:?}");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(parse_worker_reap_metrics(&stdout), Some((0, 0)), "{out:?}");
-        assert!(parse_reap_events(&stdout).is_empty(), "{out:?}");
-        let skips = parse_gc_skips(&stdout);
-        assert!(
-            skips.iter().any(|skip| skip.trigger == "ttl"
-                && skip.reason == "source-ownership"
-                && std::path::Path::new(&skip.path) == stale_job),
-            "unavailable source ownership must be reported: {out:?}"
-        );
-        assert!(
-            skips.iter().any(|skip| skip.trigger == "pooled-ttl"
-                && ["gate", "source-ownership"].contains(&skip.reason.as_str())
-                && std::path::Path::new(&skip.path) == stale_pool),
-            "stale pooled ownership refusal must be reported: {out:?}"
-        );
-        for path in [&stale_job, &active_job, &stale_pool, &active_pool] {
-            assert!(path.is_dir(), "owned directory was removed: {path:?}");
+        let metrics = parse_worker_reap_metrics(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!(metrics.0, 2, "{out:?}");
+        assert!(!stale_job.exists() && !stale_pool.exists());
+        for path in [&active_job, &active_pool] {
             assert_eq!(
                 std::fs::read(path.join("artifact.o")).unwrap(),
                 b"owned artifact"
             );
         }
+        assert_eq!(
+            std::fs::read_dir(root.join("claims-v1/released"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 
     #[cfg(target_os = "linux")]

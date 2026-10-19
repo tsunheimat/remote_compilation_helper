@@ -20,7 +20,7 @@ use super::*;
 #[path = "heartbeat_executor.rs"]
 mod heartbeat_executor;
 
-const BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub(super) struct BuildHeartbeatSnapshot {

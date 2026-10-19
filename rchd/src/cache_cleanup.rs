@@ -275,7 +275,7 @@ fn build_cleanup_command_with_source_guard(
          run_root={run_root}; \
          if [ -d \"$run_root\" ]; then \
            tally=$(mktemp /tmp/rch-cleanup.XXXXXX); \
-           (set -- \"$run_root\"/*/*.pgid\n{identity}\n killed=0; \
+           if (set -- \"$run_root\"/*/*.pgid\n{identity}\n killed=0; \
              for pgf in \"$@\"; do \
                [ -f \"$pgf\" ] && [ ! -L \"$pgf\" ] || continue; \
                [ -n \"$(find \"$pgf\" -mmin +\"$orphan_after_minutes\" -print 2>/dev/null)\" ] || continue; \
@@ -293,7 +293,10 @@ fn build_cleanup_command_with_source_guard(
                  killed) killed=$((killed + 1)) ;; \
                esac; \
              done; \
-             echo \"$killed\") > \"$tally\" 2>/dev/null; \
+             echo \"$killed\") > \"$tally\"; then :; else \
+             remove_errors=$((remove_errors + 1)); \
+             printf 'RCH_CLEANUP_ORPHAN_SWEEP_FAILED root=%s\\n' \"$run_root\" >&2; \
+           fi; \
            orphans_killed=$(cat \"$tally\" 2>/dev/null); rm -f \"$tally\"; \
            case \"$orphans_killed\" in ''|*[!0-9]*) orphans_killed=0 ;; esac; \
            find \"$run_root\" -mindepth 1 -maxdepth 1 -type d -empty -mmin +{empty_run_dir_minutes} -exec rmdir -- {{}} + 2>/dev/null || :; \
@@ -1948,6 +1951,36 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             "printf '%s %s 1 S 1\\n' \"$RCH_CLEANUP_TEST_OBSERVER\" \"$RCH_CLEANUP_TEST_OBSERVER\"",
             false,
         );
+    }
+
+    #[test]
+    fn cleanup_command_reports_bootstrap_failure_without_touching_process_records() {
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().unwrap();
+        let runs = tempfile::tempdir().unwrap();
+        let project = runs.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let record = project.join("41.pgid");
+        std::fs::write(&record, b"garbage\n").unwrap();
+        age_record(&record);
+        let tools = tempfile::tempdir().unwrap();
+        // The compiled protocol is loaded from a no-argument heredoc read.
+        // Fail only that read; ordinary record/tally readers still use cat.
+        write_shim(
+            tools.path(),
+            "cat",
+            "#!/bin/sh\n[ \"$#\" -gt 0 ] || exit 73\nexec /bin/cat \"$@\"\n",
+        );
+        let (stdout, stderr, code) =
+            run_sweep_with_runs(base.path(), runs.path(), &[tools.path().to_path_buf()]);
+        assert_eq!(code, Some(1), "{stdout}{stderr}");
+        assert!(stdout.contains("orphans_killed=0"), "{stdout}");
+        assert!(stdout.contains("remove_errors=1"), "{stdout}");
+        assert!(
+            stderr.contains("RCH_CLEANUP_ORPHAN_SWEEP_FAILED"),
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), b"garbage\n");
     }
 
     #[test]

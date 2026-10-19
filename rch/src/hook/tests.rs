@@ -8089,26 +8089,47 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
     ))
     .await;
     assert!(result.unwrap_err().to_string().contains("require the Unix"));
-    let heartbeat = received_rx.try_recv().expect("heartbeat before rejection");
-    assert_eq!(heartbeat.build_id, 71);
-    assert_eq!(heartbeat.worker_id, worker.id);
-    assert_eq!(heartbeat.hook_pid, Some(std::process::id()));
-    assert_eq!(
-        heartbeat.local_wrapper_id.as_deref(),
-        Some("preflight-wrapper")
-    );
-    assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncUp);
-    assert_eq!(heartbeat.detail.as_deref(), Some("source_validation"));
-    assert!(heartbeat.remote_pgid_file.is_none());
-    // An immediate interval tick can race the explicit flush. Drain it before
-    // waiting past the production interval: an early error must stop the loop.
-    tokio::task::yield_now().await;
-    while received_rx.try_recv().is_ok() {}
+    let mut observed = Vec::new();
+    while let Ok(heartbeat) = received_rx.try_recv() {
+        observed.push(heartbeat);
+    }
     assert!(
-        tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
-            .await
-            .is_err()
+        observed.iter().any(|heartbeat| {
+            heartbeat.build_id == 71 && heartbeat.detail.as_deref() == Some("source_validation")
+        }),
+        "the explicit source-validation flush must be received before rejection"
     );
+    // Abort runs on the heartbeat's independent executor, not this test's
+    // runtime. It cannot retract a complete request already in the socket.
+    // There are at most TWO startup sends: one immediate tick and the flush.
+    // Observe TWO complete subsequent intervals, so a leaked periodic sender
+    // necessarily exceeds that bound even if its immediate tick lost the race.
+    let stopped_deadline = tokio::time::Instant::now()
+        + progress_reporting::BUILD_HEARTBEAT_INTERVAL * 2
+        + Duration::from_secs(1);
+    while let Ok(heartbeat) = tokio::time::timeout_at(stopped_deadline, received_rx.recv()).await {
+        observed.push(heartbeat.expect("heartbeat receiver stays alive"));
+        assert!(
+            observed.len() <= 2,
+            "a rejected build kept sending: {observed:?}"
+        );
+    }
+    assert!(!observed.is_empty() && observed.len() <= 2, "{observed:?}");
+    for heartbeat in observed {
+        assert_eq!(heartbeat.build_id, 71);
+        assert_eq!(heartbeat.worker_id, worker.id);
+        assert_eq!(heartbeat.hook_pid, Some(std::process::id()));
+        assert_eq!(
+            heartbeat.local_wrapper_id.as_deref(),
+            Some("preflight-wrapper")
+        );
+        assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncUp);
+        assert!(heartbeat.remote_pgid_file.is_none());
+        assert!(matches!(heartbeat.progress_counter, Some(0 | 1)));
+        assert!(
+            heartbeat.detail.is_none() || heartbeat.detail.as_deref() == Some("source_validation")
+        );
+    }
 
     // While preflight is still working, periodic liveness must not invent
     // forward progress. Exercise the same guard over a real daemon socket.
@@ -8133,7 +8154,15 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         .unwrap();
     assert_eq!(first.build_id, 72);
     assert_eq!(next.build_id, first.build_id);
-    assert_eq!(next.progress_counter, first.progress_counter);
+    // The first immediate tick can precede update_phase on the independent
+    // executor. Only compare periodic snapshots after that transition.
+    let periodic = tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
+        .await
+        .expect("second periodic preflight heartbeat")
+        .unwrap();
+    assert_eq!(periodic.build_id, 72);
+    assert_eq!(periodic.progress_counter, next.progress_counter);
+    assert_eq!(periodic.detail.as_deref(), Some("source_validation"));
     assert_eq!(next.detail.as_deref(), Some("source_validation"));
     assert!(next.remote_pgid_file.is_none());
     drop(heartbeat_loop);

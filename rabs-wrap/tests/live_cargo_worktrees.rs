@@ -134,6 +134,17 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            // Preserve the real typed refusal before the fixture directory
+            // disappears. A tally such as toolchain-refused cannot distinguish
+            // a changed compiler generation from a failed or timed-out probe.
+            use std::io::Write;
+            let log = std::fs::read_to_string(&self.log);
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "real Cargo daemon evidence: {log:?}"
+            );
+        }
     }
 }
 
