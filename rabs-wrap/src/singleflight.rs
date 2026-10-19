@@ -270,6 +270,16 @@ fn reconnect_waiter(
     Ok(reader)
 }
 
+// Unit fixtures must retain the actual I/O refusal rather than printing only
+// `Err(())`. No request/environment bytes are logged, and the release wrapper's
+// public breaker result and quiet fallback behavior remain unchanged.
+fn wait_io_failure(stage: &str, error: io::Error) {
+    #[cfg(test)]
+    eprintln!("RABS wait I/O refusal stage={stage}: {error:?}");
+    #[cfg(not(test))]
+    let _ = (stage, error);
+}
+
 fn read_with_policy(
     mut reader: BufReader<ConsultStream>,
     frame: &str,
@@ -292,7 +302,7 @@ fn read_with_policy(
     loop {
         let response_deadline = reader.get_ref().deadline;
         let line = read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, response_deadline, owned)
-            .map_err(|_| ())?;
+            .map_err(|error| wait_io_failure("response", error))?;
         let reply = reply_json::parse(&line).ok_or(())?;
         if reply.get("kind").and_then(Value::as_str) != Some("rustc-decision") {
             return if consult_succeeded(&line) {
@@ -383,15 +393,17 @@ fn read_with_policy(
             // edge releases any connection-scoped flight accounting on drop.
             drop(reader);
             reader = reconnect_waiter(socket, connect_timeout, decision_budget, deadline, owned)
-                .map_err(|_| ())?;
+                .map_err(|error| wait_io_failure("rollover handshake", error))?;
             requests_on_connection = 0;
         }
         let request_deadline = Instant::now()
             .checked_add(decision_budget)
             .ok_or(())?
             .min(deadline);
-        write_owned(&mut reader, frame.as_bytes(), request_deadline, owned).map_err(|_| ())?;
-        write_owned(&mut reader, b"\n", request_deadline, owned).map_err(|_| ())?;
+        write_owned(&mut reader, frame.as_bytes(), request_deadline, owned)
+            .map_err(|error| wait_io_failure("request body", error))?;
+        write_owned(&mut reader, b"\n", request_deadline, owned)
+            .map_err(|error| wait_io_failure("request delimiter", error))?;
         requests_on_connection += 1;
         retries += 1;
     }

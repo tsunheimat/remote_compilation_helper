@@ -595,22 +595,32 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
         .unwrap();
     let socket = base.path().join("edge.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    let replies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let daemon_replies = Arc::clone(&replies);
+    let daemon_stage = Arc::clone(&stage);
+    let started = Instant::now();
     let daemon = std::thread::spawn(move || {
         let (first, _) = listener.accept().unwrap();
+        daemon_stage.store(1, Ordering::SeqCst);
         first
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let mut first = BufReader::new(first);
         first.get_mut().write_all(PREPARING.as_bytes()).unwrap();
+        daemon_replies.store(1, Ordering::SeqCst);
         for _ in 0..59 {
             let mut request = String::new();
             first.read_line(&mut request).unwrap();
             assert_eq!(request, "original bytes\n");
             first.get_mut().write_all(PREPARING.as_bytes()).unwrap();
+            daemon_replies.fetch_add(1, Ordering::SeqCst);
         }
+        daemon_stage.store(2, Ordering::SeqCst);
         // The first connection's 60 requests have all received their
         // replies before the follower may open a new connection.
         let (second, _) = listener.accept().unwrap();
+        daemon_stage.store(3, Ordering::SeqCst);
         second
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -626,6 +636,7 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
         second.read_line(&mut request).unwrap();
         assert_eq!(request, "original bytes\n");
         second.get_mut().write_all(EXECUTE.as_bytes()).unwrap();
+        daemon_stage.store(4, Ordering::SeqCst);
     });
     let client = UnixStream::connect(&socket).unwrap();
     let mut settings = policy(70);
@@ -640,8 +651,23 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
         Some((socket.to_str().unwrap(), Duration::from_secs(1))),
         &|| true,
     );
-    assert!(matches!(result, Ok(Live::Execute { .. })));
+    let outcome = match &result {
+        Ok(Live::Execute { .. }) => "execute",
+        Ok(Live::PassThrough) => "pass-through",
+        Ok(Live::Served(_)) => "served",
+        Ok(Live::FailClosed(reason)) => reason.as_str(),
+        Err(()) => "I/O or protocol refusal (see typed I/O evidence above)",
+    };
+    assert!(
+        matches!(result, Ok(Live::Execute { .. })),
+        "outcome={outcome}, elapsed={:?}, preparation_replies={}, daemon_stage={}",
+        started.elapsed(),
+        replies.load(Ordering::SeqCst),
+        stage.load(Ordering::SeqCst),
+    );
     daemon.join().unwrap();
+    assert_eq!(replies.load(Ordering::SeqCst), 60);
+    assert_eq!(stage.load(Ordering::SeqCst), 4);
     std::fs::remove_file(socket).unwrap();
     base.close().unwrap();
 }

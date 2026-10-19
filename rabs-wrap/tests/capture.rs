@@ -358,18 +358,30 @@ fn exited_compiler_cannot_leave_wrapper_joining_a_stalled_output_consumer() {
         producer.set_nonblocking(false).unwrap();
         let sink = Stdio::from(OwnedFd::from(producer));
         let mut command = fixture.command(5000);
-        command.stdout(Stdio::null()).stderr(Stdio::null());
+        // Keep the non-stalled stream rather than sending all failure evidence
+        // to /dev/null. This does not read or release the blocked consumer.
+        let diagnostic_path = fixture.root.path().join("unstalled-output");
+        let diagnostic = Stdio::from(std::fs::File::create(&diagnostic_path).unwrap());
         if stall_stderr {
-            command.stderr(sink);
+            command.stdout(diagnostic).stderr(sink);
         } else {
-            command.stdout(sink);
+            command.stdout(sink).stderr(diagnostic);
         }
         let output = Running(Some(command.spawn().unwrap())).output();
         // Only now release the blocked relay's consumer. Running::output's
         // outer deadline fails the old unbounded join implementation.
         drop(consumer);
         daemon.join().unwrap();
-        assert_eq!(output.status.code(), Some(122));
+        let diagnostic = std::fs::read(&diagnostic_path).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(122),
+            "stall_stderr={stall_stderr}, unstalled output={:?}, finished={:?}, runs={:?}",
+            String::from_utf8_lossy(&diagnostic),
+            std::fs::read(fixture.root.path().join("finished")),
+            std::fs::read(fixture.root.path().join("runs")),
+        );
+        assert_eq!(diagnostic, if stall_stderr { b"stdout" } else { b"stderr" });
         assert_eq!(
             std::fs::read(fixture.root.path().join("finished")).unwrap(),
             b"done"

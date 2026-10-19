@@ -432,6 +432,103 @@ unchanged and unresolved. The final native CI revision must qualify these change
 no former run is relabeled as a new-revision pass. All 12 workflow owners remain,
 and main, original-checkout work and deployed workers are untouched.
 
+### Direct process formation and complete SSH previews after `798cb378`
+
+Published baseline `798cb3781294f99dad0b65ae63c86c4021f127fb` completed
+CI `39235058108`: pinned fatal-warning Clippy, formatting, security, integrity,
+Linux x64 workspace tests, and both Linux and macOS E2E jobs passed. The macOS
+E2E result includes the unchanged full-hook timing gate. Both macOS native rows
+failed the UUID sweep fixture, ARM macOS additionally failed the cold-wait
+rollover fixture, and Linux ARM failed real vendored Cargo reuse. Shipping was
+therefore correctly skipped. RABS `39235058119` also failed its real-Cargo M4
+phase, despite passing the preceding release and lifecycle gates.
+
+The preserved Linux ARM and release daemon logs identify the same refusal:
+`process_group(0) not honored: live leader ... not found in any /proc pgrp`.
+Formation used a best-effort host scan that excludes zombie leaders and then
+assumed two nonterminal waitpid observations made a missing scan entry proof of
+failed setpgid. The new proof reads the directly owned, unreaped child's bounded
+stat record and checks PID, parent and process group, including terminal states.
+It preserves the initial full membership observation separately. Formation is
+not quiescence, unknown live identity still refuses, and the existing armed
+unadmitted-child guard still kills/reaps on failure or unwind. Regression coverage
+includes a real unreaped zombie, a real live child in the wrong group, malformed
+identities and the existing descendant, unwind and bounded-output cases. A native
+pthread fixture deterministically reproduces the exact old refusal predicate:
+the main thread is Z, another thread remains alive, the process-only scan is
+empty and two waitpid polls are nonterminal. The corrected production formation
+check accepts the same owned process; the test then kills and reaps it. The
+fixture also has its own natural alarm bound. All 18 process-group tests pass.
+
+The actual RCH -> daemon -> SSH qualification exposed a separate data-loss defect:
+`read_line(String)` silently ended the SSH preview reader on invalid UTF-8 and
+lost the later output. Both lanes now read bounded byte fragments before text
+rendering, retain valid split UTF-8 and delimiters, and report real I/O errors.
+A JoinSet owns the readers through cancellation and checks their terminal results;
+cutting off a post-completion output tail is unconfirmed transport, not success.
+The text-preview contract remains unchanged: workload text goes to stderr and
+stdout remains the protocol surface. Exact binary data is returned as artifacts,
+not misrepresented as a lossless Unicode preview. New tests cover both lanes,
+NUL/invalid bytes, unterminated tails, bounded long fragments, read failures and
+closed consumers.
+
+The UUID fixture now requires exit 1 and no successful metrics for failed or
+malformed UUID admission. A successful native sweep removes only the two stale
+targets and checks exact retired-claim contents, including the fresh job whose
+ordinary TTL activity check runs after ownership acquisition. This test now runs
+on every Unix host. Production admission/retirement policy is unchanged.
+
+The cold-wait rollover failure remains unproven locally: 35 singleflight tests
+pass, including exactly 60 preparation replies before reconnect. Its test now
+retains phase/reply counts, elapsed time and typed I/O refusal diagnostics, without
+changing timeouts, retries, protocol authority or release-wrapper logging.
+Capture's stalled-stream fixture likewise retains the non-stalled diagnostic
+instead of discarding it; its exit-122 and unread-consumer assertions are intact.
+
+Additional maintenance keeps the async CLI frame outside the pass-through entry
+and separates the SSH fixture's local inetd audit log from actual remote stderr.
+The same-invocation Linux development comparison was 5.55 ms versus 5.02 ms over
+50 samples per binary, with all 14 real-process behavior cases unchanged. This is
+not release/fleet performance evidence. All 54 real SSH/rsync policy cases and
+nine imported Rust receipt-policy tests passed; spoofed server notices on remote
+stderr still refuse, as do changed host keys and failed authentication.
+
+Pinned `nightly-2026-08-31` validation on `u25-agent-test` passed all four new SSH
+reader tests, all 18 process-group tests, all 35 singleflight tests, the complete
+10-test real-Cargo worktree target and full workspace/all-target/all-feature
+Clippy with `--locked --keep-going -- -D warnings`. Logs are under
+`target/remote-pinned-validation/merge-ready-*.log`. The aggregate driver initially
+failed only because its second SSH job correctly rejected missing native worker
+topology configuration; the real capability probe has independent
+`RCH_WKR_CANONICAL_ROOT`/`RCH_WKR_ALIAS_ROOT` settings, not the client's TOML.
+The fixture now configures these owned paths and verifies the real worker's
+healthy topology before starting its daemon; it does not disable preflight.
+
+The corrected actual SSH run `rt-20261019-131320-x7y42kzg` passed failure (23) and
+success (0) jobs, complete text previews, exact NUL/non-UTF-8 binary artifacts,
+opaque argv, managed persistent cache/environment, distinct source inodes and
+mount namespaces, and scratch removal. The daemon terminated cleanly. Evidence
+and binary/source identities are in the owned
+`managed-ssh-gcttlho6/verified-preview-b0tkg869` directory. No persistent worker
+service, source-host compiler, global SSH configuration or deployed binary was
+changed; this is isolated runner qualification, not fleet rollout.
+
+UBS was unavailable on both hosts. A private source checkout pinned to
+`3729ccf088dc4fbdcf45d9193dfb8a939a08ea06` runs static analysis on changed files;
+its Cargo phases are explicitly separate from the pinned checks above. Its five
+critical reports were present at the published baseline: three fixed test shell
+protocols, the intentionally caller-configured process executor API, and a native
+fixture resolving only literal gfind/find tool names. Each boundary is reviewed
+and documented with a single-rule source annotation, not a global rule disable.
+The default static scanner verdict is now exit 0 with zero unsuppressed critical
+findings; other findings remain visible. Required compiler warnings, audit rules,
+assertions, deadlines, platform selections and all 12 workflow owners are intact.
+
+These working-tree results do not qualify a later commit automatically. Keep PR
+#3 draft until its exact published revision passes native CI, both E2E jobs,
+RABS release gates and all six shipping platforms. Main and the original
+checkout's unrelated edits remain untouched.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

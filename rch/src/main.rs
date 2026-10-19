@@ -2062,6 +2062,14 @@ fn main() {
     if hook::try_fast_passthrough() {
         return;
     }
+    run_with_cli_runtime();
+}
+
+// Keep the large async CLI future out of main's entry stack frame. A source
+// early return alone still paid for that frame's stack probes before deciding
+// whether an ordinary pass-through command needed any runtime at all.
+#[inline(never)]
+fn run_with_cli_runtime() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

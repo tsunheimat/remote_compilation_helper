@@ -6389,50 +6389,26 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
-        enum StreamEvent {
-            Stdout(String),
-            Stderr(String),
-        }
-
-        // Spawn stdout reader
+        // This API is a text preview, not the durable binary transcript. Read
+        // bytes before rendering: read_line(String) used to discard a non-UTF-8
+        // line and silently stop draining the rest of that SSH output stream.
+        // JoinSet owns both readers on every return/cancellation path; a read
+        // error or panic is a transport failure, never a successful early EOF.
+        let mut readers = tokio::task::JoinSet::new();
         if let Some(out) = stdout {
             let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(out);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stdout(line.clone())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+            readers.spawn(async move {
+                pump_ssh_preview(out, tx, StreamOrigin::Stdout)
+                    .await
+                    .context("SSH stdout preview failed")
             });
         }
-
-        // Spawn stderr reader
         if let Some(err) = stderr {
             let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(err);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stderr(line.clone())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+            readers.spawn(async move {
+                pump_ssh_preview(err, tx, StreamOrigin::Stderr)
+                    .await
+                    .context("SSH stderr preview failed")
             });
         }
 
@@ -6503,6 +6479,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             continue;
                         }
                     },
+                    Some(reader) = readers.join_next(), if !readers.is_empty() => {
+                        reader.context("SSH preview reader panicked")??;
+                        continue;
+                    }
                     _ = completion_tick.tick(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
                         if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
                             durable_status = Some(status);
@@ -6513,15 +6493,18 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                         continue;
                     }
                     () = drain_expired => {
-                        let _ = child.kill().await;
-                        break;
+                        // A durable exit code is not proof that this channel
+                        // delivered its tail. Use the existing unconfirmed-
+                        // transport path; never join backpressured readers or
+                        // authorize a replay after cutting their output short.
+                        anyhow::bail!("SSH output did not reach EOF after durable completion");
                     }
                 };
                 if let Some(cap) = drain_cap {
                     drain_deadline = Some((tokio::time::Instant::now() + COMPLETION_DRAIN_IDLE).min(cap));
                 }
                 match event {
-                    StreamEvent::Stdout(line) => {
+                    (line, StreamOrigin::Stdout) => {
                         on_stdout(&line);
                         if stdout_acc.len() < MAX_OUTPUT_SIZE {
                             stdout_acc.push_str(&line);
@@ -6530,7 +6513,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             }
                         }
                     }
-                    StreamEvent::Stderr(line) => {
+                    (line, StreamOrigin::Stderr) => {
                         on_stderr(&line);
                         if stderr_acc.len() < MAX_OUTPUT_SIZE {
                             stderr_acc.push_str(&line);
@@ -6542,6 +6525,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }
             }
 
+            while let Some(reader) = readers.join_next().await {
+                reader.context("SSH preview reader panicked")??;
+            }
             child.wait().await.context("Failed to wait for ssh command")
         })
         .await
@@ -8868,6 +8854,69 @@ enum StreamOrigin {
     Stderr,
 }
 
+/// Text-only SSH preview, preserving delimiters, NULs and subsequent output
+/// after invalid UTF-8. Exact binary output belongs to retained logs/artifacts.
+/// Bound a newline-free fragment independently of the accumulated preview cap.
+async fn pump_ssh_preview<R>(
+    stream: R,
+    tx: tokio::sync::mpsc::Sender<(String, StreamOrigin)>,
+    origin: StreamOrigin,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    const MAX_FRAGMENT: usize = 64 * 1024;
+    let mut reader = BufReader::new(stream);
+    let mut pending = Vec::new();
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let eof = available.is_empty();
+        if !eof {
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1)
+                .min(MAX_FRAGMENT - pending.len());
+            pending.extend_from_slice(&available[..count]);
+            reader.consume(count);
+        }
+        if eof || pending.last() == Some(&b'\n') || pending.len() == MAX_FRAGMENT {
+            let mut end = pending.len();
+            if !eof && end == MAX_FRAGMENT {
+                // Do not replace a valid multibyte character merely because
+                // its remaining bytes land in the next bounded fragment.
+                if let Some(start) = pending.iter().rposition(|byte| byte & 0xc0 != 0x80)
+                    && std::str::from_utf8(&pending[start..])
+                        .is_err_and(|error| error.error_len().is_none())
+                {
+                    end = start;
+                }
+            }
+            if end != 0 {
+                tx.send((
+                    String::from_utf8_lossy(&pending[..end]).into_owned(),
+                    origin,
+                ))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "SSH preview consumer closed",
+                    )
+                })?;
+                pending.drain(..end);
+            }
+        }
+        if eof {
+            return Ok(());
+        }
+    }
+}
+
 /// Pump a child stream into the segment channel, splitting on BOTH `\n` and
 /// `\r`.
 ///
@@ -9554,6 +9603,89 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ssh_preview_keeps_invalid_utf8_nuls_delimiters_and_the_final_tail() {
+        for origin in [StreamOrigin::Stdout, StreamOrigin::Stderr] {
+            let (mut writer, reader) = tokio::io::duplex(7);
+            let bytes = b"first\0\xff\nsecond\r\n\nlast \xf0\x9f\xa6\x80\xff";
+            let producer = tokio::spawn(async move {
+                for chunk in bytes.chunks(2) {
+                    writer.write_all(chunk).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let pump = tokio::spawn(pump_ssh_preview(reader, tx, origin));
+            let mut rendered = String::new();
+            while let Some((text, lane)) = rx.recv().await {
+                assert_eq!(lane, origin);
+                rendered.push_str(&text);
+            }
+            producer.await.unwrap();
+            pump.await.unwrap().unwrap();
+            assert_eq!(rendered, String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_preview_bounds_unterminated_fragments_without_splitting_unicode() {
+        let mut bytes = vec![b'x'; 65_535];
+        bytes.extend_from_slice("🦀".as_bytes());
+        bytes.extend(std::iter::repeat_n(b'\xff', 140_000));
+        bytes.extend_from_slice(b"\nlast");
+        let expected = String::from_utf8_lossy(&bytes).into_owned();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let pump = tokio::spawn(pump_ssh_preview(
+            std::io::Cursor::new(bytes),
+            tx,
+            StreamOrigin::Stdout,
+        ));
+        let mut rendered = String::new();
+        let mut fragments = 0;
+        while let Some((text, _)) = rx.recv().await {
+            // Each invalid byte can expand to the three-byte replacement char.
+            assert!(text.len() <= 3 * 65_536);
+            rendered.push_str(&text);
+            fragments += 1;
+        }
+        pump.await.unwrap().unwrap();
+        assert!(fragments >= 4);
+        assert_eq!(rendered, expected);
+    }
+
+    #[tokio::test]
+    async fn ssh_preview_read_errors_are_not_successful_eof() {
+        struct FailedReader;
+        impl tokio::io::AsyncRead for FailedReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let reader = std::io::Cursor::new(b"complete prefix\n").chain(FailedReader);
+        let result = pump_ssh_preview(reader, tx, StreamOrigin::Stderr).await;
+        assert_eq!(result.unwrap_err().to_string(), "injected read failure");
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            ("complete prefix\n".into(), StreamOrigin::Stderr)
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_preview_closed_consumer_stops_the_reader_with_an_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let error = pump_ssh_preview(&b"not delivered\n"[..], tx, StreamOrigin::Stdout)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
 
     /// Pins this thread to the real transport for the guard's lifetime. Mock
     /// mode falls back to a process-global override that other tests enable
@@ -12899,7 +13031,7 @@ Number of files transferred: 42
                             let role = if final_exit == 0 { "receiver" } else { "sender" };
                             format!("printf '%s\\n' 'rsync: [{role}] write failed: No space left on device (28)' >&2\nexit {final_exit}")
                         };
-                        let output = Command::new("sh").args(["-c", &script])
+                        let output = Command::new("sh").args(["-c", &script]) // ubs:ignore[rust.security.shell-command] Fixed fault-injection text; role and exit are typed fixture values, not external shell input.
                             .current_dir(root).output().await?;
                         check_archive_upload_result(&output, worker, "/worker-source-volume/project")
                     }
@@ -17723,6 +17855,7 @@ fn main() {
             let Ok(path) = which::which(name) else {
                 continue;
             };
+            // ubs:ignore[rust.security.command-executable] This native fixture resolves only the constant gfind/find names above through the trusted local tool PATH.
             let mut probe = Command::new(&path);
             probe
                 .arg("--version")

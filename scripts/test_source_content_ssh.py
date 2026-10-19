@@ -105,7 +105,7 @@ fn main() {
             "PasswordAuthentication no\nKbdInteractiveAuthentication no\n"
             "PubkeyAuthentication yes\nUsePAM yes\nStrictModes no\n"
             "PermitRootLogin prohibit-password\nPrintMotd no\nPrintLastLog no\n"
-            "LogLevel ERROR\n"
+            "LogLevel VERBOSE\n"
             f"AllowUsers {user}\nPidFile {root}/unused-pid\n"
         )
         # Only the isolated runner's privilege-separation directory is needed;
@@ -113,7 +113,16 @@ fn main() {
         run(["sudo", "-n", "mkdir", "-p", "/run/sshd"])
         run(["sudo", "-n", sshd, "-t", "-f", str(server)])
         config = root / "ssh_config"
-        proxy = shlex.join(["sudo", "-n", sshd, "-i", "-e", "-f", str(server)])
+        # The inetd server is LOCAL to this fixture's ProxyCommand. Its audit
+        # log is not the remote command's stderr (a normal worker logs through
+        # its own syslog). -e mixed these channels and intermittently made a
+        # valid receipt fail on `mm_reap: child terminated by signal 1`.
+        # Retain verbose server evidence separately; never filter client or
+        # remote stderr, and refuse to follow/overwrite an existing log path.
+        server_log = args.evidence.resolve() / "sshd.log"
+        descriptor = os.open(server_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        proxy = shlex.join(["sudo", "-n", sshd, "-i", "-E", str(server_log), "-f", str(server)])
         config.write_text(
             f"Host *\n  ProxyCommand {proxy}\n  User {user}\n"
             "  UserKnownHostsFile /dev/null\n  GlobalKnownHostsFile /dev/null\n"
@@ -201,7 +210,8 @@ fn main() {
             assert delta.returncode == 0 and b"input.rs" in delta.stdout
             shutil.copy2(source / "input.rs", destination / "input.rs")
             spoofed_notice = "Warning: Permanently added 'worker' (ED25519) to the list of known hosts."
-            for notice in ("rsync integrity warning", spoofed_notice):
+            server_notice = "mm_reap: child terminated by signal 1"
+            for notice in ("rsync integrity warning", spoofed_notice, server_notice):
                 remote = f"printf '%s\\n' {shlex.quote(notice)} >&2; exec rsync"
                 warning = barrier(f"{name}: remote stderr is not suppressed: {notice}", source, destination, accepted=False, rsync_path=remote)
                 assert warning.returncode == 0 and notice.encode() in warning.stderr
@@ -215,8 +225,9 @@ fn main() {
             assert old_hash.returncode == 0 and b"Permanently added" in old_hash.stderr
             for attempt in range(2):
                 hash_transport(f"{name}: repeated direct hash {attempt}", file, accepted=True)
-            warned_hash = hash_transport(f"{name}: direct hash preserves remote stderr", file, accepted=False, warning=spoofed_notice)
-            assert warned_hash.returncode == 0 and spoofed_notice.encode() in warned_hash.stderr
+            for notice in (spoofed_notice, server_notice):
+                warned_hash = hash_transport(f"{name}: direct hash preserves remote stderr: {notice}", file, accepted=False, warning=notice)
+                assert warned_hash.returncode == 0 and notice.encode() in warned_hash.stderr
             missing_hash = hash_transport(f"{name}: direct hash missing file", destination / "missing.rs", accepted=False)
             assert missing_hash.returncode == 63
         wrong_hosts = root / "wrong_known_hosts"
@@ -231,6 +242,7 @@ fn main() {
             assert failed.returncode != 0 and diagnostic in failed.stderr
             failed_hash = hash_transport(f"direct hash: {label}", file, accepted=False, **options)
             assert failed_hash.returncode != 0 and diagnostic in failed_hash.stderr
+        assert b"Accepted publickey" in server_log.read_bytes(), "server audit evidence must be retained"
     print(f"PASS: {len(records)} real SSH/rsync cases; exact Rust policy tests passed", flush=True)
 
 

@@ -3358,16 +3358,12 @@ mod tests {
         }
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(unix)]
     #[test]
-    fn worker_sweep_requires_a_successful_native_uuid_fallback() {
+    fn worker_sweep_requires_successful_uuid_generation_without_a_false_success_summary() {
         use std::process::Command;
         use std::time::{Duration, UNIX_EPOCH};
 
-        assert!(
-            std::fs::read_to_string("/proc/sys/kernel/random/uuid").is_err(),
-            "this refusal fixture requires an unavailable Linux kernel UUID source"
-        );
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let base = root.join("projects");
@@ -3396,36 +3392,41 @@ mod tests {
             None,
             root.join("claims-v1").to_str().unwrap(),
         );
-        // Darwin intentionally falls back to native uuidgen. Missing procfs
-        // alone is not a refusal. Exercise actual failed/invalid generators,
-        // including plausible output followed by failure, before the live tool.
+        // Darwin intentionally falls back to native uuidgen. Force only the
+        // Linux UUID read to miss so the same fallback failure contract runs
+        // on every Unix host. Other filesystem/process observations stay real.
+        // Unknown admission is a FAILED sweep, not a successful zero-removal
+        // summary; the first failure must abort before touching either target.
         for generator in [
             "return 1",
             "printf '%s\\n' 12345678-1234-1234-1234-123456789ABC; return 1",
             "printf '%s\\n' malformed-token",
         ] {
             let out = Command::new("sh")
-                .args(["-c", &format!("uuidgen() {{ {generator}; }}\n{cmd}")])
+                .args([
+                    "-c",
+                    &format!(
+                        "cat() {{ if [ \"$#\" -eq 1 ] && [ \"$1\" = /proc/sys/kernel/random/uuid ]; then return 1; fi; command cat \"$@\"; }}\n\
+                         uuidgen() {{ {generator}; }}\n{cmd}"
+                    ),
+                ])
                 .env("TMPDIR", &tmpbase)
                 .output()
                 .expect("actual worker sweep should execute");
-            assert!(out.status.success(), "{out:?}");
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
             let stdout = String::from_utf8_lossy(&out.stdout);
-            assert_eq!(parse_worker_reap_metrics(&stdout), Some((0, 0)), "{out:?}");
+            assert_eq!(parse_worker_reap_metrics(&stdout), None, "{out:?}");
             assert!(parse_reap_events(&stdout).is_empty(), "{out:?}");
-            let skips = parse_gc_skips(&stdout);
             assert!(
-                skips.iter().any(|skip| skip.trigger == "ttl"
-                    && skip.reason == "source-ownership"
-                    && std::path::Path::new(&skip.path) == stale_job),
-                "unavailable source ownership must be reported: {out:?}"
+                String::from_utf8_lossy(&out.stderr)
+                    .contains(&format!("RCH_GC_ADMISSION_UNKNOWN {}", stale_job.display())),
+                "unavailable source ownership must fail explicitly: {out:?}"
             );
-            assert!(
-                skips.iter().any(|skip| skip.trigger == "pooled-ttl"
-                    && ["gate", "source-ownership"].contains(&skip.reason.as_str())
-                    && std::path::Path::new(&skip.path) == stale_pool),
-                "stale pooled ownership refusal must be reported: {out:?}"
-            );
+            let records: Vec<_> = std::fs::read_dir(root.join("claims-v1"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(records, vec![std::ffi::OsString::from("metadata.lock")]);
             for path in [&stale_job, &active_job, &stale_pool, &active_pool] {
                 assert!(path.is_dir(), "owned directory was removed: {path:?}");
                 assert_eq!(
@@ -3438,7 +3439,7 @@ mod tests {
             .args(["-c", &cmd])
             .env("TMPDIR", &tmpbase)
             .output()
-            .expect("native uuidgen-backed sweep");
+            .expect("native UUID-backed sweep");
         assert!(out.status.success(), "{out:?}");
         let metrics = parse_worker_reap_metrics(&String::from_utf8_lossy(&out.stdout)).unwrap();
         assert_eq!(metrics.0, 2, "{out:?}");
@@ -3449,12 +3450,20 @@ mod tests {
                 b"owned artifact"
             );
         }
-        assert_eq!(
-            std::fs::read_dir(root.join("claims-v1/released"))
-                .unwrap()
-                .count(),
-            2
-        );
+        // The ordinary TTL pass acquires ownership before checking recent
+        // activity, so even its preserved fresh job has a retirement receipt.
+        // The pooled pass performs its cheap activity check before admission.
+        let mut released: Vec<_> = std::fs::read_dir(root.join("claims-v1/released"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        let mut expected: Vec<_> = [&stale_job, &active_job, &stale_pool]
+            .into_iter()
+            .map(|path| format!("{}\n", path.display()))
+            .collect();
+        released.sort();
+        expected.sort();
+        assert_eq!(released, expected, "{out:?}");
     }
 
     #[cfg(target_os = "linux")]
@@ -4391,6 +4400,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             let release_claims = || {
                 let script =
                     abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0);
+                // ubs:ignore[rust.security.shell-command] Execute the production quoting/ownership protocol against this test's private registry, not caller-supplied shell text.
                 let output = Command::new("sh").args(["-c", &script]).output().unwrap();
                 assert!(output.status.success(), "{output:?}");
                 let (status, claims) =
@@ -4482,6 +4492,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
                 registry.to_str().unwrap(),
                 min_age,
             );
+            // ubs:ignore[rust.security.shell-command] The fixed production generator shell-quotes this test-owned registry; apply and age are typed fixture values.
             let output = Command::new("sh").args(["-c", &script]).output().unwrap();
             assert!(output.status.success(), "{output:?}");
             let (status, claims) = parse_gc_claim_reports(&String::from_utf8_lossy(&output.stdout));
