@@ -568,9 +568,21 @@ fn assert_native_target_refusal(world: &World, daemon: &Daemon, host: &str) {
         let output = world.wrapped("leaf", &fallback_out, &[], &[]);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let decisions = daemon.decisions().split_off(mark);
-        if let [decision] = decisions.as_slice()
+        // A preparing-capable wrapper may finish its cold polling within this
+        // single compiler invocation. Those genuine pre-key observations may
+        // precede the exact refusal, but no execution/serving decision may.
+        let cold_observation = |decision: &Value| {
+            decision["decision"] == "toolchain-warming"
+                || (decision["decision"] == "preparing"
+                    && decision["reason"] == "toolchain-facts-pending")
+        };
+        if let Some((decision, prefix)) = decisions.split_last()
             && decision["decision"] == "shadow"
         {
+            assert!(
+                prefix.iter().all(cold_observation),
+                "unexpected pre-refusal decisions: {decisions:#?}"
+            );
             assert_eq!(decision["crate"], "leaf", "{decision:#?}");
             assert_eq!(decision["reason"], "LIVE_DEP_OUTPUTS", "{decision:#?}");
             assert_eq!(decision["detail"], expected_detail, "{decision:#?}");
@@ -586,9 +598,7 @@ fn assert_native_target_refusal(world: &World, daemon: &Daemon, host: &str) {
             return;
         }
         assert!(
-            decisions
-                .iter()
-                .all(|decision| decision["decision"] == "toolchain-warming"),
+            decisions.iter().all(cold_observation),
             "unsupported target admitted an unexpected decision: {decisions:#?}"
         );
         assert!(

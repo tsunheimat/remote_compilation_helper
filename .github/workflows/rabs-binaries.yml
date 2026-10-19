@@ -187,8 +187,17 @@ jobs:
       - name: Toolchain ownership and complete live input observations
         run: cargo test --release -p rabsd --lib edge::live_facts --locked
       - name: Cargo layout projection keys and real split-directory builds
+        shell: bash
         run: |
-          cargo test --release -p rabsd cargo_placement_reuse --locked
+          set -euo pipefail
+          placement_tests=(cargo test --release -p rabsd --lib cargo_placement::tests --locked)
+          listed_tests=$("${placement_tests[@]}" -- --list)
+          printf '%s\n' "$listed_tests"
+          if ! grep -q ': test$' <<< "$listed_tests"; then
+            echo '::error::Cargo placement selector matched no tests' >&2
+            exit 1
+          fi
+          "${placement_tests[@]}"
           cargo test --release -p rabs-wrap --test live_cargo_layout --locked -- --nocapture
       - name: Real Cargo worktrees receive served dependencies (M4)
         run: cargo test --release -p rabs-wrap --test live_cargo_worktrees --locked -- --nocapture

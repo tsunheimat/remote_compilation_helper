@@ -1478,6 +1478,78 @@ mod tests {
         );
     }
 
+    /// Positive deletion fixtures need a completely observable process world.
+    /// Re-exec the WHOLE test before it creates files or CWD holders: isolating
+    /// only its sweep would hide those holders and invalidate the safety test.
+    /// Production still refuses an unobservable host; no fake idle census is
+    /// injected here. A private /proc and PID 1 are kernel-enforced, not a flag.
+    #[cfg(target_os = "linux")]
+    fn reexec_with_owned_procfs() -> bool {
+        use std::process::{Command, Stdio};
+
+        if std::process::id() == 1 {
+            assert_eq!(
+                std::fs::read_link("/proc/self").unwrap(),
+                std::path::Path::new("1")
+            );
+            assert!(std::fs::read_link("/proc/1/cwd").is_ok());
+            return false;
+        }
+        let namespace = |privileged: bool| {
+            let mut command = Command::new("timeout");
+            command.args(["--kill-after=5", "90"]);
+            if privileged {
+                // Explicitly opted in by an ephemeral CI runner, never an
+                // implicit privilege escalation on a developer workstation.
+                command.args([
+                    "sudo",
+                    "-n",
+                    "--preserve-env=PATH,TMPDIR,LLVM_PROFILE_FILE,RUST_BACKTRACE",
+                    "--",
+                    "unshare",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                    "--kill-child=KILL",
+                ]);
+            } else {
+                command.args([
+                    "unshare",
+                    "--user",
+                    "--map-root-user",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                    "--kill-child=KILL",
+                ]);
+            }
+            command.stdin(Stdio::null());
+            command
+        };
+        let probe = namespace(false)
+            .args(["sh", "-c", "test \"$$\" -eq 1 && test \"$(readlink /proc/self)\" -gt 0 && readlink /proc/1/cwd"])
+            .output()
+            .expect("GNU timeout and util-linux unshare are required for native cleanup tests");
+        let privileged = !probe.status.success();
+        assert!(
+            !privileged || std::env::var("RCH_TEST_ALLOW_SUDO_UNSHARE").as_deref() == Ok("1"),
+            "a private PID/proc namespace is required; unprivileged setup failed: {probe:?}"
+        );
+        let thread = std::thread::current();
+        let name = thread.name().expect("named Rust test thread");
+        let output = namespace(privileged)
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .output()
+            .expect("re-execute the exact native cleanup test in its owned process world");
+        assert!(output.status.success(), "isolated {name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "{output:?}"
+        );
+        true
+    }
+
     #[cfg(target_os = "linux")]
     fn source_transaction_fixture(body: &str) -> (std::process::Output, std::path::PathBuf) {
         use std::io::Write;
@@ -1527,6 +1599,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_source_transaction_holds_real_lock_until_checked_retirement() {
+        if reexec_with_owned_procfs() {
+            return;
+        }
         let _guard = test_guard!();
         let (output, directory) = source_transaction_fixture(
             r#"
@@ -1868,7 +1943,11 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     #[test]
     fn cleanup_command_deletes_stale_process_records_only() {
         let _guard = test_guard!();
-        assert_process_record_sweep("printf '%s 1 S\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"", false);
+        assert_process_record_sweep(
+            "printf '%s 1 S\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            "printf '%s %s 1 S 1\\n' \"$RCH_CLEANUP_TEST_OBSERVER\" \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            false,
+        );
     }
 
     #[test]
@@ -1876,6 +1955,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         let _guard = test_guard!();
         assert_process_record_sweep(
             "printf '%s 1 S\\n2147482000 1 ?\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            "printf '%s %s 1 S 1\\n2147482000 2147482000 1 ? 1\\n' \"$RCH_CLEANUP_TEST_OBSERVER\" \"$RCH_CLEANUP_TEST_OBSERVER\"",
             true,
         );
     }
@@ -1883,16 +1963,31 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     #[test]
     fn cleanup_command_keeps_record_when_observer_is_missing() {
         let _guard = test_guard!();
-        assert_process_record_sweep("printf '2147482000 1 S\\n'", true);
+        assert_process_record_sweep(
+            "printf '2147482000 1 S\\n'",
+            "printf '2147482000 2147482000 1 S 1\\n'",
+            true,
+        );
     }
 
     #[test]
     fn cleanup_command_keeps_record_when_process_observation_fails() {
         let _guard = test_guard!();
-        assert_process_record_sweep("exit 1", true);
+        assert_process_record_sweep("exit 1", "exit 1", true);
     }
 
-    fn assert_process_record_sweep(ps_body: &str, retain_vanished: bool) {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_command_keeps_record_when_a_terminal_leader_has_unobserved_threads() {
+        let _guard = test_guard!();
+        assert_process_record_sweep(
+            "exit 97",
+            "printf '%s %s 1 S 1\\n2147483000 2147483000 2147483000 Z 2\\n' \"$RCH_CLEANUP_TEST_OBSERVER\" \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            true,
+        );
+    }
+
+    fn assert_process_record_sweep(darwin: &str, linux: &str, retain_vanished: bool) {
         let base = tempfile::tempdir().expect("base");
         let runs = tempfile::tempdir().expect("run root");
         let run = runs.path().join("project-0123456789abcdef");
@@ -1921,12 +2016,17 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         // outcomes explicitly instead of assuming every host observation
         // succeeds. The live-group and cwd cases below still use native ps.
         let shim_dir = tempfile::tempdir().expect("process observation shim");
+        // Match the actual platform census. Linux's five columns describe
+        // individual threads; a process-only row cannot prove group absence.
+        let (arguments, ps_body) = if cfg!(target_os = "macos") {
+            ("-axo pid=,pgid=,stat=", darwin)
+        } else {
+            ("-e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=", linux)
+        };
         write_shim(
             shim_dir.path(),
             "ps",
-            &format!(
-                "#!/bin/sh\n[ \"$*\" = '-e -o pid= -o pgid= -o stat=' ] || exit 97\n{ps_body}\n"
-            ),
+            &format!("#!/bin/sh\n[ \"$*\" = '{arguments}' ] || exit 97\n{ps_body}\n"),
         );
         let (stdout, stderr, code) =
             run_sweep_with_runs(base.path(), runs.path(), &[shim_dir.path().to_path_buf()]);
@@ -1992,6 +2092,9 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_keeps_directory_used_as_process_cwd() {
+        if reexec_with_owned_procfs() {
+            return;
+        }
         let _guard = test_guard!();
         let base = tempfile::tempdir().expect("base");
         let pool = base.path().join("repo").join(".rch-target-pool-busy");
@@ -2129,6 +2232,9 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_evicts_young_inactive_caches_below_the_placement_ratio() {
+        if reexec_with_owned_procfs() {
+            return;
+        }
         let _guard = test_guard!();
         assert_eq!(placement_low_disk_permille(), 70);
         let base = tempfile::tempdir().expect("base");
@@ -2182,6 +2288,9 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reaps_aged_pool_normally() {
+        if reexec_with_owned_procfs() {
+            return;
+        }
         let _guard = test_guard!();
         let base = tempfile::tempdir().expect("base");
         let pool = base
@@ -2199,6 +2308,9 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reaps_empty_husk_when_rmdir_succeeds() {
+        if reexec_with_owned_procfs() {
+            return;
+        }
         let _guard = test_guard!();
         let base = tempfile::tempdir().expect("base");
         // Empty husk: contents were removed by an interfering writer,
@@ -2231,6 +2343,9 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reports_survivor_and_unreapable_husk_as_errors() {
+        if reexec_with_owned_procfs() {
+            return;
+        }
         let _guard = test_guard!();
         let base = tempfile::tempdir().expect("base");
         let survivor = base.path().join("repo_a").join(".rch-target-pool-survivor");

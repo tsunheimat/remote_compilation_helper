@@ -527,6 +527,15 @@ fn extract_zip_archive(archive_file: fs::File, dest: &Path) -> Result<(), Update
         let mut entry = zip
             .by_index(index)
             .map_err(|e| UpdateError::InstallFailed(format!("Invalid zip archive entry: {}", e)))?;
+        // ZIP bit 11 declares UTF-8. ZIP 9's general name decoder can fall
+        // back to CP437 even for a falsely flagged name, so enforce that wire
+        // declaration before decoding or choosing ANY extraction destination.
+        // Unflagged legacy CP437 names retain their existing decoding contract.
+        if entry.flags().as_u16() & (1 << 11) != 0 {
+            std::str::from_utf8(entry.name_raw()).map_err(|error| {
+                UpdateError::InstallFailed(format!("Invalid UTF-8 update zip entry name: {error}"))
+            })?;
+        }
         let entry_name = entry
             .name()
             .map_err(|error| {
@@ -1669,7 +1678,9 @@ mod tests {
         let mut observed = zip::ZipArchive::new(fs::File::open(&archive_path).unwrap()).unwrap();
         for (name, mode) in entries {
             assert_eq!(
-                observed.by_name(name).unwrap().unix_mode().unwrap() & 0o7000,
+                // ZIP 9 sanitizes unix_mode() on READ as well as write helpers.
+                // Inspect the raw wire attributes to prove hostile input exists.
+                (observed.by_name(name).unwrap().external_attributes() >> 16) & 0o7000,
                 mode & 0o7000
             );
         }
@@ -1732,6 +1743,12 @@ mod tests {
             bytes[base + name_offset] = 0xff;
         }
         fs::write(&archive_path, &bytes).unwrap();
+        let mut observed = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let entry = observed.by_index(0).unwrap();
+        assert_ne!(entry.flags().as_u16() & (1 << 11), 0);
+        assert!(std::str::from_utf8(entry.name_raw()).is_err());
+        drop(entry);
+        drop(observed);
         let result = extract_archive(&archive_path, &destination);
         assert!(
             matches!(result, Err(UpdateError::InstallFailed(_))),

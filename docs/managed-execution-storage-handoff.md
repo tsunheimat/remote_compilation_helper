@@ -289,6 +289,45 @@ workspace suite, with no added workflow. Broader Cargo reuse, cleanup-activity
 observability and shell E2E findings remain open until reproduced and resolved.
 Do not merge main or deploy workers on the basis of intermediate Clippy passes.
 
+### Completed native results and resumed integration after `1f374f02`
+
+CI `39200654564` passed pinned formatting, fatal-warning full-workspace Clippy,
+security and workflow integrity, but native suites and shell E2E failed. RABS
+`39200654559` passed the replay/endpoint/maintenance/capture/input and real Cargo
+layout gates; its large-input worktree case failed on missing readiness telemetry.
+The final doctor/overhead gate did not run. These are failures, not acceptance.
+
+The resumed batch reviews and retains the unpublished worktree repairs alongside
+new native regression fixes. Both concurrent input warmers are now represented
+by their actually observed `BothPending` state and `also_pending` diagnostic;
+no additional polling delay is introduced. The cold Cargo test requires every
+pending observation before execution and retains its full real-artifact ladder.
+An unexplained debug-only toolchain refusal now retains complete daemon decisions
+instead of only a tally; it remains open until its cause or final result is known.
+
+Worker-owned `RCH_CH_BASE` cannot be overwritten through raw allowlists. ZIP names
+flagged UTF-8 are validated as raw UTF-8 before decoding, while hostile permission
+fixtures inspect raw archive attributes rather than ZIP 9's sanitized accessor.
+macOS fixtures use physical temporary roots, bounded socket paths, actual flock
+and timeout tools, and exact native EILSEQ refusal with lossy-neighbor protection.
+The lifecycle socket fixture explicitly selects blocking reads on accepted streams
+and adds a fragmented-request regression. Production endpoint authority is unchanged.
+
+Positive cleanup fixtures re-execute the entire original test in an owned PID/proc
+namespace so real CWD holders remain visible. Unknown host activity still refuses
+cleanup. Linux thread-census and Darwin process-census fixtures use their actual
+argument/column contracts; missing threads still retain records. Scoped sudo-unshare
+requires an explicit ephemeral-CI opt-in, not a workstation or host policy change.
+The Cargo placement gate now selects its actual module and rejects zero listed tests.
+All 12 workflow owners and existing required checks are retained.
+
+Remote `u25-agent-test` validation: four extracted-production activity cases passed
+(idle, live CWD, recent write, unavailable process), 46 actual source-registry tests
+passed, and all 93 cases against the actual CI aggregate passed. Stable remote
+formatting and shell/diff checks passed. These are not pinned Rust/native-macOS or
+whole-worker acceptance; exact published-revision CI must validate the new batch.
+Original-checkout edits, main and deployed workers remain untouched. Keep PR draft.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

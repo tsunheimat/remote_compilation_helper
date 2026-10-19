@@ -90,7 +90,9 @@ fn held(culprit: &TypedDigest, reason: &'static str) -> ServeOutcome {
 
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        // The install lane refuses symlinked destination ancestors. Use the
+        // physical temporary parent, including macOS's /var -> /private/var.
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let cas = Arc::new(mount_and_reconcile(&root.path().join("cas")).unwrap());
         let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
         let authority = coord

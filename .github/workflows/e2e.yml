@@ -17,6 +17,9 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_BUILD_JOBS: 2
   RUSTUP_TOOLCHAIN: nightly-2026-08-31
+  # Match native CI: positive cleanup tests own a complete PID/proc namespace.
+  # The opt-in permits scoped sudo-unshare on hosted Ubuntu, not weaker GC.
+  RCH_TEST_ALLOW_SUDO_UNSHARE: "1"
 
 jobs:
   run:
@@ -36,6 +39,20 @@ jobs:
           persist-credentials: false
       - name: List E2E scenarios
         run: scripts/run_all_e2e.sh --list
+      - name: Install native macOS shell prerequisites
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          brew install coreutils findutils flock
+          rch_test_tools="$(mktemp -d "$RUNNER_TEMP/rch-e2e-tools.XXXXXX")"
+          ln -s "$(brew --prefix coreutils)/bin/gtimeout" "$rch_test_tools/timeout"
+          ln -s "$(brew --prefix flock)/bin/flock" "$rch_test_tools/flock"
+          "$rch_test_tools/timeout" --version
+          "$rch_test_tools/flock" --version
+          printf '%s\n' "$rch_test_tools" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}

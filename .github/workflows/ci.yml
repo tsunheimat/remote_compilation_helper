@@ -35,6 +35,10 @@ env:
   CARGO_BUILD_JOBS: 2
   # Match the repository pin and the toolchain used by the worker fleet.
   RUSTUP_TOOLCHAIN: nightly-2026-08-31
+  # Positive native cleanup fixtures re-exec inside a fresh PID/proc namespace.
+  # Hosted Ubuntu may restrict unprivileged user namespaces; permit only this
+  # test's scoped sudo-unshare route, never a host-wide AppArmor/sysctl change.
+  RCH_TEST_ALLOW_SUDO_UNSHARE: "1"
 
 jobs:
   # One checkout/cache for formatting and the compiler-backed Clippy check.
@@ -185,11 +189,13 @@ jobs:
           HOMEBREW_NO_INSTALL_UPGRADE: '1'
           HOMEBREW_NO_INSTALL_CLEANUP: '1'
         run: |
-          brew install coreutils findutils
-          # Expose only timeout under its worker command name. Keep the host's
-          # BSD utilities in place; the Cygwin inventory fixture selects gfind.
+          brew install coreutils findutils flock
+          # Expose the real timeout/flock prerequisites, not replacements for
+          # host BSD utilities; the Cygwin inventory fixture selects gfind.
           rch_test_tools="$(mktemp -d "$RUNNER_TEMP/rch-test-tools.XXXXXX")"
           ln -s "$(brew --prefix coreutils)/bin/gtimeout" "$rch_test_tools/timeout"
+          ln -s "$(brew --prefix flock)/bin/flock" "$rch_test_tools/flock"
+          "$rch_test_tools/flock" --version
           printf '%s\n' "$rch_test_tools" >> "$GITHUB_PATH"
           "$rch_test_tools/timeout" --version
           gfind --version

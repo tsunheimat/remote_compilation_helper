@@ -37,7 +37,13 @@ pub(crate) mod test_util {
     /// ones whose umask is 0002, which is indistinguishable from a real
     /// regression until you check the host.
     pub fn private_tempdir() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("temp dir");
+        // macOS commonly exposes its temporary directory through /var ->
+        // /private/var. Destination installation correctly refuses symlinked
+        // ancestors; create fixtures under the physical parent from the start.
+        let parent = std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temp parent");
+        let dir = tempfile::tempdir_in(parent).expect("temp dir");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -122,32 +122,51 @@ enum PendingFacts {
     Toolchain,
     Package,
     Dependencies,
+    PackageAndDependencies,
 }
 
 impl PendingFacts {
     const fn reason(self) -> &'static str {
         match self {
             Self::Toolchain => "toolchain-facts-pending",
-            Self::Package => "package-facts-pending",
+            Self::Package | Self::PackageAndDependencies => "package-facts-pending",
             Self::Dependencies => "dependency-facts-pending",
+        }
+    }
+
+    const fn also_pending(self) -> Option<&'static str> {
+        match self {
+            Self::PackageAndDependencies => Some("dependency-facts-pending"),
+            _ => None,
         }
     }
 }
 
 fn preparing(unit: &str, facts: PendingFacts) -> Decided {
     let reason = facts.reason();
-    log("preparing", &[("crate", unit), ("reason", reason)]);
+    // Keep the primary reason stable, but expose BOTH observed warmers to
+    // diagnostics. Concurrent hashing need not produce a later dependency-only
+    // request; inventing that extra round trip would serialize readiness again.
+    if let Some(other) = facts.also_pending() {
+        log(
+            "preparing",
+            &[("crate", unit), ("reason", reason), ("also_pending", other)],
+        );
+    } else {
+        log("preparing", &[("crate", unit), ("reason", reason)]);
+    }
     // Returning Reply releases the blocking lane. The existing bounded
     // warmer owns the observation; this connection retains no waiter task,
     // action reservation or writable output. Its next request reobserves
     // everything through decide, rather than adopting a stale descriptor.
-    Decided::Reply(
-        json!({
-            "kind": "rustc-decision", "decision": "preparing", "reason": reason,
-            "compiler_skip_authorized": false, "materialization_started": false,
-        })
-        .to_string(),
-    )
+    let mut reply = json!({
+        "kind": "rustc-decision", "decision": "preparing", "reason": reason,
+        "compiler_skip_authorized": false, "materialization_started": false,
+    });
+    if let Some(other) = facts.also_pending() {
+        reply["also_pending"] = json!(other);
+    }
+    Decided::Reply(reply.to_string())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -347,6 +366,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     };
     let (package, dependencies) = match input_preparation::observe(&live.facts, &plan, may_wait) {
         Ok(observed) => observed,
+        // observe starts both pending warmers only for a waiting-capable caller.
+        Err(input_preparation::InputMiss::BothPending) => {
+            return preparing(unit, PendingFacts::PackageAndDependencies);
+        }
         Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
             return preparing(unit, PendingFacts::Package);
         }
@@ -854,6 +877,10 @@ mod tests {
             (PendingFacts::Toolchain, "toolchain-facts-pending"),
             (PendingFacts::Package, "package-facts-pending"),
             (PendingFacts::Dependencies, "dependency-facts-pending"),
+            (
+                PendingFacts::PackageAndDependencies,
+                "package-facts-pending",
+            ),
         ] {
             let Decided::Reply(reply) = preparing("leaf", facts) else {
                 panic!("preparation must release the request lane without ownership");
@@ -862,6 +889,10 @@ mod tests {
             assert_eq!(reply["kind"], "rustc-decision");
             assert_eq!(reply["decision"], "preparing");
             assert_eq!(reply["reason"], reason);
+            assert_eq!(
+                reply.get("also_pending").and_then(Value::as_str),
+                facts.also_pending()
+            );
             assert_eq!(reply["compiler_skip_authorized"], false);
             assert_eq!(reply["materialization_started"], false);
             for absent in ["action_key", "attempt", "env"] {

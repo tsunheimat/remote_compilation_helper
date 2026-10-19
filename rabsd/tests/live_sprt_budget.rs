@@ -118,7 +118,9 @@ fn compare(cas: &LiveCas, coord: &CoordLive, original: &OfferPreparedActionResul
 }
 
 fn fixture(stage: u64) -> (tempfile::TempDir, Arc<LiveCas>, Arc<CoordLive>) {
-    let dir = tempfile::tempdir().unwrap();
+    // Keep safety-sensitive install paths beneath physical, not aliased,
+    // temporary parents on every native platform.
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let (cas, coord) = open(dir.path());
     let authority = coord.authority().unwrap();

@@ -3961,6 +3961,16 @@ impl TransferPipeline {
                 continue;
             }
 
+            // This is captured from the WORKER before managed TMPDIR and cd.
+            // Forwarding it would overwrite that authoritative physical base
+            // inside the workload shell and turn a durable cache into scratch.
+            // Profile validation already reserves it; raw allowlists must too.
+            if key == rch_common::RCH_CARGO_HOME_BASE_VAR {
+                info!("Rejecting env var '{}': worker-owned Cargo cache base", key);
+                rejected.push(key.to_owned());
+                continue;
+            }
+
             // Profile defaults do not implicitly forward the controller's environment.
             let forwarded = self
                 .env_allowlist
@@ -14246,6 +14256,21 @@ Number of files transferred: 42
                             source.join("forwarded-poison").to_str().unwrap().to_owned(),
                         ),
                     ]));
+                let environment = pipeline.build_remote_env_plan(source.to_str().unwrap());
+                assert!(
+                    environment
+                        .env_prefix
+                        .rejected
+                        .iter()
+                        .any(|key| key == "RCH_CH_BASE")
+                );
+                assert!(
+                    !environment
+                        .env_prefix
+                        .applied
+                        .iter()
+                        .any(|key| key == "RCH_CH_BASE")
+                );
                 let workload = crate::hook::add_cargo_isolation(
                     "printf 'cargo-home=%s\\ntmpdir=%s\\n' \"$CARGO_HOME\" \"$TMPDIR\"; printf 'cache-probe-stderr' >&2",
                     &worker,

@@ -168,16 +168,39 @@ fn excluded_directories_are_not_enumerated_even_with_opaque_or_unreadable_childr
     use std::os::unix::fs::PermissionsExt;
 
     let (_, roots) = fixture();
+    let fifo = |path: &std::path::Path| {
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+    };
+    // A kernel-supported poison on both Linux and APFS: prove that the same
+    // node would be refused if it were encountered in selected source.
+    let selected_poison = roots[0].1.join("selected-fifo");
+    fifo(&selected_poison);
+    assert!(capture_sealed_source(&roots, false, 1, 4096).is_err());
+    fs::remove_file(selected_poison).unwrap();
     for (_, root) in &roots {
         for directory in STATE_DIRS {
             let path = root.join(directory);
+            fifo(&path.join("must-not-enumerate"));
             let opaque = std::ffi::OsString::from_vec(b"invalid-\xff-name".to_vec());
-            fs::write(path.join(opaque), b"private opaque filename").unwrap();
+            if let Err(error) = fs::write(path.join(opaque), b"private opaque filename") {
+                // APFS refuses non-UTF-8 names; its real FIFO remains a
+                // separately proven enumeration poison, including as root.
+                assert!(cfg!(target_os = "macos"), "{error}");
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(rustix::io::Errno::ILSEQ.raw_os_error())
+                );
+            }
             fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         }
     }
-    // Root can read mode-000 directories; the invalid filename separately
-    // proves that sealed capture did not enumerate the excluded directory.
+    // Root can read mode-000 directories; the poison nodes independently
+    // prove that sealed capture did not enumerate any excluded directory.
     let image = capture_sealed_source(&roots, false, 1, 4096).unwrap();
     for (id, root) in &roots {
         let scan = scan_directory(root, false).unwrap();

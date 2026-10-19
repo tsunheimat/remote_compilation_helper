@@ -53,6 +53,10 @@ impl Daemon {
                     }
                     Err(error) => panic!("scripted daemon accept: {error}"),
                 };
+                // Darwin may retain the listener's nonblocking flag on the
+                // accepted stream. This fixture reads a bounded complete
+                // request, so select blocking I/O before applying its deadline.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -116,6 +120,34 @@ impl Daemon {
             thread: Some(thread),
         }
     }
+}
+
+#[test]
+fn scripted_daemon_accepts_fragmented_requests_before_the_read_deadline() {
+    use std::net::Shutdown;
+
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(directory.path(), Reply::Retires);
+    let mut stream = std::os::unix::net::UnixStream::connect(&daemon.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    for fragment in ["POST ", "/restart-", "admission"] {
+        stream.write_all(fragment.as_bytes()).unwrap();
+        std::thread::yield_now();
+    }
+    stream.shutdown(Shutdown::Write).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    let body: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["admission_closed"], true);
+    assert_eq!(
+        daemon.requests.lock().unwrap().as_slice(),
+        &["POST /restart-admission"]
+    );
+    assert!(daemon.socket.exists());
 }
 
 impl Drop for Daemon {

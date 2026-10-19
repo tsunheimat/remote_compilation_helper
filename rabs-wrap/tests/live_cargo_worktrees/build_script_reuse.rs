@@ -197,7 +197,12 @@ fn tracked_out_dir_reads_never_become_cross_worktree_cache_hits() {
             // Capture rejection has no publication task to settle. Request
             // decisions precede compiler execution and are already recorded.
             let decisions = daemon.decisions().split_off(mark);
-            assert_eq!(count(&decisions, "execute"), 1, "{:?}", tally(&decisions));
+            assert_eq!(
+                count(&decisions, "execute"),
+                1,
+                "tracked read must execute at {expression}/{index}; decisions={decisions:#?}; daemon log:\n{}",
+                std::fs::read_to_string(&daemon.log).expect("retain actual refusal diagnostics")
+            );
             assert_eq!(count(&decisions, "hit"), 0, "{:?}", tally(&decisions));
             for forbidden in ["committed", "verified", "served"] {
                 assert_eq!(count(&decisions, forbidden), 0, "{:?}", tally(&decisions));

@@ -158,6 +158,13 @@ fn actual_ci_aggregate_rejects_failed_cancelled_skipped_and_missing_required_res
     let output = std::process::Command::new("python3")
         .args(["-c", AGGREGATE_CASES, script])
         .env_clear()
+        // CPython needs its executable search path to resolve sys.executable
+        // when launched by name; an empty environment can leave it empty on
+        // Linux. Child cases must re-execute the SAME real Python interpreter.
+        .env(
+            "PATH",
+            std::env::var_os("PATH").expect("Python test requires PATH"),
+        )
         .stdin(std::process::Stdio::null())
         .output()
         .expect("Python 3 is required by the Unix CI workflow tests");
@@ -176,6 +183,7 @@ import subprocess
 import sys
 
 script = sys.argv[1]
+assert sys.executable and os.path.isabs(sys.executable), 'Python executable identity is unavailable'
 core = {'check', 'manifest_sync', 'security', 'test', 'e2e', 'build-release'}
 extra = {'docs', 'benchmark', 'coverage'}
 all_jobs = core | extra

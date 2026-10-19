@@ -330,7 +330,8 @@ fn stderr(output: &Output) -> String {
 fn assert_preparing(decisions: &[serde_json::Value], reason: &str) {
     assert!(
         decisions.iter().any(|decision| {
-            decision["decision"] == "preparing" && decision["reason"] == reason
+            decision["decision"] == "preparing"
+                && (decision["reason"] == reason || decision["also_pending"] == reason)
         }),
         "no {reason} observation in real Cargo build: {:?}",
         tally(decisions)
@@ -637,12 +638,19 @@ fn real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution() 
         let decisions = daemon.settled_since(mark);
         assert!(stderr(&build).contains("Fresh leaf"), "{}", stderr(&build));
         if outcome == "committed" {
+            let execution = decisions
+                .iter()
+                .position(|decision| decision["decision"] == "execute")
+                .expect("the first real build must admit middle exactly once");
+            // Both independent input warmers must have been observed BEFORE
+            // execution. One reply may report both: require their actual live
+            // readiness facts, not a scheduler-dependent extra polling round.
             for reason in [
                 "toolchain-facts-pending",
                 "package-facts-pending",
                 "dependency-facts-pending",
             ] {
-                assert_preparing(&decisions, reason);
+                assert_preparing(&decisions[..execution], reason);
             }
         }
         assert_eq!(count(&decisions, outcome), 1, "{:?}", tally(&decisions));

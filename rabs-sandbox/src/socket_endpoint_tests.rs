@@ -258,21 +258,41 @@ fn explicit_unlock_releases_even_with_a_duplicate_file_description() {
 #[test]
 fn raw_names_sibling_churn_and_permanent_locks_do_not_invalidate_ownership() {
     let root = directory();
-    let path = root
-        .path()
-        .join(OsString::from_vec(b"edge-\xff.sock".to_vec()));
-    let mut lease = EndpointLease::acquire(&path).unwrap();
-    let listener = UnixListener::bind(&path).unwrap();
-    lease.claim_bound().unwrap();
-    fs::write(root.path().join("unrelated"), b"sibling churn").unwrap();
-    fs::create_dir(root.path().join("cargo-launcher")).unwrap();
-    lease.verify().unwrap();
-    let lock = lease.parent.join(&lease.lock_name);
-    drop(listener);
-    assert!(lease.retire_bound().unwrap());
-    drop(lease);
-    assert!(lock.is_file());
-    assert!(EndpointLease::acquire(&path).is_ok());
+    let lossy = root.path().join("edge-\u{fffd}.sock");
+    fs::write(&lossy, b"never retire a lossy alias").unwrap();
+    for name in [
+        OsString::from("edge-\u{e9}.sock"),
+        OsString::from_vec(b"edge-\xff.sock".to_vec()),
+    ] {
+        let path = root.path().join(name);
+        match EndpointLease::acquire(&path) {
+            Ok(mut lease) => {
+                let listener = UnixListener::bind(&path).unwrap();
+                lease.claim_bound().unwrap();
+                fs::write(root.path().join("unrelated"), b"sibling churn").unwrap();
+                fs::create_dir_all(root.path().join("cargo-launcher")).unwrap();
+                lease.verify().unwrap();
+                let lock = lease.parent.join(&lease.lock_name);
+                drop(listener);
+                assert!(lease.retire_bound().unwrap());
+                drop(lease);
+                assert!(lock.is_file());
+                assert!(EndpointLease::acquire(&path).is_ok());
+            }
+            Err(error) => {
+                // Native APFS rejects this name before acquiring its lock.
+                // The owner must retain the exact refusal, never sanitize it
+                // into authority over the pre-existing lossy alias.
+                assert!(cfg!(target_os = "macos"), "{error}");
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(rustix::io::Errno::ILSEQ.raw_os_error())
+                );
+                assert!(fs::symlink_metadata(&path).is_err());
+            }
+        }
+        assert_eq!(fs::read(&lossy).unwrap(), b"never retire a lossy alias");
+    }
 }
 
 #[test]

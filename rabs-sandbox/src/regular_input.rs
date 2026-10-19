@@ -39,16 +39,36 @@ mod tests {
     #[test]
     fn regular_inputs_keep_their_bytes_and_raw_names() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory
-            .path()
-            .join(std::ffi::OsString::from_vec(b"input-\xff".to_vec()));
-        for bytes in [b"".as_slice(), b"\0binary\xff".as_slice()] {
-            std::fs::write(&path, bytes).unwrap();
-            let mut held = open(&path).unwrap();
-            let mut observed = Vec::new();
-            held.read_to_end(&mut observed).unwrap();
-            assert_eq!(observed, bytes);
+        let lossy = directory.path().join("input-\u{fffd}");
+        std::fs::write(&lossy, b"never select a lossy alias").unwrap();
+        for name in [
+            std::ffi::OsString::from("input-\u{e9}"),
+            std::ffi::OsString::from_vec(b"input-\xff".to_vec()),
+        ] {
+            let path = directory.path().join(name);
+            for bytes in [b"".as_slice(), b"\0binary\xff".as_slice()] {
+                match std::fs::write(&path, bytes) {
+                    Ok(()) => {
+                        let mut held = open(&path).unwrap();
+                        let mut observed = Vec::new();
+                        held.read_to_end(&mut observed).unwrap();
+                        assert_eq!(observed, bytes);
+                    }
+                    Err(error) => {
+                        // Native APFS rejects an invalid UTF-8 component. The
+                        // input adapter must preserve that refusal, not read
+                        // an existing replacement-character alias instead.
+                        assert!(cfg!(target_os = "macos"), "{error}");
+                        assert_eq!(
+                            error.raw_os_error(),
+                            Some(rustix::io::Errno::ILSEQ.raw_os_error())
+                        );
+                        assert!(open(&path).is_err());
+                    }
+                }
+            }
         }
+        assert_eq!(std::fs::read(lossy).unwrap(), b"never select a lossy alias");
     }
 
     #[test]

@@ -15,6 +15,9 @@ use std::sync::Arc;
 pub(super) enum InputMiss {
     Package(FactsMiss),
     Dependencies(FactsMiss),
+    /// Both live observations started and neither was ready at this request.
+    /// Do not hide one warmer merely because the other has display priority.
+    BothPending,
 }
 
 pub(super) fn observe(
@@ -54,6 +57,7 @@ fn join_observations<P, D>(
     let dependencies = observe_dependencies();
     match (package, dependencies) {
         (_, Err(miss @ FactsMiss::Refused(_))) => Err(InputMiss::Dependencies(miss)),
+        (Err(FactsMiss::Pending), Err(FactsMiss::Pending)) => Err(InputMiss::BothPending),
         (Err(miss), _) => Err(InputMiss::Package(miss)),
         (Ok(_), Err(miss)) => Err(InputMiss::Dependencies(miss)),
         (Ok(package), Ok(dependencies)) => Ok((package, dependencies)),
@@ -77,10 +81,7 @@ mod tests {
             true,
         );
         assert_eq!(calls.get(), 1);
-        assert!(matches!(
-            result,
-            Err(InputMiss::Package(FactsMiss::Pending))
-        ));
+        assert!(matches!(result, Err(InputMiss::BothPending)));
     }
 
     #[test]

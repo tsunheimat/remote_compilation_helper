@@ -489,6 +489,10 @@ fn non_utf8_destinations_remain_distinct_and_lossless() {
     use std::os::unix::ffi::OsStringExt;
     let mut fixture = Fixture::new();
     let output = fixture.add("placeholder", OutputRole::Materializable, b"codegen");
+    let parent = output.destination.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
+    let lossy = parent.join("a\u{fffd}");
+    std::fs::write(&lossy, b"never replace a lossy alias").unwrap();
     fixture.outputs.clear();
     for byte in [0xfe, 0xff] {
         let mut output = output.clone();
@@ -499,9 +503,40 @@ fn non_utf8_destinations_remain_distinct_and_lossless() {
         fixture.outputs.push(output);
     }
     let prepared = fixture.select().stage(&|_, _| Ok(())).unwrap();
-    let receipt = prepared.install(&mut fixture.store).unwrap();
-    assert_eq!(receipt.installed.len(), 2);
-    for output in fixture.outputs {
-        assert_eq!(std::fs::read(output.destination).unwrap(), b"codegen");
+    match prepared.install(&mut fixture.store) {
+        Ok(receipt) => {
+            assert_eq!(receipt.installed.len(), 2);
+            for output in &fixture.outputs {
+                assert_eq!(std::fs::read(&output.destination).unwrap(), b"codegen");
+            }
+        }
+        Err(failure) => {
+            // APFS cannot represent either non-UTF-8 destination. Exercise the
+            // real rename failure, not a fake successful materializer or a
+            // replacement-character path that aliases the two logical outputs.
+            assert!(cfg!(target_os = "macos"), "{failure:?}");
+            assert!(failure.installed.is_empty(), "{failure:?}");
+            let MaterializeError::Io {
+                step: "rename-into-place",
+                error,
+            } = &failure.error
+            else {
+                panic!("wrong native refusal: {failure:?}");
+            };
+            assert!(
+                error.contains(&format!(
+                    "os error {}",
+                    rustix::io::Errno::ILSEQ.raw_os_error()
+                )),
+                "{error}"
+            );
+            for output in &fixture.outputs {
+                assert!(std::fs::symlink_metadata(&output.destination).is_err());
+            }
+        }
     }
+    assert_eq!(
+        std::fs::read(lossy).unwrap(),
+        b"never replace a lossy alias"
+    );
 }

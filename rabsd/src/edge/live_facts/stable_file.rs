@@ -258,12 +258,29 @@ mod tests {
     #[test]
     fn non_utf8_input_paths_keep_their_original_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join(std::ffi::OsString::from_vec(b"input-\xff".to_vec()));
-        fs::write(&path, b"bytes").unwrap();
-        assert_eq!(read_stable(&path, 5).unwrap().1, b"bytes");
-        assert!(digest_stable(&path).is_ok());
+        let lossy = dir.path().join("input-\u{fffd}");
+        fs::write(&lossy, b"wrong").unwrap();
+        for name in [
+            std::ffi::OsString::from("input-\u{e9}"),
+            std::ffi::OsString::from_vec(b"input-\xff".to_vec()),
+        ] {
+            let path = dir.path().join(name);
+            match fs::write(&path, b"bytes") {
+                Ok(()) => {
+                    assert_eq!(read_stable(&path, 5).unwrap().1, b"bytes");
+                    assert!(digest_stable(&path).is_ok());
+                }
+                Err(error) => {
+                    // Darwin EILSEQ (92): APFS cannot represent this raw
+                    // component. Neither content fact may use the lossy alias.
+                    assert!(cfg!(target_os = "macos"), "{error}");
+                    assert_eq!(error.raw_os_error(), Some(92));
+                    assert!(read_stable(&path, 5).is_err());
+                    assert!(digest_stable(&path).is_err());
+                }
+            }
+        }
+        assert_eq!(fs::read(lossy).unwrap(), b"wrong");
     }
 
     #[test]

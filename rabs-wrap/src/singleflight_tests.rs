@@ -587,14 +587,13 @@ fn disabled_cold_wait_does_not_disable_keyed_waiting() {
 #[test]
 fn cold_preparation_rolls_over_after_sixty_requests() {
     use std::os::unix::net::UnixListener;
-    let base = std::env::temp_dir().join(format!(
-        "rabs-rollover-{}-{:?}-{:?}",
-        std::process::id(),
-        std::thread::current().id(),
-        std::time::SystemTime::now(),
-    ));
-    std::fs::create_dir(&base).unwrap();
-    let socket = base.join("edge.sock");
+    // The real Unix endpoint must fit sun_path on macOS as well as Linux;
+    // a debug-formatted SystemTime beneath Darwin's long TMPDIR does not.
+    let base = tempfile::Builder::new()
+        .prefix("rr-")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+        .unwrap();
+    let socket = base.path().join("edge.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let daemon = std::thread::spawn(move || {
         let (first, _) = listener.accept().unwrap();
@@ -644,5 +643,5 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
     assert!(matches!(result, Ok(Live::Execute { .. })));
     daemon.join().unwrap();
     std::fs::remove_file(socket).unwrap();
-    std::fs::remove_dir(base).unwrap();
+    base.close().unwrap();
 }
