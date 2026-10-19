@@ -165,16 +165,21 @@ fn source_changes_with_agent_names_still_exhaust_the_capture_budget() {
 #[test]
 fn excluded_directories_are_not_enumerated_even_with_opaque_or_unreadable_children() {
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     let (_, roots) = fixture();
     let fifo = |path: &std::path::Path| {
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .unwrap();
+        // rustix's *at FIFO helper is not exposed on Darwin. The native
+        // utility creates the same kernel node without unsafe code or a shim.
+        let output = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "native FIFO creation: {output:?}");
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     };
     // A kernel-supported poison on both Linux and APFS: prove that the same
     // node would be refused if it were encountered in selected source.

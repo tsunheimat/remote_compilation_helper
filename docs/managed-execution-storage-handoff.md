@@ -328,6 +328,51 @@ formatting and shell/diff checks passed. These are not pinned Rust/native-macOS 
 whole-worker acceptance; exact published-revision CI must validate the new batch.
 Original-checkout edits, main and deployed workers remain untouched. Keep PR draft.
 
+### Pinned native validation and FIFO portability after `89cfa4ed`
+
+At `89cfa4edd57261057c38583a82f82c38f223afa6`, CI `39210558778` passed
+pinned formatting, fatal-warning full-workspace Clippy, security and integrity.
+The Linux x64 native workspace job completed successfully. The complete Linux
+E2E job also passed: Cargo true-E2E, explicit mock SSH and all 41 native shell
+scenarios. The retained `e2e-ubuntu-latest` artifact (12168890907) contains 41
+passing status records, including the formerly failing cleanup scenario.
+
+Both macOS native jobs stopped during compilation because rustix does not expose
+`mkfifoat` for that target. The excluded-tree regression now creates the same real
+kernel FIFO through native `mkfifo -m 600`, then checks its type and exact mode.
+Selected FIFOs still refuse capture, and excluded FIFOs still prove that no walk
+occurs. No platform test is disabled and no production snapshot policy changes.
+
+Pinned Rust is now installed in an owned directory under the remote validation
+`target/` tree, not over the worker's system compiler and not through shell
+profile changes. Installation used rustup 1.29.1 with its official checksum and
+`--no-modify-path`. Tests report the repository-pinned nightly-2026-08-31 compiler
+`90850177249efe0321573c569aec5d12b257f8d6`, and run only on `u25-agent-test`.
+The temporary root of a remote job is private; setup and execution use one owned
+persistent validation tree. No compiler/test falls back to the source machine.
+
+Against the 89cfa4ed tree plus the FIFO change, pinned remote execution passed:
+
+| Actual test selection | Passed / failed |
+| --- | --- |
+| Excluded-directory real-FIFO regression | 1 / 0 |
+| `rchd` cleanup module, including owned PID/proc namespaces | 55 / 0 |
+| `daemon_stop_safety`, including fragmented native socket requests | 8 / 0 |
+| Extraction-related tests, including ZIP/tar safety and filename guards | 33 / 0 |
+| Managed storage/environment/scratch regressions | 11 / 0 |
+| Cargo-home boundary tests | 4 / 0 |
+| Compound environment and authored inline override | 1 / 0 each |
+| Complete real Cargo worktree target, including large inputs and tracked OUT_DIR reads | 10 / 0 |
+
+All selections were nonempty and returned exit 0 without ignored tests. Pinned
+formatting passed. Evidence and source hashes remain in the ignored remote
+validation tree, under `evidence-owned-tools-8mm93nf3` and
+`runtime-evidence-7osr51sz`. These are targeted native-Linux results, not proof of
+macOS, six-platform shipping or a full final-revision CI pass. The broader RABS
+release job had reached the real layout tests at this checkpoint. Final revision
+CI must still qualify the FIFO portability correction and all remaining gates.
+Main, original-checkout edits and deployed workers remain unchanged; PR is draft.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR
