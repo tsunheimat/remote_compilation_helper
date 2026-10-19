@@ -394,13 +394,86 @@ fn hung_mid_frame_client_cannot_wedge_shutdown() {
 }
 
 #[test]
+fn unsafe_stale_socket_is_refused_without_unlinking_or_rewriting_it() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("untrusted.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let before = std::fs::symlink_metadata(&socket).unwrap();
+    assert!(before.file_type().is_socket());
+    assert_eq!(
+        UnixStream::connect(&socket).unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_rabsd"))
+        .args(["--run-for-ms", "2000"])
+        .env("RABS_SOCKET_PATH", &socket)
+        .env("RABS_BOOT_MARKER", directory.path().join("refused.boot"))
+        .env("RABS_STATE_DIR", directory.path().join("refused.state"))
+        .env("RABS_CONFIG", "/nonexistent-rabs-config")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = daemon.kill();
+            let output = daemon.wait_with_output().unwrap();
+            panic!("unsafe endpoint refusal did not finish: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = daemon.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() || stdout.contains("\"clean\":false"),
+        "{output:?}"
+    );
+    assert!(
+        stdout.contains("private socket") || stderr.contains("private socket"),
+        "{output:?}"
+    );
+    let after = std::fs::symlink_metadata(&socket).unwrap();
+    assert!(after.file_type().is_socket());
+    assert_eq!(
+        (after.dev(), after.ino(), after.mode()),
+        (before.dev(), before.ino(), before.mode())
+    );
+    assert_eq!(
+        (
+            after.uid(),
+            after.nlink(),
+            after.ctime(),
+            after.ctime_nsec()
+        ),
+        (
+            before.uid(),
+            before.nlink(),
+            before.ctime(),
+            before.ctime_nsec()
+        )
+    );
+    assert_eq!(
+        UnixStream::connect(&socket).unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+}
+
+#[test]
 fn stale_socket_takeover_and_live_daemon_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
 
-    // A stale socket file from a dead incarnation.
+    // Reproduce a dead real daemon's private endpoint, not a raw listener's
+    // umask-dependent socket that startup is intentionally forbidden to repair.
+    use std::os::unix::fs::PermissionsExt;
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(socket.exists());
 
     let mut daemon = spawn_daemon(&socket, &marker);

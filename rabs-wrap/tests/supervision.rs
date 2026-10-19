@@ -74,6 +74,11 @@ fn no_success(completion: Option<Value>) {
     }
 }
 
+enum DecisionPeer {
+    Connected,
+    ParentTerminated,
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     socket: PathBuf,
@@ -104,7 +109,7 @@ impl Fixture {
 
     fn daemon_paused(
         &self,
-        pause: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        pause: Option<(mpsc::Sender<()>, mpsc::Receiver<DecisionPeer>)>,
         compiler_profile: Option<PathBuf>,
     ) -> std::thread::JoinHandle<Option<Value>> {
         let listener = UnixListener::bind(&self.socket).unwrap();
@@ -138,10 +143,12 @@ impl Fixture {
             reader.read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(request["kind"], "rustc-request");
-            if let Some((arrived, release)) = pause {
+            let peer = if let Some((arrived, release)) = pause {
                 arrived.send(()).unwrap();
-                release.recv_timeout(Duration::from_secs(10)).unwrap();
-            }
+                release.recv_timeout(Duration::from_secs(10)).unwrap()
+            } else {
+                DecisionPeer::Connected
+            };
             let mut env = vec![
                 json!(["PATH", "/usr/bin:/bin"]),
                 json!(["EXACT", "admitted value"]),
@@ -153,7 +160,19 @@ impl Fixture {
                 "action_key":"fixture", "attempt":"supervised-attempt",
                 "capture_protocol":1, "compiler_skip_authorized":false,
                 "env":env});
-            writeln!(writer, "{reply}").unwrap();
+            if let Err(error) = writeln!(writer, "{reply}") {
+                // Only the parent-death scenario can announce this state,
+                // after killing and reaping its actual caller. Correct wrapper
+                // cancellation can close the socket before the paused reply.
+                // Timeouts and every unrelated transport failure remain fatal.
+                match (peer, error.kind()) {
+                    (
+                        DecisionPeer::ParentTerminated,
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset,
+                    ) => return None,
+                    _ => panic!("decision delivery: {error}"),
+                }
+            }
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => None,
@@ -394,24 +413,29 @@ fn original_caller_death_cancels_a_still_living_wrapper_and_its_compiler() {
 
 #[test]
 fn parent_lost_during_the_decision_cannot_start_an_orphaned_compiler() {
-    let fixture = Fixture::new("printf 'must not run' > forbidden\nexit 0");
-    let (arrived, ready) = mpsc::channel();
-    let (release, released) = mpsc::channel();
-    let daemon = fixture.daemon_paused(Some((arrived, released)), None);
-    let mut caller = Owned(fixture.caller().spawn().unwrap());
-    ready.recv_timeout(Duration::from_secs(10)).unwrap();
-    let wrapper = fixture.pid("wrapper.pid");
-    assert!(!stopped(wrapper));
-    assert!(!fixture.root.path().join("compiler.pid").exists());
-    // The identity was captured before this request reached the daemon. Let
-    // the kernel reparent the surviving wrapper BEFORE replying with execute.
-    caller.0.kill().unwrap();
-    wait(&mut caller);
-    release.send(()).unwrap();
-    group_stopped(&[wrapper]);
-    no_success(daemon.join().unwrap());
-    assert!(!fixture.root.path().join("compiler.pid").exists());
-    assert!(!fixture.root.path().join("forbidden").exists());
+    for close_before_reply in [false, true] {
+        let fixture = Fixture::new("printf 'must not run' > forbidden\nexit 0");
+        let (arrived, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let daemon = fixture.daemon_paused(Some((arrived, released)), None);
+        let mut caller = Owned(fixture.caller().spawn().unwrap());
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let wrapper = fixture.pid("wrapper.pid");
+        assert!(!stopped(wrapper));
+        assert!(!fixture.root.path().join("compiler.pid").exists());
+        // Preserve the original reply-versus-cancellation race, and separately
+        // force the already-closed peer ordering with a real process exit.
+        caller.0.kill().unwrap();
+        assert_eq!(wait(&mut caller).signal(), Some(9));
+        if close_before_reply {
+            group_stopped(&[wrapper]);
+        }
+        release.send(DecisionPeer::ParentTerminated).unwrap();
+        group_stopped(&[wrapper]);
+        no_success(daemon.join().unwrap());
+        assert!(!fixture.root.path().join("compiler.pid").exists());
+        assert!(!fixture.root.path().join("forbidden").exists());
+    }
 }
 
 #[test]

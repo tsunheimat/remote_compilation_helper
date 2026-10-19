@@ -257,6 +257,38 @@ checks and was still executing replay verification at this checkpoint. No new
 workflow, ignored test, warning exemption, runtime permission or artifact type
 is introduced. Main and deployed workers remain unchanged.
 
+### Native cancellation and stale-endpoint fixtures
+
+Revision `5426abf4a07bafa773c01aff42281d2a7fdd38bd` passed pinned formatting,
+full-workspace/all-target/all-feature Clippy with fatal warnings, the security
+audit and workflow integrity in CI `39199931539`. Both native RABS installer
+jobs and release spine compilation passed in `39199931558`. Native workspace
+and E2E jobs started; their success is not yet established.
+
+Two remaining older native failures are fixture/protocol mismatches. The paused
+supervision daemon used to panic when a correctly cancelled wrapper closed its
+socket before the delayed decision reply. It now accepts only BrokenPipe or
+ConnectionReset, and only after the test explicitly confirms killing and reaping
+the original caller. Ordinary replies, timeouts and unrelated errors remain
+fatal. The test exercises both the original cancellation/reply race and an
+already-exited wrapper before reply; neither may start a compiler, create the
+forbidden output or report successful completion. Production supervision and
+its cancellation deadlines are unchanged.
+
+The stale-socket takeover fixture previously left a raw listener's umask-derived
+permissions, although the real endpoint owner leaves mode 0600 and refuses to
+retire a non-private socket. The positive fixture now reproduces that real mode.
+A new real-daemon negative test supplies a connect-refused but mode-0660 socket
+and requires a named privacy refusal without changing its inode, device, owner,
+link count, permissions or ctime. A refused connect alone never grants cleanup
+authority. No production endpoint policy or timeout is relaxed.
+
+Remote formatting and diff validation passed; these two native regressions must
+still pass in the exact final CI revision. The changes are in the existing
+workspace suite, with no added workflow. Broader Cargo reuse, cleanup-activity
+observability and shell E2E findings remain open until reproduced and resolved.
+Do not merge main or deploy workers on the basis of intermediate Clippy passes.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR
