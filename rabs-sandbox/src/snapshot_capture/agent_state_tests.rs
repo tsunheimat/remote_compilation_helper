@@ -187,14 +187,19 @@ fn excluded_directories_are_not_enumerated_even_with_opaque_or_unreadable_childr
             let path = root.join(directory);
             fifo(&path.join("must-not-enumerate"));
             let opaque = std::ffi::OsString::from_vec(b"invalid-\xff-name".to_vec());
-            if let Err(error) = fs::write(path.join(opaque), b"private opaque filename") {
-                // APFS refuses non-UTF-8 names; its real FIFO remains a
-                // separately proven enumeration poison, including as root.
-                assert!(cfg!(target_os = "macos"), "{error}");
-                assert_eq!(
-                    error.raw_os_error(),
-                    Some(rustix::io::Errno::ILSEQ.raw_os_error())
-                );
+            match fs::write(path.join(opaque), b"private opaque filename") {
+                Ok(()) => {}
+                #[cfg(target_os = "macos")]
+                Err(error) => {
+                    // APFS refuses non-UTF-8 names; its real FIFO remains a
+                    // separately proven enumeration poison, including as root.
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(rustix::io::Errno::ILSEQ.raw_os_error())
+                    );
+                }
+                #[cfg(not(target_os = "macos"))]
+                Err(error) => panic!("opaque fixture creation failed: {error}"),
             }
             fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         }

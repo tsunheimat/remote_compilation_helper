@@ -571,7 +571,7 @@ fn assert_native_target_refusal(world: &World, daemon: &Daemon, host: &str) {
         // A preparing-capable wrapper may finish its cold polling within this
         // single compiler invocation. Those genuine pre-key observations may
         // precede the exact refusal, but no execution/serving decision may.
-        let cold_observation = |decision: &Value| {
+        let cold_observation = |decision: &serde_json::Value| {
             decision["decision"] == "toolchain-warming"
                 || (decision["decision"] == "preparing"
                     && decision["reason"] == "toolchain-facts-pending")

@@ -510,11 +510,11 @@ fn non_utf8_destinations_remain_distinct_and_lossless() {
                 assert_eq!(std::fs::read(&output.destination).unwrap(), b"codegen");
             }
         }
+        #[cfg(target_os = "macos")]
         Err(failure) => {
             // APFS cannot represent either non-UTF-8 destination. Exercise the
             // real rename failure, not a fake successful materializer or a
             // replacement-character path that aliases the two logical outputs.
-            assert!(cfg!(target_os = "macos"), "{failure:?}");
             assert!(failure.installed.is_empty(), "{failure:?}");
             let MaterializeError::Io {
                 step: "rename-into-place",
@@ -534,6 +534,8 @@ fn non_utf8_destinations_remain_distinct_and_lossless() {
                 assert!(std::fs::symlink_metadata(&output.destination).is_err());
             }
         }
+        #[cfg(not(target_os = "macos"))]
+        Err(failure) => panic!("raw destination installation failed: {failure:?}"),
     }
     assert_eq!(
         std::fs::read(lossy).unwrap(),

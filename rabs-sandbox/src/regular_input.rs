@@ -54,17 +54,19 @@ mod tests {
                         held.read_to_end(&mut observed).unwrap();
                         assert_eq!(observed, bytes);
                     }
+                    #[cfg(target_os = "macos")]
                     Err(error) => {
                         // Native APFS rejects an invalid UTF-8 component. The
                         // input adapter must preserve that refusal, not read
                         // an existing replacement-character alias instead.
-                        assert!(cfg!(target_os = "macos"), "{error}");
                         assert_eq!(
                             error.raw_os_error(),
                             Some(rustix::io::Errno::ILSEQ.raw_os_error())
                         );
                         assert!(open(&path).is_err());
                     }
+                    #[cfg(not(target_os = "macos"))]
+                    Err(error) => panic!("raw input creation failed: {error}"),
                 }
             }
         }

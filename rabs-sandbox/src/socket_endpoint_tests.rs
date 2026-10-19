@@ -279,17 +279,19 @@ fn raw_names_sibling_churn_and_permanent_locks_do_not_invalidate_ownership() {
                 assert!(lock.is_file());
                 assert!(EndpointLease::acquire(&path).is_ok());
             }
+            #[cfg(target_os = "macos")]
             Err(error) => {
                 // Native APFS rejects this name before acquiring its lock.
                 // The owner must retain the exact refusal, never sanitize it
                 // into authority over the pre-existing lossy alias.
-                assert!(cfg!(target_os = "macos"), "{error}");
                 assert_eq!(
                     error.raw_os_error(),
                     Some(rustix::io::Errno::ILSEQ.raw_os_error())
                 );
                 assert!(fs::symlink_metadata(&path).is_err());
             }
+            #[cfg(not(target_os = "macos"))]
+            Err(error) => panic!("raw endpoint acquisition failed: {error}"),
         }
         assert_eq!(fs::read(&lossy).unwrap(), b"never retire a lossy alias");
     }
