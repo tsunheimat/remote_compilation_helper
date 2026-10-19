@@ -200,8 +200,23 @@ jobs:
           "${placement_tests[@]}"
           cargo test --release -p rabs-wrap --test live_cargo_layout --locked -- --nocapture
       - name: Real Cargo worktrees receive served dependencies (M4)
-        run: cargo test --release -p rabs-wrap --test live_cargo_worktrees --locked -- --nocapture
-      - name: Doctor + wrapper overhead gate (release, enforcing)
+        shell: bash
         run: |
-          cargo test --release -p rabsd --test doctor_live
-          cargo test --release -p rabs-wrap --test overhead_live -- --nocapture
+          set -euo pipefail
+          mkdir -p target/test-logs/rabs-release
+          cargo test --release -p rabs-wrap --test live_cargo_worktrees --locked -- --nocapture 2>&1 | tee target/test-logs/rabs-release/live-cargo-worktrees.log
+      - name: Doctor + wrapper overhead gate (release, enforcing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/test-logs/rabs-release
+          cargo test --release -p rabsd --test doctor_live 2>&1 | tee target/test-logs/rabs-release/doctor-live.log
+          cargo test --release -p rabs-wrap --test overhead_live -- --nocapture 2>&1 | tee target/test-logs/rabs-release/overhead-live.log
+      - name: Retain the release-gate evidence independently of the full job log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rabs-release-gates-${{ github.sha }}
+          path: target/test-logs/rabs-release/
+          if-no-files-found: warn
+          retention-days: 7

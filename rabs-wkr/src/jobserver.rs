@@ -271,34 +271,73 @@ mod tests {
     fn bridge_kernel_credit_plus_implicit_slot_equals_the_grant() {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
-        for grant in [0, 1, 2, 8, MAX_BRIDGE_TOKENS] {
-            let workspace = tempfile::tempdir().unwrap();
-            let bridge = JobserverBridge::mint(grant, workspace.path()).unwrap();
-            let slots = grant.max(1);
-            assert!(
-                bridge
-                    .makeflags()
-                    .starts_with(&format!("-j{slots} --jobserver-auth=fifo:"))
-            );
-            let mut reader = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(0o4000) // Linux O_NONBLOCK; independent of client descriptors.
-                .open(&bridge.host_path)
+        const CHILD: &str = "RABS_WORKER_BRIDGE_CREDIT_TEST_CHILD";
+        const COMPLETE: &str = "worker bridge credit and final-writer EOF assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            // Match the shared mint's EOF fixture: CLOEXEC does not prevent
+            // unrelated parallel tests from inheriting our writer during fork.
+            // This child owns every launch after its private FIFOs are minted.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "jobserver::tests::bridge_kernel_credit_plus_implicit_slot_equals_the_grant",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
                 .unwrap();
-            let mut tokens = vec![0; (slots - 1) as usize];
-            reader.read_exact(&mut tokens).unwrap();
-            assert_eq!(tokens, vec![b'|'; (slots - 1) as usize]);
-            assert_eq!(
-                reader.read(&mut [0]).unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock,
-                "the implicit slot must never become an extra readable token"
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stderr.contains(COMPLETE),
+                "worker bridge child did not complete its assertions: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                stderr,
             );
-            let path = bridge.host_path.clone();
-            drop(bridge);
-            assert!(!path.exists());
-            assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-            assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+            return;
         }
+        for grant in [0, 1, 2, 8, MAX_BRIDGE_TOKENS] {
+            for retain_writer in [false, true] {
+                let workspace = tempfile::tempdir().unwrap();
+                let bridge = JobserverBridge::mint(grant, workspace.path()).unwrap();
+                let slots = grant.max(1);
+                assert!(
+                    bridge
+                        .makeflags()
+                        .starts_with(&format!("-j{slots} --jobserver-auth=fifo:"))
+                );
+                let mut reader = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(0o4000) // Linux O_NONBLOCK; independent of client descriptors.
+                    .open(&bridge.host_path)
+                    .unwrap();
+                let mut tokens = vec![0; (slots - 1) as usize];
+                reader.read_exact(&mut tokens).unwrap();
+                assert_eq!(tokens, vec![b'|'; (slots - 1) as usize]);
+                assert_eq!(
+                    reader.read(&mut [0]).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "the implicit slot must never become an extra readable token"
+                );
+                // A retained writer descriptor models fork's lifetime without
+                // guessing at a scheduler delay or treating WouldBlock as EOF.
+                let held_writer = retain_writer.then(|| bridge._writer.try_clone().unwrap());
+                let path = bridge.host_path.clone();
+                drop(bridge);
+                assert!(!path.exists());
+                if held_writer.is_some() {
+                    assert_eq!(
+                        reader.read(&mut [0]).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock,
+                        "unlinking the FIFO must not invent EOF while a writer remains"
+                    );
+                }
+                drop(held_writer);
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0, "the final writer closed");
+                assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+            }
+        }
+        eprintln!("{COMPLETE}");
     }
 
     #[cfg(target_os = "linux")]

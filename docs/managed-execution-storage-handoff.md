@@ -581,6 +581,34 @@ revision; these local results cannot qualify a later commit by themselves.
 Keep the integration draft until the final published revision's required checks
 complete. Main, the original checkout and deployed workers remain unchanged.
 
+### Worker jobserver EOF and retained release-gate evidence
+
+Published `63f591cbf55a3351b478a1097150e38766f7f41f` completed all 41 macOS
+shell E2E scenarios, as well as Linux E2E. The Linux x64 workspace's remaining
+failure was `rabs-wkr --lib`'s `bridge_kernel_credit_plus_implicit_slot_equals_the_grant`:
+its final read observed WouldBlock, not EOF, while unrelated parallel tests
+could temporarily retain the writer between fork and exec. The kernel-credit
+fixture now runs its exact assertions in a child that creates all its FIFOs
+after exec. It also deliberately retains a cloned writer, proves unlinking does
+NOT authorize EOF, then requires EOF only after the final writer closes. Token
+counts, the implicit slot, path cleanup, and all production bridge code remain
+unchanged. A child completion marker prevents a zero-test process from passing.
+
+An earlier saved validation invoked this library-only test through the binary
+and selected zero tests; that output is not qualification. The corrected pinned
+remote invocation explicitly selected `--lib` and `--exact`: 1 passed. The full
+worker library then passed all 158 tests with no failures, ignored or filtered
+cases, followed by full-workspace/all-target/all-feature Clippy with fatal
+warnings and formatting. Evidence: `worker-bridge-final-db7bJDD9` under
+`target/remote-pinned-validation/`.
+
+RABS's hosted release M4 gate is still a separate open failure; a previous local
+development-profile pass is not release qualification. The existing release
+workflow now retains M4, doctor and overhead logs as an artifact using pipefail,
+without changing their commands, thresholds, selection, or failure handling.
+There is no new workflow. Keep draft until the final published revision completes
+its native, E2E, RABS release and six-platform shipping gates.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR
