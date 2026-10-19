@@ -183,6 +183,45 @@ extracted ordinary files/directories. Existing safe regular ZIP extraction stays
 covered. The unmaintained unsafe-libyaml and yanked yoke-derive warnings are
 separate unresolved dependency-maintenance findings, not hidden exclusions.
 
+### Permit-boundary and CI-policy follow-up after `44be5087`
+
+Completed evidence for `44be5087bf98d15ff6791fbc3b0e8b1f9b0d8ad8`:
+[CI 39150730505](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39150730505)
+passed the refreshed ZIP security audit and workflow integrity; two ZIP-test line
+wraps stopped pinned formatting before Clippy. Those exact wraps are corrected.
+[RABS 39150730517](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39150730517)
+passed both installer jobs, release compilation, 29 sampling tests, 14 staged
+materialization tests, 28 coordinator tests, 14 complete-output tests, both class
+safety tests and all five SPRT-budget tests. The replay target had six passes and
+one failure; later release gates were not executed after that failing step.
+
+The remaining replay test incorrectly treated a destination-arbiter refusal as
+an admitted installation. Arbitration now precedes staging and permit spending:
+that refusal leaves zero receipts, and the subsequent 24-way contention must
+produce exactly 16 installed outputs, eight refusals and 16 contiguous receipts.
+The test now checks these receipt identities as well as bytes and absent paths.
+It does not change the production replay limit.
+
+A separate deterministic regression preserves the opposite boundary: after real
+private staging, a late filesystem obstruction reaches the production terminal
+receipt/delivery function. The failure must retain its spent permit and leave
+the obstruction untouched; only the remaining 15 installations are allowed,
+and an exhausted retry cannot append another receipt. The production code is
+factored without changing the ordering of authority checks, spending or delivery;
+there is no test-only failure callback or mocked materializer success/error.
+
+The stale auto-merge YAML test is replaced by `ci_workflow_policy.rs`: validation
+contents stay read-only, privileged triggers/permissions and dangling job needs
+are rejected, E2E/shipping retain one reusable PR owner, and dependency proposals
+remain enabled without auto-merging. It includes 93 subprocess cases against the
+actual aggregate Python program, not a copied result evaluator. Those Python
+cases passed remotely; Rust YAML parsing and the new native regressions still
+require exact-revision compiler/test results. No workflow is added or test gate
+relaxed. Remote access is restored to configured `agnet-test` (hostname
+`u25-agent-test`); formatter execution passed there with a source-host refusal
+guard. This is not a pinned-toolchain or full-suite pass. Main and workers are
+unchanged; PR #3 remains draft.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

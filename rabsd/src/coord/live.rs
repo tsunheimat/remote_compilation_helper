@@ -37,7 +37,7 @@ use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
-use rabs_cas::materialization::ActionMaterializeFailure;
+use rabs_cas::materialization::{ActionMaterializeFailure, staged::PreparedActionOutputs};
 use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
@@ -636,6 +636,40 @@ fn live_replay_permit(
         .replay_install_limit(store, action)?
         .unwrap_or(LIVE_REPLAY_INSTALL_LIMIT);
     Ok((used < limit).then_some(ReplayInstallPermit { subject, seq: used }))
+}
+
+/// Complete the already-authorized install under the caller's exclusive CAS
+/// lock. Keeping receipt spending and real output delivery in one boundary
+/// ensures an installation error cannot refund an allowance whose write was
+/// already durable. Earlier arbitration/staging failures never enter here.
+fn finish_replay_install(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    manifest_key: &str,
+    requires_permit: bool,
+    plan: &output_install::PreparedOutputs,
+    prepared: PreparedActionOutputs,
+) -> Result<ServeOutcome, ServeError> {
+    if requires_permit {
+        let Some(permit) = live_replay_permit(store, action, manifest_key)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        else {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::FreshVerificationRequired,
+            ));
+        };
+        store
+            .record_decision_receipt(
+                LIVE_INSTALL_RECEIPT,
+                &permit.subject,
+                permit.seq,
+                "install",
+                manifest_key,
+            )
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+    }
+    let files = output_install::install_prepared(store, plan, prepared)?;
+    Ok(ServeOutcome::Served { files })
 }
 
 /// Final live replay admission, called with the SAME store lock subsequently
@@ -2306,28 +2340,16 @@ impl CoordLive {
             Some(current) => return Ok(ServeOutcome::ManifestUnavailable { key: current }),
             None => return Ok(ServeOutcome::NoCommit),
         }
-        if sampling.is_some() {
-            let Some(permit) = live_replay_permit(&mut *store, action_key, &manifest_key)
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?
-            else {
-                return Ok(ServeOutcome::ExecutePrivately(
-                    ReplayRefusal::FreshVerificationRequired,
-                ));
-            };
-            // Spend only after the post-staging gates pass. A failed/partial
-            // install still conservatively consumes this durable allowance.
-            store
-                .record_decision_receipt(
-                    LIVE_INSTALL_RECEIPT,
-                    &permit.subject,
-                    permit.seq,
-                    "install",
-                    &manifest_key,
-                )
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?;
-        }
-        let files = output_install::install_prepared(&mut *store, &plan, prepared)?;
-        Ok(ServeOutcome::Served { files })
+        // Spend only after the post-staging gates pass. A failed/partial
+        // install still conservatively consumes this durable allowance.
+        finish_replay_install(
+            &mut *store,
+            action_key,
+            &manifest_key,
+            sampling.is_some(),
+            &plan,
+            prepared,
+        )
     }
 
     /// Allocate a pin id unique to this incarnation.
@@ -2753,8 +2775,7 @@ mod tests {
         (state, coord)
     }
 
-    #[test]
-    fn replay_preview_observes_the_install_budget_without_spending_or_creating_outputs() {
+    fn replay_coordinator() -> (tempfile::TempDir, CoordLive, OfferPreparedActionResult, i64) {
         use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
         use rabs_cas::test_support::{
             FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
@@ -2829,6 +2850,15 @@ mod tests {
                 .as_micros(),
         )
         .unwrap();
+        (state, coord, offer, now)
+    }
+
+    #[test]
+    fn replay_preview_observes_the_install_budget_without_spending_or_creating_outputs() {
+        use rabs_cas::test_support::sample_action_key;
+
+        let (state, coord, _offer, now) = replay_coordinator();
+        let cas = coord.cas.as_ref().unwrap();
         let destination = state.path().join("preview-only");
         for used in 0..=LIVE_REPLAY_INSTALL_LIMIT {
             let before = cas.store().lock().unwrap().differential_snapshot().unwrap();
@@ -2876,6 +2906,102 @@ mod tests {
                     b"verified preview artifact"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn failed_delivery_keeps_its_durable_permit_and_exhaustion_does_not_spend_again() {
+        use rabs_cas::test_support::sample_action_key;
+
+        let (state, coord, offer, _now) = replay_coordinator();
+        let cas = coord.cas.as_ref().unwrap();
+        let action = sample_action_key();
+        let manifest_key = digest_key(&offer.manifest_id.0);
+        let destination = state.path().join("failed-delivery");
+        let stage = || {
+            let mut store = cas.store().lock().unwrap();
+            let plan = output_install::prepare(
+                &mut *store,
+                &offer.manifest,
+                &destination,
+                &ExpectedOutputs::WhateverWasCommitted,
+            )
+            .unwrap()
+            .unwrap();
+            let selected = output_install::select_for_install(&mut *store, &plan).unwrap();
+            drop(store);
+            let prepared = output_install::stage_for_install(selected, &plan).unwrap();
+            (plan, prepared)
+        };
+        let (plan, prepared) = stage();
+        assert!(!destination.exists());
+        // Inject the filesystem obstruction AFTER real private staging. This
+        // isolates the production receipt/delivery boundary deterministically,
+        // without races, test-only callbacks, or fake materializer results.
+        std::fs::write(&destination, b"late unrelated file").unwrap();
+        let mut store = cas.store().lock().unwrap();
+        let first = live_replay_permit(&mut *store, &action, &manifest_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.seq, 0);
+        assert!(matches!(
+            finish_replay_install(&mut *store, &action, &manifest_key, true, &plan, prepared),
+            Err(ServeError::Preparation { .. })
+        ));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"late unrelated file");
+        let next = live_replay_permit(&mut *store, &action, &manifest_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.seq, 1, "a failed delivery cannot refund its receipt");
+        assert_eq!(next.subject, first.subject);
+        drop(store);
+        // Remove only this fixture's injected file; the production failure did
+        // not alter or remove it. Install the remaining allowance normally.
+        std::fs::remove_file(&destination).unwrap();
+        for _ in 1..LIVE_REPLAY_INSTALL_LIMIT {
+            let (plan, prepared) = stage();
+            assert!(matches!(
+                finish_replay_install(
+                    &mut *cas.store().lock().unwrap(),
+                    &action,
+                    &manifest_key,
+                    true,
+                    &plan,
+                    prepared,
+                )
+                .unwrap(),
+                ServeOutcome::Served { .. }
+            ));
+        }
+        let (plan, prepared) = stage();
+        let mut store = cas.store().lock().unwrap();
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            finish_replay_install(&mut *store, &action, &manifest_key, true, &plan, prepared)
+                .unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired)
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        let receipts = store
+            .query(
+                "SELECT seq, decision, reason FROM decision_receipts \
+             WHERE kind = ?1 AND subject = ?2 ORDER BY seq",
+                &[
+                    SqlValue::Text(LIVE_INSTALL_RECEIPT.into()),
+                    SqlValue::Text(first.subject),
+                ],
+            )
+            .unwrap();
+        assert_eq!(receipts.len(), LIVE_REPLAY_INSTALL_LIMIT as usize);
+        for (seq, row) in receipts.iter().enumerate() {
+            assert_eq!(
+                row,
+                &vec![
+                    SqlValue::Int(seq as i64),
+                    SqlValue::Text("install".into()),
+                    SqlValue::Text(manifest_key.clone())
+                ]
+            );
         }
     }
 

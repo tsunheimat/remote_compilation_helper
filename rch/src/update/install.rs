@@ -1652,8 +1652,7 @@ mod tests {
         for (name, mode) in entries {
             // unix_permissions() deliberately masks these bits. Use the raw
             // ZIP attributes so this fixture actually carries hostile modes.
-            let options =
-                zip::write::SimpleFileOptions::default().external_attributes(mode << 16);
+            let options = zip::write::SimpleFileOptions::default().external_attributes(mode << 16);
             if name.ends_with('/') {
                 writer.add_directory(name, options).unwrap();
             } else {
@@ -1672,7 +1671,10 @@ mod tests {
         drop(observed);
 
         extract_archive(&archive_path, &dest).unwrap();
-        assert_eq!(fs::read(dest.join("rch")).unwrap(), b"ordinary update bytes");
+        assert_eq!(
+            fs::read(dest.join("rch")).unwrap(),
+            b"ordinary update bytes"
+        );
         assert!(dest.join("nested").is_dir());
         for (name, _) in entries {
             assert_eq!(
