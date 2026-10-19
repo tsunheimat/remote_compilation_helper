@@ -1,6 +1,7 @@
 //! Exercise the production completion handoff against real coordinator/CAS
 //! state and Unix sockets. Only toolchain probes and compiled artifact bytes
 //! are fixtures; these are not executions of Cargo or rustc.
+#![cfg(test)]
 
 use super::super::rustc_request::{Decided, LiveEdge, complete_on_lane, decide};
 use super::super::{EdgeStream, FRAME_READ_BUFFER_BYTES};

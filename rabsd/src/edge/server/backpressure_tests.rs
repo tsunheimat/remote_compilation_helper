@@ -1,3 +1,7 @@
+// Keep this out-of-line fixture test-only even when source scanners inspect it
+// independently of backpressure.rs's cfg-gated module declaration.
+#![cfg(test)]
+
 use super::*;
 use asupersync::runtime::RuntimeBuilder;
 use rabs_asupersync::daemon_runtime::block_on_top_level;

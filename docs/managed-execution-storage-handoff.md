@@ -222,6 +222,41 @@ relaxed. Remote access is restored to configured `agnet-test` (hostname
 guard. This is not a pinned-toolchain or full-suite pass. Main and workers are
 unchanged; PR #3 remains draft.
 
+### Guarded-runtime and archive-contract reconciliation
+
+At `d40a133b3839fdcd33346608bce460816a51561f`, CI `39198658477` passed pinned
+formatting, security and workflow integrity. Clippy exposed ZIP 9's fallible
+`ZipFile::name()` signature. Extraction now maps a decoding failure to a typed
+installation refusal before any path is selected; it does not use lossy names.
+A regression creates and successfully extracts a valid ZIP, changes only the
+local/central filename bytes and UTF-8 flags, then verifies malformed extraction
+cannot create a replacement-character output. The unchanged valid extraction
+remains byte-identical. No dependency rollback or advisory exemption is used.
+
+The older native failure log also exposed static review drift after runtime
+entry was moved behind guarded adapters. The AST scanner now treats calls to
+`block_on_top_level` and `block_on_worker_runtime` as runtime entry, including
+opaque macros; original reviewed caller counts remain unchanged. Only the two
+actual adapter bodies are newly reviewed entry owners, each borrowing an owned
+runtime and rejecting an active Cx before calling block_on. New detector fixtures
+reject both adapters from async/nested/macro/unreviewed contexts. Three split-out
+fixture modules explicitly declare `#![cfg(test)]`, matching their already-gated
+parent module declarations; all src files continue to be scanned independently.
+
+Cargo archive expectations now distinguish the existing contracts rather than
+widening production delivery: `cargo package` returns only final root archives;
+`cargo publish --dry-run` may return tmp-registry/tmp-crate archives too. Both
+managed/unmanaged cases assert exact selected and excluded path sets. The real
+Cargo package/rsync fixture still verifies extracted-source provenance and final
+archive byte equality, and now asserts scratch archives are not returned.
+
+Remote formatting and diff checks passed. These changes do not establish native
+runtime/packaging/ZIP-test success: those require the next pinned CI revision.
+The d40 RABS run `39198658478` passed installers, release build and early worker
+checks and was still executing replay verification at this checkpoint. No new
+workflow, ignored test, warning exemption, runtime permission or artifact type
+is introduced. Main and deployed workers remain unchanged.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR

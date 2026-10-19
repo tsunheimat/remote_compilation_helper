@@ -527,7 +527,12 @@ fn extract_zip_archive(archive_file: fs::File, dest: &Path) -> Result<(), Update
         let mut entry = zip
             .by_index(index)
             .map_err(|e| UpdateError::InstallFailed(format!("Invalid zip archive entry: {}", e)))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry
+            .name()
+            .map_err(|error| {
+                UpdateError::InstallFailed(format!("Invalid update zip entry name: {error}"))
+            })?
+            .into_owned();
         let relative_path = safe_archive_entry_path(Path::new(&entry_name))?;
         let destination = dest.join(&relative_path);
 
@@ -1682,6 +1687,65 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn test_extract_zip_rejects_invalid_utf8_names_without_lossy_replacement() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.zip");
+        let destination = temp.path().join("invalid-name");
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("rch", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"ordinary binary bytes").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // Prove the original fixture is an ordinary extractable archive, then
+        // change only both filename copies and their UTF-8 flags. File payload,
+        // CRC, compression, offsets and field lengths remain unchanged.
+        fs::write(&archive_path, &bytes).unwrap();
+        let valid = temp.path().join("valid-name");
+        extract_archive(&archive_path, &valid).unwrap();
+        assert_eq!(
+            fs::read(valid.join("rch")).unwrap(),
+            b"ordinary binary bytes"
+        );
+        for (signature, flags_offset, name_offset) in [
+            ([0x50, 0x4b, 0x03, 0x04], 6, 30),
+            ([0x50, 0x4b, 0x01, 0x02], 8, 46),
+        ] {
+            let offsets: Vec<_> = bytes
+                .windows(4)
+                .enumerate()
+                .filter_map(|(offset, header)| (header == signature).then_some(offset))
+                .collect();
+            assert_eq!(
+                offsets.len(),
+                1,
+                "fixture must contain one header of each kind"
+            );
+            let base = offsets[0];
+            assert_eq!(&bytes[base + name_offset..base + name_offset + 3], b"rch");
+            let flags = base + flags_offset;
+            let value = u16::from_le_bytes([bytes[flags], bytes[flags + 1]]) | (1 << 11);
+            bytes[flags..flags + 2].copy_from_slice(&value.to_le_bytes());
+            bytes[base + name_offset] = 0xff;
+        }
+        fs::write(&archive_path, &bytes).unwrap();
+        let result = extract_archive(&archive_path, &destination);
+        assert!(
+            matches!(result, Err(UpdateError::InstallFailed(_))),
+            "{result:?}"
+        );
+        // The private extraction root itself may have been created, but no
+        // replacement-character path or partial output is authorized.
+        if destination.exists() {
+            assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        }
+        assert_eq!(
+            fs::read(valid.join("rch")).unwrap(),
+            b"ordinary binary bytes"
+        );
     }
 
     #[test]

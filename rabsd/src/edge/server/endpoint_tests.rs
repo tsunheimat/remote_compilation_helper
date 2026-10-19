@@ -1,3 +1,6 @@
+// Match the owning endpoint module's compiler-enforced test-only boundary.
+#![cfg(test)]
+
 use super::*;
 use asupersync::runtime::RuntimeBuilder;
 use rabs_asupersync::daemon_runtime::block_on_top_level;

@@ -1447,24 +1447,19 @@ mod managed_build_dir_tests {
             .partition_staged_artifact_paths(&inventory, &patterns)
             .unwrap();
         let archive = PathBuf::from("package/managed_package_fixture-0.1.0.crate");
-        // Cargo can retain its identical archive staging copy. The production
-        // policy deliberately retrieves tmp-crate archives for dry-run publish;
-        // keep that contract while rejecting every unrelated selected file.
+        // Cargo package may retain a byte-identical verification scratch copy,
+        // but its declared output is only the final root archive. Publish dry-run
+        // has a different delivery contract, covered independently below.
         let temporary_archive =
             PathBuf::from("package/tmp-crate/managed_package_fixture-0.1.0.crate");
-        let mut expected = vec![archive.clone()];
         if pool.join(&temporary_archive).is_file() {
             assert_eq!(
                 fs::read(pool.join(&temporary_archive)).unwrap(),
                 fs::read(pool.join(&archive)).unwrap(),
                 "Cargo's staging archive must be byte-identical to its final archive"
             );
-            expected.push(temporary_archive.clone());
         }
-        expected.sort();
-        let mut selected_set = selected.clone();
-        selected_set.sort();
-        assert_eq!(selected_set, expected);
+        assert_eq!(selected.as_slice(), std::slice::from_ref(&archive));
         let mut rsync = Command::new("/usr/bin/timeout") // ubs:ignore — copies only production-selected fixture archives, locally.
             .args([
                 "--kill-after=5",
@@ -1493,6 +1488,8 @@ mod managed_build_dir_tests {
         }
         let transferred = rsync.wait_with_output().unwrap();
         assert!(transferred.status.success(), "{transferred:?}");
+        assert!(!root.join("returned").join(&temporary_archive).exists());
+        assert!(!root.join("returned/package/tmp-registry").exists());
         for relative in &selected {
             let original = fs::read(pool.join(relative)).unwrap();
             let returned = fs::read(root.join("returned").join(relative)).unwrap();
@@ -1682,10 +1679,28 @@ mod managed_build_dir_tests {
             .into_iter()
             .map(PathBuf::from),
         );
-        for command in [
-            "cargo package --offline",
-            "cargo publish --dry-run --locked",
+        for (command, publish_dry_run) in [
+            ("cargo package --offline", false),
+            ("cargo publish --dry-run --locked", true),
         ] {
+            let expected_patterns = if publish_dry_run {
+                vec![
+                    "package/*.crate",
+                    "package/tmp-registry/*.crate",
+                    "package/tmp-crate/*.crate",
+                ]
+            } else {
+                vec!["package/*.crate"]
+            };
+            let expected_archives: BTreeSet<_> = archives[..if publish_dry_run { 3 } else { 1 }]
+                .iter()
+                .cloned()
+                .collect();
+            let expected_excluded: BTreeSet<_> = inventory
+                .iter()
+                .filter(|path| !expected_archives.contains(*path))
+                .cloned()
+                .collect();
             for target in [None, Some("/worker/managed pool")] {
                 let plan = super::ManagedCargoCommand::new(command, target).unwrap();
                 let stamped =
@@ -1695,25 +1710,17 @@ mod managed_build_dir_tests {
                 assert_eq!(plan.policy_command(), command);
                 let patterns =
                     get_custom_target_artifact_patterns(kind, Some(plan.policy_command()));
-                assert_eq!(
-                    expected_output_glob_list(&patterns),
-                    [
-                        "package/*.crate",
-                        "package/tmp-registry/*.crate",
-                        "package/tmp-crate/*.crate",
-                    ]
-                );
+                assert_eq!(expected_output_glob_list(&patterns), expected_patterns);
                 assert!(
                     get_project_artifact_patterns(kind, Some(plan.policy_command()), true)
                         .is_empty()
                 );
                 assert_eq!(
                     get_project_artifact_patterns(kind, Some(plan.policy_command()), false),
-                    [
-                        "target/package/*.crate",
-                        "target/package/tmp-registry/*.crate",
-                        "target/package/tmp-crate/*.crate",
-                    ]
+                    expected_patterns
+                        .iter()
+                        .map(|pattern| format!("target/{pattern}"))
+                        .collect::<Vec<_>>()
                 );
                 let pipeline = crate::transfer::TransferPipeline::new(
                     PathBuf::from("/unused/local"),
@@ -1726,9 +1733,12 @@ mod managed_build_dir_tests {
                     .unwrap();
                 assert_eq!(
                     selected.into_iter().collect::<BTreeSet<_>>(),
-                    archives.iter().cloned().collect::<BTreeSet<_>>()
+                    expected_archives
                 );
-                assert_eq!(excluded.len(), 5);
+                assert_eq!(
+                    excluded.into_iter().collect::<BTreeSet<_>>(),
+                    expected_excluded
+                );
                 assert!(sync_back_verified_zero_package_archives(
                     Some(0),
                     plan.policy_command()
