@@ -2631,10 +2631,34 @@ mod tests {
         }
     }
 
+    // Open executable writers only after exec. A parallel test's fork can
+    // inherit even a CLOEXEC descriptor until it execs, so closing a writer
+    // in this multithreaded test process does not establish executable custody.
+    // Reaping this single-threaded writer does; production probes still refuse
+    // ETXTBSY rather than retrying an unstable toolchain generation.
+    fn install_toolchain_probe(compiler: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "exec /bin/cat > \"$1\"", "write-fixture-probe"])
+            .arg(compiler)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let written = writer.stdin.take().unwrap().write_all(bytes);
+        let output = writer.wait_with_output().unwrap();
+        written.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        std::fs::set_permissions(compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     // A scripted version/sysroot probe over real filesystem inputs. This
     // exercises toolchain observation, not a real compiler or cache hit.
     pub(super) fn toolchain_fixture() -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         // Short paths also fit macOS's smaller Unix-domain socket address.
         let dir = tempfile::Builder::new()
             .prefix("rt-")
@@ -2660,7 +2684,7 @@ mod tests {
         )
         .unwrap();
         let compiler = root.join("bin/rustc");
-        std::fs::write(
+        install_toolchain_probe(
             &compiler,
             br#"#!/bin/sh
 root=${0%/bin/rustc}
@@ -2679,10 +2703,56 @@ case "$*" in
     *) exit 64 ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         (dir, compiler)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_executable_writer_is_refused_until_its_owned_process_exits() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let (directory, compiler) = toolchain_fixture();
+        let original = std::fs::read(&compiler).unwrap();
+        // Deliberately retain a real writable descriptor without changing any
+        // bytes. The version probe must not accept or wait for this writer.
+        let mut writer = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 3>> \"$1\"; printf ready; IFS= read -r release || :",
+                "hold-fixture-probe",
+            ])
+            .arg(&compiler)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 5];
+        let announced = writer.stdout.take().unwrap().read_exact(&mut ready);
+        let log = directory.path().join("probe-log");
+        let env = [("RABS_TEST_LOG".to_owned(), log.to_str().unwrap().to_owned())];
+        let refused = announced
+            .as_ref()
+            .ok()
+            .map(|()| probe_toolchain(&compiler, &env));
+        // Release and reap the exact child before assertions or the positive
+        // observation. No test-harness descriptor ever opens compiler writable.
+        drop(writer.stdin.take());
+        let output = writer.wait_with_output().unwrap();
+        announced.unwrap();
+        assert_eq!(&ready, b"ready");
+        assert!(output.status.success(), "{output:?}");
+        let Err(error) = refused.unwrap() else {
+            panic!("live writer must refuse");
+        };
+        assert!(error.contains("Text file busy"), "{error}");
+        assert!(!log.exists(), "a rejected version probe must not run");
+        assert_eq!(std::fs::read(&compiler).unwrap(), original);
+        let accepted = probe_toolchain(&compiler, &env).unwrap();
+        assert!(accepted.still_current());
+        assert_eq!(std::fs::read(log).unwrap(), b"probe\nprobe\n");
     }
 
     #[test]
@@ -2954,7 +3024,7 @@ while :; do printf '%0200d' 0; done
 "#;
         let probes = [(&first, first_dir.path()), (&second, second_dir.path())];
         for (compiler, root) in probes {
-            std::fs::write(compiler, script).unwrap();
+            install_toolchain_probe(compiler, script);
             let env = vec![
                 (
                     "STARTED".into(),

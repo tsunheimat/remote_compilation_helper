@@ -1,5 +1,69 @@
 # Managed execution storage: local Codex handoff
 
+## October 20 continuation: executable and endpoint fixture custody
+
+The published baseline is `69b95b9d418d035ed8affa58b4d83163aa175b25`.
+[CI 39376800751](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39376800751)
+passed formatting/full fatal-warning Clippy, security/integrity, both macOS
+workspace rows, Linux ARM64, both complete E2E jobs and their aggregate.
+Linux x64 had exactly one failing test: the library toolchain-membership fixture
+could not launch its `-vV` probe (`Text file busy`, OS error 26). Shipping remained
+correctly gated. [RABS 39376800789](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39376800789)
+then completed every gate successfully, including M4 and doctor/overhead.
+These are baseline results, not results for the following test-only patch.
+
+The integration test's executable writer was already isolated, but the equivalent
+library helper still opened executable files in the multithreaded test process.
+A concurrent fork can inherit that writable descriptor until exec, even when the
+originating descriptor is CLOEXEC. The library helper now opens its writer only
+in a post-exec child, then reaps that child before any LiveFacts probe. Its second
+script-replacement caller uses the same helper. Script bytes, permissions,
+production probing and test parallelism are unchanged. The production prefix of
+`live_facts.rs` is byte-identical to the baseline.
+
+The new Linux regression deliberately retains an actual executable writer in an
+owned process. The real probe must refuse it with ETXTBSY without running the
+script. After the exact writer is released and reaped, the same unchanged bytes
+must probe successfully, retain current facts, and emit exactly the two expected
+identity-probe records. No production retry, timeout, guard or assertion is relaxed.
+
+A subsequent repeated run exposed the same custody mistake in the legacy-socket
+fixture: dropping its multithreaded-parent listener did not establish that an
+unrelated fork had released every inherited listening descriptor. That fixture
+now creates the listener after exec in a dedicated child, validates its readiness
+against the exact child PID, retains the live-refusal/unchanged-inode assertions,
+and releases and reaps that child before demanding ConnectionRefused and safe
+stale takeover. The fixture's control message does not depend on pipe EOF. Its
+owned-child guard also reaps on assertion failure. Production endpoint code and
+its one-second bind checks are unchanged; the modified file is `cfg(test)` only.
+
+On the configured `u25-agent-test` runner with pinned `nightly-2026-08-31`, the
+final two-file patch passed formatting, `cargo check --locked --workspace
+--all-targets`, and full-workspace/all-target/all-feature Clippy with fatal
+warnings. It then passed **eight complete `rabsd --lib` runs: 769 passed, zero
+failed, ignored or filtered in each run**, with normal parallel test execution.
+Logs and exact validated file hashes are retained in the owned ignored
+`target/fixture-custody-j6Di5E5X/` tree. Earlier runs, including the discovered
+socket failure, are retained under `target/remote-pinned-validation/lib-probe-writer-er4jaauj/`.
+The initial cold compilation batch reached its execution limit during Clippy;
+the independent final batch completed successfully without changing any gate.
+The runner's normalization of Cargo caches/builds to `/srv/remote-test` roots
+was honored throughout. No compilation or testing ran on the source host.
+
+UBS v5.5.3 static scans of the two changed Rust files and their unchanged parent
+both exit 1. The ten
+unchanged critical labels mistake filesystem `FileSig` values (device, inode,
+size and timestamps) for secret signatures. Newly reported findings are confined
+to test assertions/filesystem I/O and slash-containing shell strings; there are
+no new critical or production findings. Raw reports and comparison are retained
+under `target/ubs-fixture-custody-4jxha633/`. The scan is not described as clean;
+no suppressions or skipped categories were added. Compiler-backed checks are
+separate from this explicitly static scan.
+
+The 12-workflow graph is unchanged. Keep PR #3 draft until the final published
+revision passes all native rows, both E2E suites, RABS gates, six shipping targets
+and `ci-success`. Main and deployed workers are unchanged.
+
 ## Upstream v2.1.34 integration — 2026-10-16
 
 This section supersedes the checkout/status statements below; older evidence

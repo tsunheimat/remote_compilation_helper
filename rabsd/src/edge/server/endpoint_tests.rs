@@ -62,15 +62,95 @@ fn admitted_connection_owner_fences_restart_after_listener_drop() {
 
 #[test]
 fn actual_dead_socket_is_recovered_but_live_legacy_listener_is_not() {
+    use std::io::Write;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+
+    struct OwnedLegacy(Child);
+    impl Drop for OwnedLegacy {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    const CHILD_PATH: &str = "RABS_TEST_LEGACY_ENDPOINT_OWNER";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        // The listener is created only after exec, outside the multithreaded
+        // parent's concurrent forks. Reaping this process proves that no
+        // inherited listening descriptor remains; a parent-side drop cannot.
+        let path = std::path::PathBuf::from(path);
+        let legacy = StdListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let pending = path.with_extension("ready-pending");
+        fs::write(&pending, std::process::id().to_string()).unwrap();
+        fs::rename(pending, path.with_extension("ready")).unwrap();
+        let mut release = String::new();
+        std::io::stdin().read_line(&mut release).unwrap();
+        assert_eq!(release, "stop\n");
+        drop(legacy);
+        return;
+    }
+
     let root = crate::test_util::private_tempdir();
     let path = root.path().join("edge.sock");
-    let legacy = StdListener::bind(&path).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut legacy = OwnedLegacy(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "edge::server::endpoint::tests::actual_dead_socket_is_recovered_but_live_legacy_listener_is_not",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let ready = path.with_extension("ready");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.is_file() {
+        assert!(
+            legacy.0.try_wait().unwrap().is_none(),
+            "listener owner exited before readiness"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "listener owner did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read_to_string(ready).unwrap(),
+        legacy.0.id().to_string()
+    );
     let before = identity(&path);
     assert!(run(bind_inner(&path, Duration::from_secs(1))).is_err());
     assert_eq!(identity(&path), before);
     assert!(StdStream::connect(&path).is_ok());
-    drop(legacy);
+
+    // A complete message, not EOF, releases the owner even if a concurrent
+    // fork temporarily inherited the parent's write end of this control pipe.
+    legacy.0.stdin.take().unwrap().write_all(b"stop\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = legacy.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "listener owner did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        identity(&path),
+        before,
+        "owner exit must leave the stale inode intact"
+    );
+    assert_eq!(
+        StdStream::connect(&path).unwrap_err().kind(),
+        io::ErrorKind::ConnectionRefused
+    );
     let successor = run(bind_inner(&path, Duration::from_secs(1))).unwrap();
     assert!(StdStream::connect(&path).is_ok());
     drop(successor);
