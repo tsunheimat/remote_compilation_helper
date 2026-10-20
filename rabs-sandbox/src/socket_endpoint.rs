@@ -232,6 +232,25 @@ impl EndpointLease {
         Ok(())
     }
 
+    /// Bind a new listener and retain its exact post-claim generation.
+    /// On Linux, restrict the socket descriptor BEFORE publishing its pathname:
+    /// a crash between bind and claim must not leave a broadly accessible inode
+    /// that the next daemon correctly refuses to take over. This changes no
+    /// process-wide umask and never repairs an existing endpoint's permissions.
+    /// Other Unix platforms retain their native bind followed by claim.
+    ///
+    /// # Errors
+    /// Lost ownership, an existing endpoint, bind/listen errors, or claim failure.
+    pub fn bind_listener(&mut self) -> io::Result<std::os::unix::net::UnixListener> {
+        self.verify()?;
+        if self.bound.is_some() {
+            return Err(refused("endpoint already bound by this lease"));
+        }
+        let listener = bind_new_listener(&self.path)?;
+        self.claim_bound()?;
+        Ok(listener)
+    }
+
     /// Call once after successfully binding a NEW listener. Record its final
     /// post-chmod generation for identity-checked teardown.
     ///
@@ -284,6 +303,36 @@ impl EndpointLease {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn bind_private_socket(path: &Path) -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, bind, socket_with};
+
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    // Linux's unix_bind_bsd derives the pathname mode from this descriptor's
+    // inode AND the caller's umask. Normal masks may remove permissions but
+    // can never add group/world access. claim_bound still enforces exact 0600.
+    rustix::fs::fchmod(&socket, Mode::from_raw_mode(0o600))?;
+    bind(&socket, &SocketAddrUnix::new(path)?)?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_new_listener(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+    let socket = bind_private_socket(path)?;
+    rustix::net::listen(&socket, 128)?;
+    Ok(socket.into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_new_listener(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+    std::os::unix::net::UnixListener::bind(path)
+}
+
 fn validate_directory(metadata: &fs::Metadata, uid: u32) -> io::Result<()> {
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
         return Err(refused(
@@ -309,3 +358,96 @@ fn validate_lock(metadata: &fs::Metadata, uid: u32) -> io::Result<()> {
 #[cfg(test)]
 #[path = "socket_endpoint_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod private_bind_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild(Child);
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn interrupted_bind_child() {
+        let Some(path) = std::env::var_os("RABS_TEST_PRIVATE_BIND_PATH") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let mask = u32::from_str_radix(&std::env::var("RABS_TEST_BIND_MASK").unwrap(), 8).unwrap();
+        // Only this dedicated post-exec helper changes its process umask.
+        rustix::fs::umask(Mode::from_raw_mode(mask));
+        let lease = EndpointLease::acquire(&path).unwrap();
+        let socket = bind_private_socket(lease.path()).unwrap();
+        if std::env::var("RABS_TEST_BIND_LISTEN").as_deref() == Ok("1") {
+            rustix::net::listen(&socket, 128).unwrap();
+        }
+        let ready = path.with_extension("ready");
+        let pending = path.with_extension("pending");
+        fs::write(&pending, b"bound before claim\n").unwrap();
+        fs::rename(&pending, &ready).unwrap();
+        // The parent kills and reaps this process at the real syscall boundary.
+        // No destructor, chmod, endpoint claim or graceful retirement runs.
+        let mut byte = [0];
+        let _ = std::io::stdin().read_exact(&mut byte);
+        panic!("interrupted-bind child must be killed before it can continue");
+    }
+
+    #[test]
+    fn killing_before_claim_leaves_a_private_recoverable_endpoint() {
+        for mask in [0o000, 0o022, 0o077] {
+            for listen in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("edge.sock");
+                let ready = path.with_extension("ready");
+                let mut child = OwnedChild(
+                    Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "socket_endpoint::private_bind_tests::interrupted_bind_child",
+                            "--nocapture",
+                        ])
+                        .env("RABS_TEST_PRIVATE_BIND_PATH", &path)
+                        .env("RABS_TEST_BIND_MASK", format!("{mask:o}"))
+                        .env("RABS_TEST_BIND_LISTEN", if listen { "1" } else { "0" })
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .unwrap(),
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready.exists() && Instant::now() < deadline {
+                    assert!(child.0.try_wait().unwrap().is_none(), "bind helper exited");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(fs::read(&ready).unwrap(), b"bound before claim\n");
+                let before = SocketStamp::of(&fs::symlink_metadata(&path).unwrap());
+                assert_eq!(before.mode & 0o777, 0o600, "mask={mask:o}, listen={listen}");
+                assert!(EndpointLease::acquire(&path).is_err());
+                child.0.kill().unwrap();
+                assert!(!child.0.wait().unwrap().success());
+                let mut lease = EndpointLease::acquire(&path).unwrap();
+                assert_eq!(lease.observe().unwrap(), Some(before));
+                let error = UnixStream::connect(&path).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+                lease.retire_refused(before, &error).unwrap();
+                let listener = lease.bind_listener().unwrap();
+                assert!(UnixStream::connect(&path).is_ok());
+                assert_eq!(lease.observe().unwrap().unwrap().mode & 0o777, 0o600);
+                drop(listener);
+                assert!(lease.retire_bound().unwrap());
+            }
+        }
+    }
+}

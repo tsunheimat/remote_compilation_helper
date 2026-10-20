@@ -92,10 +92,9 @@ async fn bind_inner(path: &Path, budget: Duration) -> io::Result<ListenerOwner> 
         }
     }
     lease.verify()?;
-    // Same native bind as Asupersync uses, but without its shorter-lived
-    // automatic pathname cleanup. No second runtime or worker thread.
-    let listener = std::os::unix::net::UnixListener::bind(lease.path())?;
-    lease.claim_bound()?;
+    // Preserve endpoint ownership beyond the listener while Linux publishes
+    // the socket with private permissions from its first visible instant.
+    let listener = lease.bind_listener()?;
     let owner = Arc::new(EndpointOwner(lease));
     let listener = UnixListener::from_std(listener)?;
     Ok(ListenerOwner { listener, owner })

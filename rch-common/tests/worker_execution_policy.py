@@ -143,10 +143,15 @@ ps -o ni= -p "$$"
         ready = self.root / f"{build}.ready"
         # An independently configured child ignores TERM, exercising witnessed
         # KILL escalation after the original group leader has been terminated.
+        # Publish only a closed, complete PID record. Seeing a freshly created
+        # empty file is not readiness; do not hide that producer race by retrying
+        # int() or weakening the subsequent priority and group-death assertions.
         child = (
-            "import os,signal,sys,time; "
+            "import os,signal,sys,time; from pathlib import Path; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
+            "pending = Path(sys.argv[1] + '.pending'); "
+            "pending.write_text(str(os.getpid())); "
+            "pending.replace(sys.argv[1]); time.sleep(60)"
         )
         body = r'''
 rch_remote_record "$1" "$2" || exit $?
@@ -164,6 +169,8 @@ wait
         while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertTrue(ready.exists(), f"build {build} did not become ready")
+        self.assertRegex(ready.read_text(), r"\A[1-9][0-9]*\Z")
+        self.assertFalse(Path(str(ready) + ".pending").exists())
         return proc, record, ready
 
     def cancel(self, record: Path, build: int = 42, mode: str = "term") -> subprocess.CompletedProcess[str]:
