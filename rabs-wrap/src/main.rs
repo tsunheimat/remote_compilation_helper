@@ -465,10 +465,37 @@ impl ConsultStream {
     }
 }
 
+/// Darwin refuses setsockopt after both socket halves close, even when a
+/// complete final reply remains queued. Read only immediately available bytes
+/// in that case: a failed timeout setup must never authorize a blocking read.
+/// No bytes available means the original configuration failure, not fake EOF.
+fn drain_after_timeout_error(
+    stream: &mut UnixStream,
+    buf: &mut [u8],
+    timeout_error: io::Error,
+) -> io::Result<usize> {
+    stream.set_nonblocking(true)?;
+    let result = stream.read(buf);
+    stream.set_nonblocking(false)?;
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(timeout_error),
+        other => other,
+    }
+}
+
 impl Read for ConsultStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buf)
+        // Check the absolute budget first, including the nonblocking drain.
+        let remaining = self.remaining()?;
+        match self.stream.set_read_timeout(Some(remaining)) {
+            Ok(()) => self.stream.read(buf),
+            Err(error)
+                if cfg!(target_vendor = "apple") && error.kind() == io::ErrorKind::InvalidInput =>
+            {
+                drain_after_timeout_error(&mut self.stream, buf, error)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1295,6 +1322,86 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_native_peer_retains_its_complete_reply_and_real_eof() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let bytes = b"complete\0\xff\r\nunterminated";
+        peer.write_all(bytes).unwrap();
+        // Close before the first timeout-setting read, without a timing sleep.
+        drop(peer);
+        let mut source = ConsultStream {
+            stream,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        let mut actual = Vec::new();
+        source.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(source.read(&mut [0; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_timeout_setup_drains_only_ready_bytes_and_never_invents_eof() {
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        let failure = || io::Error::new(io::ErrorKind::InvalidInput, "injected timeout setup");
+        let mut buf = [0; 4];
+        let error = drain_after_timeout_error(&mut stream, &mut buf, failure()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "injected timeout setup");
+        peer.write_all(b"data").unwrap();
+        assert_eq!(
+            drain_after_timeout_error(&mut stream, &mut buf, failure()).unwrap(),
+            4
+        );
+        assert_eq!(&buf, b"data");
+        drop(peer);
+        assert_eq!(
+            drain_after_timeout_error(&mut stream, &mut buf, failure()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn peer_close_never_substitutes_for_complete_authorized_installation() {
+        let served = "{\"kind\":\"rustc-decision\",\"decision\":\"served\",\"compiler_skip_authorized\":true,\"stderr_hex\":\"00ff\"}\n";
+        for reply in [
+            served,
+            "{\n",
+            "",
+            "{\"kind\":\"rustc-decision\",\"decision\":\"served\"}\n",
+            served.trim_end(),
+        ] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(reply.as_bytes()).unwrap();
+            drop(peer);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut reader = BufReader::new(ConsultStream { stream, deadline });
+            let answer =
+                singleflight::read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, &|| true);
+            if reply == served {
+                assert!(
+                    matches!(accepted_install_reply(&answer.unwrap()), Live::Served(bytes) if bytes == b"\0\xff")
+                );
+            } else if let Ok(line) = answer {
+                assert!(matches!(accepted_install_reply(&line), Live::FailClosed(_)));
+            }
+        }
+        for owned in [false, true] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(served.as_bytes()).unwrap();
+            drop(peer);
+            let deadline = if owned {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(2)
+            };
+            let mut reader = BufReader::new(ConsultStream { stream, deadline });
+            assert!(
+                singleflight::read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, &|| owned)
+                    .is_err()
+            );
+        }
+    }
 
     fn delivered_stream(bytes: &[u8]) -> CompilerStream {
         CompilerStream {

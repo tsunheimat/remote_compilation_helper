@@ -23,10 +23,30 @@ use rabsd::coord::live_dependency::{
 };
 use rabsd::edge::live_facts::{FactsMiss, LiveFacts};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Open executable writers only after exec, in a single-threaded child.
+/// Another test may fork while this process holds any file descriptor, even
+/// one marked CLOEXEC. Closing our own copy would not then prove the last
+/// writer closed; a concurrent real toolchain probe can return ETXTBSY.
+fn install_probe(compiler: &Path, bytes: &[u8]) {
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "exec /bin/cat > \"$1\"", "write-fixture-probe"])
+        .arg(compiler)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = writer.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    std::fs::set_permissions(compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
 
 /// Script only the two identity probes. The actual LiveFacts observer reads
 /// these files and retains their generations; no compiler execution is claimed.
@@ -40,7 +60,7 @@ fn write_toolchain(root: &Path) -> PathBuf {
     )
     .unwrap();
     let compiler = root.join("bin/rustc");
-    std::fs::write(
+    install_probe(
         &compiler,
         br#"#!/bin/sh
 case "$*" in
@@ -49,9 +69,7 @@ case "$*" in
     *) exit 64 ;;
 esac
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     compiler
 }
 
@@ -390,7 +408,14 @@ fn change_toolchain(fixture: &Fixture, mutation: &str) {
         "compiler" => {
             let retained = root.parent().unwrap().join("retained-compiler");
             std::fs::rename(fixture.compiler(), &retained).unwrap();
-            std::fs::copy(&retained, fixture.compiler()).unwrap();
+            let bytes = std::fs::read(&retained).unwrap();
+            install_probe(fixture.compiler(), &bytes);
+            assert_eq!(std::fs::read(fixture.compiler()).unwrap(), bytes);
+            assert_ne!(
+                std::fs::metadata(&retained).unwrap().ino(),
+                std::fs::metadata(fixture.compiler()).unwrap().ino(),
+                "equal-byte replacement must be a different file generation"
+            );
         }
         _ => panic!("unknown fixture mutation"),
     }

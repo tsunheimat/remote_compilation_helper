@@ -609,6 +609,51 @@ without changing their commands, thresholds, selection, or failure handling.
 There is no new workflow. Keep draft until the final published revision completes
 its native, E2E, RABS release and six-platform shipping gates.
 
+### Final native failure isolation after `ca74bf55` — October 20
+
+The completed `ca74bf55258c83214700eddb4e0cacf51aa877b9` hosted runs narrowed the
+remaining blockers. RABS `39283814245` passed every job and gate, including real
+Cargo worktree reuse, doctor and enforcing overhead. CI `39283814010` passed
+Clippy/format/integrity, both ARM64 workspace rows, both complete E2E jobs and
+aggregation. Shipping correctly remained skipped because the two x64 workspace
+rows each failed one test. The security job found zero vulnerabilities but its
+GitHub check-update API returned 404; a targeted rerun passed without changing
+any dependency, advisory rule or audit configuration.
+
+Linux x64 failed `live_output_capture` while probing a newly replaced fixture
+compiler: `Text file busy (os error 26)`. Executable writers now open only after
+exec in a dedicated child, and that child is reaped before LiveFacts probes it.
+This prevents an unrelated parallel fixture's fork from retaining the parent's
+CLOEXEC writer. The equal-byte replacement still verifies identical content and
+a different inode; stale observation rejection and all publication assertions
+remain. No production retry or toolchain-admission policy changed.
+
+macOS x64 failed the actual singleflight wrapper after a cache hit was accepted.
+Its assertion did not retain stderr, so the particular hosted error could not
+be reconstructed. The adapter nevertheless had a concrete Darwin close race:
+Apple's [sosetoptlock implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_socket.c#L4749-L4754)
+rejects timeout updates with EINVAL after both halves close, even with a final
+reply still queued. The Apple-only branch now performs a single nonblocking
+read after that precise error and restores blocking mode. An empty live socket
+returns the original error, never fabricated EOF or an unbounded read. Absolute
+deadlines, ownership checks, strict framing and post-acceptance fail-closed
+semantics are unchanged. Native peer-close tests and a forced timeout-error
+adapter test cover these boundaries; the integration assertion now retains its
+complete process result. Native macOS execution is still required to qualify
+this change and determine whether the hosted symptom is fully resolved.
+
+Pinned remote job `rt-20261020-054300-abxaw80i` on `u25-agent-test` passed 92 wrapper
+unit cases plus 8 capture, 8 live-protocol and 7 singleflight integration cases.
+All 12 live-output-capture cases passed once, then eight more fixed repetitions
+with normal parallelism. Full-workspace/all-target check, all-feature fatal-warning
+Clippy and formatting also passed. Evidence is retained under the existing
+ignored `target/remote-pinned-validation/peer-close-fixture-1QOze2eK/` directory.
+These Linux results are not macOS or final shipping qualification. The requested
+precommit UBS invocation was unavailable on the authorized runner (exit 127);
+no UBS pass is claimed. No workflow, production timeout, warning policy or test
+exclusion changed. Keep the PR draft until the newly published revision passes
+its full required graph.
+
 ## Historical October 12 handoff
 
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR
