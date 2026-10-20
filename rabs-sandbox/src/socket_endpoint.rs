@@ -386,7 +386,7 @@ mod private_bind_tests {
         let path = PathBuf::from(path);
         let mask = u32::from_str_radix(&std::env::var("RABS_TEST_BIND_MASK").unwrap(), 8).unwrap();
         // Only this dedicated post-exec helper changes its process umask.
-        rustix::fs::umask(Mode::from_raw_mode(mask));
+        rustix::process::umask(Mode::from_raw_mode(mask));
         let lease = EndpointLease::acquire(&path).unwrap();
         let socket = bind_private_socket(lease.path()).unwrap();
         if std::env::var("RABS_TEST_BIND_LISTEN").as_deref() == Ok("1") {
