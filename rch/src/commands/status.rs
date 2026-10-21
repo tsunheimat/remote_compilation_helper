@@ -604,7 +604,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
     // The non-Unix hook has no local/remote speed gate. Preserve the portable
     // response schema, but never fabricate timing samples or an admission.
     #[cfg(not(unix))]
-    let speed_gate: Option<SpeedGateDiagnosis> = None;
+    let speed_gate: Option<super::types::SpeedGateDiagnosis> = None;
     #[cfg(not(unix))]
     if would_intercept && config.compilation.local_slots > 0 {
         capabilities_warnings.push("Local speed gate unavailable on this platform".to_owned());
