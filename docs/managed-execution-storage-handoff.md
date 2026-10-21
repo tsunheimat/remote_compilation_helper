@@ -1,5 +1,35 @@
 # Managed execution storage: local Codex handoff
 
+## October 21 continuation: certificate-trust security updates
+
+The refreshed audit for `bf6a2069` reported RUSTSEC-2026-0381, -0382 and
+-0383, published on October 20. Cargo updates only the affected lock records:
+`rustls-webpki` 0.103.15 -> 0.103.16, `webpki-roots` 1.0.9 -> 1.0.10 and
+`webpki-root-certs` 1.0.9 -> 1.0.10. All other package records, selected features,
+manifests, application code and test gates are unchanged. No advisory is ignored.
+
+On configured runner u25-agent-test, pinned nightly-2026-08-31, the patched
+lockfile passed formatting, workspace/all-target compiler checks, full strict
+all-feature Clippy and the complete rch binary unit target: 3,738 passed,
+zero failed, one existing ignored test, zero filtered. Evidence:
+`target/trust-patch-validation-necld605/`; Cargo update evidence is retained in
+`target/certificate-trust-patches-wyqwu8ku/`.
+
+The first audit attempt could not obtain a database lock on the shared NFS
+filesystem. Its replacement uses a new runner-local /tmp database, without
+disabling locking or advisory checks. Against the same 1,348-advisory snapshot
+(`4b587f00996ebe5c05a73eaef105ef241e876414`), the baseline has exactly the three
+vulnerabilities above and the candidate has zero; candidate audit exits zero.
+Both the advisory file digest and database Git HEAD are unchanged between runs.
+Evidence: `target/trust-audit-fixed-snapshot-gl9vyov7/`; remote job
+`rt-20261021-064732-tys7516n`. The unmaintained unsafe-libyaml and yanked
+yoke-derive warnings remain visible and are not reclassified as a clean scan.
+
+Validated Cargo.lock SHA-256:
+`1396b07e6d7b14e067f10d651a4da2e2ee96e1105f08f4bfd1fccbef8e51405d`.
+Hosted native, E2E, RABS and six-platform packaging still require results for
+the newly published head. No parent pass is promoted to final-head evidence.
+
 ## October 21 continuation: durable follower cancellation
 
 At `13f9579859d29975280672c905d98625119611c2`, RABS run `39409758151`
