@@ -1,5 +1,49 @@
 # Managed execution storage: local Codex handoff
 
+## October 21 continuation: durable follower cancellation
+
+At `13f9579859d29975280672c905d98625119611c2`, RABS run `39409758151`
+passed every gate. CI `39409758211` passed strict Clippy/formatting,
+security/integrity, Linux x64, both macOS workspace rows, both complete E2E
+jobs and aggregation. Linux ARM64 alone failed the unread-stderr durability
+test: after receipt failure, a copy helper still held the activity lock.
+Shipping and ci-success were correctly blocked; none of these gates is removed.
+
+The follower must remember TERM even between pipeline creation and PID binding.
+It now finishes cancellation by killing and reaping its disposable final writer,
+including a writer that cannot act on TERM. Its own wait diagnostics cannot block
+on the same unread channel. Workload descendants are not signalled or detached
+from their activity lock. Missing completion still exits 255, never fabricates a
+receipt, and never authorizes replay. The production timeout is unchanged.
+
+Two new native Rust/Python regressions force the assignment-gap cancellation and
+the TERM-masked-writer boundary in the actual generated shell, retaining the real
+saturated socket and inherited lock. A separate live process must survive. The
+existing descendant-fencing, binary-output, nonzero-status, umask, slow-reader,
+receipt-failure and replay-refusal assertions remain intact.
+
+The intermediate TERM-only candidate was rejected: its 200-case stress run had
+13 timeouts despite passing the small native suite. An observed failure retained
+a head process blocked on the socket. The final disposal choice passed 300 fixed
+stress cases, and a same-invocation controlled case failed with TERM but released
+the lock with KILL. This is not a claim that tracing proved every scheduler race.
+Evidence is retained in `target/durable-causal-9f73ovq_`,
+`target/durable-hang-observed-9_zn1t0v`, `target/durable-helper-kill-unlslsdt`
+and `target/durable-term-causal-svrh7hdf`.
+
+Final candidate validation on u25-agent-test, nightly-2026-08-31: formatting,
+workspace/all-target check, all-feature fatal-warning Clippy, 11 shell tests and
+all nine native durability tests passed. All 11 shell tests also passed with the
+outer follower executed by the owned Bash 3.2 binary on Linux; this is not native
+Darwin qualification. Evidence: `target/durable-custody-final-gvn5_h98` and
+`target/durable-shell-review-y7yalm88`. UBS baseline and candidate both exit 1
+with the same three critical labels (the restored umask and handles closed by
+tearDown). Five added warnings are regression assertions and witness processes
+also reaped by tearDown. No suppression is added; the raw scan is not called clean.
+
+Keep PR #3 draft until the newly published revision completes all required native,
+E2E, RABS and six-platform shipping checks. Main and deployed workers are unchanged.
+
 ## October 20 continuation: executable and endpoint fixture custody
 
 The published baseline is `69b95b9d418d035ed8affa58b4d83163aa175b25`.

@@ -3046,6 +3046,16 @@ impl TransferPipeline {
         // Once the workload has finished, followers that make no progress
         // for `stall_secs` are killed. Any live reader drains 1 MiB well
         // within that window.
+        // TERM can arrive after the pipeline forks but before h=$! binds its
+        // final writer. Remember cancellation instead of exiting in that gap;
+        // once bound, stop and reap that writer even when wait was interrupted.
+        // Cancellation is final for this disposable copy helper. Use KILL so
+        // an inherited/transitioning TERM disposition cannot leave it blocked
+        // on an unread transport. This does not signal the workload group.
+        // Suppress only wait's own helper-termination diagnostic: writing it
+        // into the same stalled channel would deadlock cleanup all over again.
+        // Only follower helpers are signalled. Live workload descendants keep
+        // their inherited activity lock and continue to fence recovery.
         //
         // Wait for the supervisor we spawned, not for the receipt it intends
         // to publish (bd-t5c8p). A killed supervisor or failed receipt write
@@ -3062,10 +3072,13 @@ impl TransferPipeline {
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
              p=$!; \
-             rch_follow() {{ h=; trap '[ -z \"$h\" ] || kill \"$h\" 2>/dev/null; exit 1' TERM; \
-               o=0; while :; do if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
+             rch_follow() {{ h=; cancelled=; trap 'cancelled=1; [ -z \"$h\" ] || kill -KILL \"$h\" 2>/dev/null || :' TERM; \
+               o=0; while :; do [ -z \"$cancelled\" ] || return 1; if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
                if [ \"$s\" -gt \"$o\" ]; then n=$((s - o)); [ \"$n\" -le 1048576 ] || n=1048576; \
-               tail -c +$((o + 1)) -- \"$1\" | head -c \"$n\" & h=$!; wait \"$h\" || :; h=; \
+               tail -c +$((o + 1)) -- \"$1\" | head -c \"$n\" & h=$!; \
+               if [ -n \"$cancelled\" ]; then kill -KILL \"$h\" 2>/dev/null || :; fi; \
+               wait \"$h\" 2>/dev/null || :; \
+               if [ -n \"$cancelled\" ]; then trap '' TERM; wait \"$h\" 2>/dev/null || :; return 1; fi; h=; \
                o=$((o + n)); echo \"$o\" > \"$2\"; continue; fi; \
                [ -n \"$d\" ] && {{ echo done > \"$2\"; return 0; }}; sleep 0.2 2>/dev/null || sleep 1; done; }}; \
              rch_follow {out} {out_progress} & a=$!; rch_follow {err} {err_progress} >&2 & b=$!; \
@@ -10243,6 +10256,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn durable_execution_missing_receipt_does_not_block_on_unread_stderr() {
+        assert_missing_receipt_releases_followers(false, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_cancellation_before_follower_pid_assignment_reaps_the_writer() {
+        assert_missing_receipt_releases_followers(true, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_cancellation_reaps_a_term_masked_copy_helper() {
+        assert_missing_receipt_releases_followers(false, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_missing_receipt_releases_followers(cancel_after_fork: bool, mask_copy_term: bool) {
         use std::io::{ErrorKind, Write};
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
@@ -10260,9 +10290,49 @@ mod tests {
             TransferConfig::default(),
         )
         .with_recovery_completion(receipt.to_owned(), "id".to_string());
-        let command = pipeline.durable_execution_command(
-            "printf 'compiled\\n'; printf 'diagnostic\\n' >&2".to_string(),
-        );
+        let marker = directory.path().join("cancel-point");
+        let workload = if cancel_after_fork || mask_copy_term {
+            format!(
+                "printf 'diagnostic\\n' >&2; i=0; while [ ! -f {marker} ] && [ \"$i\" -lt 200 ]; do \
+                 sleep 0.01; i=$((i + 1)); done; test -f {marker}",
+                marker = escape(Cow::Borrowed(marker.to_str().unwrap())),
+            )
+        } else {
+            "printf 'compiled\\n'; printf 'diagnostic\\n' >&2".to_string()
+        };
+        let mut command = pipeline.durable_execution_command(workload);
+        if cancel_after_fork {
+            // Force TERM in the actual generated shell's fork/assignment gap.
+            // Keep the real pipeline and saturated transport; do not release
+            // their descriptors to make the activity-lock assertion pass.
+            let boundary = " & h=$!;";
+            assert_eq!(command.matches(boundary).count(), 1);
+            command = command.replacen(
+                boundary,
+                &format!(
+                    " & printf ready > {}; read -r follower rest < /proc/self/stat; \
+                     kill -TERM \"$follower\"; h=$!;",
+                    escape(Cow::Borrowed(marker.to_str().unwrap())),
+                ),
+                1,
+            );
+        }
+        if mask_copy_term {
+            // Model cancellation while the disposable writer cannot act on
+            // TERM. The real head still writes to the saturated socket; only
+            // its signal disposition changes. Readiness precedes supervisor
+            // exit, and its PID survives exec, so no timing retry is needed.
+            let boundary = "| head -c \"$n\" & h=$!;";
+            assert_eq!(command.matches(boundary).count(), 1);
+            command = command.replacen(
+                boundary,
+                &format!(
+                    "| ( trap '' TERM; printf ready > {}; exec head -c \"$n\" ) & h=$!;",
+                    escape(Cow::Borrowed(marker.to_str().unwrap())),
+                ),
+                1,
+            );
+        }
 
         // Fill a real transport before starting the wrapper; its peer remains
         // open but never drains. A direct stderr diagnostic must block here.
@@ -10293,6 +10363,9 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(255), "{status:?}");
+        if cancel_after_fork || mask_copy_term {
+            assert_eq!(std::fs::read(marker).unwrap(), b"ready");
+        }
         assert!(!Path::new(receipt).exists());
         assert!(Path::new(&format!("{receipt}.started")).is_dir());
         assert!(

@@ -151,6 +151,7 @@ class DurableExecution(unittest.TestCase):
 
     def start(
         self, command: str, blocked_reader: bool = False, blocked_stderr: bool = False,
+        cancel_after_fork: bool = False, mask_copy_term: bool = False,
     ) -> subprocess.Popen:
         stdout = subprocess.PIPE if blocked_reader else open(self.root / 'client.stdout', 'wb')
         if blocked_stderr:
@@ -170,8 +171,35 @@ class DurableExecution(unittest.TestCase):
             self.handles.append(stderr)
         if not blocked_reader:
             self.handles.append(stdout)
+        rendered = script(self.receipt, command)
+        if cancel_after_fork:
+            # Deliver TERM at the fork/PID-assignment boundary in the actual
+            # rendered follower. Only scheduling changes: its real pipeline,
+            # saturated transport and inherited activity descriptor remain.
+            # /proc/self is opened by the shell builtin, not a child lookup.
+            boundary = ' & h=$!;'
+            self.assertEqual(rendered.count(boundary), 1)
+            rendered = rendered.replace(
+                boundary,
+                ' & printf ready > ' + shlex.quote(str(self.root / 'cancel-point'))
+                + '; read -r follower rest < /proc/self/stat; '
+                  'kill -TERM "$follower"; h=$!;',
+                1,
+            )
+        if mask_copy_term:
+            # A real final writer with TERM ignored must still be disposable.
+            # It announces readiness before supervisor exit, then execs head
+            # without changing PID or draining/closing the saturated socket.
+            boundary = '| head -c "$n" & h=$!;'
+            self.assertEqual(rendered.count(boundary), 1)
+            rendered = rendered.replace(
+                boundary,
+                '| ( trap "" TERM; printf ready > '
+                + shlex.quote(str(self.root / 'cancel-point'))
+                + '; exec head -c "$n" ) & h=$!;', 1,
+            )
         process = subprocess.Popen(
-            ['flock', '-x', str(self.activity), 'sh', '-c', script(self.receipt, command)],
+            ['flock', '-x', str(self.activity), 'sh', '-c', rendered],
             cwd=self.root, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
             start_new_session=True,
         )
@@ -259,6 +287,40 @@ class DurableExecution(unittest.TestCase):
         self.assert_unconfirmed(process)
         self.wait_free()
         self.assertEqual(Path(str(self.receipt) + '.stdout').read_bytes(), b'compiled\n')
+        self.assertIn(b'diagnostic\n', Path(str(self.receipt) + '.stderr').read_bytes())
+
+    def test_cancellation_between_follower_fork_and_pid_assignment_reaps_the_writer(self) -> None:
+        Path(str(self.receipt) + '.pending').mkdir()
+        witness = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        self.processes.append(witness)
+        process = self.start(
+            "printf 'diagnostic\\n' >&2; "
+            "i=0; while [ ! -f cancel-point ] && [ \"$i\" -lt 200 ]; do "
+            "sleep 0.01; i=$((i + 1)); done; test -f cancel-point",
+            blocked_stderr=True, cancel_after_fork=True,
+        )
+        self.assert_unconfirmed(process)
+        self.assertEqual((self.root / 'cancel-point').read_bytes(), b'ready')
+        # Do not drain or close the client to release the stranded head. The
+        # follower must finish its own cleanup before the activity lock is free.
+        self.wait_free()
+        self.assertIsNone(witness.poll(), 'cancellation signalled an unrelated job')
+        self.assertIn(b'diagnostic\n', Path(str(self.receipt) + '.stderr').read_bytes())
+
+    def test_cancellation_reaps_a_term_masked_copy_helper_without_touching_other_jobs(self) -> None:
+        Path(str(self.receipt) + '.pending').mkdir()
+        witness = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        self.processes.append(witness)
+        process = self.start(
+            "printf 'diagnostic\\n' >&2; "
+            "i=0; while [ ! -f cancel-point ] && [ \"$i\" -lt 200 ]; do "
+            "sleep 0.01; i=$((i + 1)); done; test -f cancel-point",
+            blocked_stderr=True, mask_copy_term=True,
+        )
+        self.assert_unconfirmed(process)
+        self.assertEqual((self.root / 'cancel-point').read_bytes(), b'ready')
+        self.wait_free()
+        self.assertIsNone(witness.poll(), 'copy cancellation signalled an unrelated job')
         self.assertIn(b'diagnostic\n', Path(str(self.receipt) + '.stderr').read_bytes())
 
     def test_normal_nonzero_completion_preserves_exact_streams_status_and_umask(self) -> None:
