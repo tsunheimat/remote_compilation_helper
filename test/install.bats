@@ -141,7 +141,7 @@ EOF
 }
 
 @test "install.sh --offline fails with missing tarball" {
-    run bash "$INSTALL_SCRIPT" --offline /nonexistent/path.tar.gz --yes
+    VERSION=0.1.0 run bash "$INSTALL_SCRIPT" --offline /nonexistent/path.tar.gz --yes
     [[ "$status" -ne 0 ]]
 }
 
@@ -162,9 +162,25 @@ echo "rchd 0.1.0"
 EOF
     chmod +x "$pkg_dir/rchd"
 
-    tar -czf "$TEST_DIR/rch.tar.gz" -C "$pkg_dir" rch rchd
+    # Include every required binary; these are fixture payloads, not live builds.
+    cat > "$pkg_dir/rch-wkr" << 'EOF'
+#!/bin/bash
+echo "rch-wkr 0.1.0"
+EOF
+    chmod +x "$pkg_dir/rch-wkr"
+    tar -czf "$TEST_DIR/rch.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
+    local digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "$TEST_DIR/rch.tar.gz")
+    else
+        digest=$(shasum -a 256 "$TEST_DIR/rch.tar.gz")
+    fi
+    printf '%s  rch.tar.gz\n' "${digest%% *}" > "$TEST_DIR/rch.tar.gz.sha256"
 
-    run bash "$INSTALL_SCRIPT" --offline "$TEST_DIR/rch.tar.gz" --yes
+    # Arbitrary fixture names need an explicit release identity. These fixtures
+    # have real checksums but intentionally provide no signature evidence.
+    VERSION=0.1.0 RCH_SIGNATURE_POLICY=optional \
+        run bash "$INSTALL_SCRIPT" --offline "$TEST_DIR/rch.tar.gz" --yes
     [[ "$status" -eq 0 ]]
     [[ -x "$INSTALL_DIR/rch" ]]
     [[ -x "$INSTALL_DIR/rchd" ]]

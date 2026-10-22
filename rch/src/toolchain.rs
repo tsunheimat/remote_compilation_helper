@@ -46,6 +46,20 @@ pub fn detect_toolchain(project_root: &Path) -> Result<ToolchainInfo, ToolchainE
     detect_resolved_toolchain_with(project_root, ambient.as_deref(), "rustup", "rustc")
 }
 
+pub fn configured_native_toolchain(
+    project_root: &Path,
+    version: &str,
+    explicit_pin: Option<&str>,
+) -> anyhow::Result<ToolchainInfo> {
+    anyhow::ensure!(
+        explicit_pin.is_none() && nearest_toolchain_file(project_root)?.is_none(),
+        "compilation.native_toolchain cannot override a command or project toolchain pin"
+    );
+    ToolchainInfo::native(version).ok_or_else(|| {
+        anyhow::anyhow!("compilation.native_toolchain must be an exact major.minor.patch version")
+    })
+}
+
 /// Also used with explicit executable paths by subprocess-boundary tests.
 fn detect_resolved_toolchain_with(
     project_root: &Path,
@@ -718,6 +732,20 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let parsed: ToolchainInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(info, parsed);
+    }
+
+    #[test]
+    fn native_configuration_refuses_project_and_command_pins() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(configured_native_toolchain(root.path(), "1.93.1", None).is_ok());
+        assert!(configured_native_toolchain(root.path(), "nightly", None).is_err());
+        assert!(configured_native_toolchain(root.path(), "1.93.1", Some("nightly")).is_err());
+        std::fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel='nightly'\n",
+        )
+        .unwrap();
+        assert!(configured_native_toolchain(root.path(), "1.93.1", None).is_err());
     }
 
     #[test]

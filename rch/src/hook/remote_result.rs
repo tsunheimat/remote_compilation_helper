@@ -30,8 +30,10 @@ use super::*;
 /// Result of remote compilation execution.
 #[derive(Debug)]
 pub(super) struct RemoteExecutionResult {
-    /// This attempt's launcher reported deadline enforcement and exited 137.
+    /// Deadline enforcement completed (native launcher 137, requested shared deadline 124).
     pub(super) deadline_triggered: bool,
+    /// A requested interrupt completed owned cleanup and output delivery.
+    pub(super) interrupted: bool,
     /// Exit code of the remote command.
     pub(super) exit_code: i32,
     /// Standard error output (used for toolchain detection).
@@ -65,7 +67,8 @@ pub(super) struct ExecResultDirStat {
 ///
 /// `outcome` describes delivery and launcher termination: `completed` means the
 /// remote command ran and its outputs were handled (whatever the exit code),
-/// `deadline_exceeded` means the launcher enforced its deadline (exit 137),
+/// `deadline_exceeded` means the launcher enforced its deadline (native 137 or
+/// requested shared deadline 124); `interrupted` is a verified requested stop,
 /// `transport_error` / `collection_error` mean RCH itself failed to deliver.
 /// Observed admission/journal reference, not a source, SDK or slot attestation.
 /// Decimal build IDs preserve the daemon's complete u64 identity in JS clients.
@@ -105,39 +108,109 @@ pub(crate) struct ExecResultEnvelope<'a> {
     pub admission: Option<ExecAdmissionReference>,
 }
 
-/// Whether THIS invocation requested machine output on stdout (bd-uoh4x).
-/// Set once by `run_exec` from its OutputContext; the PreToolUse hook path
-/// never sets it, so hook protocol stdout stays pristine.
-static MACHINE_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Output belongs to one asynchronous invocation, not a thread or process.
+/// Task-local scoping survives executor migration without leaking a result path
+/// into another invocation or into the permission hook.
+pub(super) struct ExecOutputSink {
+    pub machine: bool,
+    pub path: Option<PathBuf>,
+    /// Whether workload stdout must stay on stderr while this invocation is
+    /// running. Hook and machine-output callers reserve stdout for their
+    /// protocol envelope; ordinary CLI callers must retain Unix stream
+    /// separation so shell redirection remains meaningful.
+    pub workload_stderr: bool,
+    emitted: std::cell::Cell<bool>,
+    execution_details: std::cell::RefCell<Option<serde_json::Value>>,
+}
 
-pub(super) fn set_machine_output(on: bool) {
-    MACHINE_OUTPUT.store(on, std::sync::atomic::Ordering::Relaxed);
+impl ExecOutputSink {
+    #[cfg(test)]
+    pub(super) fn new(machine: bool, path: Option<PathBuf>) -> Self {
+        Self {
+            machine,
+            path,
+            workload_stderr: machine,
+            emitted: std::cell::Cell::new(false),
+            execution_details: std::cell::RefCell::new(None),
+        }
+    }
+
+    pub(super) fn for_cli(machine: bool, path: Option<PathBuf>, workload_stderr: bool) -> Self {
+        Self {
+            machine,
+            path,
+            workload_stderr,
+            emitted: std::cell::Cell::new(false),
+            execution_details: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+tokio::task_local! {
+    pub(super) static EXEC_OUTPUT: ExecOutputSink;
 }
 
 pub(super) fn machine_output() -> bool {
-    MACHINE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+    EXEC_OUTPUT.try_with(|sink| sink.machine).unwrap_or(false)
 }
 
-/// Print the execution envelope to stdout when machine output is active.
-/// Never prints otherwise; delivery failures use stderr and a nonzero exit.
+/// Hook execution has no output scope because it must reserve stdout for its
+/// JSON response. A normal `rch exec` scope explicitly opts into separate
+/// workload streams unless it requested machine output.
+pub(super) fn workload_streams_to_stderr() -> bool {
+    EXEC_OUTPUT
+        .try_with(|sink| sink.workload_stderr)
+        .unwrap_or(true)
+}
+
+pub(super) fn exec_envelope_emitted() -> bool {
+    EXEC_OUTPUT
+        .try_with(|sink| sink.emitted.get())
+        .unwrap_or(false)
+}
+
+/// Retain the complete observed local result, including the guard's explicit
+/// limitations and retained lease identity, without changing command status.
+pub(super) fn record_exec_details(result: &impl serde::Serialize) -> anyhow::Result<()> {
+    let details = serde_json::to_value(result)?;
+    EXEC_OUTPUT
+        .try_with(|sink| *sink.execution_details.borrow_mut() = Some(details))
+        .context("execution details require an invocation output scope")?;
+    Ok(())
+}
+
+/// Persist the terminal envelope independently of native workload streams.
+/// Failure to publish a requested result file is a control failure, never an
+/// invitation to replay the command whose result was already observed.
 pub(super) fn emit_exec_envelope(env: &ExecResultEnvelope<'_>) {
-    if !machine_output() {
-        return;
-    }
-    use std::io::Write;
-    let delivered = serde_json::to_string(env)
-        .map_err(|error| error.to_string())
-        .and_then(|line| {
-            writeln!(std::io::stdout().lock(), "{line}").map_err(|error| error.to_string())
-        });
-    if let Err(error) = delivered {
-        // A lost result is failure even if compilation succeeded. Avoid a
-        // panic or a second stdout document when either stream is closed.
+    let result = EXEC_OUTPUT.try_with(|sink| {
+        sink.emitted.set(true);
+        let mut envelope = serde_json::to_value(env)?;
+        if let Some(details) = sink.execution_details.borrow().as_ref() {
+            envelope["execution_details"] = details.clone();
+        }
+        if let Some(path) = &sink.path {
+            crate::guarded_exec::write_json_result(path, &envelope)?;
+        }
+        if sink.machine {
+            use std::io::Write;
+            writeln!(
+                std::io::stdout().lock(),
+                "{}",
+                serde_json::to_string(&envelope)?
+            )?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    if let Ok(Err(error)) = result {
+        // Broken output is not successful result delivery, even when the job
+        // completed. Neither panic nor emit another document on that channel.
+        use std::io::Write;
         let _ = writeln!(
             std::io::stderr().lock(),
-            "[RCH] execution result output failed: {error}"
+            "[RCH-E500] could not publish execution result: {error:#}"
         );
-        std::process::exit(super::EXIT_BUILD_ERROR);
+        std::process::exit(EXIT_BUILD_ERROR);
     }
 }
 

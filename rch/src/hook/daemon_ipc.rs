@@ -45,6 +45,7 @@ async fn resume_queued_selection(
     deadline: tokio::time::Instant,
     disk_headroom_gib: u32,
     required_tools: bool,
+    has_toolchain_environment: bool,
 ) -> anyhow::Result<SelectionResponse> {
     let result = async {
         let stream = loop {
@@ -74,7 +75,12 @@ async fn resume_queued_selection(
             }
         };
         let (reader, mut writer) = stream.into_split();
-        let route = selection_route(disk_headroom_gib, true, required_tools);
+        let route = selection_route(
+            disk_headroom_gib,
+            true,
+            required_tools,
+            has_toolchain_environment,
+        );
         let request = format!("GET {route}?{query}\n");
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         anyhow::ensure!(
@@ -391,6 +397,7 @@ pub(crate) async fn query_daemon(
     preferred_workers: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
+    remote_environment: Option<&std::collections::BTreeMap<String, String>>,
 ) -> anyhow::Result<SelectionResponse> {
     query_daemon_with_mode(
         socket_path,
@@ -408,6 +415,7 @@ pub(crate) async fn query_daemon(
         preferred_workers,
         job_mode,
         required_tools,
+        remote_environment,
         false,
     )
     .await
@@ -426,6 +434,7 @@ pub(crate) async fn query_daemon_dry_run(
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
     preferred_workers: &[WorkerId],
+    remote_environment: Option<&std::collections::BTreeMap<String, String>>,
 ) -> anyhow::Result<SelectionResponse> {
     query_daemon_with_mode(
         socket_path,
@@ -443,6 +452,7 @@ pub(crate) async fn query_daemon_dry_run(
         preferred_workers,
         false,
         &[],
+        remote_environment,
         true,
     )
     .await
@@ -465,10 +475,15 @@ async fn query_daemon_with_mode(
     preferred_workers: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
+    remote_environment: Option<&std::collections::BTreeMap<String, String>>,
     dry_run: bool,
 ) -> anyhow::Result<SelectionResponse> {
     if let Some(refusal) = unresolved_toolchain_refusal(toolchain, required_runtime) {
         return Ok(refusal);
+    }
+    if let Some(environment) = remote_environment {
+        rch_common::execution_storage::validate_remote_environment(environment)
+            .map_err(anyhow::Error::msg)?;
     }
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     // This needs to be checked in the hook since the daemon may be started
@@ -513,6 +528,14 @@ async fn query_daemon_with_mode(
         && let Ok(json) = serde_json::to_string(tc)
     {
         query.push_str(&format!("&toolchain={}", urlencoding_encode(&json)));
+    }
+    if toolchain.is_some()
+        && let Some(environment) = remote_environment
+    {
+        query.push_str(&format!(
+            "&toolchain_environment={}",
+            urlencoding_encode(&serde_json::to_string(environment)?)
+        ));
     }
 
     if required_runtime != RequiredRuntime::None {
@@ -590,7 +613,13 @@ async fn query_daemon_with_mode(
     }
 
     // Bound writes independently from the longer, queue-aware response wait.
-    let route = selection_route(disk_headroom_gib, false, !required_tools.is_empty());
+    let has_toolchain_environment = toolchain.is_some() && remote_environment.is_some();
+    let route = selection_route(
+        disk_headroom_gib,
+        false,
+        !required_tools.is_empty(),
+        has_toolchain_environment,
+    );
     let request = format!("GET {route}?{query}\n");
     let response_budget = daemon_response_timeout(wait_for_worker, job_mode);
     let deadline = tokio::time::Instant::now() + response_budget;
@@ -634,6 +663,7 @@ async fn query_daemon_with_mode(
                 deadline,
                 disk_headroom_gib,
                 !required_tools.is_empty(),
+                has_toolchain_environment,
             )
             .await?
         }
@@ -692,10 +722,24 @@ async fn query_daemon_with_mode(
     Ok(response)
 }
 
-/// Hard requirements use exact routes that older daemons cannot admit.
-/// The tools endpoint deliberately has a different prefix: a daemon with an
-/// old permissive /select-worker prefix parser must not ignore tool constraints.
-fn selection_route(disk_headroom_gib: u32, resume: bool, required_tools: bool) -> &'static str {
+/// Hard requirements use distinct exact routes, never optional hints. Both
+/// verified tools and toolchain environments must be refused by an old daemon
+/// whose permissive /select-worker prefix parser would ignore their parameters.
+fn selection_route(
+    disk_headroom_gib: u32,
+    resume: bool,
+    required_tools: bool,
+    environment: bool,
+) -> &'static str {
+    if environment {
+        // This contract also enforces any explicit required_tools in the query.
+        return match (disk_headroom_gib > 0, resume) {
+            (false, false) => "/select-toolchain-environment",
+            (false, true) => "/select-toolchain-environment/resume-queued",
+            (true, false) => "/select-toolchain-environment/disk-budget",
+            (true, true) => "/select-toolchain-environment/resume-queued/disk-budget",
+        };
+    }
     match (disk_headroom_gib > 0, resume, required_tools) {
         (false, false, false) => "/select-worker",
         (false, true, false) => "/select-worker/resume-queued",
@@ -1094,10 +1138,10 @@ mod bounded_ipc_tests {
             (64, false, "/select-verified-tools/disk-budget"),
             (64, true, "/select-verified-tools/resume-queued/disk-budget"),
         ] {
-            assert_eq!(selection_route(budget, resume, true), expected);
-            assert!(!selection_route(budget, resume, true).starts_with("/select-worker"));
+            assert_eq!(selection_route(budget, resume, true, false), expected);
+            assert!(!selection_route(budget, resume, true, false).starts_with("/select-worker"));
         }
-        assert_eq!(selection_route(0, false, false), "/select-worker");
+        assert_eq!(selection_route(0, false, false, false), "/select-worker");
     }
 
     #[tokio::test]
@@ -1129,6 +1173,7 @@ mod bounded_ipc_tests {
                     &[],
                     false,
                     &[],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1153,6 +1198,7 @@ mod bounded_ipc_tests {
                 toolchain.as_ref(),
                 RequiredRuntime::Rust,
                 &[],
+                None,
             )
             .await
             .unwrap();
@@ -1186,6 +1232,10 @@ mod bounded_ipc_tests {
         let path = directory.path().join("diagnostic.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let info = ToolchainInfo::new("nightly", Some("2026-08-31".into()), "selected override");
+        let environment = std::collections::BTreeMap::from([(
+            "PATH".into(),
+            "/private tools' bin:/usr/bin".into(),
+        )]);
         let expected = format!(
             "&toolchain={}",
             urlencoding_encode(&serde_json::to_string(&info).unwrap())
@@ -1199,6 +1249,11 @@ mod bounded_ipc_tests {
                 .await
                 .unwrap();
             assert!(request.contains(&expected), "{request}");
+            assert!(request.starts_with("GET /select-toolchain-environment?"));
+            assert!(request.contains(&format!(
+                "&toolchain_environment={}",
+                urlencoding_encode(&serde_json::to_string(&environment).unwrap())
+            )));
             assert!(request.contains("&runtime=rust") && request.contains("&dry_run=1"));
             writer
                 .write_all(
@@ -1220,6 +1275,7 @@ mod bounded_ipc_tests {
             Some(&info),
             RequiredRuntime::Rust,
             &[],
+            Some(&environment),
         );
         let (response, ()) = timeout(Duration::from_secs(2), async {
             tokio::join!(client, server)

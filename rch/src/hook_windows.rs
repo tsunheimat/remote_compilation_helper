@@ -90,10 +90,14 @@ pub async fn run_exec(
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
     command_parts: Vec<String>,
+    invocation: Option<rch_common::invocation::InvocationOptions>,
     _out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
     if exact_worker.is_some() {
         anyhow::bail!("--worker remote admission requires the Unix daemon transport");
+    }
+    if invocation.is_some() {
+        anyhow::bail!("explicit invocation semantics require a Linux dispatcher");
     }
     if clean_overlay
         || base.is_some()
@@ -151,6 +155,7 @@ pub(crate) async fn query_daemon(
     _preferred_workers: &[WorkerId],
     _job_mode: bool,
     _required_tools: &[String],
+    _remote_environment: Option<&std::collections::BTreeMap<String, String>>,
 ) -> anyhow::Result<SelectionResponse> {
     Err(PlatformError::UnixSocketUnsupported)?
 }
@@ -167,6 +172,7 @@ pub(crate) async fn query_daemon_dry_run(
     _toolchain: Option<&ToolchainInfo>,
     _required_runtime: RequiredRuntime,
     _preferred_workers: &[WorkerId],
+    _remote_environment: Option<&std::collections::BTreeMap<String, String>>,
 ) -> anyhow::Result<SelectionResponse> {
     Err(PlatformError::UnixSocketUnsupported)?
 }
@@ -224,8 +230,8 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
                 RequiredRuntime::Go
             }
 
-            // `tsc` / `npx tsc` run under Node.
-            CompilationKind::Tsc => RequiredRuntime::Node,
+            // TypeScript and Node's built-in test runner share the Node gate.
+            CompilationKind::Tsc | CompilationKind::NodeTest => RequiredRuntime::Node,
 
             _ => RequiredRuntime::None,
         },

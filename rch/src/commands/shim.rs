@@ -356,6 +356,185 @@ esac
     )
 }
 
+/// Generic frontends deliberately share the CLI's verification classifier rather
+/// than carrying a second shell approximation of package-manager semantics.
+pub const GENERIC_TOOLS: &[&str] = &[
+    "rtk",
+    "go",
+    "swift",
+    "npm",
+    "pnpm",
+    "bun",
+    "pytest",
+    "python",
+    "python3",
+    "node",
+    "make",
+    "npx",
+    "bunx",
+    "vitest",
+    "jest",
+    "tsc",
+    "eslint",
+    "prettier",
+    "playwright",
+    "vite",
+];
+const GENERIC_SHIM_VERSION: &str = "1";
+
+/// Render a PATH frontend. The real executable is passed out-of-band, keeping
+/// original argument boundaries (including non-UTF8 bytes) intact. The dispatcher
+/// owns classification, local guard policy, and the verification execution path.
+pub fn generic_shim_content(tool: &str) -> Result<String> {
+    anyhow::ensure!(
+        GENERIC_TOOLS.contains(&tool),
+        "unsupported shim tool: {tool}"
+    );
+    Ok(format!(
+        r##"#!/bin/sh
+# rch generic {tool} shim — MANAGED FILE, edit via `rch shim install --tools`.
+{marker} generic-{version}
+# Never invoke predecessor remote-test wrappers, including copies/symlinks in
+# otherwise ordinary PATH directories. Do not reconstruct argv or retry an exit.
+resolve_real() {{
+  remaining=${{PATH:-}}
+  while :; do
+    entry=${{remaining%%:*}}
+    case "$remaining" in *:*) remaining=${{remaining#*:}}; last=0 ;; *) last=1 ;; esac
+    [ -n "$entry" ] || entry=.
+    directory=$(CDPATH= cd -- "$entry" 2>/dev/null && pwd -P) || directory=
+    case "$directory/" in
+      */.rch/shims/|*/remote-test/shims/|*/remote_test/shims/|*/remote-test-shims/|*/remote_test_shims/|*/remote-test-tool-bin/|*/remote-test-go-bin/) directory= ;;
+    esac
+    candidate="$directory/{tool}"
+    if [ -n "$directory" ] && [ -f "$candidate" ] && [ -x "$candidate" ] \
+       && ! [ "$candidate" -ef "$0" ]; then
+      resolved=$(command -p readlink -f "$candidate" 2>/dev/null) || resolved=$candidate
+      case "$resolved" in
+        */.rch/shims/*|*/remote-test/shims/*|*/remote_test/shims/*|*/remote-test-shims/*|*/remote_test_shims/*|*/remote-test-tool-bin/*|*/remote-test-go-bin/*|*/remote-test-tool-shim|*/remote-test-go)
+          [ "$last" = 0 ] && continue
+          break ;;
+      esac
+      # Match ownership/header lines, never incidental mentions in a real tool's
+      # comments or data (e.g. TMPDIR under remote-test-local-fallback). These two
+      # legacy headers identify copies of the shipped generic and Go wrappers.
+      if ! command -p head -c 8192 "$candidate" | LC_ALL=C command -p grep -aEq '^# (rch-shim-version: [^[:space:]]+|Generic PATH shim for direct shell/CI entry points\.  The installer creates|PATH shim for direct shell/CI Go entry points\.  Install this file as `go`)$'; then
+        REAL=$candidate
+        return 0
+      fi
+    fi
+    [ "$last" = 0 ] || break
+  done
+  printf '%s\n' 'rch shim: no real {tool} executable found outside managed/legacy shim paths' >&2
+  exit 127
+}}
+resolve_real
+# A bypass is scoped to RCH's execution/fallback, not ordinary python/node
+# launchers: children of those launchers must still reach the dispatcher.
+if [ "${{RCH_SHIM_BYPASS:-}}" = 1 ]; then
+  exec "$REAL" "$@"
+fi
+if ! command -v rch >/dev/null 2>&1; then
+  printf '%s\n' 'rch shim: RCH is unavailable; cannot classify or guard local execution (explicit override: RCH_SHIM_BYPASS=1)' >&2
+  exit 127
+fi
+RCH_SHIM_REAL_TOOL=$REAL
+export RCH_SHIM_REAL_TOOL
+exec rch shim dispatch --tool {tool} -- "$@"
+"##,
+        marker = SHIM_MARKER,
+        version = GENERIC_SHIM_VERSION,
+    ))
+}
+
+/// Validate every destination before writing any, including dangling symlinks.
+/// A generic install never modifies Cargo, rustup, shell rc files, or PATH.
+fn install_tools_in(tools: &[String], dry_run: bool, directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut planned = Vec::new();
+    for tool in tools {
+        let content = generic_shim_content(tool)?;
+        let path = directory.join(tool);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let owned = metadata.is_file()
+                    && std::fs::read_to_string(&path).is_ok_and(|existing| {
+                        existing.lines().nth(1) == content.lines().nth(1)
+                            && existing.lines().any(|line| line.starts_with(SHIM_MARKER))
+                    });
+                anyhow::ensure!(
+                    owned,
+                    "refusing to overwrite unowned shim path {}",
+                    path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        }
+        planned.push((path, content));
+    }
+    if !dry_run {
+        for (path, content) in &planned {
+            atomic_write(path, content.as_bytes())
+                .with_context(|| format!("write generic shim {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+    }
+    Ok(planned.into_iter().map(|(path, _)| path).collect())
+}
+
+/// Install explicitly selected generic tools, or report the exact plan without
+/// touching the filesystem. Existing Cargo/clippy installation remains separate.
+pub fn install_tools(tools: &[String], dry_run: bool, ctx: &OutputContext) -> Result<()> {
+    if !dry_run
+        && let Ok(config) = crate::config::load_config()
+        && config.general.role == rch_common::BoxRole::Worker
+    {
+        anyhow::bail!("refusing to install generic shims on a worker");
+    }
+    let mut expanded = Vec::new();
+    for tool in tools {
+        if tool == "all" {
+            expanded.extend(GENERIC_TOOLS.iter().map(|name| (*name).to_owned()));
+        } else {
+            expanded.push(tool.clone());
+        }
+    }
+    expanded.sort();
+    expanded.dedup();
+    let tools = &expanded;
+    let paths = install_tools_in(tools, dry_run, &shim_dir()?)?;
+    if ctx.is_json() {
+        ctx.json(&serde_json::json!({ "dry_run": dry_run, "tools": tools, "paths": paths }))?;
+    } else {
+        for path in paths {
+            println!(
+                "{} {}",
+                if dry_run {
+                    "Would install"
+                } else {
+                    "Installed"
+                },
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Print-only activation for an operator to evaluate explicitly. No installation,
+/// shell configuration writes, or process-global environment changes occur here.
+pub fn activation_script(shell: &str) -> Result<String> {
+    match shell {
+        "sh" | "bash" | "zsh" => Ok("export PATH=\"$HOME/.rch/shims:$PATH\"\n".to_owned()),
+        "fish" => Ok("set -gx PATH \"$HOME/.rch/shims\" $PATH\n".to_owned()),
+        _ => anyhow::bail!("unsupported activation shell {shell:?}; use sh, bash, zsh, or fish"),
+    }
+}
+
 /// Read the `SHIM_VERSION` recorded in an installed shim, if it is rch-managed.
 fn installed_shim_version(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -734,9 +913,35 @@ fn local_build_process_count() -> Option<usize> {
     None
 }
 
+#[derive(Debug, Serialize)]
+struct GenericShimStatus {
+    tool: &'static str,
+    path: PathBuf,
+    installed: bool,
+    up_to_date: bool,
+}
+
+fn generic_shim_statuses(directory: &Path) -> Vec<GenericShimStatus> {
+    GENERIC_TOOLS
+        .iter()
+        .map(|&tool| {
+            let path = directory.join(tool);
+            let expected = format!("generic-{GENERIC_SHIM_VERSION}");
+            GenericShimStatus {
+                tool,
+                installed: installed_shim_version(&path).is_some(),
+                up_to_date: installed_shim_version(&path).as_deref() == Some(expected.as_str())
+                    && which::which(&path).is_ok(),
+                path,
+            }
+        })
+        .collect()
+}
+
 /// Machine-readable result for `--json`.
 #[derive(Debug, Serialize)]
 struct ShimStatus {
+    generic_tools: Vec<GenericShimStatus>,
     installed: bool,
     /// Whether the companion `cargo-clippy` shim is present. Without it, a
     /// script invoking the `cargo-clippy` binary directly bypasses offload
@@ -842,6 +1047,7 @@ pub fn shim_install(
 
     if ctx.is_json() {
         let status = ShimStatus {
+            generic_tools: generic_shim_statuses(&shim_dir()?),
             installed: true,
             clippy_shim_installed: cargo_clippy_shim_path()
                 .map(|p| p.exists())
@@ -980,6 +1186,7 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
 
     if ctx.is_json() {
         let status = ShimStatus {
+            generic_tools: generic_shim_statuses(&shim_dir()?),
             installed,
             clippy_shim_installed: clippy_installed,
             path: path.display().to_string(),
@@ -996,6 +1203,21 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
         };
         let _ = ctx.json(&status);
         return Ok(());
+    }
+
+    for generic in generic_shim_statuses(&shim_dir()?) {
+        if generic.installed {
+            println!(
+                "  {} shim: {} ({})",
+                generic.tool,
+                generic.path.display(),
+                if generic.up_to_date {
+                    "current"
+                } else {
+                    "stale or not executable"
+                }
+            );
+        }
     }
 
     // Surfaced separately from the cargo shim: a box can have a perfect cargo
@@ -1127,6 +1349,7 @@ pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
     if ctx.is_json() {
         let (tc_wrapped, tc_total) = toolchain_wrap_counts();
         let status = ShimStatus {
+            generic_tools: generic_shim_statuses(&shim_dir()?),
             installed: false,
             clippy_shim_installed: false,
             path: path.display().to_string(),
@@ -1171,6 +1394,265 @@ pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn generic_sandbox(tool: &str, rch: Option<&str>) -> (PathBuf, std::process::Command) {
+        let root = tempfile::tempdir().unwrap().keep();
+        for name in [
+            ".rch/shims",
+            "real",
+            "dispatcher",
+            "remote-test-tool-bin",
+            "aliases",
+        ] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        write_exe(
+            &root.join(".rch/shims").join(tool),
+            &generic_shim_content(tool).unwrap(),
+        );
+        write_exe(
+            &root.join("real").join(tool),
+            "#!/bin/sh\nprintf '%s\\0' LOCAL\nif [ \"$#\" -gt 0 ]; then printf '%s\\0' \"$@\"; fi\n",
+        );
+        write_exe(
+            &root.join("remote-test-tool-bin").join(tool),
+            "#!/bin/sh\nexit 91\n",
+        );
+        std::os::unix::fs::symlink(
+            root.join("remote-test-tool-bin").join(tool),
+            root.join("aliases").join(tool),
+        )
+        .unwrap();
+        if let Some(body) = rch {
+            write_exe(&root.join("dispatcher/rch"), body);
+        }
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg(root.join(".rch/shims").join(tool))
+            .env_clear()
+            .env("HOME", &root)
+            .env(
+                "PATH",
+                std::env::join_paths([
+                    root.join(".rch/shims"),
+                    root.join("aliases"),
+                    root.join("remote-test-tool-bin"),
+                    root.join("dispatcher"),
+                    root.join("real"),
+                ])
+                .unwrap(),
+            );
+        (root, command)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_dispatch_preserves_exact_argv_and_never_replays_failure() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut args = argv_bytes(&[
+            "test",
+            "",
+            "two words",
+            "'quote",
+            "$(false)",
+            "line\nbreak",
+            "--",
+            "*.py",
+        ]);
+        args.push(std::ffi::OsString::from_vec(b"raw-\xff".to_vec()));
+        for tool in GENERIC_TOOLS {
+            let (root, mut command) = generic_sandbox(
+                tool,
+                Some("#!/bin/sh\nprintf '%s\\0' \"$RCH_SHIM_REAL_TOOL\" \"$@\"\nexit 103\n"),
+            );
+            let output = output_retrying_text_busy(command.args(&args));
+            assert_eq!(output.status.code(), Some(103), "{tool}: {output:?}");
+            let fields = recorded_fields(&output);
+            assert_eq!(
+                fields[0],
+                root.join("real").join(tool).as_os_str().as_bytes()
+            );
+            assert_eq!(
+                &fields[1..6],
+                &[
+                    b"shim".as_slice(),
+                    b"dispatch",
+                    b"--tool",
+                    tool.as_bytes(),
+                    b"--"
+                ]
+            );
+            assert_eq!(
+                &fields[6..],
+                args.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_missing_rch_refuses_uncontrolled_execution_but_explicit_bypass_works() {
+        let (_root, mut command) = generic_sandbox("python", None);
+        command.args(["-c", "print('ordinary launch')"]);
+        let output = output_retrying_text_busy(&mut command);
+        assert_eq!(output.status.code(), Some(127));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot classify or guard"));
+        let output = output_retrying_text_busy(command.env("RCH_SHIM_BYPASS", "1"));
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            recorded_fields(&output),
+            vec![b"LOCAL".as_slice(), b"-c", b"print('ordinary launch')"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_nested_local_fallback_does_not_reenter_rch() {
+        let (root, mut command) = generic_sandbox(
+            "node",
+            Some(
+                "#!/bin/sh\nprintf '%s\\0' DISPATCH\nshift 5\nRCH_SHIM_BYPASS=1\nexport RCH_SHIM_BYPASS\nexec node \"$@\"\n",
+            ),
+        );
+        // The dispatcher boundary stub models an admitted local fallback, not
+        // verification classification. Actual classification is tested by CLI tests.
+        let output = output_retrying_text_busy(command.args(["app.js", "a b"]));
+        assert!(output.status.success(), "{}: {output:?}", root.display());
+        assert_eq!(
+            recorded_fields(&output),
+            vec![b"DISPATCH".as_slice(), b"LOCAL", b"app.js", b"a b"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_local_launch_does_not_disable_child_verification() {
+        for tool in ["python", "python3", "node"] {
+            let (_root, mut command) = generic_sandbox(
+                tool,
+                Some(
+                    "#!/bin/sh\n[ -z \"${RCH_SHIM_BYPASS:-}\" ] || exit 92\nshift 5\nexec \"$RCH_SHIM_REAL_TOOL\" \"$@\"\n",
+                ),
+            );
+            let output = output_retrying_text_busy(command.args(["app", "a b", ""]));
+            assert!(output.status.success(), "{tool}: {output:?}");
+            assert_eq!(
+                recorded_fields(&output),
+                vec![b"LOCAL".as_slice(), b"app", b"a b", b""]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_resolution_accepts_incidental_legacy_text_but_skips_identified_copies() {
+        for header in [
+            "# Generic PATH shim for direct shell/CI entry points.  The installer creates",
+            "# PATH shim for direct shell/CI Go entry points.  Install this file as `go`",
+            "# rch-shim-version: generic-1",
+        ] {
+            let (root, mut command) = generic_sandbox("go", None);
+            let copied = root.join("copied-wrapper");
+            std::fs::create_dir_all(&copied).unwrap();
+            write_exe(
+                &copied.join("go"),
+                &format!("#!/bin/sh\n{header}\nexit 91\n"),
+            );
+            // These references are ordinary content, not executable identity.
+            write_exe(
+                &root.join("real/go"),
+                concat!(
+                    "#!/bin/sh\n",
+                    "# migration from remote-test and remote_test; .rch/shims/ is documented here\n",
+                    "TMPDIR=/mnt/hdd-vibe-coding-share/remote-test-local-fallback/tmp\n",
+                    "printf '%s\\0' NATIVE \"$@\"\n",
+                ),
+            );
+            command
+                .env(
+                    "PATH",
+                    std::env::join_paths([root.join(".rch/shims"), copied, root.join("real")])
+                        .unwrap(),
+                )
+                .env("RCH_SHIM_BYPASS", "1")
+                .args(["version", "two words"]);
+            let output = output_retrying_text_busy(&mut command);
+            assert!(output.status.success(), "{header}: {output:?}");
+            assert_eq!(
+                recorded_fields(&output),
+                vec![b"NATIVE".as_slice(), b"version", b"two words"]
+            );
+        }
+    }
+
+    #[test]
+    fn generic_install_is_explicit_owned_only_and_dry_run_is_read_only() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let directory = root.join("not-created");
+        let tools = vec!["go".to_owned(), "python".to_owned()];
+        let paths = install_tools_in(&tools, true, &directory).unwrap();
+        assert_eq!(paths, vec![directory.join("go"), directory.join("python")]);
+        assert!(!directory.exists());
+        assert!(
+            generic_shim_statuses(&directory)
+                .iter()
+                .all(|status| !status.installed && !status.up_to_date)
+        );
+        assert!(!directory.exists());
+        assert!(install_tools_in(&["../escape".to_owned()], false, &directory).is_err());
+        assert!(!directory.exists());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("python"), "user-owned").unwrap();
+        assert!(install_tools_in(&tools, false, &directory).is_err());
+        assert!(
+            !directory.join("go").exists(),
+            "all collisions must be checked before any write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("python")).unwrap(),
+            "user-owned"
+        );
+        install_tools_in(&["go".to_owned()], false, &directory).unwrap();
+        install_tools_in(&["go".to_owned()], false, &directory).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("go")).unwrap(),
+            generic_shim_content("go").unwrap()
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("absent"), directory.join("node")).unwrap();
+            assert!(install_tools_in(&["node".to_owned()], false, &directory).is_err());
+            assert!(!root.join("absent").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_is_read_only_and_handles_shell_sensitive_home() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let home = root.join("home ' with spaces");
+        let script = activation_script("sh").unwrap() + "printf '%s' \"$PATH\"\n";
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}/.rch/shims:/usr/bin:/bin", home.display())
+        );
+        assert!(!home.exists());
+        assert!(activation_script("powershell").is_err());
+        assert_eq!(
+            activation_script("fish").unwrap(),
+            "set -gx PATH \"$HOME/.rch/shims\" $PATH\n"
+        );
+    }
 
     #[test]
     fn shim_body_is_loop_safe_and_fail_open() {

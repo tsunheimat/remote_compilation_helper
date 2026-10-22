@@ -186,6 +186,7 @@ fn daemon_worker_selector(
         headroom,
     )));
     selector.set_ssh_pool(ssh_pool);
+    selector.set_remote_environment(config.environment.remote.clone());
     selector
 }
 

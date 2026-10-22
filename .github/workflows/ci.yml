@@ -92,6 +92,14 @@ jobs:
           chmod +x scripts/check_release_assets.sh
           ./scripts/check_release_assets.sh --self-test
 
+      - name: Exercise exact original and rewritten shell semantics
+        run: python3 -I rch/src/hook/test_semantic.py
+      - name: Validate the inactive Hermes adapter protocol
+        run: python3 -I rch/src/agent/hermes_plugin.py
+      - name: Reject local or refused results in the remote acceptance validator
+        run: python3 -I scripts/validate_remote_execution.py --self-test
+      - name: Exercise installer release identity, checksums and refusal paths
+        run: bash scripts/install_no_downgrade_unit_test.sh
       - name: Check installer scripts (retained from notify-acfs)
         shell: bash
         run: |

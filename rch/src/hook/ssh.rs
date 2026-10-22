@@ -1483,9 +1483,10 @@ fn build_worker_projects_topology_cmd(
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
     let canonical_slash_display = format!("{}/", canonical_display.trim_end_matches('/'));
+    let separation = topology_source_separation_cmd(topology_policy, &[]);
 
     format!(
-        "set -e; \
+        "set -e; {separation} \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then \
            if [ {allow_initialization} != true ]; then printf 'RCH_TOPOLOGY_ERR_INITIALIZATION_REQUIRED:path=%s\\n' {canonical} >&2; exit 48; fi; \
            mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\" >&2; exit 45; }}; fi; \
@@ -1519,6 +1520,37 @@ fn build_worker_projects_topology_cmd(
         canonical_slash = shell_escape::escape(canonical_slash_display.into()),
         alias = shell_escape::escape(alias_display.into()),
         allow_initialization = allow_initialization,
+    )
+}
+
+/// Resolve on the worker as well as the controller. A shared mount or a
+/// worker-only symlink must never turn a mirror sync/ownership sweep into a
+/// write to the original source. `readlink -m` resolves existing ancestors of
+/// destinations that rsync has not created yet.
+fn topology_source_separation_cmd(policy: &PathTopologyPolicy, roots: &[PathBuf]) -> String {
+    let Some(source) = policy.source_root() else {
+        return String::new();
+    };
+    let quote = |path: &Path| shell_escape::escape(path.to_string_lossy()).into_owned();
+    let destinations = std::iter::once(policy.canonical_root())
+        .chain(roots.iter().map(PathBuf::as_path))
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "rch_source=$(readlink -m -- {source}) && rch_mirror=$(readlink -m -- {mirror}) && rch_alias=$(readlink -m -- {alias}) || exit 49; \
+         for rch_path in {alias} \"$rch_alias\"; do \
+         case \"$rch_path/\" in \"$rch_source/\"*) printf 'RCH_TOPOLOGY_ERR_SOURCE_OVERLAP\\n' >&2; exit 49;; esac; \
+         case \"$rch_source/\" in \"$rch_path/\"*) printf 'RCH_TOPOLOGY_ERR_SOURCE_OVERLAP\\n' >&2; exit 49;; esac; done; \
+         for rch_path in {destinations}; do \
+         rch_path=$(readlink -m -- \"$rch_path\") || exit 49; \
+         case \"$rch_path/\" in \"$rch_source/\"*) printf 'RCH_TOPOLOGY_ERR_SOURCE_OVERLAP\\n' >&2; exit 49;; esac; \
+         case \"$rch_source/\" in \"$rch_path/\"*) printf 'RCH_TOPOLOGY_ERR_SOURCE_OVERLAP\\n' >&2; exit 49;; esac; \
+         case \"$rch_path/\" in \"$rch_mirror/\"*) ;; *) printf 'RCH_TOPOLOGY_ERR_MIRROR_ESCAPE\\n' >&2; exit 49;; esac; \
+         done;",
+        source = quote(source),
+        mirror = quote(policy.canonical_root()),
+        alias = quote(policy.alias_root()),
     )
 }
 
@@ -1679,7 +1711,11 @@ pub(super) async fn ensure_worker_projects_topology(
 
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
-    let topology_cmd = build_worker_projects_topology_cmd(topology_policy, allow_initialization);
+    let topology_cmd = format!(
+        "{}\n{}",
+        topology_source_separation_cmd(topology_policy, dispatch_closure_roots),
+        build_worker_projects_topology_cmd(topology_policy, allow_initialization)
+    );
     let remote_reader = match source_identity {
         Some(identity) => format!("{} sh -s", source_authority_activity_prefix(identity)?),
         None => "sh -s".to_owned(),
@@ -4136,6 +4172,42 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             },
             policy,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_source_worker_probe_rejects_symlinked_destination_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let mirror = dir.path().join("mirror");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&mirror).unwrap();
+        std::fs::write(source.join("keep"), "source bytes").unwrap();
+        let policy = PathTopologyPolicy::new(mirror.clone(), dir.path().join("alias"))
+            .with_source_root(source.clone());
+        let run = |root: PathBuf| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(topology_source_separation_cmd(&policy, &[root]))
+                .output()
+                .unwrap()
+        };
+        assert!(run(mirror.join("new/repo")).status.success());
+        std::os::unix::fs::symlink(&source, mirror.join("escape")).unwrap();
+        let output = run(mirror.join("escape/repo"));
+        assert_eq!(output.status.code(), Some(49));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("SOURCE_OVERLAP"));
+        assert!(!source.join("repo").exists());
+        assert_eq!(
+            std::fs::read_to_string(source.join("keep")).unwrap(),
+            "source bytes"
+        );
+        let outside = dir.path().join("other");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, mirror.join("outside")).unwrap();
+        let output = run(mirror.join("outside/repo"));
+        assert_eq!(output.status.code(), Some(49));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("MIRROR_ESCAPE"));
     }
 
     #[test]

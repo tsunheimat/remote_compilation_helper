@@ -39,6 +39,7 @@ pub static COMPILATION_KEYWORDS: &[&str] = &[
     "cc",
     "c++",
     "bun",
+    "node",
     "nextest",
     "nix",
     "nix-build",
@@ -279,6 +280,10 @@ pub enum CompilationKind {
     /// bun typecheck - Runs TypeScript type checking
     BunTypecheck,
 
+    /// Node's built-in test runner, with stdout/stderr results only.
+    /// File-producing options are deliberately not admitted.
+    NodeTest,
+
     // Go commands
     //
     // Builds require an explicit file output and durable artifact delivery.
@@ -331,6 +336,7 @@ impl CompilationKind {
                 | CompilationKind::CargoNextest
                 | CompilationKind::CargoBench
                 | CompilationKind::BunTest
+                | CompilationKind::NodeTest
                 | CompilationKind::GoTest
         )
     }
@@ -366,6 +372,7 @@ impl CompilationKind {
             CompilationKind::Meson => "meson",
             // Bun commands
             CompilationKind::BunTest | CompilationKind::BunTypecheck => "bun",
+            CompilationKind::NodeTest => "node",
             // Nix commands. Both `nix build` and the legacy `nix-build` route
             // through this kind; the canonical allowlist base name is "nix".
             CompilationKind::NixBuild => "nix",
@@ -514,7 +521,7 @@ fn classify_command_inner(cmd: &str, depth: u8) -> Classification {
     }
 
     // Tier 4: Full classification
-    classify_full(normalized)
+    classify_full(normalized, cmd)
 }
 
 /// Try to classify a compound command (e.g., "cd /path && cargo build").
@@ -1423,7 +1430,7 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
     });
 
     // Tier 4: Full classification
-    let classification = classify_full(normalized);
+    let classification = classify_full(normalized, cmd);
     let decision = if classification.is_compilation {
         TierDecision::Pass
     } else {
@@ -1951,7 +1958,7 @@ fn positional_build_targets<'a>(cmd: &'a str, value_flags: &[&str]) -> Vec<&'a s
 }
 
 /// Full classification of a command (Tier 4).
-fn classify_full(cmd: &str) -> Classification {
+fn classify_full(cmd: &str, authored: &str) -> Classification {
     // Cargo commands
     if cmd.starts_with("cargo ") || cmd.eq("cargo") {
         return classify_cargo(cmd);
@@ -2146,6 +2153,20 @@ fn classify_full(cmd: &str) -> Classification {
         }
     }
 
+    if command_word_matches(cmd, "node") {
+        // Normalization strips inline assignments. Both the hook and detailed
+        // preflight must reject options that can secretly enable file outputs.
+        if ["NODE_OPTIONS", "NODE_V8_COVERAGE"]
+            .iter()
+            .any(|name| authored.contains(name))
+        {
+            return Classification::not_compilation(
+                "Node environment options have no artifact contract",
+            );
+        }
+        return classify_node_test(cmd);
+    }
+
     // Go commands
     if cmd.starts_with("go ") {
         return classify_go(cmd);
@@ -2163,6 +2184,84 @@ fn classify_full(cmd: &str) -> Classification {
     }
 
     Classification::not_compilation("no matching pattern")
+}
+
+/// Admit only Node's built-in, non-watching test runner with streamed results.
+/// An option allowlist keeps profiles, coverage files, snapshots, reporter
+/// destinations, env/config files and future file-producing flags local until
+/// they have a real artifact return contract. Values are consumed before looking
+/// for `--test`, so `node --require --test app.js` is never a test invocation.
+fn classify_node_test(command: &str) -> Classification {
+    let Some(words) = literal_flag_words(command) else {
+        return Classification::not_compilation(
+            "Node test arguments are not bounded literal words",
+        );
+    };
+    let mut args = words.into_iter().skip(1);
+    let mut test = false;
+    while let Some(arg) = args.next() {
+        let (flag, attached) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        match flag {
+            "--test" => {
+                if attached == Some("") {
+                    return Classification::not_compilation("empty Node test pattern");
+                }
+                test = true;
+            }
+            "--require"
+            | "-r"
+            | "--import"
+            | "--loader"
+            | "--experimental-loader"
+            | "--test-name-pattern"
+            | "--test-skip-pattern"
+            | "--test-concurrency"
+            | "--test-timeout"
+            | "--test-shard" => {
+                if !attached
+                    .or_else(|| args.next())
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    return Classification::not_compilation("missing Node option value");
+                }
+            }
+            "--test-reporter" => {
+                // Custom reporters execute arbitrary output code; only built-in
+                // stdout reporters participate in this stream-only contract.
+                if !matches!(
+                    attached.or_else(|| args.next()),
+                    Some("spec" | "tap" | "dot" | "junit" | "lcov")
+                ) {
+                    return Classification::not_compilation("unsupported Node test reporter");
+                }
+            }
+            "--test-only"
+            | "--test-force-exit"
+            | "--no-warnings"
+            | "--trace-warnings"
+            | "--enable-source-maps"
+                if attached.is_none() => {}
+            _ if arg.starts_with("-r") && !arg.starts_with("--") && arg.len() > 2 => {}
+            _ if arg.starts_with('-') => {
+                return Classification::not_compilation(
+                    "Node option has no stream-only test contract",
+                );
+            }
+            _ if !test => {
+                return Classification::not_compilation(
+                    "ordinary Node script, not the test runner",
+                );
+            }
+            _ => {}
+        }
+    }
+    if test {
+        Classification::compilation(CompilationKind::NodeTest, 0.95, "node --test (stream-only)")
+    } else {
+        Classification::not_compilation("Node invocation without --test")
+    }
 }
 
 /// Classify `tsc` / `npx tsc` invocations.
@@ -8329,6 +8428,107 @@ mod tests_go_and_typescript {
         assert_eq!(kind_of("golangci-lint run"), None);
     }
 
+    // --- Node built-in tests (stream-only) ---
+
+    #[test]
+    fn node_test_accepts_literal_test_forms_and_leading_value_options() {
+        for cmd in [
+            "node --test",
+            "node --test=tests/unit.test.js",
+            "node --test 'tests/*.test.js'",
+            "node --require setup.cjs --test tests/unit.test.js",
+            "node -r setup.cjs --test",
+            "node -rsetup.cjs --test",
+            "node --import setup.mjs --test",
+            "node --loader custom-loader --test",
+            "node --experimental-loader custom-loader --test",
+            "node --require=setup.cjs --import=setup.mjs --loader=loader --test",
+            "node --experimental-loader=loader --test",
+            "node --no-warnings --test --test-name-pattern 'some test'",
+            "node --test --test-skip-pattern=slow --test-concurrency=2 --test-timeout 5000",
+            "node --test --test-shard=1/2 --test-only --test-force-exit",
+            "node --test --test-reporter tap",
+            "node --test --test-reporter=junit",
+            "CI=1 node --test",
+            "env CI=1 /usr/bin/node --test",
+            "cd project && node --import setup.mjs --test",
+        ] {
+            assert_eq!(kind_of(cmd), Some(CompilationKind::NodeTest), "{cmd}");
+        }
+        assert!(CompilationKind::NodeTest.is_test_command());
+        assert_eq!(CompilationKind::NodeTest.command_base(), "node");
+        let json = serde_json::to_string(&CompilationKind::NodeTest).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CompilationKind>(&json).unwrap(),
+            CompilationKind::NodeTest
+        );
+    }
+
+    #[test]
+    fn node_test_rejects_scripts_watch_separators_and_missing_values() {
+        for cmd in [
+            "node",
+            "node app.js",
+            "node app.js --test",
+            "node --require setup.cjs app.js --test",
+            "node --require --test app.js",
+            "node --import --test",
+            "node --loader --test",
+            "node --experimental-loader --test",
+            "node -r --test",
+            "node --test-name-pattern --test",
+            "node -- --test",
+            "node --test -- tests/unit.test.js",
+            "node --test --watch",
+            "node --watch --test",
+            "node --test --watch-path=src",
+            "node --test --watch-preserve-output",
+            "node --test --require",
+            "node --test --import=",
+            "node --test=",
+            "node --eval 'code' --test",
+            "node --print 'code' --test",
+            "node --test --help",
+            "node --test --unknown-option",
+            "nodejs --test",
+            "node --test $TEST_FILES",
+            "node --test 'unterminated",
+        ] {
+            assert_eq!(kind_of(cmd), None, "{cmd} must remain local");
+        }
+    }
+
+    #[test]
+    fn node_test_rejects_file_outputs_and_hidden_options() {
+        for cmd in [
+            "node --test --test-reporter-destination results.xml",
+            "node --test --test-reporter-destination=stdout",
+            "node --test --test-reporter ./file-reporter.js",
+            "node --test --experimental-test-coverage",
+            "node --test --test-update-snapshots",
+            "node --test --test-rerun-failures failures.json",
+            "node --cpu-prof --test",
+            "node --test --heap-prof",
+            "node --test --prof",
+            "node --test --logfile=profile.log",
+            "node --test --report-on-fatalerror",
+            "node --test --report-directory reports",
+            "node --test --heapsnapshot-signal SIGUSR2",
+            "node --test --trace-events-enabled",
+            "node --test --env-file .env",
+            "node --test --experimental-config-file config.json",
+            "NODE_V8_COVERAGE=coverage node --test",
+            "env NODE_OPTIONS='--cpu-prof' node --test",
+        ] {
+            assert_eq!(kind_of(cmd), None, "{cmd} has no artifact return contract");
+            assert_eq!(
+                classify_command_detailed(cmd).classification.kind,
+                None,
+                "{cmd}"
+            );
+        }
+    }
+
     // --- TypeScript ---
 
     #[test]
@@ -8384,6 +8584,7 @@ mod tests_go_and_typescript {
             CompilationKind::GoTest,
             CompilationKind::GoVet,
             CompilationKind::Tsc,
+            CompilationKind::NodeTest,
         ] {
             let base = kind.command_base();
             assert!(

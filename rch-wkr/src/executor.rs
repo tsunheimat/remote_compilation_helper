@@ -105,6 +105,9 @@ fn next_package_manager_token<'a>(tokens: &mut impl Iterator<Item = &'a str>) ->
 /// need `node_modules/` to be installed map to Bun/Node, so a misclassified
 /// Rust command never accidentally triggers `bun install`.
 fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
+    if rch_common::classify_command(command).kind == Some(rch_common::CompilationKind::NodeTest) {
+        return RequiredRuntime::Node;
+    }
     let after_env = strip_leading_env_assignments(command);
 
     let mut tokens = after_env.split_whitespace();
@@ -164,6 +167,35 @@ fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
 #[cfg(test)]
 mod runtime_detection_tests {
     use super::*;
+
+    #[test]
+    fn node_test_runtime_prepare_matches_shared_classifier() {
+        for command in [
+            "node --test",
+            "node --test=unit.test.js",
+            "node --require setup.cjs --test",
+            "env CI=1 /usr/bin/node --import setup.mjs --test",
+        ] {
+            assert_eq!(
+                detect_runtime_from_command(command),
+                RequiredRuntime::Node,
+                "{command}"
+            );
+        }
+        for command in [
+            "node app.js --test",
+            "node --require --test",
+            "node -- --test",
+            "node --test --watch",
+            "node --test --test-reporter-destination=report.xml",
+        ] {
+            assert_eq!(
+                detect_runtime_from_command(command),
+                RequiredRuntime::None,
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn test_detect_runtime_bun_test() {

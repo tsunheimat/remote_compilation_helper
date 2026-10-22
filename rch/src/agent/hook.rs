@@ -12,19 +12,554 @@ use std::path::PathBuf;
 
 /// Return true when the given command-line invokes the `rch` binary.
 ///
-/// We match against the basename of the first whitespace-separated
-/// token, not a naive `contains("rch")`. The substring test was prone
-/// to false positives across any path or arg containing "rch" in its
-/// name — for example `search`, `archive`, `rearchive`, `rch-wkr`, or
-/// `my-rchwrapper` — which in `uninstall_hook` would silently *delete*
-/// legitimate unrelated hooks from the user's settings.
+/// Parse shell quoting so paths containing spaces are recognized without
+/// claiming unrelated commands that merely mention RCH in their arguments.
 fn is_rch_hook_command(cmd: &str) -> bool {
-    let first_token = cmd.split_whitespace().next().unwrap_or(cmd);
-    let basename = std::path::Path::new(first_token)
+    let Ok(words) = shell_words::split(cmd) else {
+        return false;
+    };
+    words.first().is_some_and(|word| {
+        std::path::Path::new(word)
+            .file_name()
+            .is_some_and(|name| name == "rch")
+    })
+}
+
+/// Reject links (including dangling ones) and special files before reading or
+/// replacing settings. A missing regular-file destination is allowed.
+fn settings_metadata(path: &std::path::Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "Refusing non-regular settings file {}; leaving it unchanged",
+                path.display()
+            );
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Cannot inspect {}", path.display())),
+    }
+}
+
+/// Atomically replace settings with the original permissions already applied
+/// to the temporary file, never exposing private JSON under a broader umask.
+/// Backups stay beside the settings, with unique names and the same permissions;
+/// this avoids global backup collisions and retention deleting unrelated files.
+fn write_json_settings(path: &std::path::Path, settings: &Value) -> Result<()> {
+    use std::io::Write;
+
+    let metadata = settings_metadata(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Settings path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Some(metadata) = &metadata {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?;
+        let original = std::fs::read(path)?;
+        let mut backup = tempfile::Builder::new()
+            .prefix(".rch-settings-backup-")
+            .suffix(".bak")
+            .tempfile_in(parent)?;
+        backup.as_file().set_permissions(metadata.permissions())?;
+        backup.write_all(&original)?;
+        backup.as_file().sync_all()?;
+        backup.keep().context("Failed to retain settings backup")?;
+    }
+    // NamedTempFile defaults to owner-only permissions for new settings.
+    temporary.write_all(serde_json::to_string_pretty(settings)?.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    settings_metadata(path)?;
+    temporary
+        .persist(path)
+        .context("Failed to replace settings atomically")?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        directory.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Read settings without ever replacing malformed user configuration.
+fn read_json_settings(path: &std::path::Path) -> Result<Value> {
+    settings_metadata(path)?;
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("Invalid JSON in {}; leaving it unchanged", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(error) => Err(error).with_context(|| format!("Cannot read {}", path.display())),
+    }
+}
+
+/// Validate the merge surface before making any on-disk changes.
+fn validate_pre_tool_settings(settings: &Value) -> Result<()> {
+    anyhow::ensure!(settings.is_object(), "Settings is not an object");
+    if let Some(hooks) = settings.get("hooks") {
+        anyhow::ensure!(hooks.is_object(), "Hooks is not an object");
+        if let Some(groups) = hooks.get("PreToolUse") {
+            let groups = groups
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("PreToolUse is not an array"))?;
+            for group in groups {
+                anyhow::ensure!(group.is_object(), "PreToolUse entry is not an object");
+                // Accept the old RCH-owned entry only so it can be repaired.
+                if group.get("matcher").is_none()
+                    && group
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_rch_hook_command)
+                {
+                    continue;
+                }
+                let handlers = group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("PreToolUse entry has no hooks array"))?;
+                anyhow::ensure!(
+                    handlers.iter().all(Value::is_object),
+                    "Hook handler is not an object"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_owned_handler(handler: &Value) -> bool {
+    handler.get("type").and_then(Value::as_str) == Some("command")
+        && handler
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(is_rch_hook_command)
+}
+
+/// Remove only owned handlers, not their unrelated siblings or group metadata.
+fn remove_pre_tool_handlers(settings: &mut Value) {
+    if let Some(groups) = settings
+        .pointer_mut("/hooks/PreToolUse")
+        .and_then(Value::as_array_mut)
+    {
+        groups.retain_mut(|group| {
+            if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = handlers.len();
+                handlers.retain(|handler| !is_owned_handler(handler));
+                return before == handlers.len() || !handlers.is_empty();
+            }
+            !(group.get("matcher").is_none()
+                && group
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_rch_hook_command))
+        });
+    }
+}
+
+fn pre_tool_hook_status(settings: &Value) -> HookStatus {
+    if validate_pre_tool_settings(settings).is_err() {
+        return HookStatus::NeedsUpdate;
+    }
+    let Some(groups) = settings
+        .pointer("/hooks/PreToolUse")
+        .and_then(Value::as_array)
+    else {
+        return HookStatus::NotInstalled;
+    };
+    let mut owned = 0;
+    let mut valid = 0;
+    for group in groups {
+        if let Some(handlers) = group.get("hooks").and_then(Value::as_array) {
+            for handler in handlers.iter().filter(|handler| is_owned_handler(handler)) {
+                owned += 1;
+                if matches!(
+                    group.get("matcher").and_then(Value::as_str),
+                    Some("Bash" | "^Bash$")
+                ) && handler.get("async").is_none_or(|value| value == false)
+                {
+                    valid += 1;
+                }
+            }
+        } else if group
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(is_rch_hook_command)
+        {
+            owned += 1;
+        }
+    }
+    match (owned, valid) {
+        (0, _) => HookStatus::NotInstalled,
+        (1, 1) => HookStatus::Installed,
+        _ => HookStatus::NeedsUpdate,
+    }
+}
+
+fn installed_hook_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|directory| directory.join("rch")))
+        .filter(|path| path.exists())
+        .map(|path| shell_words::quote(&path.to_string_lossy()).into_owned())
+        .unwrap_or_else(|| "rch".to_string())
+}
+
+fn install_pre_tool_hook_at_path(
+    path: &std::path::Path,
+    dry_run: bool,
+) -> Result<IdempotentResult> {
+    let mut settings = read_json_settings(path)?;
+    validate_pre_tool_settings(&settings)?;
+    anyhow::ensure!(
+        !has_legacy_handlers(&settings),
+        "Legacy remote-test handler present; preview agents migrate instead of enabling duplicate routing"
+    );
+    if pre_tool_hook_status(&settings) == HookStatus::Installed {
+        return Ok(IdempotentResult::Unchanged);
+    }
+    remove_pre_tool_handlers(&mut settings);
+    let hook_path = installed_hook_command();
+    let hooks = settings
+        .as_object_mut()
+        .expect("validated settings")
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let groups = hooks
+        .as_object_mut()
+        .expect("validated hooks")
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+    groups
+        .as_array_mut()
+        .expect("validated groups")
+        .push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": hook_path }]
+        }));
+    if dry_run {
+        return Ok(IdempotentResult::WouldChange(format!(
+            "Would add RCH hook to {}",
+            path.display()
+        )));
+    }
+    write_json_settings(path, &settings)?;
+    Ok(IdempotentResult::Changed)
+}
+
+fn uninstall_pre_tool_hook_at_path(
+    path: &std::path::Path,
+    dry_run: bool,
+) -> Result<IdempotentResult> {
+    let mut settings = read_json_settings(path)?;
+    validate_pre_tool_settings(&settings)?;
+    let original = settings.clone();
+    remove_pre_tool_handlers(&mut settings);
+    if original == settings {
+        return Ok(IdempotentResult::Unchanged);
+    }
+    if dry_run {
+        return Ok(IdempotentResult::WouldChange(format!(
+            "Would remove RCH hook from {}",
+            path.display()
+        )));
+    }
+    write_json_settings(path, &settings)?;
+    Ok(IdempotentResult::Changed)
+}
+
+/// Only the actual legacy executable is owned, never an argument mentioning it.
+fn is_legacy_handler(handler: &Value) -> bool {
+    if handler.get("type").and_then(Value::as_str) != Some("command") {
+        return false;
+    }
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| {
+            shell_words::split(command).is_ok_and(|words| {
+                // Refuse shell programs/pipelines, env wrappers and extra arguments:
+                // the deployed adapter is invoked as one quoted executable path.
+                words.len() == 1
+                    && std::path::Path::new(&words[0])
+                        .file_name()
+                        .is_some_and(|name| {
+                            name == "remote-test-codex-hook-bootstrap"
+                                || name == "remote-test-codex-hook"
+                        })
+            })
+        })
+}
+
+fn has_legacy_handlers(settings: &Value) -> bool {
+    settings
+        .pointer("/hooks/PreToolUse")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|handlers| handlers.iter().any(is_legacy_handler))
+            })
+        })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemovedHandlers {
+    index: usize,
+    metadata: Value,
+    handlers: Vec<(usize, Value)>,
+}
+
+/// Recovery records contain only the hooks owned by this migration, not a copy
+/// of the user's settings. Rollback merges into the current settings document.
+#[derive(Debug, Serialize, Deserialize)]
+struct HookMigration {
+    version: u32,
+    rolled_back: bool,
+    removed: Vec<RemovedHandlers>,
+    added: Option<Value>,
+}
+
+fn migration_journal(path: &std::path::Path) -> Result<PathBuf> {
+    let name = path
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(first_token);
-    basename == "rch"
+        .ok_or_else(|| anyhow::anyhow!("Missing settings name"))?;
+    Ok(path.with_file_name(format!(".{}.rch-migration.json", name.to_string_lossy())))
+}
+
+fn group_metadata(group: &Value) -> Value {
+    let mut metadata = group.clone();
+    metadata
+        .as_object_mut()
+        .expect("validated group")
+        .remove("hooks");
+    metadata
+}
+
+fn replace_json_if_unchanged(path: &std::path::Path, before: &Value, after: &Value) -> Result<()> {
+    anyhow::ensure!(
+        read_json_settings(path)? == *before,
+        "Settings changed during migration; retry rather than overwriting unrelated edits"
+    );
+    write_json_settings(path, after)
+}
+
+fn migration_settings_path(kind: AgentKind) -> Result<PathBuf> {
+    match kind {
+        AgentKind::ClaudeCode => claude_code_settings_path(),
+        AgentKind::CodexCli => codex_cli_config_path(),
+        _ => anyhow::bail!("Legacy migration supports claude-code, codex-cli and hermes only"),
+    }
+    .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
+}
+
+/// Preview or apply an explicitly requested legacy migration. No runtime restart
+/// or generic PATH activation is performed; the caller stages those separately.
+pub fn migrate_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult> {
+    if kind == AgentKind::Hermes {
+        return migrate_hermes_at_path(&hermes_plugin_path()?, dry_run, false);
+    }
+    migrate_pre_tool_at_path(&migration_settings_path(kind)?, dry_run)
+}
+
+/// Undo only this migration's owned changes, preserving subsequent user edits.
+pub fn rollback_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult> {
+    if kind == AgentKind::Hermes {
+        return migrate_hermes_at_path(&hermes_plugin_path()?, dry_run, true);
+    }
+    rollback_pre_tool_at_path(&migration_settings_path(kind)?, dry_run)
+}
+
+fn migrate_pre_tool_at_path(path: &std::path::Path, dry_run: bool) -> Result<IdempotentResult> {
+    let before = read_json_settings(path)?;
+    validate_pre_tool_settings(&before)?;
+    let journal_path = migration_journal(path)?;
+    if settings_metadata(&journal_path)?.is_some() {
+        let journal: HookMigration = serde_json::from_value(read_json_settings(&journal_path)?)?;
+        anyhow::ensure!(journal.version == 1, "Unknown migration journal version");
+        if !journal.rolled_back {
+            if !has_legacy_handlers(&before)
+                && pre_tool_hook_status(&before) == HookStatus::Installed
+            {
+                return Ok(IdempotentResult::Unchanged);
+            }
+            anyhow::bail!("Migration journal already exists; run agents rollback before retrying");
+        }
+    }
+    if !has_legacy_handlers(&before) {
+        return Ok(IdempotentResult::Unchanged);
+    }
+    anyhow::ensure!(
+        pre_tool_hook_status(&before) == HookStatus::NotInstalled,
+        "Disable existing RCH hooks before migrating legacy routing (rollback must not restore duplicate routing)"
+    );
+    let mut after = before.clone();
+    let mut removed = Vec::new();
+    let groups = after
+        .pointer_mut("/hooks/PreToolUse")
+        .and_then(Value::as_array_mut)
+        .expect("legacy handlers require groups");
+    for (index, group) in groups.iter_mut().enumerate() {
+        let metadata = group_metadata(group);
+        let handlers = group["hooks"].as_array_mut().expect("validated handlers");
+        let owned: Vec<_> = handlers
+            .iter()
+            .enumerate()
+            .filter(|(_, handler)| is_legacy_handler(handler))
+            .map(|(index, handler)| (index, handler.clone()))
+            .collect();
+        if !owned.is_empty() {
+            handlers.retain(|handler| !is_legacy_handler(handler));
+            // Keep even empty groups, so group metadata and positions survive.
+            removed.push(RemovedHandlers {
+                index,
+                metadata,
+                handlers: owned,
+            });
+        }
+    }
+    let added = if pre_tool_hook_status(&before) == HookStatus::NotInstalled {
+        let group = serde_json::json!({"matcher": "Bash", "hooks": [{"type": "command",
+            "command": installed_hook_command()}]});
+        groups.push(group.clone());
+        Some(group)
+    } else {
+        None
+    };
+    if dry_run {
+        return Ok(IdempotentResult::WouldChange(format!(
+            "Would replace {} exact legacy handler(s) in {}; journal {}; no restart or PATH change",
+            removed
+                .iter()
+                .map(|group| group.handlers.len())
+                .sum::<usize>(),
+            path.display(),
+            journal_path.display()
+        )));
+    }
+    let journal = HookMigration {
+        version: 1,
+        rolled_back: false,
+        removed,
+        added,
+    };
+    // Persist recovery intent before the one atomic settings switch. A crash
+    // before or after the switch is recoverable by the same rollback operation.
+    write_json_settings(&journal_path, &serde_json::to_value(&journal)?)?;
+    replace_json_if_unchanged(path, &before, &after)?;
+    Ok(IdempotentResult::Changed)
+}
+
+fn rollback_pre_tool_at_path(path: &std::path::Path, dry_run: bool) -> Result<IdempotentResult> {
+    let journal_path = migration_journal(path)?;
+    if settings_metadata(&journal_path)?.is_none() {
+        return Ok(IdempotentResult::Unchanged);
+    }
+    let mut journal: HookMigration = serde_json::from_value(read_json_settings(&journal_path)?)?;
+    anyhow::ensure!(journal.version == 1, "Unknown migration journal version");
+    if journal.rolled_back {
+        return Ok(IdempotentResult::Unchanged);
+    }
+    let before = read_json_settings(path)?;
+    validate_pre_tool_settings(&before)?;
+    let mut after = before.clone();
+    let groups = after
+        .pointer_mut("/hooks/PreToolUse")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("Hook groups changed since migration; refusing rollback"))?;
+    if let Some(added) = &journal.added {
+        let owned = &added["hooks"][0];
+        let matches: Vec<_> = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .filter(|handlers| handlers.contains(owned))
+                    .map(|_| index)
+            })
+            .collect();
+        anyhow::ensure!(
+            matches.len() <= 1,
+            "Migrated hook duplicated; refusing ambiguous rollback"
+        );
+        if let Some(index) = matches.first().copied() {
+            let group = &mut groups[index];
+            group["hooks"]
+                .as_array_mut()
+                .expect("validated handlers")
+                .retain(|handler| handler != owned);
+            if group["hooks"]
+                .as_array()
+                .expect("validated handlers")
+                .is_empty()
+                && group_metadata(group) == group_metadata(added)
+            {
+                groups.remove(index);
+            }
+        } else {
+            anyhow::ensure!(
+                pre_tool_hook_status(&before) == HookStatus::NotInstalled,
+                "Migrated RCH handler changed; refusing to restore duplicate legacy routing"
+            );
+        }
+    }
+    // A separately added RCH handler must not coexist with restored legacy
+    // routing, even if our exact handler was still present and removed above.
+    anyhow::ensure!(
+        groups.iter().all(|group| group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_none_or(|handlers| !handlers.iter().any(is_owned_handler))),
+        "Additional RCH handlers added after migration; refusing duplicate-routing rollback"
+    );
+    for removed in &journal.removed {
+        let matches: Vec<_> = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group_metadata(group) == removed.metadata)
+            .map(|(index, _)| index)
+            .collect();
+        let index = if matches.contains(&removed.index) {
+            removed.index
+        } else {
+            anyhow::ensure!(
+                matches.len() == 1,
+                "Original hook group changed or is ambiguous; refusing rollback"
+            );
+            matches[0]
+        };
+        let handlers = groups[index]["hooks"]
+            .as_array_mut()
+            .expect("validated handlers");
+        // Atomic publication means recovery sees either all the old handlers or
+        // none. Preserve their multiplicity (legacy installs may contain duplicates).
+        let already_restored = removed
+            .handlers
+            .iter()
+            .all(|(position, handler)| handlers.get(*position) == Some(handler));
+        if !already_restored {
+            anyhow::ensure!(
+                !handlers.iter().any(is_legacy_handler),
+                "Legacy handlers changed or moved; refusing ambiguous rollback"
+            );
+            for (position, handler) in &removed.handlers {
+                handlers.insert((*position).min(handlers.len()), handler.clone());
+            }
+        }
+    }
+    if dry_run {
+        return Ok(IdempotentResult::WouldChange(format!(
+            "Would restore owned legacy handlers in {}; unrelated settings retained",
+            path.display()
+        )));
+    }
+    replace_json_if_unchanged(path, &before, &after)?;
+    journal.rolled_back = true;
+    write_json_settings(&journal_path, &serde_json::to_value(journal)?)?;
+    Ok(IdempotentResult::Changed)
 }
 
 /// Status of RCH hook for an agent.
@@ -62,6 +597,7 @@ pub fn check_hook_status(kind: AgentKind) -> Result<HookStatus> {
         AgentKind::ClaudeCode => check_claude_code_hook(),
         AgentKind::GeminiCli => check_gemini_cli_hook(),
         AgentKind::CodexCli => check_codex_cli_hook(),
+        AgentKind::Hermes => check_hermes_hook_at_path(&hermes_plugin_path()?),
         AgentKind::ContinueDev => check_continue_dev_hook(),
         _ => Ok(HookStatus::NotSupported),
     }
@@ -82,6 +618,7 @@ pub fn install_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult> 
         AgentKind::ClaudeCode => install_claude_code_hook(dry_run),
         AgentKind::GeminiCli => install_gemini_cli_hook(dry_run),
         AgentKind::CodexCli => install_codex_cli_hook(dry_run),
+        AgentKind::Hermes => install_hermes_hook_at_path(&hermes_plugin_path()?, dry_run),
         AgentKind::ContinueDev => install_continue_dev_hook(dry_run),
         _ => Err(HookError::NotImplemented {
             agent: kind.name().to_string(),
@@ -106,6 +643,7 @@ pub fn uninstall_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult
         AgentKind::ClaudeCode => uninstall_claude_code_hook(dry_run),
         AgentKind::GeminiCli => uninstall_gemini_cli_hook(dry_run),
         AgentKind::CodexCli => uninstall_codex_cli_hook(dry_run),
+        AgentKind::Hermes => uninstall_hermes_hook_at_path(&hermes_plugin_path()?, dry_run),
         AgentKind::ContinueDev => uninstall_continue_dev_hook(dry_run),
         _ => Err(HookError::NotImplemented {
             agent: kind.name().to_string(),
@@ -146,35 +684,7 @@ fn check_claude_code_hook_at_path(settings_path: &std::path::Path) -> Result<Hoo
         }
     };
 
-    // Check for PreToolUse hook with rch
-    if let Some(hooks) = settings.get("hooks")
-        && let Some(pre_tool_use) = hooks.get("PreToolUse")
-        && let Some(arr) = pre_tool_use.as_array()
-    {
-        for hook in arr {
-            // Check correct format: { "matcher": "Bash", "hooks": [{ "command": "rch" }] }
-            if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
-                for inner in inner_hooks {
-                    if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
-                        && is_rch_hook_command(cmd)
-                    {
-                        return Ok(HookStatus::Installed);
-                    }
-                }
-            }
-            // Also check obsolete format for backwards compatibility detection:
-            // { "command": "rch", "description": "..." }
-            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && is_rch_hook_command(cmd)
-                && hook.get("matcher").is_none()
-            {
-                // Obsolete format detected - needs update
-                return Ok(HookStatus::NeedsUpdate);
-            }
-        }
-    }
-
-    Ok(HookStatus::NotInstalled)
+    Ok(pre_tool_hook_status(&settings))
 }
 
 fn install_claude_code_hook(dry_run: bool) -> Result<IdempotentResult> {
@@ -200,155 +710,14 @@ fn install_claude_code_hook_at_path(
         ));
     }
 
-    if dry_run {
-        return Ok(IdempotentResult::WouldChange(format!(
-            "Would add RCH hook to {}",
-            settings_path.display()
-        )));
-    }
-
-    // Read existing settings or create new
-    let mut settings: Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(settings_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    // Check if already installed (correctly)
-    let current_status = check_claude_code_hook_at_path(settings_path)?;
-    if current_status == HookStatus::Installed {
-        return Ok(IdempotentResult::Unchanged);
-    }
-
-    // Create backup
-    if settings_path.exists() {
-        create_backup(settings_path)?;
-    }
-
-    // If obsolete format exists, we need to remove it first
-    if current_status == HookStatus::NeedsUpdate {
-        // Remove obsolete entries before adding correct one
-        if let Some(hooks) = settings.get_mut("hooks")
-            && let Some(pre_tool_use) = hooks.get_mut("PreToolUse")
-            && let Some(arr) = pre_tool_use.as_array_mut()
-        {
-            arr.retain(|hook| {
-                // Keep entries that don't have obsolete rch format
-                let is_obsolete_rch = hook
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(is_rch_hook_command)
-                    .unwrap_or(false)
-                    && hook.get("matcher").is_none();
-                !is_obsolete_rch
-            });
-        }
-    }
-
-    // Get the rch binary path (prefer full path if available)
-    let hook_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("rch")))
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "rch".to_string());
-
-    // Add the hook in the correct format
-    let hook_entry = serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [
-            {
-                "type": "command",
-                "command": hook_path
-            }
-        ]
-    });
-
-    let hooks = settings
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("Settings is not an object"))?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("Hooks is not an object"))?;
-
-    let pre_tool_use = hooks_obj
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::json!([]));
-
-    if let Some(arr) = pre_tool_use.as_array_mut() {
-        arr.push(hook_entry);
-    }
-
-    // Write settings atomically
-    let content = serde_json::to_string_pretty(&settings)?;
-    atomic_write(settings_path, content.as_bytes())?;
-
-    Ok(IdempotentResult::Changed)
+    install_pre_tool_hook_at_path(settings_path, dry_run)
 }
 
 fn uninstall_claude_code_hook(dry_run: bool) -> Result<IdempotentResult> {
     let settings_path = claude_code_settings_path()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
-    if !settings_path.exists() {
-        return Ok(IdempotentResult::Unchanged);
-    }
-
-    if dry_run {
-        return Ok(IdempotentResult::WouldChange(format!(
-            "Would remove RCH hook from {}",
-            settings_path.display()
-        )));
-    }
-
-    let content = std::fs::read_to_string(&settings_path)?;
-    let mut settings: Value = serde_json::from_str(&content)?;
-
-    // Check if hook exists (either correct or obsolete format)
-    let status = check_claude_code_hook()?;
-    if status == HookStatus::NotInstalled || status == HookStatus::NotSupported {
-        return Ok(IdempotentResult::Unchanged);
-    }
-
-    // Create backup
-    create_backup(&settings_path)?;
-
-    // Remove the hook (handle both old and new formats)
-    if let Some(hooks) = settings.get_mut("hooks")
-        && let Some(pre_tool_use) = hooks.get_mut("PreToolUse")
-        && let Some(arr) = pre_tool_use.as_array_mut()
-    {
-        arr.retain(|hook| {
-            // Check correct format: { "matcher": "Bash", "hooks": [{ "command": "rch" }] }
-            if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
-                for inner in inner_hooks {
-                    if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
-                        && is_rch_hook_command(cmd)
-                    {
-                        return false; // Remove this entry
-                    }
-                }
-            }
-            // Check obsolete format: { "command": "rch", ... }
-            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && is_rch_hook_command(cmd)
-                && hook.get("matcher").is_none()
-            {
-                return false; // Remove this entry
-            }
-            true // Keep other entries
-        });
-    }
-
-    // Write settings atomically
-    let content = serde_json::to_string_pretty(&settings)?;
-    atomic_write(&settings_path, content.as_bytes())?;
-
-    Ok(IdempotentResult::Changed)
+    uninstall_pre_tool_hook_at_path(&settings_path, dry_run)
 }
 
 // === Gemini CLI Hook ===
@@ -493,223 +862,309 @@ fn uninstall_gemini_cli_hook(dry_run: bool) -> Result<IdempotentResult> {
 // === Codex CLI Hook ===
 
 fn codex_cli_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".codex").join("config.toml"))
+    AgentKind::CodexCli.default_config_path()
 }
 
 fn check_codex_cli_hook() -> Result<HookStatus> {
-    let config_path = match codex_cli_config_path() {
-        Some(p) => p,
-        None => return Ok(HookStatus::NotInstalled),
-    };
-
-    if !config_path.exists() {
-        return Ok(HookStatus::NotInstalled);
+    match codex_cli_config_path() {
+        Some(path) => check_claude_code_hook_at_path(&path),
+        None => Ok(HookStatus::NotInstalled),
     }
-
-    let content = std::fs::read_to_string(&config_path)?;
-    let lines: Vec<&str> = content.lines().collect();
-
-    if let Some((start, end)) = find_toml_section_range(&lines, "hooks") {
-        for line in &lines[start + 1..end] {
-            if is_pre_tool_use_rch(line) {
-                return Ok(HookStatus::Installed);
-            }
-        }
-    }
-
-    Ok(HookStatus::NotInstalled)
 }
 
 fn install_codex_cli_hook(dry_run: bool) -> Result<IdempotentResult> {
-    let config_path = codex_cli_config_path()
+    let path = codex_cli_config_path()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-
-    if dry_run {
-        return Ok(IdempotentResult::WouldChange(format!(
-            "Would add RCH hook to {}",
-            config_path.display()
-        )));
-    }
-
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    if check_codex_cli_hook()? == HookStatus::Installed {
-        return Ok(IdempotentResult::Unchanged);
-    }
-
-    let content = if config_path.exists() {
-        create_backup(&config_path)?;
-        std::fs::read_to_string(&config_path)?
-    } else {
-        String::new()
-    };
-    let mut lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
-
-    let mut changed = false;
-    if let Some((start, end)) = find_toml_section_range(
-        &lines.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        "hooks",
-    ) {
-        // Update existing pre_tool_use line or insert if missing
-        let mut found = false;
-        for line in &mut lines[start + 1..end] {
-            if is_pre_tool_use_line(line) {
-                if !is_pre_tool_use_rch(line) {
-                    *line = "pre_tool_use = \"rch\"".to_string();
-                    changed = true;
-                }
-                found = true;
-                break;
-            }
-        }
-
-        if !found {
-            lines.insert(end, "pre_tool_use = \"rch\"".to_string());
-            changed = true;
-        }
-    } else {
-        if !lines.is_empty() && !lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
-            lines.push(String::new());
-        }
-        lines.push("[hooks]".to_string());
-        lines.push("pre_tool_use = \"rch\"".to_string());
-        changed = true;
-    }
-
-    if !changed {
-        return Ok(IdempotentResult::Unchanged);
-    }
-
-    let updated = ensure_trailing_newline(lines.join("\n"));
-    atomic_write(&config_path, updated.as_bytes())?;
-
-    Ok(IdempotentResult::Changed)
+    // Codex consumes PreToolUse JSON in hooks.json. Never modify config.toml
+    // or trust state; hook approval remains an explicit user decision in Codex.
+    install_pre_tool_hook_at_path(&path, dry_run)
 }
 
 fn uninstall_codex_cli_hook(dry_run: bool) -> Result<IdempotentResult> {
-    let config_path = codex_cli_config_path()
+    let path = codex_cli_config_path()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    uninstall_pre_tool_hook_at_path(&path, dry_run)
+}
 
-    if !config_path.exists() {
-        return Ok(IdempotentResult::Unchanged);
+// === Hermes plugin ===
+// Hermes has no PreToolUse JSON settings entry: its plugin API registers a
+// Python pre_tool_call callback. Keep these assets independent of remote-test.
+const HERMES_PLUGIN: &str = include_str!("hermes_plugin.py");
+const HERMES_MANIFEST: &str = "name: rch-rewrite\nversion: \"0.1.0\"\ndescription: Rewrite Hermes terminal builds through RCH.\nauthor: local\nhooks:\n  - pre_tool_call\nprovides_hooks:\n  - pre_tool_call\n";
+const HERMES_DISABLED: &str =
+    "\"\"\"RCH integration disabled; no hooks registered.\"\"\"\ndef register(ctx):\n    pass\n";
+
+fn hermes_plugin_path() -> Result<PathBuf> {
+    AgentKind::Hermes
+        .default_config_path()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
+}
+
+fn check_hermes_hook_at_path(path: &std::path::Path) -> Result<HookStatus> {
+    let source = path.join("__init__.py");
+    if !source.exists() {
+        return Ok(HookStatus::NotInstalled);
     }
-
-    if dry_run {
-        return Ok(IdempotentResult::WouldChange(format!(
-            "Would remove RCH hook from {}",
-            config_path.display()
-        )));
+    let content = std::fs::read_to_string(source)?;
+    if content == HERMES_DISABLED {
+        return Ok(HookStatus::NotInstalled);
     }
-
-    if check_codex_cli_hook()? == HookStatus::NotInstalled {
-        return Ok(IdempotentResult::Unchanged);
+    if content == HERMES_PLUGIN
+        && std::fs::read_to_string(path.join("plugin.yaml"))
+            .is_ok_and(|manifest| manifest == HERMES_MANIFEST)
+    {
+        return Ok(HookStatus::Installed);
     }
+    Ok(HookStatus::NeedsUpdate)
+}
 
-    create_backup(&config_path)?;
-
-    let content = std::fs::read_to_string(&config_path)?;
-    let mut lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
-
-    let mut changed = false;
-    if let Some((start, end)) = find_toml_section_range(
-        &lines.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        "hooks",
-    ) {
-        let mut idx = start + 1;
-        while idx < end {
-            if is_pre_tool_use_rch(&lines[idx]) {
-                lines.remove(idx);
-                changed = true;
-                break;
-            }
-            idx += 1;
+/// Refuse symlinks and unrecognized content rather than overwriting another
+/// plugin or a user-edited copy. No activation/restart is performed here.
+fn validate_hermes_assets(path: &std::path::Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "Refusing symlinked plugin directory {}",
+                ancestor.display()
+            );
         }
     }
+    for (name, expected) in [
+        ("__init__.py", HERMES_PLUGIN),
+        ("plugin.yaml", HERMES_MANIFEST),
+    ] {
+        let file = path.join(name);
+        match std::fs::symlink_metadata(&file) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "Refusing non-regular plugin asset {}",
+                    file.display()
+                );
+                let content = std::fs::read_to_string(&file)?;
+                anyhow::ensure!(
+                    content == expected || (name == "__init__.py" && content == HERMES_DISABLED),
+                    "User-modified or unrecognized Hermes asset {}; leaving it unchanged",
+                    file.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
 
-    if !changed {
+fn install_hermes_hook_at_path(path: &std::path::Path, dry_run: bool) -> Result<IdempotentResult> {
+    validate_hermes_assets(path)?;
+    if let Some(parent) = path.parent() {
+        let legacy = parent.join("remote-test-rewrite").join("__init__.py");
+        if settings_metadata(&legacy)?.is_some() {
+            anyhow::ensure!(
+                std::fs::read_to_string(&legacy)?.ends_with(LEGACY_HERMES_DISABLE),
+                "Legacy Hermes plugin present; use agents migrate instead of enabling duplicate routing"
+            );
+        }
+    }
+    if check_hermes_hook_at_path(path)? == HookStatus::Installed {
         return Ok(IdempotentResult::Unchanged);
     }
-
-    let updated = ensure_trailing_newline(lines.join("\n"));
-    atomic_write(&config_path, updated.as_bytes())?;
-
+    if dry_run {
+        return Ok(IdempotentResult::WouldChange(format!(
+            "Would install Hermes plugin at {} (no restart)",
+            path.display()
+        )));
+    }
+    // Write the registration callback last. A partial first install cannot
+    // register a hook before both assets are present.
+    for (name, content) in [
+        ("plugin.yaml", HERMES_MANIFEST),
+        ("__init__.py", HERMES_PLUGIN),
+    ] {
+        let file = path.join(name);
+        if std::fs::read_to_string(&file).is_ok_and(|current| current == content) {
+            continue;
+        }
+        if file.exists() {
+            create_backup(&file)?;
+        }
+        atomic_write(&file, content.as_bytes())?;
+    }
     Ok(IdempotentResult::Changed)
 }
 
-fn find_toml_section_range(lines: &[&str], section: &str) -> Option<(usize, usize)> {
-    let header = format!("[{}]", section);
-    let mut start = None;
+fn uninstall_hermes_hook_at_path(
+    path: &std::path::Path,
+    dry_run: bool,
+) -> Result<IdempotentResult> {
+    validate_hermes_assets(path)?;
+    if check_hermes_hook_at_path(path)? == HookStatus::NotInstalled {
+        return Ok(IdempotentResult::Unchanged);
+    }
+    if dry_run {
+        return Ok(IdempotentResult::WouldChange(format!(
+            "Would disable Hermes plugin at {} (no deletion or restart)",
+            path.display()
+        )));
+    }
+    let source = path.join("__init__.py");
+    create_backup(&source)?;
+    atomic_write(&source, HERMES_DISABLED.as_bytes())?;
+    Ok(IdempotentResult::Changed)
+}
 
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed == header {
-            start = Some(idx);
-            continue;
+// An explicit inert register override is the disable marker understood by the
+// existing plugin's Python API; a sentinel file alone would not disable it.
+const LEGACY_HERMES_DISABLE: &str = "\n# RCH migration: legacy routing disabled; original source retained above.\ndef register(ctx):\n    pass\n";
+
+#[derive(Serialize, Deserialize)]
+struct HermesMigration {
+    version: u32,
+    original_sha256: String,
+    rolled_back: bool,
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_plugin_if_unchanged(path: &std::path::Path, before: &str, after: &str) -> Result<()> {
+    use std::io::Write;
+    let metadata = settings_metadata(path)?.ok_or_else(|| anyhow::anyhow!("Plugin disappeared"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().expect("plugin parent"))?;
+    temporary
+        .as_file()
+        .set_permissions(metadata.permissions())?;
+    temporary.write_all(after.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    anyhow::ensure!(
+        std::fs::read_to_string(path)? == before,
+        "Plugin changed during migration; retry"
+    );
+    settings_metadata(path)?;
+    temporary
+        .persist(path)
+        .context("Failed to replace plugin atomically")?;
+    std::fs::File::open(path.parent().expect("plugin parent"))?.sync_all()?;
+    Ok(())
+}
+
+fn migrate_hermes_at_path(
+    path: &std::path::Path,
+    dry_run: bool,
+    rollback: bool,
+) -> Result<IdempotentResult> {
+    validate_hermes_assets(path)?;
+    let legacy = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Plugin has no parent"))?
+        .join("remote-test-rewrite");
+    for ancestor in legacy.ancestors() {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "Refusing symlinked plugin directory"
+            );
         }
-
-        if start.is_some() && trimmed.starts_with('[') && trimmed.ends_with(']') {
-            return start.map(|s| (s, idx));
+    }
+    let source = legacy.join("__init__.py");
+    let journal_path = legacy.join(".rch-migration.json");
+    if rollback {
+        if settings_metadata(&journal_path)?.is_none() {
+            return Ok(IdempotentResult::Unchanged);
+        }
+        let mut journal: HermesMigration =
+            serde_json::from_value(read_json_settings(&journal_path)?)?;
+        anyhow::ensure!(
+            journal.version == 1,
+            "Unknown Hermes migration journal version"
+        );
+        if journal.rolled_back {
+            return Ok(IdempotentResult::Unchanged);
+        }
+        settings_metadata(&source)?;
+        let current = std::fs::read_to_string(&source)?;
+        let original = current
+            .strip_suffix(LEGACY_HERMES_DISABLE)
+            .unwrap_or(&current);
+        anyhow::ensure!(
+            sha256_hex(original.as_bytes()) == journal.original_sha256,
+            "Legacy plugin changed after migration; refusing to overwrite edits"
+        );
+        if dry_run {
+            return Ok(IdempotentResult::WouldChange("Would disable RCH Hermes routing and restore original register callback; restart Hermes afterwards".into()));
+        }
+        // Disable the replacement first: recovery never enables both adapters.
+        uninstall_hermes_hook_at_path(path, false)?;
+        if current != original {
+            write_plugin_if_unchanged(&source, &current, original)?;
+        }
+        journal.rolled_back = true;
+        write_json_settings(&journal_path, &serde_json::to_value(journal)?)?;
+        return Ok(IdempotentResult::Changed);
+    }
+    if settings_metadata(&source)?.is_none() {
+        return Ok(IdempotentResult::Unchanged);
+    }
+    let current = std::fs::read_to_string(&source)?;
+    if settings_metadata(&journal_path)?.is_some() {
+        let journal: HermesMigration = serde_json::from_value(read_json_settings(&journal_path)?)?;
+        anyhow::ensure!(
+            journal.version == 1,
+            "Unknown Hermes migration journal version"
+        );
+        if !journal.rolled_back {
+            if current
+                .strip_suffix(LEGACY_HERMES_DISABLE)
+                .is_some_and(|original| sha256_hex(original.as_bytes()) == journal.original_sha256)
+                && check_hermes_hook_at_path(path)? == HookStatus::Installed
+            {
+                return Ok(IdempotentResult::Unchanged);
+            }
+            anyhow::bail!("Incomplete Hermes migration; run agents rollback before retrying");
         }
     }
-
-    start.map(|s| (s, lines.len()))
-}
-
-fn has_pre_tool_use_key(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let Some(rest) = trimmed.strip_prefix("pre_tool_use") else {
-        return false;
+    anyhow::ensure!(
+        check_hermes_hook_at_path(path)? == HookStatus::NotInstalled,
+        "RCH Hermes plugin already active; disable it before migrating legacy routing"
+    );
+    let marker = read_json_settings(&legacy.join(".remote-test-managed"))?;
+    anyhow::ensure!(
+        marker["managed_by"] == "remote-test-install" && marker["agent"] == "hermes",
+        "Legacy Hermes ownership marker missing or invalid; plugin left untouched"
+    );
+    for name in ["__init__.py", "plugin.yaml"] {
+        let asset = legacy.join(name);
+        settings_metadata(&asset)?.ok_or_else(|| anyhow::anyhow!("Missing legacy plugin asset"))?;
+        anyhow::ensure!(
+            marker["files"][name].as_str() == Some(sha256_hex(&std::fs::read(asset)?).as_str()),
+            "Legacy Hermes asset changed from its managed digest; refusing migration"
+        );
+    }
+    if dry_run {
+        return Ok(IdempotentResult::WouldChange(format!(
+            "Would append explicit disable marker to {}, preserve legacy files, then install RCH plugin; restart Hermes afterwards",
+            source.display()
+        )));
+    }
+    let journal = HermesMigration {
+        version: 1,
+        original_sha256: sha256_hex(current.as_bytes()),
+        rolled_back: false,
     };
-
-    match rest.chars().next() {
-        None => true,
-        Some(c) => c.is_whitespace() || c == '=',
-    }
-}
-
-fn is_pre_tool_use_line(line: &str) -> bool {
-    has_pre_tool_use_key(line)
-}
-
-fn is_pre_tool_use_rch(line: &str) -> bool {
-    let stripped = line.split('#').next().unwrap_or("").trim();
-    if !has_pre_tool_use_key(stripped) {
-        return false;
-    }
-
-    let Some((_, value)) = stripped.split_once('=') else {
-        return false;
-    };
-
-    let value = value.trim();
-
-    // Handle string format: pre_tool_use = "rch" or "/abs/path/to/rch"
-    if value.starts_with('"') || value.starts_with('\'') {
-        let unquoted = value.trim_matches('"').trim_matches('\'');
-        return is_rch_hook_command(unquoted);
-    }
-
-    // Handle array format: pre_tool_use = ["rch", "other"] or ["/abs/path/to/rch", ...]
-    if value.starts_with('[') && value.ends_with(']') {
-        let inner = &value[1..value.len() - 1];
-        return inner.split(',').any(|item| {
-            let item = item.trim().trim_matches('"').trim_matches('\'');
-            is_rch_hook_command(item)
-        });
-    }
-
-    // Bare word (unlikely but handle it)
-    is_rch_hook_command(value)
-}
-
-fn ensure_trailing_newline(content: String) -> String {
-    if content.ends_with('\n') {
-        content
-    } else {
-        format!("{}\n", content)
-    }
+    write_json_settings(&journal_path, &serde_json::to_value(journal)?)?;
+    write_plugin_if_unchanged(
+        &source,
+        &current,
+        &format!("{current}{LEGACY_HERMES_DISABLE}"),
+    )?;
+    install_hermes_hook_at_path(path, false)?;
+    Ok(IdempotentResult::Changed)
 }
 
 // === Continue.dev Hook ===
@@ -828,6 +1283,179 @@ fn uninstall_continue_dev_hook(dry_run: bool) -> Result<IdempotentResult> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_matching_uses_exact_executable_not_mentions_or_shell_programs() {
+        for command in [
+            "remote-test-codex-hook-bootstrap",
+            "'/opt/old tools/remote-test-codex-hook-bootstrap'",
+            "/usr/local/libexec/remote-test-codex-hook",
+        ] {
+            assert!(is_legacy_handler(
+                &serde_json::json!({"type": "command", "command": command})
+            ));
+        }
+        for command in [
+            "echo remote-test-codex-hook-bootstrap",
+            "remote-test-codex-hook-bootstrap-extra",
+            "remote-test-codex-hook-bootstrap && audit",
+            "env remote-test-codex-hook-bootstrap",
+            "remote-test-codex-hook-bootstrap --other",
+        ] {
+            assert!(!is_legacy_handler(
+                &serde_json::json!({"type": "command", "command": command})
+            ));
+        }
+        assert!(!is_legacy_handler(
+            &serde_json::json!({"type": "prompt", "command": "remote-test-codex-hook-bootstrap"})
+        ));
+    }
+
+    fn legacy_fixture() -> Value {
+        serde_json::json!({"secret": "keep", "hooks": {"PreToolUse": [{"matcher": "Bash", "custom": true,
+            "hooks": [{"type": "command", "command": "remote-test-codex-hook-bootstrap"},
+                {"type": "command", "command": "audit", "timeout": 7}]}], "Stop": ["unrelated"]}})
+    }
+
+    #[test]
+    fn migration_preview_apply_rollback_merges_later_unrelated_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original = legacy_fixture();
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(install_pre_tool_hook_at_path(&path, false).is_err());
+        assert!(matches!(
+            migrate_pre_tool_at_path(&path, true).unwrap(),
+            IdempotentResult::WouldChange(_)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(matches!(
+            migrate_pre_tool_at_path(&path, false).unwrap(),
+            IdempotentResult::Changed
+        ));
+        let mut current = read_json_settings(&path).unwrap();
+        assert!(!has_legacy_handlers(&current));
+        assert_eq!(pre_tool_hook_status(&current), HookStatus::Installed);
+        assert!(matches!(
+            migrate_pre_tool_at_path(&path, false).unwrap(),
+            IdempotentResult::Unchanged
+        ));
+        current["later"] = serde_json::json!({"keep": true});
+        current["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "command", "command": "later-audit"}));
+        std::fs::write(&path, serde_json::to_vec(&current).unwrap()).unwrap();
+        rollback_pre_tool_at_path(&path, true).unwrap();
+        assert_eq!(read_json_settings(&path).unwrap(), current);
+        rollback_pre_tool_at_path(&path, false).unwrap();
+        let restored = read_json_settings(&path).unwrap();
+        assert!(has_legacy_handlers(&restored));
+        assert_eq!(pre_tool_hook_status(&restored), HookStatus::NotInstalled);
+        assert_eq!(restored["later"], current["later"]);
+        assert_eq!(restored["hooks"]["Stop"], original["hooks"]["Stop"]);
+        assert_eq!(
+            restored["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(matches!(
+            rollback_pre_tool_at_path(&path, false).unwrap(),
+            IdempotentResult::Unchanged
+        ));
+    }
+
+    #[test]
+    fn rollback_refuses_changed_owned_handler_and_recovers_uncommitted_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original = legacy_fixture();
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        migrate_pre_tool_at_path(&path, false).unwrap();
+        let mut current = read_json_settings(&path).unwrap();
+        current["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"] = serde_json::json!(999);
+        std::fs::write(&path, serde_json::to_vec(&current).unwrap()).unwrap();
+        assert!(rollback_pre_tool_at_path(&path, false).is_err());
+        assert_eq!(read_json_settings(&path).unwrap(), current);
+        // Simulate a crash after journal sync but before settings publication.
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        rollback_pre_tool_at_path(&path, false).unwrap();
+        assert_eq!(read_json_settings(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_preserves_private_modes_and_rejects_invalid_json() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, "{ malformed").unwrap();
+        assert!(migrate_pre_tool_at_path(&path, false).is_err());
+        assert!(!migration_journal(&path).unwrap().exists());
+        std::fs::write(&path, serde_json::to_vec(&legacy_fixture()).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        migrate_pre_tool_at_path(&path, false).unwrap();
+        rollback_pre_tool_at_path(&path, false).unwrap();
+        for file in std::fs::read_dir(dir.path()).unwrap() {
+            assert_eq!(
+                file.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_migration_preserves_source_and_rolls_back_without_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rch-rewrite");
+        let legacy = dir.path().join("remote-test-rewrite");
+        std::fs::create_dir(&legacy).unwrap();
+        let source = "def register(ctx):\n    ctx.register_hook('pre_tool_call', callback)\n";
+        let manifest = "name: remote-test-rewrite\n";
+        std::fs::write(legacy.join("__init__.py"), source).unwrap();
+        std::fs::write(legacy.join("plugin.yaml"), manifest).unwrap();
+        assert!(install_hermes_hook_at_path(&path, false).is_err());
+        assert!(migrate_hermes_at_path(&path, false, false).is_err());
+        std::fs::write(legacy.join(".remote-test-managed"), serde_json::to_vec(&serde_json::json!({
+            "managed_by": "remote-test-install", "agent": "hermes", "files": {
+                "__init__.py": sha256_hex(source.as_bytes()), "plugin.yaml": sha256_hex(manifest.as_bytes())
+            }
+        })).unwrap()).unwrap();
+        migrate_hermes_at_path(&path, true, false).unwrap();
+        assert!(!path.exists());
+        assert!(!legacy.join(".rch-migration.json").exists());
+        migrate_hermes_at_path(&path, false, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("__init__.py")).unwrap(),
+            format!("{source}{LEGACY_HERMES_DISABLE}")
+        );
+        assert_eq!(
+            check_hermes_hook_at_path(&path).unwrap(),
+            HookStatus::Installed
+        );
+        assert!(matches!(
+            migrate_hermes_at_path(&path, false, false).unwrap(),
+            IdempotentResult::Unchanged
+        ));
+        migrate_hermes_at_path(&path, false, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("__init__.py")).unwrap(),
+            source
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("plugin.yaml")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            check_hermes_hook_at_path(&path).unwrap(),
+            HookStatus::NotInstalled
+        );
+        assert!(path.join("__init__.py").exists());
+    }
+
     // ===== TEST: is_rch_hook_command =====
 
     #[test]
@@ -869,81 +1497,244 @@ mod tests {
         assert!(!is_rch_hook_command("   "));
     }
 
-    // ===== TEST: is_pre_tool_use_rch (codex CLI hook detector) =====
-
     #[test]
-    fn is_pre_tool_use_rch_string_bare() {
-        assert!(is_pre_tool_use_rch(r#"pre_tool_use = "rch""#));
-        assert!(is_pre_tool_use_rch(r#"pre_tool_use = 'rch'"#));
+    fn quoted_hook_paths_and_unrelated_commands() {
+        assert!(is_rch_hook_command("'/opt/my tools/rch'"));
+        assert!(is_rch_hook_command("\"/opt/my tools/rch\" --verbose"));
+        assert!(!is_rch_hook_command("'/opt/my tools/rch"));
+        assert!(!is_rch_hook_command("printf rch"));
+        assert!(!is_rch_hook_command("remote-test-codex-hook-bootstrap"));
     }
 
     #[test]
-    fn is_pre_tool_use_rch_string_absolute_path() {
-        // Regression for #11: absolute paths must match. Sanitized environments
-        // (systemd units, sandboxes) often have a bare PATH that doesn't include
-        // ~/.local/bin, so users legitimately configure pre_tool_use as an absolute
-        // path. The previous exact-string equality rejected these, causing
-        // status/install/uninstall to silently misbehave.
-        assert!(is_pre_tool_use_rch(
-            r#"pre_tool_use = "/home/user/.local/bin/rch""#
+    fn codex_json_roundtrip_preserves_sibling_hooks_and_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let config = dir.path().join("config.toml");
+        let toml = "# user trust decision\n[features]\nhooks = true\n";
+        std::fs::write(&config, toml).unwrap();
+        let original = serde_json::json!({
+            "other": {"retained": true},
+            "hooks": {"PreToolUse": [{
+                "matcher": "Bash", "custom": "group metadata",
+                "hooks": [
+                    {"type": "command", "command": "/usr/local/libexec/remote-test-codex-hook-bootstrap-audit"},
+                    {"type": "command", "command": "dcg", "timeout": 7}
+                ]
+            }], "Stop": [{"hooks": [{"type": "command", "command": "log-stop"}]}]}
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(matches!(
+            install_pre_tool_hook_at_path(&path, false).unwrap(),
+            IdempotentResult::Changed
         ));
-        assert!(is_pre_tool_use_rch(
-            r#"pre_tool_use = "/usr/local/bin/rch""#
+        let installed = read_json_settings(&path).unwrap();
+        assert_eq!(
+            installed["hooks"]["PreToolUse"][0],
+            original["hooks"]["PreToolUse"][0]
+        );
+        assert_eq!(pre_tool_hook_status(&installed), HookStatus::Installed);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            install_pre_tool_hook_at_path(&path, false).unwrap(),
+            IdempotentResult::Unchanged
         ));
-        assert!(is_pre_tool_use_rch(r#"pre_tool_use = "/opt/rch/bin/rch""#));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(matches!(
+            uninstall_pre_tool_hook_at_path(&path, false).unwrap(),
+            IdempotentResult::Changed
+        ));
+        assert_eq!(read_json_settings(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(config).unwrap(), toml);
     }
 
     #[test]
-    fn is_pre_tool_use_rch_array_bare() {
-        assert!(is_pre_tool_use_rch(r#"pre_tool_use = ["rch"]"#));
-        assert!(is_pre_tool_use_rch(r#"pre_tool_use = ["rch", "other"]"#));
+    fn uninstall_preserves_mixed_group_and_non_command_handlers() {
+        let mut settings = serde_json::json!({"hooks": {"PreToolUse": [{
+            "matcher": "Bash", "custom": 42,
+            "hooks": [
+                {"type": "command", "command": "'/opt/rch tools/rch'"},
+                {"type": "command", "command": "dcg"},
+                {"type": "prompt", "command": "rch", "prompt": "keep"}
+            ]
+        }]}});
+        remove_pre_tool_handlers(&mut settings);
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0],
+            serde_json::json!({
+                "matcher": "Bash", "custom": 42,
+                "hooks": [
+                    {"type": "command", "command": "dcg"},
+                    {"type": "prompt", "command": "rch", "prompt": "keep"}
+                ]
+            })
+        );
     }
 
     #[test]
-    fn is_pre_tool_use_rch_array_absolute_path() {
-        // Regression for #11: absolute paths inside array form must also match.
-        assert!(is_pre_tool_use_rch(
-            r#"pre_tool_use = ["/home/user/.local/bin/rch"]"#
-        ));
-        assert!(is_pre_tool_use_rch(
-            r#"pre_tool_use = ["/usr/local/bin/rch", "other"]"#
-        ));
-        assert!(is_pre_tool_use_rch(
-            r#"pre_tool_use = ["other", "/opt/rch/bin/rch"]"#
-        ));
+    fn repair_wrong_matcher_async_and_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let original = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Read", "hooks": [{"type": "command", "command": "rch"}, {"type": "command", "command": "audit"}]},
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "rch", "async": true}]}
+        ]}});
+        assert_eq!(pre_tool_hook_status(&original), HookStatus::NeedsUpdate);
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        install_pre_tool_hook_at_path(&path, false).unwrap();
+        let installed = read_json_settings(&path).unwrap();
+        assert_eq!(pre_tool_hook_status(&installed), HookStatus::Installed);
+        assert_eq!(
+            installed["hooks"]["PreToolUse"][0],
+            serde_json::json!({"matcher": "Read", "hooks": [{"type": "command", "command": "audit"}]})
+        );
     }
 
     #[test]
-    fn is_pre_tool_use_rch_rejects_substring_false_positives() {
-        // The false-positive cases that motivated is_rch_hook_command's basename
-        // matching also apply here — pre_tool_use="search" or "rch-wrapper" must
-        // NOT match, otherwise install/uninstall would clobber unrelated hooks.
-        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "search""#));
-        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "/usr/bin/search""#));
-        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "rch-wrapper""#));
-        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "/usr/bin/rchd""#));
-        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = ["search"]"#));
-        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = ["rch-wrapper"]"#));
+    fn invalid_shapes_leave_configuration_bytes_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        for input in [
+            "{ invalid",
+            "null",
+            "[]",
+            r#"{"hooks":[]}"#,
+            r#"{"hooks":{"PreToolUse":{}}}"#,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[null]}]}}"#,
+        ] {
+            std::fs::write(&path, input).unwrap();
+            assert!(install_pre_tool_hook_at_path(&path, false).is_err());
+            assert!(install_pre_tool_hook_at_path(&path, true).is_err());
+            assert!(uninstall_pre_tool_hook_at_path(&path, false).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), input);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_permissions_preserved_on_install_uninstall_and_backup() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        // Uninstall removes owned handlers, not pre-existing settings containers.
+        // Start with that container so full document equality tests preservation
+        // without requiring the installer to track ownership of JSON objects.
+        let original = serde_json::json!({"secret": "private", "hooks": {"PreToolUse": []}});
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        install_pre_tool_hook_at_path(&path, false).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        uninstall_pre_tool_hook_at_path(&path, false).unwrap();
+        assert_eq!(read_json_settings(&path).unwrap(), original);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(entries.len(), 3, "settings and two distinct backups");
+        for entry in entries {
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_symlinks_and_nonregular_targets_are_preserved() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, "{\"secret\":\"private\"}").unwrap();
+        let link = dir.path().join("hooks.json");
+        symlink(&target, &link).unwrap();
+        let dangling = dir.path().join("dangling.json");
+        symlink(dir.path().join("missing.json"), &dangling).unwrap();
+        let directory = dir.path().join("directory.json");
+        std::fs::create_dir(&directory).unwrap();
+        for path in [&link, &dangling, &directory] {
+            for dry_run in [true, false] {
+                assert!(install_pre_tool_hook_at_path(path, dry_run).is_err());
+                assert!(uninstall_pre_tool_hook_at_path(path, dry_run).is_err());
+            }
+        }
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(directory.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{\"secret\":\"private\"}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
     }
 
     #[test]
-    fn is_pre_tool_use_rch_bare_word_absolute_path() {
-        // Bare-word value (no quotes) — uncommon but historically supported.
-        assert!(is_pre_tool_use_rch("pre_tool_use = rch"));
-        assert!(is_pre_tool_use_rch(
-            "pre_tool_use = /home/user/.local/bin/rch"
+    fn hermes_install_disable_and_reinstall_preserve_other_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("unrelated-rewrite");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("__init__.py"), "user plugin").unwrap();
+        let path = dir.path().join("rch-rewrite");
+        assert!(matches!(
+            install_hermes_hook_at_path(&path, true).unwrap(),
+            IdempotentResult::WouldChange(_)
         ));
-        assert!(!is_pre_tool_use_rch("pre_tool_use = search"));
+        assert!(!path.exists());
+        assert!(matches!(
+            install_hermes_hook_at_path(&path, false).unwrap(),
+            IdempotentResult::Changed
+        ));
+        assert_eq!(
+            check_hermes_hook_at_path(&path).unwrap(),
+            HookStatus::Installed
+        );
+        assert!(matches!(
+            install_hermes_hook_at_path(&path, false).unwrap(),
+            IdempotentResult::Unchanged
+        ));
+        assert!(matches!(
+            uninstall_hermes_hook_at_path(&path, false).unwrap(),
+            IdempotentResult::Changed
+        ));
+        assert_eq!(
+            check_hermes_hook_at_path(&path).unwrap(),
+            HookStatus::NotInstalled
+        );
+        assert!(path.join("__init__.py").exists());
+        assert!(path.join("plugin.yaml").exists());
+        install_hermes_hook_at_path(&path, false).unwrap();
+        assert_eq!(
+            check_hermes_hook_at_path(&path).unwrap(),
+            HookStatus::Installed
+        );
+        assert_eq!(
+            std::fs::read_to_string(sibling.join("__init__.py")).unwrap(),
+            "user plugin"
+        );
     }
 
     #[test]
-    fn is_pre_tool_use_rch_ignores_comment_lines() {
-        // Lines fully commented out, or with the value before a `#`.
-        assert!(!is_pre_tool_use_rch(r#"# pre_tool_use = "rch""#));
-        assert!(is_pre_tool_use_rch(r#"pre_tool_use = "rch"  # codex hook"#));
-        assert!(is_pre_tool_use_rch(
-            r#"pre_tool_use = "/home/user/.local/bin/rch"  # absolute path for sandbox"#
-        ));
+    fn hermes_refuses_user_modified_plugin_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rch-rewrite");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("__init__.py"), "user code").unwrap();
+        assert!(install_hermes_hook_at_path(&path, false).is_err());
+        assert!(uninstall_hermes_hook_at_path(&path, false).is_err());
+        assert!(!path.join("plugin.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(path.join("__init__.py")).unwrap(),
+            "user code"
+        );
     }
 
     // ===== TEST: HookStatus =====
@@ -1110,8 +1901,52 @@ mod tests {
         eprintln!("TEST PASS: test_uninstall_hook_unsupported_agents_error");
     }
 
+    /// Re-execute the public dispatch test with a private home. Child-local env
+    /// avoids both inspecting live hooks and racing parallel tests via set_var.
+    fn run_with_isolated_agent_home(test: &str) -> bool {
+        const CHILD: &str = "RCH_AGENT_HOOK_FIXTURE_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            return false;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, test)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("HERMES_HOME", home.join(".hermes"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test {test} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "test selector did not execute {test}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read_dir(home.join(".claude")).unwrap().count(),
+            0,
+            "dry run must not create settings or backups"
+        );
+        true
+    }
+
     #[test]
     fn test_install_hook_dry_run_supported_agents() {
+        if run_with_isolated_agent_home(
+            "agent::hook::tests::test_install_hook_dry_run_supported_agents",
+        ) {
+            return;
+        }
         eprintln!("TEST START: test_install_hook_dry_run_supported_agents");
         let supported = [
             AgentKind::ClaudeCode,
@@ -1136,6 +1971,11 @@ mod tests {
 
     #[test]
     fn test_uninstall_hook_dry_run_supported_agents() {
+        if run_with_isolated_agent_home(
+            "agent::hook::tests::test_uninstall_hook_dry_run_supported_agents",
+        ) {
+            return;
+        }
         eprintln!("TEST START: test_uninstall_hook_dry_run_supported_agents");
         let supported = [
             AgentKind::ClaudeCode,
@@ -1156,184 +1996,6 @@ mod tests {
             eprintln!("  {:?}: {:?}", kind, outcome);
         }
         eprintln!("TEST PASS: test_uninstall_hook_dry_run_supported_agents");
-    }
-
-    // ===== TEST: TOML parsing helpers =====
-
-    #[test]
-    fn test_is_pre_tool_use_rch_string_format() {
-        eprintln!("TEST START: test_is_pre_tool_use_rch_string_format");
-        // Double quotes
-        assert!(is_pre_tool_use_rch("pre_tool_use = \"rch\""));
-        assert!(is_pre_tool_use_rch("  pre_tool_use = \"rch\"  "));
-        assert!(is_pre_tool_use_rch("pre_tool_use=\"rch\""));
-
-        // Single quotes
-        assert!(is_pre_tool_use_rch("pre_tool_use = 'rch'"));
-
-        // With comments
-        assert!(is_pre_tool_use_rch("pre_tool_use = \"rch\" # comment"));
-
-        // Not rch
-        assert!(!is_pre_tool_use_rch("pre_tool_use = \"other\""));
-        assert!(!is_pre_tool_use_rch("pre_tool_use = \"rch-extended\""));
-        eprintln!("TEST PASS: test_is_pre_tool_use_rch_string_format");
-    }
-
-    #[test]
-    fn test_is_pre_tool_use_rch_array_format() {
-        eprintln!("TEST START: test_is_pre_tool_use_rch_array_format");
-        // Array with rch
-        assert!(is_pre_tool_use_rch("pre_tool_use = [\"rch\"]"));
-        assert!(is_pre_tool_use_rch("pre_tool_use = [\"rch\", \"other\"]"));
-        assert!(is_pre_tool_use_rch("pre_tool_use = [\"other\", \"rch\"]"));
-        assert!(is_pre_tool_use_rch("pre_tool_use = ['rch', 'other']"));
-
-        // Array without rch
-        assert!(!is_pre_tool_use_rch("pre_tool_use = [\"other\"]"));
-        assert!(!is_pre_tool_use_rch("pre_tool_use = [\"foo\", \"bar\"]"));
-        eprintln!("TEST PASS: test_is_pre_tool_use_rch_array_format");
-    }
-
-    #[test]
-    fn test_is_pre_tool_use_rch_edge_cases() {
-        eprintln!("TEST START: test_is_pre_tool_use_rch_edge_cases");
-
-        // Empty line
-        assert!(!is_pre_tool_use_rch(""));
-
-        // Comment line
-        assert!(!is_pre_tool_use_rch("# pre_tool_use = \"rch\""));
-
-        // Different key
-        assert!(!is_pre_tool_use_rch("post_tool_use = \"rch\""));
-
-        // No value
-        assert!(!is_pre_tool_use_rch("pre_tool_use"));
-        assert!(!is_pre_tool_use_rch("pre_tool_use ="));
-
-        // rch as substring (should not match)
-        assert!(!is_pre_tool_use_rch("pre_tool_use = \"rch_extended\""));
-        assert!(!is_pre_tool_use_rch("pre_tool_use = \"my_rch\""));
-
-        // Mixed quotes in array
-        assert!(is_pre_tool_use_rch("pre_tool_use = [\"rch\", 'other']"));
-
-        eprintln!("TEST PASS: test_is_pre_tool_use_rch_edge_cases");
-    }
-
-    #[test]
-    fn test_is_pre_tool_use_line() {
-        eprintln!("TEST START: test_is_pre_tool_use_line");
-        assert!(is_pre_tool_use_line("pre_tool_use = \"rch\""));
-        assert!(is_pre_tool_use_line("  pre_tool_use = \"rch\""));
-        assert!(is_pre_tool_use_line("\tpre_tool_use = \"rch\""));
-        assert!(is_pre_tool_use_line("pre_tool_use"));
-        assert!(is_pre_tool_use_line("pre_tool_use ="));
-        assert!(!is_pre_tool_use_line("# pre_tool_use = \"rch\""));
-        assert!(!is_pre_tool_use_line("other_key = \"value\""));
-        assert!(!is_pre_tool_use_line(""));
-        assert!(!is_pre_tool_use_line("pre_tool_uses = \"rch\""));
-        assert!(!is_pre_tool_use_line("pre_tool_useful = \"rch\""));
-        eprintln!("TEST PASS: test_is_pre_tool_use_line");
-    }
-
-    #[test]
-    fn test_find_toml_section_range() {
-        eprintln!("TEST START: test_find_toml_section_range");
-        let lines = vec![
-            "# comment",
-            "[hooks]",
-            "pre_tool_use = \"rch\"",
-            "",
-            "[other]",
-            "key = \"value\"",
-        ];
-
-        let range = find_toml_section_range(&lines, "hooks");
-        assert_eq!(range, Some((1, 4)));
-
-        let range = find_toml_section_range(&lines, "other");
-        assert_eq!(range, Some((4, 6)));
-
-        let range = find_toml_section_range(&lines, "missing");
-        assert_eq!(range, None);
-        eprintln!("TEST PASS: test_find_toml_section_range");
-    }
-
-    #[test]
-    fn test_find_toml_section_range_at_end() {
-        eprintln!("TEST START: test_find_toml_section_range_at_end");
-        let lines = vec!["[hooks]", "pre_tool_use = \"rch\""];
-
-        let range = find_toml_section_range(&lines, "hooks");
-        assert_eq!(range, Some((0, 2)));
-        eprintln!("TEST PASS: test_find_toml_section_range_at_end");
-    }
-
-    #[test]
-    fn test_find_toml_section_range_empty() {
-        eprintln!("TEST START: test_find_toml_section_range_empty");
-        let lines: Vec<&str> = vec![];
-        assert_eq!(find_toml_section_range(&lines, "hooks"), None);
-
-        let lines = vec!["# just a comment"];
-        assert_eq!(find_toml_section_range(&lines, "hooks"), None);
-        eprintln!("TEST PASS: test_find_toml_section_range_empty");
-    }
-
-    #[test]
-    fn test_find_toml_section_range_nested_brackets() {
-        eprintln!("TEST START: test_find_toml_section_range_nested_brackets");
-        let lines = vec![
-            "[parent]",
-            "key = \"value\"",
-            "[parent.child]", // Not a top-level section
-            "nested = true",
-            "[sibling]",
-            "other = 1",
-        ];
-
-        // Should find [parent] from line 0 to line 2 (before [parent.child])
-        // Actually, the current implementation treats [parent.child] as a new section
-        let range = find_toml_section_range(&lines, "parent");
-        assert!(range.is_some());
-        let (start, end) = range.unwrap();
-        assert_eq!(start, 0);
-        // End should be before the next section header
-        assert!(end <= 2 || end <= 4, "Expected end <= 4, got {}", end);
-        eprintln!("TEST PASS: test_find_toml_section_range_nested_brackets");
-    }
-
-    #[test]
-    fn test_find_toml_section_range_whitespace() {
-        eprintln!("TEST START: test_find_toml_section_range_whitespace");
-        let lines = vec![
-            "  [hooks]  ", // Note: current impl uses trim()
-            "pre_tool_use = \"rch\"",
-        ];
-
-        // Should still find it because we trim
-        let range = find_toml_section_range(&lines, "hooks");
-        assert_eq!(range, Some((0, 2)));
-        eprintln!("TEST PASS: test_find_toml_section_range_whitespace");
-    }
-
-    #[test]
-    fn test_ensure_trailing_newline() {
-        eprintln!("TEST START: test_ensure_trailing_newline");
-        assert_eq!(ensure_trailing_newline("foo".to_string()), "foo\n");
-        assert_eq!(ensure_trailing_newline("foo\n".to_string()), "foo\n");
-        assert_eq!(ensure_trailing_newline("".to_string()), "\n");
-        assert_eq!(
-            ensure_trailing_newline("multi\nline".to_string()),
-            "multi\nline\n"
-        );
-        assert_eq!(
-            ensure_trailing_newline("multi\nline\n".to_string()),
-            "multi\nline\n"
-        );
-        eprintln!("TEST PASS: test_ensure_trailing_newline");
     }
 
     // ===== TEST: Config path helpers =====
@@ -1372,7 +2034,7 @@ mod tests {
         let path = codex_cli_config_path();
         if let Some(p) = &path {
             assert!(p.to_string_lossy().contains(".codex"));
-            assert!(p.to_string_lossy().contains("config.toml"));
+            assert!(p.to_string_lossy().contains("hooks.json"));
             eprintln!("  Path: {:?}", p);
         } else {
             eprintln!("  Path: None (HOME not set)");
@@ -1642,9 +2304,9 @@ mod tests {
         eprintln!("TEST PASS: test_install_hook_at_path_preserves_existing_hooks");
     }
 
-    /// When settings.json has malformed JSON, silently replace with valid JSON.
+    /// Malformed settings must remain byte-for-byte unchanged.
     #[test]
-    fn test_install_hook_at_path_malformed_json_recovers() {
+    fn test_install_hook_at_path_malformed_json_preserved() {
         eprintln!("TEST START: test_install_hook_at_path_malformed_json_recovers");
         let test_env = TestEnv::new();
 
@@ -1656,12 +2318,12 @@ mod tests {
         let result = install_claude_code_hook_at_path(&test_env.settings_path(), false);
         eprintln!("  Result: {:?}", result);
 
-        // The current implementation silently replaces invalid JSON with {}
-        // This is reasonable behavior - verify it doesn't crash and file ends up valid
-        assert!(result.is_ok(), "Should not error on malformed JSON");
+        assert!(
+            result.is_err(),
+            "Malformed settings must not be overwritten"
+        );
         let content = std::fs::read_to_string(test_env.settings_path()).unwrap();
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&content);
-        assert!(parsed.is_ok(), "File should be valid JSON after install");
+        assert_eq!(content, "{ invalid json }");
 
         eprintln!("TEST PASS: test_install_hook_at_path_malformed_json_recovers");
     }

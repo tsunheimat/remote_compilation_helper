@@ -464,33 +464,6 @@ mod tests {
     use super::*;
     use rch_common::job_identity::JobIdentity;
 
-    /// A fake `rch` for recovery: a hard link to one shim written once per
-    /// process, whose behavior is the data file `body` beside the link.
-    /// Writing a fresh executable and exec'ing it at once fails with ETXTBSY
-    /// when a concurrent test forks while the write fd is open (the child holds
-    /// a copy until it execs); see `launchd_singleton_tests` in main.rs.
-    #[cfg(unix)]
-    fn fake_rch(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-        static SHIM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let shim = SHIM.get_or_init(|| {
-            let shim = tempfile::tempdir().unwrap().keep().join("rch-shim");
-            std::fs::write(
-                &shim,
-                "#!/bin/sh\nexec /bin/sh \"$(dirname \"$0\")/body\" \"$@\"\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
-            shim
-        });
-        std::fs::write(dir.join("body"), body).unwrap();
-        let child = dir.join("rch");
-        if !child.exists() {
-            std::fs::hard_link(shim, &child).unwrap();
-        }
-        child
-    }
-
     fn recoverable_lease_ids(
         directory: &Path,
         now: u64,
@@ -938,11 +911,30 @@ mod tests {
     #[tokio::test]
     async fn child_exit_zero_without_journal_completion_is_not_auto_recovery_success() {
         let dir = tempfile::tempdir().unwrap();
+        // Prepare each executable in a waited child, never by opening a write
+        // descriptor in this multithreaded test process. Concurrent spawns can
+        // inherit such a descriptor and cause ETXTBSY even after fs::write
+        // returns. Each script is immutable once prepared.
+        let script = |name: &str, body: &str| {
+            let child = dir.path().join(name);
+            let status = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf '%s' \"$1\" > \"$2\" && chmod 700 \"$2\"",
+                    "fixture",
+                ])
+                .arg(body)
+                .arg(&child)
+                .status()
+                .unwrap();
+            assert!(status.success(), "prepare recovery fixture {child:?}");
+            child
+        };
         let pending = handoff_lease(0, 11, 102);
         let id = &pending.identity.local_wrapper_id;
         let path = dir.path().join(format!("{id}.json"));
         std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-        let child = fake_rch(dir.path(), "exit 0\n");
+        let child = script("rch-no-completion", "#!/bin/sh\nexit 0\n");
         let error = recover_in(
             &child,
             &dir.path().join("unused.sock"),
@@ -960,10 +952,10 @@ mod tests {
         std::fs::write(&receipt, serde_json::to_vec(&complete).unwrap()).unwrap();
         // The test-owned child simulates writing the final durable journal;
         // the daemon must inspect that journal rather than its exit alone.
-        fake_rch(
-            dir.path(),
+        let child = script(
+            "rch-completed",
             &format!(
-                "cp -- {} {}\n",
+                "#!/bin/sh\ncp -- {} {}\n",
                 shell_escape::escape(receipt.to_str().unwrap().into()),
                 shell_escape::escape(path.to_str().unwrap().into())
             ),
@@ -1013,7 +1005,28 @@ mod tests {
             "{}.json",
             JobIdentity::new_local().local_wrapper_id
         ));
-        let _listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        // This must be a filesystem socket with a canonical journal name:
+        // an abstract socket would not exercise the non-regular-entry filter.
+        // On Linux, bind through an open directory fd to avoid SUN_LEN for a
+        // long shared TMPDIR, without moving the fixture or changing cwd.
+        #[cfg(target_os = "linux")]
+        let socket_directory = std::fs::File::open(dir.path()).unwrap();
+        #[cfg(target_os = "linux")]
+        let bind_path = {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!("/proc/self/fd/{}", socket_directory.as_raw_fd()))
+                .join(socket.file_name().unwrap())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let bind_path = socket.clone();
+        let _listener = std::os::unix::net::UnixListener::bind(bind_path).unwrap();
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
         let mut unknown_schema = handoff_lease(0, 11, 102);
         unknown_schema.schema_version = 2;
         std::fs::write(

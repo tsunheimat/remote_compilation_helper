@@ -746,9 +746,10 @@ mod tests {
         let base = tmp.path().join("projects");
         fs::create_dir_all(&base).unwrap();
 
-        // Three ~200KB pooled dirs with staggered ages (all idle beyond the
-        // short window, all within the pooled TTL since we pass None), plus a
-        // fresh oversized one that the safety floor must protect.
+        // Three pooled dirs with staggered ages (all idle beyond the short
+        // window, with the pooled TTL disabled), plus a fresh larger blob.
+        // Logical file lengths are not disk usage: shared/compressed storage
+        // can report only a few allocated KiB for these zero-filled blobs.
         let aged = |path: &std::path::Path, stamp: &str| {
             fs::create_dir_all(path).unwrap();
             fs::write(path.join("blob.bin"), vec![0u8; 200 * 1024]).unwrap();
@@ -770,11 +771,32 @@ mod tests {
         fs::create_dir_all(&fresh_big).unwrap();
         fs::write(fresh_big.join("blob.bin"), vec![0u8; 400 * 1024]).unwrap();
 
-        // Budget 700KB. Total is ~1020KB (3×~204 + ~404), so eviction fires;
-        // the fresh dir is protected by the -mmin floor; evicting the two
-        // oldest aged dirs (~408KB) brings the total to ~612KB ≤ 700 and the
-        // loop stops before the newest aged dir.
-        let cmd = isolated_sweep_command(tmp.path(), &base, None, Some(700));
+        // Match the production cap's actual allocated-space accounting, not
+        // assumed 4-KiB blocks or apparent file sizes. The budget fits exactly
+        // the newest and fresh pools; both older pools must be evicted on
+        // local and shared filesystems alike.
+        let allocated_kb = |path: &std::path::Path| -> u64 {
+            let out = Command::new("du").arg("-sk").arg(path).output().unwrap();
+            assert!(out.status.success(), "du for {path:?}: {out:?}");
+            let kb = std::str::from_utf8(&out.stdout)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert!(kb > 0, "fixture must occupy allocated space: {path:?}");
+            kb
+        };
+        let oldest_kb = allocated_kb(&oldest);
+        let middle_kb = allocated_kb(&middle);
+        let newest_kb = allocated_kb(&newest);
+        let fresh_kb = allocated_kb(&fresh_big);
+        let budget_kb = newest_kb + fresh_kb;
+        let initial_kb = oldest_kb + middle_kb + budget_kb;
+        assert!(initial_kb > budget_kb);
+        assert!(initial_kb - oldest_kb > budget_kb);
+        let cmd = isolated_sweep_command(tmp.path(), &base, None, Some(budget_kb));
         let out = run_sweep(&cmd, tmp.path());
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -797,10 +819,15 @@ mod tests {
         );
         let m = parse_reap_metrics(&stdout).expect("metrics line present");
         assert_eq!(m.removed, 2, "exactly the two oldest are counted: {stdout}");
-        assert!(
-            m.freed_bytes >= 300 * 1024,
-            "freed reflects evictions: {stdout}"
+        assert_eq!(
+            m.freed_bytes,
+            (oldest_kb + middle_kb) * 1024,
+            "freed reflects the allocated space actually evicted: {stdout}"
         );
+        assert!(stdout.contains(&format!(
+            "RCH_REAP_CAP initial_kb={initial_kb} cap_kb={budget_kb}"
+        )));
+        assert!(stdout.contains(&format!("RCH_REAP_CAP final_kb={budget_kb}")));
     }
 
     #[test]

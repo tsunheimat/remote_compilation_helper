@@ -1207,13 +1207,15 @@ fi
 fn recovery_completion_cleanup_script(path: &str) -> String {
     let quote = |value: String| escape(Cow::from(value)).into_owned();
     format!(
-        "rm -f -- {done} {pending} {out} {err} {out_progress} {err_progress} && {{ rmdir -- {claim} 2>/dev/null || [ ! -e {claim} ]; }}",
+        "rm -f -- {done} {pending} {out} {err} {out_progress} {err_progress} {deadline} {launch} && {{ rmdir -- {claim} 2>/dev/null || [ ! -e {claim} ]; }}",
         done = quote(path.to_owned()),
         pending = quote(format!("{path}.pending")),
         out = quote(format!("{path}.stdout")),
         err = quote(format!("{path}.stderr")),
         out_progress = quote(format!("{path}.stdout.progress")),
         err_progress = quote(format!("{path}.stderr.progress")),
+        deadline = quote(format!("{path}.deadline")),
+        launch = quote(format!("{path}.launch")),
         claim = quote(format!("{path}.started")),
     )
 }
@@ -1476,7 +1478,9 @@ fn remote_build_watchdog_script() -> String {
 __p=$$; __t="$2"; __m="$3"; shift 4
 __cancelled=0; __w=; __watch_start=
 trap '__cancelled=1' TERM
-"$@" 3>&- & __c=$!
+exec 4<&0
+"$@" <&4 4<&- 3>&- & __c=$!
+exec 4<&-
 if [ "$__t" -gt 0 ] 2>/dev/null; then (
     __timer_cancelled=0
     trap '__timer_cancelled=1' TERM
@@ -1552,7 +1556,7 @@ const LINUX_MEMINFO_PATH: &str = "/proc/meminfo";
 /// `CARGO_BUILD_JOBS` in the remote session according to `policy`, unless the
 /// session already carries one (issue #49).
 ///
-/// The fragment runs in the OUTER `sh -s` script, before the `sh -lc` that
+/// The fragment runs in the OUTER `sh -s` script, before the login shell that
 /// executes the build, so:
 /// - a worker-side `CARGO_BUILD_JOBS` (pam `/etc/environment`) is already
 ///   visible and wins via the `-z` guard;
@@ -2611,6 +2615,263 @@ pub struct TransferPipeline {
     source_authority_prefix: Option<String>,
     /// Cooperative collection-only cancellation; the sender never drops a live child future.
     retrieval_control: Option<(tokio::sync::watch::Receiver<bool>, TokioInstant)>,
+    /// Explicit byte-stream invocation; cwd is resolved by the orchestrator into remote_path.
+    invocation_options: Option<rch_common::invocation::InvocationOptions>,
+}
+
+/// Byte-stream completion. Output is delivered verbatim through separate callbacks,
+/// never decoded, accumulated, or interpreted as control-plane evidence.
+#[derive(Debug, Clone)]
+pub(crate) struct RawExecutionResult {
+    pub(crate) exit_code: i32,
+    pub(crate) duration_ms: u64,
+    pub(crate) stdout_bytes: u64,
+    pub(crate) stderr_bytes: u64,
+    pub(crate) termination: Option<RawTermination>,
+}
+
+/// Only an OS failure before a transport child exists can carry this proof.
+/// An SSH exit, lost receipt, or failed stream after spawn is never unstarted.
+#[derive(Debug, thiserror::Error)]
+#[error("raw execution transport did not start: {0}")]
+pub(crate) struct RawTransportNotStarted(#[source] std::io::Error);
+
+// The staged program contains nested sh -c arguments. Keeping the entire file
+// below this conservative POSIX-worker bound also bounds every embedded argv
+// word below Linux's 128 KiB MAX_ARG_STRLEN. This is a generated-program limit,
+// not a promise that every authored argument of this length is supported.
+const RAW_PROGRAM_LIMIT: usize = 120 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawTermination {
+    Deadline,
+    Interrupted,
+}
+
+impl RawTermination {
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Deadline => 124,
+            Self::Interrupted => 130,
+        }
+    }
+}
+
+/// Cancellation is terminal for this dispatch, even when remote cleanup fails.
+#[derive(Debug, thiserror::Error)]
+#[error("remote invocation cancelled; automatic replay is unsafe ({cleanup}: {detail})")]
+pub(crate) struct RemoteInvocationCancelled {
+    pub(crate) cleanup: RemoteTimeoutCleanup,
+    pub(crate) detail: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("raw process deadline elapsed")]
+#[cfg(test)]
+struct RawProcessTimedOut;
+
+#[derive(Debug, thiserror::Error)]
+#[error("raw process cancelled")]
+#[cfg(test)]
+struct RawProcessCancelled;
+
+/// Pollable process output. Unlike Tokio's stdio adapter, a full pipe does not
+/// leave an uncancellable blocking-pool writer behind when the job times out.
+#[cfg(unix)]
+pub(crate) struct RawOutputSink {
+    descriptor: RawOutputDescriptor,
+    original_flags: rustix::fs::OFlags,
+}
+
+#[cfg(unix)]
+enum RawOutputDescriptor {
+    Pollable(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>),
+    File(std::os::fd::OwnedFd),
+}
+
+#[cfg(unix)]
+impl RawOutputSink {
+    pub(crate) fn stdout() -> std::io::Result<Self> {
+        Self::from_fd(std::io::stdout())
+    }
+    pub(crate) fn stderr() -> std::io::Result<Self> {
+        Self::from_fd(std::io::stderr())
+    }
+
+    fn from_fd(fd: impl std::os::fd::AsFd) -> std::io::Result<Self> {
+        let fd = rustix::io::dup(fd)?;
+        let original_flags = rustix::fs::fcntl_getfl(&fd)?;
+        let metadata = rustix::fs::fstat(&fd)?;
+        let kind = rustix::fs::FileType::from_raw_mode(metadata.st_mode);
+        let is_null = kind.is_char_device()
+            && rustix::fs::stat("/dev/null").is_ok_and(|null| null.st_rdev == metadata.st_rdev);
+        if kind.is_file() || is_null {
+            return Ok(Self {
+                descriptor: RawOutputDescriptor::File(fd),
+                original_flags,
+            });
+        }
+        // dup shares the open-file flags. Restore them before returning control
+        // to the caller; never leave its stdout/stderr nonblocking afterwards.
+        let pollable = tokio::io::unix::AsyncFd::new(fd)?;
+        rustix::fs::fcntl_setfl(
+            pollable.get_ref(),
+            original_flags | rustix::fs::OFlags::NONBLOCK,
+        )?;
+        Ok(Self {
+            descriptor: RawOutputDescriptor::Pollable(pollable),
+            original_flags,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawOutputSink {
+    fn drop(&mut self) {
+        if let RawOutputDescriptor::Pollable(fd) = &self.descriptor {
+            let _ = rustix::fs::fcntl_setfl(fd.get_ref(), self.original_flags);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncWrite for RawOutputSink {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &self.descriptor {
+            RawOutputDescriptor::File(fd) => {
+                std::task::Poll::Ready(rustix::io::write(fd, bytes).map_err(Into::into))
+            }
+            RawOutputDescriptor::Pollable(fd) => loop {
+                let mut ready = std::task::ready!(fd.poll_write_ready(cx))?;
+                match ready.try_io(|fd| {
+                    rustix::io::write(fd.get_ref(), bytes).map_err(std::io::Error::from)
+                }) {
+                    Ok(result) => return std::task::Poll::Ready(result),
+                    Err(_) => continue,
+                }
+            },
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.poll_flush(cx)
+    }
+}
+
+/// Scoped reads avoid detached reader tasks and keep memory independent of
+/// line length. Killing and reaping on every interrupted path precedes return.
+#[cfg(all(unix, test))]
+pub(crate) async fn collect_raw_process<W, E>(
+    command: Command,
+    timeout: Option<Duration>,
+    stdout_sink: W,
+    stderr_sink: E,
+) -> Result<(std::process::ExitStatus, u64, u64)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
+    let (status, out, err, _) = collect_raw_process_controlled(
+        command,
+        timeout,
+        stdout_sink,
+        stderr_sink,
+        |cause| async move {
+            Err(match cause {
+                RawTermination::Deadline => anyhow::Error::new(RawProcessTimedOut),
+                RawTermination::Interrupted => anyhow::Error::new(RawProcessCancelled),
+            })
+        },
+    )
+    .await?;
+    Ok((status, out, err))
+}
+
+/// Keep the transport and its readers alive while the owned remote process
+/// group is stopped. Completion, output drain and verified cleanup are all
+/// required; a killed SSH client alone proves none of them.
+#[cfg(unix)]
+async fn collect_raw_process_controlled<W, E, F, Fut>(
+    mut command: Command,
+    timeout: Option<Duration>,
+    mut stdout_sink: W,
+    mut stderr_sink: E,
+    stop: F,
+) -> Result<(std::process::ExitStatus, u64, u64, Option<RawTermination>)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+    F: FnOnce(RawTermination) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(RawTransportNotStarted)?;
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(RawTransportNotStarted)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("raw transport stdout missing")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("raw transport stderr missing")?;
+    let drain = async {
+        let (stdout_bytes, stderr_bytes) = tokio::try_join!(
+            tokio::io::copy(&mut stdout, &mut stdout_sink),
+            tokio::io::copy(&mut stderr, &mut stderr_sink),
+        )?;
+        tokio::try_join!(stdout_sink.flush(), stderr_sink.flush())?;
+        let status = child.wait().await?;
+        Ok::<_, anyhow::Error>((status, stdout_bytes, stderr_bytes))
+    };
+    let deadline = async {
+        match timeout {
+            Some(timeout) => tokio::time::sleep(timeout).await,
+            None => std::future::pending().await,
+        }
+    };
+    let result = async {
+        tokio::pin!(drain);
+        let cause = tokio::select! {
+            result = &mut drain => return result.map(|(status, out, err)| (status, out, err, None)),
+            _ = deadline => RawTermination::Deadline,
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("listen for interrupt")?;
+                RawTermination::Interrupted
+            }
+            _ = terminate.recv() => RawTermination::Interrupted,
+        };
+        tokio::time::timeout(
+            REMOTE_TIMEOUT_KILL_BUDGET + Duration::from_secs(10),
+            async {
+                let ((), (status, out, err)) = tokio::try_join!(stop(cause), &mut drain)?;
+                Ok((status, out, err, Some(cause)))
+            },
+        )
+        .await
+        .context("interrupted transport did not drain after remote cleanup")?
+    }
+    .await;
+    if result.is_err() {
+        child.kill().await.context("kill and reap raw transport")?;
+    }
+    result
 }
 
 /// Only emitted after the interrupted local receiver has been killed and reaped.
@@ -2729,7 +2990,19 @@ impl TransferPipeline {
             recovery_completion: None,
             source_authority_prefix: None,
             retrieval_control: None,
+            invocation_options: None,
         }
+    }
+
+    /// Configure an explicit invocation without deriving cwd from controller paths.
+    /// The orchestrator must set the admitted worker path with `with_remote_path`.
+    pub(crate) fn with_invocation_options(
+        mut self,
+        options: rch_common::invocation::InvocationOptions,
+    ) -> Result<Self> {
+        options.validate().map_err(anyhow::Error::msg)?;
+        self.invocation_options = Some(options);
+        Ok(self)
     }
 
     pub(crate) fn with_retrieval_control(
@@ -3027,6 +3300,36 @@ impl TransferPipeline {
             done = quote(path),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
         );
+        if self
+            .invocation_options
+            .as_ref()
+            .is_some_and(|options| options.interactive)
+        {
+            // A PTY is one bidirectional terminal stream, not two byte channels.
+            // Keep the same exclusive claim and durable receipt, but do not put
+            // files between the workload and its terminal descriptors.
+            return format!(
+                "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; umask \"$rch_umask\"; exec sh -c {supervisor}",
+                directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
+                claim = quote(&format!("{path}.started")),
+                supervisor = quote(&supervisor),
+            );
+        }
+        let stdin_setup = if self.invocation_options.is_some() {
+            "exec 4<&0; "
+        } else {
+            ""
+        };
+        let stdin_redirection = if self.invocation_options.is_some() {
+            "<&4 4<&-"
+        } else {
+            "</dev/null"
+        };
+        let stdin_close = if self.invocation_options.is_some() {
+            "exec 4<&-; "
+        } else {
+            ""
+        };
         // Each follower copies its log by byte offset and decides completion
         // itself: it samples the receipt BEFORE the size, so once the receipt
         // exists the size it reads is final, and it leaves only after a pass
@@ -3070,8 +3373,8 @@ impl TransferPipeline {
         // ordinary compiler failure would incorrectly authorize release.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
-             nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
-             p=$!; \
+             {stdin_setup}nohup sh -c {supervisor} {stdin_redirection} >{out} 2>{err} & \
+             p=$!; {stdin_close}\
              rch_follow() {{ h=; cancelled=; trap 'cancelled=1; [ -z \"$h\" ] || kill -KILL \"$h\" 2>/dev/null || :' TERM; \
                o=0; while :; do [ -z \"$cancelled\" ] || return 1; if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
                if [ \"$s\" -gt \"$o\" ]; then n=$((s - o)); [ \"$n\" -le 1048576 ] || n=1048576; \
@@ -3960,6 +4263,17 @@ impl TransferPipeline {
                 keys.push(key.clone());
             }
         }
+        if let Some(options) = &self.invocation_options {
+            for key in options
+                .env
+                .keys()
+                .filter(|key| self.managed_remote_env_value(key, remote_path).is_some())
+            {
+                if !keys.contains(key) {
+                    keys.push(key.clone());
+                }
+            }
+        }
         for raw_key in &keys {
             let key = raw_key.trim();
             if key.is_empty() {
@@ -3991,8 +4305,14 @@ impl TransferPipeline {
                 .any(|allowed| allowed.trim() == key)
                 .then(|| self.env_value(key))
                 .flatten();
-            let Some(original_value) =
-                forwarded.or_else(|| self.remote_environment.get(key).cloned())
+            let explicit_managed = self
+                .invocation_options
+                .as_ref()
+                .filter(|_| self.managed_remote_env_value(key, remote_path).is_some())
+                .and_then(|options| options.env.get(key).cloned());
+            let Some(original_value) = explicit_managed
+                .or(forwarded)
+                .or_else(|| self.remote_environment.get(key).cloned())
             else {
                 continue;
             };
@@ -4038,10 +4358,15 @@ impl TransferPipeline {
         // rest are injected fresh. This is what forces wrapper/unclassified
         // builds — which may never forward CARGO_TARGET_DIR/GOCACHE/etc. — to
         // still drop artifacts inside the managed `/data/tmp` zone.
-        let mut managed_keys = FORCED_MANAGED_ENV_KEYS
-            .iter()
-            .map(|key| (*key).to_owned())
-            .collect::<Vec<_>>();
+        let mut managed_keys = if self.invocation_options.is_some() {
+            // A general invocation must not acquire compiler target/cache paths.
+            Vec::new()
+        } else {
+            FORCED_MANAGED_ENV_KEYS
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect::<Vec<_>>()
+        };
         managed_keys.extend(
             self.execution_storage
                 .cache_env()
@@ -4596,7 +4921,30 @@ impl TransferPipeline {
     fn build_remote_command(&self, command: &str, toolchain: Option<&ToolchainInfo>) -> String {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
-        let toolchain_command = wrap_command_with_toolchain(command, toolchain);
+        let toolchain_command = if let Some(options) = &self.invocation_options {
+            // Explicit environment values are literal bytes (except NUL), may
+            // contain newlines, and override worker defaults inside the shell.
+            let assignments = options
+                .env
+                .iter()
+                .filter(|(key, _)| self.managed_remote_env_value(key, &remote_path).is_none())
+                .map(|(key, value)| {
+                    format!("export {key}={}; ", escape(Cow::Borrowed(value.as_str())))
+                })
+                .collect::<String>();
+            let shell = match &options.command {
+                rch_common::invocation::CommandSpec::Shell(_) => "bash --noprofile --norc -c",
+                rch_common::invocation::CommandSpec::Argv(_) => "sh -c",
+            };
+            format!(
+                "{shell} {}",
+                escape(Cow::Owned(format!(
+                    "{assignments}export RCH_SHIM_BYPASS=1 RCH_CARGO_WRAPPER_BYPASS=1; {command}"
+                )))
+            )
+        } else {
+            wrap_command_with_toolchain(command, toolchain)
+        };
         // Dependency preparation belongs inside the workload's environment,
         // timeout and process group, including managed cache and scratch policy.
         let toolchain_command = self.wrap_with_dependency_preparation(toolchain_command);
@@ -4650,7 +4998,11 @@ impl TransferPipeline {
         // Wall-clock cap in seconds for the pgid-tracked path's watchdog (0 = disabled).
         // Same source of truth as `wrap_with_external_timeout`, applied via an
         // in-session group-kill watchdog instead of `timeout(1)` (see build_id branch).
-        let external_timeout_secs = if self.compilation_config.external_timeout_enabled() {
+        let external_timeout_secs = if let Some(options) = &self.invocation_options {
+            // Preserve the explicit deadline after a dispatcher disconnect.
+            // Raw execution directs watchdog diagnostics away from data streams.
+            options.timeout_seconds.unwrap_or(0)
+        } else if self.compilation_config.external_timeout_enabled() {
             self.compilation_config
                 .timeout_for_kind(self.compilation_kind)
                 .as_secs()
@@ -4718,63 +5070,113 @@ exit 125;; esac; done && "
         // SSH ConnectTimeout and the in-loop `command_timeout`, which kill the
         // local `ssh` on expiry; a detached `cargo.exe`/`rustc.exe` can still
         // outlive the channel close. Acceptable for v1 single-Windows-worker use.
-        let execution_command =
-            if let Some(build_id) = self.build_id.filter(|_| !self.worker_platform.is_windows()) {
-                let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
-                let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
-                let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
-                let escaped_run_dir = escape(Cow::from(remote_run_dir));
-                // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
-                // `timeout --foreground` only signals its direct child, so a livelocked
-                // test binary (and its fixtures) that the test harness spawned survive
-                // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
-                // the raw command and arm an in-session watchdog that, at the wall-clock
-                // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
-                // daemon's stuck-detector kills (`cancellation.rs`). One group, both
-                // reapers, entire tree. Killing the group includes the leader `sh -c`,
-                // but that is a child of the ssh `sh -s`, so the outer shell still
-                // reports 137 (128+SIGKILL) for clean timeout exit semantics.
-                let escaped_command = escape(Cow::from(workload_command.as_str()));
-                // The watchdog publishes boot UUID + leader start ticks + build ID
-                // before launching the workload, so daemon recovery rejects an
-                // observed reboot or reused leader before signalling. An abnormal
-                // external leader exit can still race the final proc read and kill.
-                // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
-                // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
-                // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
-                // `-PGID` form works in both dash and bash.
-                // The timer detaches standard I/O and its sleep closes fd 3.
-                // Normal completion stops the timer and waits while it reaps
-                // that sleep, leaving neither an open SSH pipe nor an orphan
-                // group member that would obstruct later recovery. Only the
-                // timer retains fd 3 for its deadline marker before group kill.
-                let watchdog = escape(Cow::Owned(remote_build_watchdog_script()));
-
+        let execution_command = if let Some(build_id) =
+            self.build_id.filter(|_| !self.worker_platform.is_windows())
+        {
+            let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
+            let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
+            let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
+            let escaped_run_dir = escape(Cow::from(remote_run_dir));
+            // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
+            // `timeout --foreground` only signals its direct child, so a livelocked
+            // test binary (and its fixtures) that the test harness spawned survive
+            // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
+            // the raw command and arm an in-session watchdog that, at the wall-clock
+            // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
+            // daemon's stuck-detector kills (`cancellation.rs`). One group, both
+            // reapers, entire tree. Killing the group includes the leader `sh -c`,
+            // but that is a child of the ssh `sh -s`, so the outer shell still
+            // reports 137 (128+SIGKILL) for clean timeout exit semantics.
+            let escaped_command = escape(Cow::from(workload_command.as_str()));
+            // The watchdog publishes boot UUID + leader start ticks + build ID
+            // before launching the workload, so daemon recovery rejects an
+            // observed reboot or reused leader before signalling. An abnormal
+            // external leader exit can still race the final proc read and kill.
+            // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
+            // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
+            // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
+            // `-PGID` form works in both dash and bash.
+            // The timer detaches standard I/O and its sleep closes fd 3.
+            // Normal completion stops the timer and waits while it reaps
+            // that sleep, leaving neither an open SSH pipe nor an orphan
+            // group member that would obstruct later recovery. Only the
+            // timer retains fd 3 for its deadline marker before group kill.
+            let watchdog = escape(Cow::Owned(remote_build_watchdog_script()));
+            let deadline_output = self
+                .invocation_options
+                .as_ref()
+                .map(|_| {
+                    self.recovery_completion.as_ref().map_or_else(
+                        || "3>/dev/null".to_string(),
+                        |(path, _)| format!("3>{}", escape(Cow::Owned(format!("{path}.deadline")))),
+                    )
+                })
+                .unwrap_or_else(|| "3>&2".to_string());
+            if self
+                .invocation_options
+                .as_ref()
+                .is_some_and(|options| options.interactive)
+            {
+                // The SSH PTY already belongs to sshd's session. A new
+                // identity-tracked session cannot steal it with setsid -c
+                // as an ordinary user. script creates a nested controlling
+                // PTY and waits for its session leader instead.
+                let tracked = format!(
+                    "exec sh -c {watchdog} rch-build {escaped_pgid_file} {external_timeout_secs} {} {build_id} sh -c {escaped_command} {deadline_output}",
+                    self.deadline_marker,
+                );
+                format!(
+                    "command -v script >/dev/null 2>&1 || exit 125; mkdir -p {escaped_run_dir} && rm -f {escaped_pgid_file} && script -qefc {} /dev/null",
+                    escape(Cow::Owned(tracked)),
+                )
+            } else {
                 format!(
                     "if ! command -v setsid >/dev/null 2>&1; then \
 printf '\\n%s\\n' {} >&2; exit 125; fi; \
 mkdir -p {} && rm -f {} && \
-setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
+setsid {}sh -c {} rch-build {} {} {} {} {} {} {}",
                     self.remote_process_setup_marker(),
                     escaped_run_dir,
                     escaped_pgid_file,
+                    if self.invocation_options.is_some() {
+                        "--wait "
+                    } else {
+                        ""
+                    },
                     watchdog,
                     escaped_pgid_file,
                     external_timeout_secs,
                     self.deadline_marker,
                     build_id,
+                    // Explicit invocations inherit the worker environment;
+                    // compiler jobs retain login initialization for toolchain
+                    // PATH. Worker profiles use Bash syntax, so invoking them
+                    // through POSIX sh both corrupts stderr and misconfigures
+                    // the compiler environment. Preserve the existing POSIX
+                    // shell fallback on minimal workers without Bash.
+                    if self.invocation_options.is_some() {
+                        "sh -c"
+                    } else {
+                        "\"$(command -v bash || command -v sh)\" -lc"
+                    },
                     escaped_command,
+                    deadline_output,
                 )
-            } else {
-                timeout_wrapped_command
-            };
+            }
+        } else {
+            timeout_wrapped_command
+        };
 
         // Per-job rustc cap (issue #49). Exported in the outer session so
         // explicit worker/command/project settings all still win; see
         // `remote_build_jobs_fragment`. Windows workers run Git's sh without
         // nproc/meminfo/sysctl and are skipped.
-        let build_jobs_fragment = self.remote_build_jobs_fragment();
-        let cargo_home_base = if command.contains("cargo") {
+        let build_jobs_fragment = if self.invocation_options.is_some() {
+            String::new()
+        } else {
+            self.remote_build_jobs_fragment()
+        };
+        let cargo_home_base = if self.invocation_options.is_none() && command.contains("cargo") {
             let base_var = rch_common::RCH_CARGO_HOME_BASE_VAR;
             let physical_base = if self.worker_platform.is_windows() {
                 String::new()
@@ -4839,17 +5241,25 @@ setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
         remote_build_jobs_fragment(policy, LINUX_MEMINFO_PATH)
     }
 
-    /// Prepare TypeScript and Bun dependencies through the worker's fingerprint
-    /// and transaction checks, including when `node_modules` already exists.
+    /// Prepare Node, TypeScript and Bun dependencies through the worker's
+    /// fingerprint and transaction checks, including existing `node_modules`.
     fn wrap_with_dependency_preparation(&self, command: String) -> String {
         let runtime = match self.compilation_kind {
-            Some(CompilationKind::Tsc) => "node",
+            Some(CompilationKind::Tsc | CompilationKind::NodeTest) => "node",
             Some(CompilationKind::BunTest | CompilationKind::BunTypecheck) => "bun",
             _ => return command,
         };
         let script = escape(Cow::Borrowed(include_str!("transfer/node_prepare.sh")));
         let command = escape(Cow::from(command.as_str()));
-        format!("sh -c {script} rch-prepare {runtime} sh -c {command}")
+        // The mirror Node-test contract streams results, not arbitrary extra
+        // files. Check the actual worker environment before preparation starts.
+        let guard = if self.compilation_kind == Some(CompilationKind::NodeTest) {
+            "if [ -n \"${NODE_OPTIONS:-}\" ] || [ -n \"${NODE_V8_COVERAGE:-}\" ]; then \
+             printf '%s\\n' 'RCH: Node environment options require an explicit artifact contract' >&2; exit 125; fi; "
+        } else {
+            ""
+        };
+        format!("{guard}sh -c {script} rch-prepare {runtime} sh -c {command}")
     }
 
     /// Wrap a command with an external timeout to prevent zombie/stuck processes.
@@ -4913,6 +5323,7 @@ setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
             Some(CompilationKind::GoTest) => "go test",
             Some(CompilationKind::GoVet) => "go vet",
             Some(CompilationKind::Tsc) => "tsc",
+            Some(CompilationKind::NodeTest) => "node --test",
             Some(CompilationKind::Job) => "job",
             None => "unknown",
         };
@@ -5493,8 +5904,21 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         remote_args: &[&str],
         bind_activity: bool,
     ) -> Command {
+        self.worker_ssh_command_for_terminal(worker, remote_args, bind_activity, None)
+    }
+
+    fn worker_ssh_command_for_terminal(
+        &self,
+        worker: &WorkerConfig,
+        remote_args: &[&str],
+        bind_activity: bool,
+        interactive: Option<bool>,
+    ) -> Command {
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let mut cmd = Command::new("ssh");
+        if let Some(interactive) = interactive {
+            cmd.arg(if interactive { "-tt" } else { "-T" });
+        }
         cmd.arg("-o").arg("BatchMode=yes");
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-o").arg(format!(
@@ -6604,6 +7028,299 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             stdout: stdout_acc,
             stderr: stderr_acc,
             duration_ms: duration.as_millis() as u64,
+        })
+    }
+
+    /// Stage inert shell source before execution is admitted. Quoting this whole
+    /// generated program into SSH argv multiplies nested apostrophes until even
+    /// a small authored command exceeds execve's per-argument limit. Upload on
+    /// a separate preparation channel; the execution channel keeps all stdin.
+    #[cfg(unix)]
+    pub(crate) async fn prepare_raw_transport(
+        &self,
+        worker: &WorkerConfig,
+        command: &str,
+    ) -> Result<Command> {
+        let options = self
+            .invocation_options
+            .as_ref()
+            .context("raw execution requires invocation options")?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && !use_mock_transport(worker),
+            "raw execution requires real POSIX process transport"
+        );
+        let (completion, _) = self
+            .recovery_completion
+            .as_ref()
+            .context("raw execution requires durable receipt")?;
+        anyhow::ensure!(
+            self.build_id.is_some() && self.source_authority_prefix.is_some(),
+            "raw execution requires process ownership and source authority"
+        );
+        let script = self.durable_execution_command(self.build_remote_command(command, None));
+        anyhow::ensure!(
+            script.len() <= RAW_PROGRAM_LIMIT,
+            "raw generated execution program is {} bytes; supported limit is {} bytes; workload not started",
+            script.len(),
+            RAW_PROGRAM_LIMIT
+        );
+        let path = format!("{completion}.launch");
+        let parent = Path::new(&path).parent().context("raw launch parent")?;
+        anyhow::ensure!(
+            parent.is_absolute(),
+            "raw launch requires an absolute transport root"
+        );
+        // Open each directory without following symlinks and never replace a
+        // pre-existing launch file. The upload is inert, source-fenced prep.
+        // A partial file stays private evidence and is never admitted to run.
+        const UPLOAD: &str = r#"import os,sys
+path=sys.argv[1]
+parts=path.split('/')
+assert path.startswith('/') and all(p not in ('.','..') for p in parts)
+os.umask(0o077)
+fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
+for part in parts[1:-1]:
+ if not part: continue
+ try: os.mkdir(part,0o700,dir_fd=fd)
+ except FileExistsError: pass
+ child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+ os.close(fd);fd=child
+out=os.open(parts[-1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
+with os.fdopen(out,'wb') as stream:
+ while True:
+  data=sys.stdin.buffer.read(65536)
+  if not data: break
+  stream.write(data)
+ stream.flush();os.fsync(stream.fileno())
+os.close(fd)
+"#;
+        let upload = shell_words::join(["python3", "-I", "-c", UPLOAD, &path]);
+        let mut sender =
+            self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::Borrowed(&upload))]);
+        sender
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = sender
+            .spawn()
+            .context("spawn raw program preparation transport")?;
+        let mut input = child
+            .stdin
+            .take()
+            .context("raw program preparation stdin")?;
+        let mut diagnostics = child
+            .stderr
+            .take()
+            .context("raw program preparation stderr")?;
+        let prepared = tokio::time::timeout(Duration::from_secs(15), async {
+            let send = async {
+                input.write_all(script.as_bytes()).await?;
+                drop(input);
+                Ok::<_, std::io::Error>(())
+            };
+            let read = async {
+                let mut saved = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let size = diagnostics.read(&mut buffer).await?;
+                    if size == 0 {
+                        break;
+                    }
+                    let keep = size.min(8192_usize.saturating_sub(saved.len()));
+                    saved.extend_from_slice(&buffer[..keep]);
+                }
+                Ok::<_, std::io::Error>(saved)
+            };
+            let ((), status, diagnostics) = tokio::try_join!(send, child.wait(), read)?;
+            anyhow::ensure!(
+                status.success(),
+                "raw program preparation failed: {status}: {}",
+                String::from_utf8_lossy(&diagnostics)
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        if !matches!(&prepared, Ok(Ok(()))) && child.id().is_some() {
+            child
+                .kill()
+                .await
+                .context("reap raw program preparation transport")?;
+        }
+        prepared.context("raw program preparation timed out")??;
+        let mut ssh = self.worker_ssh_command_for_terminal(
+            worker,
+            &["sh", &escape(Cow::Borrowed(&path))],
+            true,
+            Some(options.interactive),
+        );
+        ssh.stdin(Stdio::inherit());
+        Ok(ssh)
+    }
+
+    /// Execute an admitted invocation without decoding or line-buffering output.
+    /// No retry or local replay is permitted once this method is entered. PTY
+    /// mode explicitly trades split binary streams for terminal semantics.
+    #[cfg(unix)]
+    pub(crate) async fn execute_remote_bytes<W, E>(
+        &self,
+        worker: &WorkerConfig,
+        ssh: Command,
+        stdout_sink: W,
+        stderr_sink: E,
+    ) -> Result<RawExecutionResult>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        E: tokio::io::AsyncWrite + Unpin,
+    {
+        let options = self
+            .invocation_options
+            .as_ref()
+            .context("raw execution requires invocation options")?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows(),
+            "raw execution requires a POSIX worker"
+        );
+        anyhow::ensure!(
+            !use_mock_transport(worker),
+            "raw execution requires real process transport"
+        );
+        anyhow::ensure!(
+            self.recovery_completion.is_some()
+                && self.build_id.is_some()
+                && self.source_authority_prefix.is_some(),
+            "raw execution requires durable receipt, process ownership, and source authority"
+        );
+        let timeout = options.timeout_seconds.map(Duration::from_secs);
+        let start = std::time::Instant::now();
+        let collected = collect_raw_process_controlled(
+            ssh,
+            timeout,
+            stdout_sink,
+            stderr_sink,
+            |cause| async move {
+                let (cleanup, detail) = self.kill_remote_process_group_after_timeout(worker).await;
+                if cleanup == RemoteTimeoutCleanup::Verified {
+                    return Ok(());
+                }
+                match cause {
+                    RawTermination::Deadline => Err(SshCommandTimedOut {
+                        timeout: timeout.expect("deadline exists for timeout"),
+                        cleanup,
+                        detail,
+                        evidence: self.build_id.map(|build_id| {
+                            rch_common::orphan_quarantine::QuarantineEvidence {
+                                build_id,
+                                pgid_file: Self::remote_pgid_file_path_for_root(
+                                    &self.remote_path(),
+                                    build_id,
+                                ),
+                            }
+                        }),
+                    }
+                    .into()),
+                    RawTermination::Interrupted => {
+                        Err(RemoteInvocationCancelled { cleanup, detail }.into())
+                    }
+                }
+            },
+        )
+        .await;
+        let (status, stdout_bytes, stderr_bytes, mut termination) = match collected {
+            Ok(result) => result,
+            Err(error) => {
+                if error.is::<RawTransportNotStarted>() {
+                    // No child was created: do not probe/kill a remote process
+                    // or turn definitive local spawn failure into uncertainty.
+                    return Err(error);
+                }
+                // A stream/control fault still requires owned cleanup, but is
+                // never promoted to a successfully delivered terminal result.
+                if !error.is::<SshCommandTimedOut>() && !error.is::<RemoteInvocationCancelled>() {
+                    let _ = self.kill_remote_process_group_after_timeout(worker).await;
+                }
+                return Err(error.context(RemoteExecutionUnconfirmed));
+            }
+        };
+        // An SSH exit (including 0 or 255) is not workload completion proof.
+        // Never inspect stdout/stderr, even when it resembles an RCH marker.
+        let exit_code = self
+            .read_recovery_completion(worker)
+            .await
+            .context(RemoteExecutionUnconfirmed)?
+            .context(RemoteExecutionUnconfirmed)?;
+        anyhow::ensure!(status.code() == Some(exit_code), RemoteExecutionUnconfirmed);
+        if termination.is_none() && options.timeout_seconds.is_some() {
+            let (path, _) = self
+                .recovery_completion
+                .as_ref()
+                .expect("validated receipt");
+            let probe = format!(
+                "if [ -f {p} ] && [ ! -L {p} ]; then cat -- {p}; fi",
+                p = escape(Cow::Owned(format!("{path}.deadline")))
+            );
+            let output = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.worker_ssh_command_with_activity(
+                    worker,
+                    &["sh", "-c", &escape(Cow::Borrowed(&probe))],
+                    false,
+                )
+                .output(),
+            )
+            .await
+            .context(RemoteExecutionUnconfirmed)?
+            .context(RemoteExecutionUnconfirmed)?;
+            anyhow::ensure!(output.status.success(), RemoteExecutionUnconfirmed);
+            if output.stdout == format!("\n{}\n", self.deadline_marker).as_bytes() {
+                let (cleanup, _) = self.kill_remote_process_group_after_timeout(worker).await;
+                anyhow::ensure!(
+                    cleanup == RemoteTimeoutCleanup::Verified,
+                    RemoteExecutionUnconfirmed
+                );
+                termination = Some(RawTermination::Deadline);
+            } else {
+                anyhow::ensure!(output.stdout.is_empty(), RemoteExecutionUnconfirmed);
+            }
+        }
+        if !options.interactive {
+            let (path, _) = self
+                .recovery_completion
+                .as_ref()
+                .expect("validated receipt");
+            let sizes = format!(
+                "wc -c < {}; wc -c < {}",
+                escape(Cow::Owned(format!("{path}.stdout"))),
+                escape(Cow::Owned(format!("{path}.stderr")))
+            );
+            let output = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.worker_ssh_command_with_activity(
+                    worker,
+                    &["sh", "-c", &escape(Cow::Borrowed(&sizes))],
+                    false,
+                )
+                .output(),
+            )
+            .await
+            .context(RemoteExecutionUnconfirmed)?
+            .context(RemoteExecutionUnconfirmed)?;
+            let counts = std::str::from_utf8(&output.stdout)
+                .context(RemoteExecutionUnconfirmed)?
+                .split_whitespace()
+                .map(str::parse::<u64>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context(RemoteExecutionUnconfirmed)?;
+            anyhow::ensure!(
+                output.status.success() && counts == [stdout_bytes, stderr_bytes],
+                RemoteExecutionUnconfirmed
+            );
+        }
+        Ok(RawExecutionResult {
+            exit_code,
+            duration_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            stdout_bytes,
+            stderr_bytes,
+            termination,
         })
     }
 
@@ -9700,6 +10417,460 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
+    fn raw_test_options() -> rch_common::invocation::InvocationOptions {
+        rch_common::invocation::InvocationOptions {
+            command: rch_common::invocation::CommandSpec::Shell("cat".into()),
+            cwd: PathBuf::from("/controller/workspace"),
+            env: std::collections::BTreeMap::new(),
+            timeout_seconds: None,
+            interactive: false,
+            workspace: rch_common::invocation::WorkspaceMode::Shared,
+            verification: false,
+            json_result: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_transport_generated_live_wrapper_reproduces_quote_amplification() {
+        let identity = "987b7cad-23eb-409a-814e-9c94ff499dff";
+        let body = "import os,json,pathlib,runpy,socket; pathlib.Path('storage-env.json').write_text(json.dumps({'runtime_host':socket.gethostname(),'HOME':os.environ.get('HOME'),'TMPDIR':os.environ.get('TMPDIR')})); runpy.run_path('/mnt/vibe-coding-share/scratch/rch-rtk-live-01a1387e-20261015T044808Z-00d4c2/sigint/cancel.py',run_name='__main__')";
+        assert_eq!(body.len(), 328);
+        let authored = rch_common::invocation::CommandSpec::Argv(vec![
+            "rtk".into(),
+            "proxy".into(),
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            body.into(),
+        ]);
+        let output = format!("/srv/remote-test/rch/tmp/rch-output/{identity}");
+        let mut options = raw_test_options();
+        options.timeout_seconds = Some(30);
+        options.command = rch_common::invocation::CommandSpec::Argv(vec![
+            "python3".into(),
+            "-I".into(),
+            format!("{output}/.capture.py"),
+            "run".into(),
+            output,
+            identity.into(),
+            serde_json::to_string(&authored).unwrap(),
+        ]);
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/controller/unused"), "raw".into(), identity.into(), TransferConfig::default(),
+        )
+        .with_remote_path_override("/mnt/vibe-coding-share/scratch/rch-storage-fixture-01a1387e-20261015T123335Z-a5d871/cancel")
+        .with_build_id(Some(30065928666349570))
+        .with_execution_environment(ExecutionStorageConfig {
+            cache_root: Some("/srv/remote-test/rch/cache".into()),
+            tmp_root: Some("/srv/remote-test/rch/tmp".into()),
+            home_root: Some("/srv/remote-test/rch/home".into()),
+            tmp_mode: TmpMode::PrivateMount,
+            tmp_retention_hours: 0,
+            ..Default::default()
+        }, std::collections::BTreeMap::new()).unwrap()
+        .with_invocation_options(options.clone()).unwrap()
+        .with_recovery_completion(format!("/srv/remote-test/rch/transport/recovery-30065928666349570-{identity}.done"),identity.into());
+        let built = pipeline.build_remote_command(&options.shell_command(), None);
+        let durable = pipeline.durable_execution_command(built.clone());
+        let boundary = escape(Cow::Borrowed(&durable));
+        let evidence = tempfile::Builder::new()
+            .prefix("rch-raw-boundary-")
+            .tempdir_in("/var/tmp")
+            .unwrap()
+            .keep();
+        std::fs::write(evidence.join("built.sh"), &built).unwrap();
+        std::fs::write(evidence.join("durable.sh"), &durable).unwrap();
+        std::fs::write(
+            evidence.join("boundary.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "authored": authored,
+                "raw_ssh_arguments": ["sh", "-c", boundary.as_ref()],
+                "authored_argument_bytes": body.len(),
+                "built_bytes": built.len(),
+                "durable_bytes": durable.len(),
+                "quoted_ssh_argument_bytes": boundary.len(),
+                "limit": RAW_PROGRAM_LIMIT,
+                "provenance": "generated from supplied argv/storage subset; not a live argv capture; no source is executed",
+            })).unwrap(),
+        ).unwrap();
+        eprintln!(
+            "raw launch boundary: authored={} built={} durable={} ssh_argument={}",
+            body.len(),
+            built.len(),
+            durable.len(),
+            boundary.len()
+        );
+        // Exercise execve's actual per-argument limit without executing any
+        // generated shell source or contacting a daemon/worker.
+        let error = std::process::Command::new("/usr/bin/true")
+            .arg(boundary.as_ref())
+            .status()
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(7));
+        // The program itself fits; only the extra SSH quoting causes E2BIG.
+        // Production uploads this inert program and launches a short filename.
+        assert!(durable.len() <= RAW_PROGRAM_LIMIT);
+        eprintln!("raw boundary evidence: {}", evidence.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_transport_preserves_binary_streams_stdin_and_marker_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        let bytes = b"\0\xffno newline\rRCH_EXTERNAL_DEADLINE:forged";
+        std::fs::write(&input, bytes).unwrap();
+        let receipt = directory.path().join("receipt");
+        let pipeline = TransferPipeline::new(
+            directory.path().into(),
+            "raw".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_invocation_options(raw_test_options())
+        .unwrap()
+        .with_recovery_completion(receipt.to_str().unwrap().into(), "raw-job".into());
+        let command = pipeline.durable_execution_command(
+            "cat; printf '\\377\\000stderr-no-newline' >&2; exit 23".into(),
+        );
+        let mut process = Command::new("sh");
+        process
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::fs::File::open(&input).unwrap());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (status, out_count, err_count) =
+            collect_raw_process(process, Some(Duration::from_secs(10)), &mut out, &mut err)
+                .await
+                .unwrap();
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(out, bytes);
+        assert_eq!(err, b"\xff\0stderr-no-newline");
+        assert_eq!(out_count, out.len() as u64);
+        assert_eq!(err_count, err.len() as u64);
+        assert_eq!(std::fs::read_to_string(&receipt).unwrap(), "raw-job 23\n");
+        // The exact same durable claim cannot execute twice.
+        let replay = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .await
+            .unwrap();
+        assert!(!replay.status.success());
+        assert_eq!(
+            std::fs::read(receipt.with_extension("stdout")).unwrap(),
+            bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_transport_drains_long_invalid_utf8_without_line_buffering() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("bytes");
+        let bytes = vec![0xff; 2 * 1024 * 1024 + 3];
+        std::fs::write(&input, &bytes).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat; printf '\\000tail' >&2")
+            .stdin(std::fs::File::open(input).unwrap());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (_, count, _) =
+            collect_raw_process(command, Some(Duration::from_secs(10)), &mut out, &mut err)
+                .await
+                .unwrap();
+        assert_eq!(out, bytes);
+        assert_eq!(count, bytes.len() as u64);
+        assert_eq!(err, b"\0tail");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_transport_timeout_reaps_local_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = directory.path().join("pid");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "read -r pid rest < /proc/self/stat; printf '%s' \"$pid\" > {}; exec sleep 30",
+            escape(Cow::Borrowed(pid.to_str().unwrap()))
+        ));
+        let error = collect_raw_process(
+            command,
+            Some(Duration::from_millis(100)),
+            tokio::io::sink(),
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.downcast_ref::<RawProcessTimedOut>().is_some());
+        let pid: u32 = std::fs::read_to_string(pid).unwrap().parse().unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_requested_deadline_drains_bytes_and_verifies_owned_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let mut options = raw_test_options();
+        options.timeout_seconds = Some(1);
+        let pipeline = TransferPipeline::new(
+            directory.path().into(),
+            "raw".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_invocation_options(options)
+        .unwrap()
+        .with_remote_path_override(root)
+        .with_build_id(Some(91921))
+        .with_recovery_completion(format!("{root}/receipt"), "deadline-job".into());
+        let script = pipeline.durable_execution_command(pipeline.build_remote_command(
+            "/usr/bin/python3 -c 'import os,subprocess,time; p=subprocess.Popen([\"/usr/bin/sleep\",\"30\"]); open(\"pids\",\"w\").write(str(os.getpid())+\" \"+str(p.pid)); open(\"runs\",\"a\").write(\"x\"); os.write(1,b\"out\\x00\\xff\"); os.write(2,b\"err\\x00\\xfe\"); time.sleep(30)'", None));
+        let mut process = Command::new("sh");
+        process.arg("-c").arg(&script).stdin(Stdio::null());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let start = std::time::Instant::now();
+        let (status, out_count, err_count, cause) = collect_raw_process_controlled(
+            process,
+            Some(Duration::from_secs(1)),
+            &mut out,
+            &mut err,
+            |_| async {
+                let output = Command::new("sh")
+                    .arg("-c")
+                    .arg(remote_timeout_kill_script(
+                        &TransferPipeline::remote_pgid_file_path_for_root(root, 91921),
+                        91921,
+                    ))
+                    .output()
+                    .await?;
+                anyhow::ensure!(output.status.success());
+                anyhow::ensure!(
+                    parse_remote_timeout_kill_output(&String::from_utf8_lossy(&output.stdout))
+                        == Some(RemoteTimeoutCleanup::Verified)
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(137));
+        assert_eq!(cause, Some(RawTermination::Deadline));
+        assert!(start.elapsed() < Duration::from_secs(8));
+        assert_eq!(out, b"out\0\xff");
+        assert!(err.starts_with(b"err\0\xfe"), "{err:?}");
+        assert_eq!(out_count, out.len() as u64);
+        assert_eq!(err_count, err.len() as u64);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("receipt")).unwrap(),
+            "deadline-job 137\n"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("receipt.stdout")).unwrap(),
+            out
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("receipt.stderr")).unwrap(),
+            err
+        );
+        for pid in std::fs::read_to_string(directory.path().join("pids"))
+            .unwrap()
+            .split_whitespace()
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            assert!(
+                stat.as_ref()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    || stat.as_ref().is_ok_and(|s| s
+                        .rsplit_once(") ")
+                        .unwrap()
+                        .1
+                        .starts_with(['Z', 'X'])),
+                "descendant {pid} is running: {stat:?}"
+            );
+        }
+        let replay = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .await
+            .unwrap();
+        assert!(!replay.status.success());
+        assert_eq!(std::fs::read(directory.path().join("runs")).unwrap(), b"x");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_invocation_process_wrapper_relays_stdin_and_literal_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let input = directory.path().join("input");
+        std::fs::write(&input, b"\0\xffstdin").unwrap();
+        let mut options = raw_test_options();
+        options
+            .env
+            .insert("LITERAL".into(), "one\n'two; $(false)".into());
+        options.env.insert("RCH_SHIM_BYPASS".into(), "0".into());
+        options
+            .env
+            .insert("RCH_CARGO_WRAPPER_BYPASS".into(), "0".into());
+        let pipeline = TransferPipeline::new(
+            directory.path().into(),
+            "raw".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_invocation_options(options)
+        .unwrap()
+        .with_remote_path_override(root)
+        .with_build_id(Some(91919))
+        .with_recovery_completion(format!("{root}/receipt"), "raw-job".into());
+        let script = pipeline.durable_execution_command(
+            pipeline.build_remote_command("[[ $RCH_SHIM_BYPASS:$RCH_CARGO_WRAPPER_BYPASS == 1:1 ]] || exit 99; values=(one two); [[ ${values[1]} == two ]] || exit 98; cat; printf '%s' \"$LITERAL\" >&2; exit 23", None),
+        );
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::fs::File::open(input).unwrap())
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(23), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"\0\xffstdin");
+        assert_eq!(output.stderr, b"one\n'two; $(false)");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_interactive_process_wrapper_has_controlling_terminal_and_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let mut options = raw_test_options();
+        options.interactive = true;
+        let pipeline = TransferPipeline::new(
+            directory.path().into(),
+            "raw".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_invocation_options(options)
+        .unwrap()
+        .with_remote_path_override(root)
+        .with_build_id(Some(91920))
+        .with_recovery_completion(format!("{root}/receipt"), "raw-job".into());
+        let script = pipeline.durable_execution_command(pipeline.build_remote_command(
+            "test -t 0 && test -t 1 && test -t 2 && test -r /dev/tty",
+            None,
+        ));
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+        assert_eq!(
+            std::fs::read_to_string(format!("{root}/receipt")).unwrap(),
+            "raw-job 0\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_transport_output_error_stops_reader() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec yes");
+        let (writer, reader) = tokio::io::duplex(64);
+        drop(reader);
+        let error = collect_raw_process(
+            command,
+            Some(Duration::from_secs(5)),
+            writer,
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_output_sink_accepts_null_output() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut sink = RawOutputSink::from_fd(file).unwrap();
+        sink.write_all(b"\0\xffdiscarded").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_transport_full_output_socket_does_not_block_deadline() {
+        let (writer, _unread_consumer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        let mut sink = RawOutputSink::from_fd(&writer).unwrap();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec yes");
+        let start = std::time::Instant::now();
+        let result = collect_raw_process(
+            command,
+            Some(Duration::from_millis(150)),
+            &mut sink,
+            tokio::io::sink(),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<RawProcessTimedOut>()
+                .is_some()
+        );
+        assert!(start.elapsed() < Duration::from_secs(3));
+        drop(sink);
+        assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+    }
+
+    #[test]
+    fn raw_invocation_preserves_env_and_selects_explicit_terminal() {
+        let mut options = raw_test_options();
+        options
+            .env
+            .insert("LITERAL".into(), "one\n'two; $(false)".into());
+        options.interactive = true;
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/controller"),
+            "raw".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_invocation_options(options)
+        .unwrap()
+        .with_build_id(Some(7))
+        .with_recovery_completion("/tmp/rch-test.done".into(), "test-identity".into());
+        let script = pipeline.build_remote_command("printf '%s' \"$LITERAL\"", None);
+        assert!(script.contains("script -qefc"));
+        assert!(!script.contains("CARGO_TARGET_DIR="));
+        assert!(!script.contains("sh -lc"));
+        let durable = pipeline.durable_execution_command(script);
+        assert!(!durable.contains("rch_follow"));
+        // Scope descriptor checks to the supervisor boundary. The embedded
+        // watchdog timer deliberately uses /dev/null for its own stdin.
+        let supervisor_only = pipeline.durable_execution_command("cat".into());
+        assert!(!supervisor_only.contains("</dev/null"));
+        assert!(!supervisor_only.contains("nohup"));
+    }
+
     /// Pins this thread to the real transport for the guard's lifetime. Mock
     /// mode falls back to a process-global override that other tests enable
     /// concurrently, which silently rerouted real-transport tests through the
@@ -11617,6 +12788,68 @@ Number of files transferred: 42
         assert!(wrapped.contains("timeout"));
         assert!(wrapped.contains("1800")); // Default test_timeout_sec
         assert!(wrapped.contains("cargo test"));
+    }
+
+    #[test]
+    fn node_test_prepares_dependencies_and_uses_test_timeout() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::NodeTest));
+
+        let preparation = pipeline.wrap_with_dependency_preparation("node --test".into());
+        assert!(preparation.contains("rch-wkr prepare --project . --runtime"));
+        assert!(preparation.contains("rch-prepare node sh -c"));
+        assert!(!preparation.contains("[ ! -d node_modules ]"));
+        assert!(preparation.contains("1>&2"));
+        let wrapped = pipeline.wrap_with_external_timeout("node --test");
+        assert!(wrapped.contains("timeout"));
+        assert!(wrapped.contains("1800"));
+        assert!(wrapped.contains("node --test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_test_worker_environment_refuses_hidden_outputs_before_execution() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::NodeTest));
+        let root = tempfile::tempdir().unwrap();
+        let command = pipeline.wrap_with_dependency_preparation("printf workload-started".into());
+        for (key, value) in [
+            ("NODE_OPTIONS", "--cpu-prof"),
+            ("NODE_V8_COVERAGE", "coverage"),
+        ] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .current_dir(root.path())
+                .env_remove("NODE_OPTIONS")
+                .env_remove("NODE_V8_COVERAGE")
+                .env(key, value)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(125), "{key}");
+            assert!(output.stdout.is_empty(), "{key} ran the workload");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("artifact contract"));
+        }
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .current_dir(root.path())
+            .env_remove("NODE_OPTIONS")
+            .env_remove("NODE_V8_COVERAGE")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"workload-started");
     }
 
     #[test]
@@ -15278,7 +16511,7 @@ exit "${RCH_PREPARE_FIXTURE_STATUS:-0}"
             "auto policy must export the derived count: {command}"
         );
         // The export must precede the `cd` into the project so the inner
-        // `sh -lc` inherits it.
+        // login shell inherits it.
         let export_at = command.find("export CARGO_BUILD_JOBS").unwrap();
         let cd_at = command.find("&& cd ").unwrap();
         assert!(export_at < cd_at, "export must precede cd: {command}");
@@ -17319,7 +18552,10 @@ fn main() {
         );
         // The default cargo-test cap (1800s) is passed to the watchdog as an arg.
         assert!(
-            command.contains(&format!("1800 {} 7 sh -lc", pipeline.deadline_marker)),
+            command.contains(&format!(
+                "1800 {} 7 \"$(command -v bash || command -v sh)\" -lc",
+                pipeline.deadline_marker
+            )),
             "watchdog must receive the test timeout (1800s): {command}"
         );
         assert!(

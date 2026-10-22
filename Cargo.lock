@@ -5461,6 +5461,7 @@ dependencies = [
  "ftui-widgets",
  "futures",
  "glob",
+ "humantime",
  "indicatif",
  "insta",
  "is-terminal",

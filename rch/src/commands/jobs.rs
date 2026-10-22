@@ -462,6 +462,16 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
         if lease.terminal_acknowledged {
+            // Slot release can precede delivery of retained RTK logs. Recovery
+            // may collect them, but must never execute the workload again.
+            if recover && lease.recovery.is_some() && !process_matches(&lease) {
+                within_job_deadline(
+                    deadline,
+                    "retained output recovery",
+                    crate::hook::recover_job(&writer),
+                )
+                .await?;
+            }
             // The daemon refused before admission: no remote command ran, so
             // there is no remote exit to report or recover.
             let report = if lease.state

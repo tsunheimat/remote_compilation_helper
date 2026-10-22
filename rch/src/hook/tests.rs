@@ -48,7 +48,8 @@ use super::timing_history::{
     estimate_timing_for_build, record_build_timing, timing_cache,
 };
 use super::transfer_orchestration::{
-    apply_source_sync_integrity_policy, source_sync_terminal_summary, wrap_command_with_telemetry,
+    apply_source_sync_integrity_policy, dispatch_workload_line, source_sync_terminal_summary,
+    wrap_command_with_telemetry,
 };
 use proptest::prelude::*;
 use rch_common::mock::{
@@ -62,6 +63,259 @@ use std::sync::OnceLock;
 use tokio::io::BufReader as TokioBufReader;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
+
+#[tokio::test]
+async fn hook_request_cwd_selects_project_policy_without_changing_process_cwd() {
+    let _lock = test_lock().lock().await;
+    let ambient = std::env::current_dir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let enabled = root.path().join("enabled");
+    let disabled = root.path().join("disabled");
+    for (path, force_local) in [(&enabled, false), (&disabled, true)] {
+        std::fs::create_dir_all(path.join(".rch")).unwrap();
+        std::fs::write(path.join(".rch/config.toml"), format!(
+            "[general]\nenabled = true\nforce_local = {force_local}\nforce_remote = false\n[compilation]\nconfidence_threshold = 0.0\n"
+        )).unwrap();
+    }
+    // Deliberately opposite ambient policy: request cwd must select the actual
+    // project file, not load_config's command-only test/ambient context.
+    let mut ambient_config = rch_common::RchConfig::default();
+    ambient_config.general.force_local = true;
+    let _config = ConfigOverrideGuard::set(ambient_config);
+    for command in ["python -m pytest -q", "cargo test"] {
+        let request = |cwd: &Path| {
+            serde_json::from_value::<HookRequest>(serde_json::json!({
+                "cwd": cwd, "tool_name": "Bash", "tool_input": {"command": command},
+            }))
+            .unwrap()
+        };
+        let enabled_request = request(&enabled);
+        let disabled_request = request(&disabled);
+        let (enabled_output, disabled_output) = tokio::join!(
+            process_hook_with_cwd(enabled_request.input, enabled_request.cwd.as_deref()),
+            process_hook_with_cwd(disabled_request.input, disabled_request.cwd.as_deref()),
+        );
+        assert!(
+            matches!(enabled_output, HookOutput::AllowWithModifiedCommand(_)),
+            "{command}"
+        );
+        assert!(matches!(disabled_output, HookOutput::Allow(_)), "{command}");
+        assert_eq!(std::env::current_dir().unwrap(), ambient);
+        let invalid = request(Path::new("relative-cwd"));
+        assert!(matches!(
+            process_hook_with_cwd(invalid.input, invalid.cwd.as_deref()).await,
+            HookOutput::Allow(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn semantic_verification_rewrite_does_not_grant_permission() {
+    let _lock = test_lock().lock().await;
+    let _config = ConfigOverrideGuard::set(rch_common::RchConfig::default());
+    let command = "cd web && python -m pytest -q > test.log";
+    let input: HookInput = serde_json::from_value(serde_json::json!({
+        "tool_name": "Bash", "tool_input": {"command": command},
+    }))
+    .unwrap();
+    let output = process_hook(input).await;
+    let json = serde_json::to_value(output).unwrap();
+    let specific = &json["hookSpecificOutput"];
+    assert!(specific.get("permissionDecision").is_none());
+    assert_eq!(
+        specific["updatedInput"]["command"],
+        "cd web && rch exec --verification -- python -m pytest -q > test.log"
+    );
+}
+
+#[tokio::test]
+async fn explicit_job_never_uses_verification_local_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("must-not-run");
+    let invocation = InvocationOptions {
+        command: rch_common::invocation::CommandSpec::Argv(vec![
+            "touch".into(),
+            marker.to_str().unwrap().into(),
+        ]),
+        cwd: directory.path().to_path_buf(),
+        env: Default::default(),
+        timeout_seconds: None,
+        interactive: false,
+        workspace: WorkspaceMode::Shared,
+        verification: true,
+        json_result: None,
+    };
+    let mut config = rch_common::RchConfig::default();
+    config.compilation.allow_local_fallback = true;
+    let error = guarded_verification_fallback(&invocation, &config, true, "missing mapping")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not authorized"));
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn typed_mirror_refusal_writes_terminal_result_without_running_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let result_path = directory.path().join("result.json");
+    let marker = directory.path().join("must-not-run");
+    let invocation = InvocationOptions {
+        command: rch_common::invocation::CommandSpec::Argv(vec![
+            "touch".into(),
+            marker.to_str().unwrap().into(),
+        ]),
+        cwd: directory.path().to_path_buf(),
+        env: Default::default(),
+        timeout_seconds: None,
+        interactive: false,
+        workspace: WorkspaceMode::Mirror,
+        verification: true,
+        json_result: Some(result_path.clone()),
+    };
+    let context = crate::ui::context::OutputContext::new(Default::default());
+    let result = run_exec(
+        None,
+        vec![],
+        false,
+        vec![],
+        false,
+        false,
+        false,
+        vec![],
+        vec![],
+        None,
+        vec![],
+        Some(invocation),
+        &context,
+    )
+    .await;
+    let error = result.unwrap_err();
+    assert!(error.downcast_ref::<ExecErrorReported>().is_some());
+    assert!(error.to_string().contains("require --workspace shared"));
+    assert!(!marker.exists());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    assert_eq!(envelope["outcome"], "control_error");
+    assert_eq!(envelope["location"], "controller");
+}
+
+#[tokio::test]
+async fn exec_result_file_is_task_scoped_and_independent_of_machine_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.json");
+    let second = directory.path().join("second.json");
+    async fn emit(path: PathBuf, command: &str) {
+        remote_result::EXEC_OUTPUT
+            .scope(
+                remote_result::ExecOutputSink::new(false, Some(path)),
+                async {
+                    if command == "first" {
+                        remote_result::record_exec_details(&serde_json::json!({
+                            "lease_path": "/guard/first",
+                            "lease_retained": true,
+                            "descendants_quiesced": false,
+                            "process_control": "best_effort_owned_process_group",
+                        }))
+                        .unwrap();
+                    }
+                    tokio::task::yield_now().await;
+                    assert!(!remote_result::machine_output());
+                    emit_exec_envelope(&ExecResultEnvelope {
+                        api_version: "1.0",
+                        command,
+                        outcome: "completed",
+                        location: "remote",
+                        fallback_reason: None,
+                        worker_id: None,
+                        remote_exit_code: Some(17),
+                        duration_ms: Some(1),
+                        timing: None,
+                        result_dirs: None,
+                        error_code: None,
+                        admission: None,
+                    });
+                    assert!(remote_result::exec_envelope_emitted());
+                },
+            )
+            .await;
+    }
+    tokio::join!(emit(first.clone(), "first"), emit(second.clone(), "second"));
+    for (path, expected) in [(first, "first"), (second, "second")] {
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(result["command"], expected);
+        assert_eq!(result["remote_exit_code"], 17);
+        if expected == "first" {
+            assert_eq!(result["execution_details"]["lease_retained"], true);
+            assert_eq!(result["execution_details"]["descendants_quiesced"], false);
+            assert_eq!(result["execution_details"]["lease_path"], "/guard/first");
+        } else {
+            assert!(result.get("execution_details").is_none());
+        }
+    }
+    assert!(!remote_result::exec_envelope_emitted());
+}
+
+#[test]
+fn native_cli_streams_keep_workload_stdout_and_stderr_byte_separate() {
+    let directory = tempfile::tempdir().unwrap();
+    let stdout_path = directory.path().join("native.stdout");
+    let stderr_path = directory.path().join("native.stderr");
+    let mut stdout = |value: &str| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout_path)
+            .unwrap();
+        file.write_all(value.as_bytes()).unwrap();
+    };
+    let mut stderr = |value: &str| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_path)
+            .unwrap();
+        file.write_all(value.as_bytes()).unwrap();
+    };
+
+    // These are the exact line boundaries delivered by the streaming SSH
+    // reader. In particular, do not assert against a merged diagnostic string:
+    // shell redirection depends on each byte reaching its original stream.
+    dispatch_workload_line(
+        "RCH_CARGO_WITNESS\nCARGO-RAW-00\n",
+        false,
+        &mut stdout,
+        &mut stderr,
+    );
+    dispatch_workload_line("error: diagnostic\n", true, &mut stdout, &mut stderr);
+
+    assert_eq!(
+        std::fs::read(stdout_path).unwrap(),
+        b"RCH_CARGO_WITNESS\nCARGO-RAW-00\n"
+    );
+    assert_eq!(std::fs::read(stderr_path).unwrap(), b"error: diagnostic\n");
+}
+
+#[tokio::test]
+async fn hook_and_machine_scopes_still_reserve_stdout_for_protocols() {
+    assert!(remote_result::workload_streams_to_stderr());
+
+    remote_result::EXEC_OUTPUT
+        .scope(
+            remote_result::ExecOutputSink::for_cli(false, None, false),
+            async {
+                assert!(!remote_result::workload_streams_to_stderr());
+            },
+        )
+        .await;
+    remote_result::EXEC_OUTPUT
+        .scope(remote_result::ExecOutputSink::new(true, None), async {
+            assert!(remote_result::workload_streams_to_stderr());
+        })
+        .await;
+}
 
 #[tokio::test]
 async fn queued_cancellation_replaces_hook_command_with_terminal_exit() {
@@ -2382,6 +2636,7 @@ async fn test_daemon_query_missing_socket() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
     assert!(result.is_err());
@@ -3339,6 +3594,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             &[WorkerId::new("next-worker")],
             true,
             &["git".into(), "cmake".into()],
+            &Default::default(),
             &writer,
             true,
             &HookReporter::new(OutputVisibility::None),
@@ -3408,6 +3664,7 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
                 &[],
                 false,
                 &[],
+                None,
             )
             .await
         };
@@ -3481,6 +3738,7 @@ async fn queued_selection_preconnect_failure_preserves_recovery() {
             &[],
             false,
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -3576,6 +3834,7 @@ async fn test_daemon_query_protocol() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 
@@ -3666,6 +3925,7 @@ async fn test_daemon_query_sends_preferred_workers() {
         &preferred,
         false,
         &[],
+        None,
     )
     .await;
 
@@ -3770,6 +4030,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
         &[WorkerId::new("requested")],
         false,
         &[],
+        None,
     )
     .await
     .expect("query should return a structured refusal");
@@ -3870,6 +4131,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         &[WorkerId::new("requested")],
         false,
         &[],
+        None,
     )
     .await
     .expect_err("an unacknowledged release must not look like a safe ordinary refusal (9ec9b32f)");
@@ -3966,6 +4228,7 @@ async fn test_daemon_query_wait_parameters() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 
@@ -4039,6 +4302,7 @@ async fn test_daemon_query_url_encoding() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
     daemon_handle.await.expect("Daemon task");
@@ -5265,6 +5529,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
     // Existing remote-command evidence still follows its actual exit status.
     for exit_code in [0, 101] {
         let result = Ok(remote_result::RemoteExecutionResult {
+            interrupted: false,
             deadline_triggered: false,
             exit_code,
             stderr: "No space left on device".into(),
@@ -5315,6 +5580,7 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
     assert!(!remote_release_faults(&quoted, &worker).live_checkout_refused);
     let build = Ok(remote_result::RemoteExecutionResult {
         deadline_triggered: false,
+        interrupted: false,
         exit_code: 101,
         stderr: refusal.into(),
         duration_ms: 10,
@@ -5713,6 +5979,82 @@ fn test_zigbuild_requires_the_zig_runtime_not_bare_rust() {
             "{kind:?} must stay on the Rust runtime gate"
         );
     }
+}
+
+#[test]
+fn node_test_hidden_environment_requires_local_execution_or_strict_refusal() {
+    use std::ffi::OsString;
+    let kind = Some(CompilationKind::NodeTest);
+    let empty = rch_common::EnvironmentConfig::default();
+    assert!(!node_test_has_untracked_environment(kind, &empty, |_| None));
+    assert!(!node_test_has_untracked_environment(
+        kind,
+        &empty,
+        |_| Some(OsString::new())
+    ));
+    for name in ["NODE_OPTIONS", "NODE_V8_COVERAGE"] {
+        // Ambient values matter even if not forwarded: otherwise local and
+        // remote behavior differ. Allowlisting must not bypass the gate either.
+        for allowlist in [vec![], vec![name.to_string()]] {
+            let environment = rch_common::EnvironmentConfig {
+                allowlist,
+                ..Default::default()
+            };
+            assert!(node_test_has_untracked_environment(
+                kind,
+                &environment,
+                |key| { (key == name).then(|| OsString::from("hidden-output-option")) }
+            ));
+        }
+        for value in ["coverage", ""] {
+            let mut environment = rch_common::EnvironmentConfig::default();
+            environment
+                .remote
+                .insert(name.to_string(), value.to_string());
+            assert!(node_test_has_untracked_environment(
+                kind,
+                &environment,
+                |_| None
+            ));
+            for other in [
+                None,
+                Some(CompilationKind::Job),
+                Some(CompilationKind::CargoTest),
+            ] {
+                assert!(!node_test_has_untracked_environment(
+                    other,
+                    &environment,
+                    |_| { Some(OsString::from("hidden-output-option")) }
+                ));
+            }
+        }
+    }
+    let mut ordinary = rch_common::EnvironmentConfig::default();
+    ordinary.remote.insert("CI".to_string(), "1".to_string());
+    assert!(!node_test_has_untracked_environment(
+        kind,
+        &ordinary,
+        |_| None
+    ));
+}
+
+#[test]
+fn node_test_hook_uses_node_gate_and_stream_only_artifact_policy() {
+    let _guard = test_guard!();
+    let command = "node --import setup.mjs --test --test-reporter=tap";
+    let classification = rch_common::classify_command(command);
+    assert_eq!(classification.kind, Some(CompilationKind::NodeTest));
+    assert_eq!(
+        required_runtime_for_kind(classification.kind),
+        RequiredRuntime::Node
+    );
+    assert!(get_artifact_patterns(classification.kind, Some(command)).is_empty());
+    assert!(!kind_produces_transferable_artifacts(classification.kind));
+    let config = rch_common::CompilationConfig::default();
+    assert_eq!(
+        estimate_cores_for_command(classification.kind, command, &config),
+        config.test_slots.max(1)
+    );
 }
 
 #[test]
@@ -7793,6 +8135,35 @@ fn test_build_sync_closure_plan_deterministic_under_permutation() {
     );
 }
 
+#[test]
+fn separate_source_root_maps_project_and_sibling_dependency_to_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("sources");
+    let project = source.join("team/repo");
+    let dependency = source.join("team/dep");
+    let mirror = dir.path().join("worker/projects");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&dependency).unwrap();
+    let policy = PathTopologyPolicy::new(mirror.clone(), dir.path().join("alias"))
+        .with_source_root(source.clone());
+    assert!(project_topology_local_reason(&policy, &project).is_none());
+    let plan = build_sync_closure_plan(
+        &[project.clone(), dependency.clone()],
+        &project,
+        "abcdef",
+        &policy,
+    );
+    assert_eq!(plan.len(), 2);
+    for entry in plan {
+        assert_eq!(
+            Path::new(&entry.remote_root),
+            mirror.join(entry.local_root.strip_prefix(&source).unwrap())
+        );
+        assert!(entry.local_root == project || entry.local_root == dependency);
+        assert!(!Path::new(&entry.remote_root).starts_with(&source));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn test_build_sync_closure_plan_dedupes_alias_entries() {
@@ -8086,6 +8457,8 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
+        None,
+        &rch_common::JobsConfig::default(),
     ))
     .await;
     assert!(result.unwrap_err().to_string().contains("require the Unix"));
@@ -8241,6 +8614,8 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
+        None,
+        &rch_common::JobsConfig::default(),
     ))
     .await;
 
@@ -8360,6 +8735,8 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
+        None,
+        &rch_common::JobsConfig::default(),
     ))
     .await;
 
@@ -8528,6 +8905,8 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         &layer0_env,
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
+        None,
+        &rch_common::JobsConfig::default(),
     ))
     .await;
     if let Some(prev) = prev_cwd {
@@ -8627,6 +9006,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
+        None,
+        &rch_common::JobsConfig::default(),
     ))
     .await;
 
@@ -8656,6 +9037,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
+        None,
+        &rch_common::JobsConfig::default(),
     ))
     .await;
 
@@ -10467,6 +10850,7 @@ async fn test_daemon_query_connect_timeout_fail_open() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 
@@ -10586,6 +10970,7 @@ async fn test_daemon_query_partial_response_timeout() {
         &[],
         false,
         &[],
+        None,
     )
     .await;
 
@@ -13002,7 +13387,7 @@ fn project_topology_local_reason_admits_projects_under_the_canonical_root_only()
 
     let reason = project_topology_local_reason(&policy, &outside)
         .expect("a project outside the canonical root must run locally");
-    assert!(reason.contains("outside canonical root"), "{reason}");
+    assert!(reason.contains("fails source topology"), "{reason}");
     assert!(reason.contains(&outside.display().to_string()), "{reason}");
     assert!(
         reason.contains("canonical_root"),
@@ -13023,13 +13408,7 @@ async fn fast_passthrough_answers_only_what_process_hook_plainly_allows() {
         })
         .to_string()
     };
-    for command in [
-        "ls -la",
-        "git status",
-        "cd /tmp && ls",
-        r#"br comments add x "cargo test -p rchd""#,
-        "echo cargo build",
-    ] {
+    for command in ["ls -la", "git status", "cd /tmp && ls"] {
         let input = request("Bash", command);
         assert!(super::fast_passthrough_allows(&input), "{command}");
         let output = process_hook(serde_json::from_str(&input).unwrap()).await;
@@ -13037,6 +13416,19 @@ async fn fast_passthrough_answers_only_what_process_hook_plainly_allows() {
             matches!(output, HookOutput::Allow(_)),
             "fast path allowed what process_hook would not: {command} -> {output:?}"
         );
+    }
+    // The cheap semantic filter intentionally routes quoted tool names to
+    // the full parser; they must still remain plain allow, not false rewrites.
+    for command in [
+        r#"br comments add x "cargo test -p rchd""#,
+        "echo cargo build",
+    ] {
+        let input = request("Bash", command);
+        assert!(!super::fast_passthrough_allows(&input));
+        assert!(matches!(
+            process_hook(serde_json::from_str(&input).unwrap()).await,
+            HookOutput::Allow(_)
+        ));
     }
     assert!(super::fast_passthrough_allows(""));
     assert!(super::fast_passthrough_allows(&request(
@@ -13048,6 +13440,8 @@ async fn fast_passthrough_answers_only_what_process_hook_plainly_allows() {
         "cargo test -p rch",
         "cargo build | tee build.log",
         "cargo build > build.log 2>&1 &",
+        "python -m pytest -q",
+        "cd web && npm test > test.log",
     ] {
         assert!(
             !super::fast_passthrough_allows(&request("Bash", command)),

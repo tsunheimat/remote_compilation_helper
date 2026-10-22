@@ -136,6 +136,9 @@ pub(super) fn get_artifact_patterns(
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
         Some(CompilationKind::NixBuild) => Vec::new(),
+        // Node tests return stdout/stderr and exit status only. The classifier
+        // rejects file reporters, profiles, snapshots and other emitting flags.
+        Some(CompilationKind::NodeTest) => Vec::new(),
         // Explicit Go builds were selected by direct_compiler above. Other Go
         // and TS commands stream their results; unsupported emitting forms
         // are declined by their classifiers. Falling through to the
@@ -460,6 +463,7 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         | Some(CompilationKind::CargoClippy)
         | Some(CompilationKind::BunTest)
         | Some(CompilationKind::BunTypecheck)
+        | Some(CompilationKind::NodeTest)
         // Nix builds stream their result; outputs stay in the worker's /nix/store.
         | Some(CompilationKind::NixBuild)
         // Jobs are arbitrary admitted commands: no artifact contract exists in
