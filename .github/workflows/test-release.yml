@@ -1,7 +1,9 @@
 name: Test Release
 
+# CI calls this exact-revision packaging graph; do not also trigger a second
+# independent copy for the same pull request.
 on:
-  pull_request:
+  workflow_call:
   workflow_dispatch:
 
 # Cancel in-progress runs for the same branch/PR to save resources.
@@ -15,6 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 2
+  CARGO_BUILD_JOBS: 2
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   RUSTUP_TOOLCHAIN: nightly-2026-08-31
 

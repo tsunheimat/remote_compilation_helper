@@ -527,10 +527,33 @@ fn extract_zip_archive(archive_file: fs::File, dest: &Path) -> Result<(), Update
         let mut entry = zip
             .by_index(index)
             .map_err(|e| UpdateError::InstallFailed(format!("Invalid zip archive entry: {}", e)))?;
-        let entry_name = entry.name().to_string();
+        // ZIP bit 11 declares UTF-8. ZIP 9's general name decoder can fall
+        // back to CP437 even for a falsely flagged name, so enforce that wire
+        // declaration before decoding or choosing ANY extraction destination.
+        // Unflagged legacy CP437 names retain their existing decoding contract.
+        if entry.flags().as_u16() & (1 << 11) != 0 {
+            std::str::from_utf8(entry.name_raw()).map_err(|error| {
+                UpdateError::InstallFailed(format!("Invalid UTF-8 update zip entry name: {error}"))
+            })?;
+        }
+        let entry_name = entry
+            .name()
+            .map_err(|error| {
+                UpdateError::InstallFailed(format!("Invalid update zip entry name: {error}"))
+            })?
+            .into_owned();
         let relative_path = safe_archive_entry_path(Path::new(&entry_name))?;
         let destination = dest.join(&relative_path);
 
+        // Reject links before the trailing-slash directory classification. The
+        // updater extracts only ordinary bytes/directories and never applies
+        // archive-supplied modes or follows an entry's link target.
+        if entry.is_symlink() {
+            return Err(UpdateError::InstallFailed(format!(
+                "Unsupported update zip symlink for {}",
+                relative_path.display()
+            )));
+        }
         if entry.is_dir() {
             fs::create_dir_all(&destination).map_err(|e| {
                 UpdateError::InstallFailed(format!(
@@ -1587,6 +1610,158 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest.join(optional_update_binary())).unwrap(),
             "optional binary"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_zip_rejects_links_without_changing_external_bytes_or_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in ["rch", "directory-link/"] {
+            for relative in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let archive_path = temp.path().join("rch.zip");
+                let dest = temp.path().join("extract");
+                let outside = temp.path().join("outside");
+                fs::write(&outside, b"retain external bytes").unwrap();
+                fs::set_permissions(&outside, fs::Permissions::from_mode(0o640)).unwrap();
+                let before = fs::metadata(&outside).unwrap().permissions().mode();
+                let target = if relative {
+                    "../outside".to_owned()
+                } else {
+                    outside.to_str().unwrap().to_owned()
+                };
+                let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+                writer
+                    .add_symlink(name, target, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.finish().unwrap();
+                let mut observed =
+                    zip::ZipArchive::new(fs::File::open(&archive_path).unwrap()).unwrap();
+                assert!(observed.by_index(0).unwrap().is_symlink());
+                drop(observed);
+
+                assert!(matches!(
+                    extract_archive(&archive_path, &dest),
+                    Err(UpdateError::InstallFailed(_))
+                ));
+                assert!(fs::symlink_metadata(dest.join(name.trim_end_matches('/'))).is_err());
+                assert_eq!(fs::read(&outside).unwrap(), b"retain external bytes");
+                assert_eq!(fs::metadata(&outside).unwrap().permissions().mode(), before);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_extract_zip_never_preserves_privileged_archive_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.zip");
+        let dest = temp.path().join("extract");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+        let entries = [("rch", 0o106755_u32), ("nested/", 0o047777_u32)];
+        for (name, mode) in entries {
+            // unix_permissions() deliberately masks these bits. Use the raw
+            // ZIP attributes so this fixture actually carries hostile modes.
+            let options = zip::write::SimpleFileOptions::default().external_attributes(mode << 16);
+            if name.ends_with('/') {
+                writer.add_directory(name, options).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(b"ordinary update bytes").unwrap();
+            }
+        }
+        writer.finish().unwrap();
+        let mut observed = zip::ZipArchive::new(fs::File::open(&archive_path).unwrap()).unwrap();
+        for (name, mode) in entries {
+            assert_eq!(
+                // ZIP 9 sanitizes unix_mode() on READ as well as write helpers.
+                // Inspect the raw wire attributes to prove hostile input exists.
+                (observed.by_name(name).unwrap().external_attributes() >> 16) & 0o7000,
+                mode & 0o7000
+            );
+        }
+        drop(observed);
+
+        extract_archive(&archive_path, &dest).unwrap();
+        assert_eq!(
+            fs::read(dest.join("rch")).unwrap(),
+            b"ordinary update bytes"
+        );
+        assert!(dest.join("nested").is_dir());
+        for (name, _) in entries {
+            assert_eq!(
+                fs::metadata(dest.join(name)).unwrap().permissions().mode() & 0o7000,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_zip_rejects_invalid_utf8_names_without_lossy_replacement() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.zip");
+        let destination = temp.path().join("invalid-name");
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("rch", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"ordinary binary bytes").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // Prove the original fixture is an ordinary extractable archive, then
+        // change only both filename copies and their UTF-8 flags. File payload,
+        // CRC, compression, offsets and field lengths remain unchanged.
+        fs::write(&archive_path, &bytes).unwrap();
+        let valid = temp.path().join("valid-name");
+        extract_archive(&archive_path, &valid).unwrap();
+        assert_eq!(
+            fs::read(valid.join("rch")).unwrap(),
+            b"ordinary binary bytes"
+        );
+        for (signature, flags_offset, name_offset) in [
+            ([0x50, 0x4b, 0x03, 0x04], 6, 30),
+            ([0x50, 0x4b, 0x01, 0x02], 8, 46),
+        ] {
+            let offsets: Vec<_> = bytes
+                .windows(4)
+                .enumerate()
+                .filter_map(|(offset, header)| (header == signature).then_some(offset))
+                .collect();
+            assert_eq!(
+                offsets.len(),
+                1,
+                "fixture must contain one header of each kind"
+            );
+            let base = offsets[0];
+            assert_eq!(&bytes[base + name_offset..base + name_offset + 3], b"rch");
+            let flags = base + flags_offset;
+            let value = u16::from_le_bytes([bytes[flags], bytes[flags + 1]]) | (1 << 11);
+            bytes[flags..flags + 2].copy_from_slice(&value.to_le_bytes());
+            bytes[base + name_offset] = 0xff;
+        }
+        fs::write(&archive_path, &bytes).unwrap();
+        let mut observed = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let entry = observed.by_index(0).unwrap();
+        assert_ne!(entry.flags().as_u16() & (1 << 11), 0);
+        assert!(std::str::from_utf8(entry.name_raw()).is_err());
+        drop(entry);
+        drop(observed);
+        let result = extract_archive(&archive_path, &destination);
+        assert!(
+            matches!(result, Err(UpdateError::InstallFailed(_))),
+            "{result:?}"
+        );
+        // The private extraction root itself may have been created, but no
+        // replacement-character path or partial output is authorized.
+        if destination.exists() {
+            assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        }
+        assert_eq!(
+            fs::read(valid.join("rch")).unwrap(),
+            b"ordinary binary bytes"
         );
     }
 

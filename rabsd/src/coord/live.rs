@@ -37,7 +37,7 @@ use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
-use rabs_cas::materialization::ActionMaterializeFailure;
+use rabs_cas::materialization::{ActionMaterializeFailure, staged::PreparedActionOutputs};
 use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
@@ -416,8 +416,9 @@ const LIVE_SAMPLING_POLICY: SamplingPolicy = SamplingPolicy::sample_all(2, 10_00
 const LIVE_VERIFICATION_RECEIPT: &str = "rabs-live-verification-v1";
 const LIVE_INSTALL_RECEIPT: &str = "rabs-live-replay-install-v1";
 
-/// Maximum cache installations admitted after one new independent comparison.
-/// This fixed bound supplies ongoing verification; it is not an SPRT ratchet.
+/// Default cache installations after one new independent comparison.
+/// Opt-in SPRT replaces only this ceiling with its evidence-qualified limit;
+/// the same comparison binding and durable installation receipts remain required.
 pub const LIVE_REPLAY_INSTALL_LIMIT: u64 = 16;
 
 fn record_descriptor_class(
@@ -628,7 +629,47 @@ fn live_replay_permit(
     }
     let used = u64::try_from(installed.len())
         .map_err(|_| StoreError::Corruption("live replay count exhausted".into()))?;
-    Ok((used < LIVE_REPLAY_INSTALL_LIMIT).then_some(ReplayInstallPermit { subject, seq: used }))
+    // None means the opt-in is off, not that evidence failed. Some(0) is a
+    // hard verification requirement and must never inherit the fixed budget.
+    // Policy changes reuse these same receipts, so they cannot replenish it.
+    let limit = LIVE_SAMPLING_POLICY
+        .replay_install_limit(store, action)?
+        .unwrap_or(LIVE_REPLAY_INSTALL_LIMIT);
+    Ok((used < limit).then_some(ReplayInstallPermit { subject, seq: used }))
+}
+
+/// Complete the already-authorized install under the caller's exclusive CAS
+/// lock. Keeping receipt spending and real output delivery in one boundary
+/// ensures an installation error cannot refund an allowance whose write was
+/// already durable. Earlier arbitration/staging failures never enter here.
+fn finish_replay_install(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    manifest_key: &str,
+    requires_permit: bool,
+    plan: &output_install::PreparedOutputs,
+    prepared: PreparedActionOutputs,
+) -> Result<ServeOutcome, ServeError> {
+    if requires_permit {
+        let Some(permit) = live_replay_permit(store, action, manifest_key)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        else {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::FreshVerificationRequired,
+            ));
+        };
+        store
+            .record_decision_receipt(
+                LIVE_INSTALL_RECEIPT,
+                &permit.subject,
+                permit.seq,
+                "install",
+                manifest_key,
+            )
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+    }
+    let files = output_install::install_prepared(store, plan, prepared)?;
+    Ok(ServeOutcome::Served { files })
 }
 
 /// Final live replay admission, called with the SAME store lock subsequently
@@ -2105,12 +2146,12 @@ impl CoordLive {
             .lock()
             .map_err(|_| ServeError::StoreUnavailable)?;
         declare_coordinator_domains(&mut *store);
-        if let Some(held) = replay_authority {
+        if let Some(ref held) = replay_authority {
             match store
                 .active_authority()
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
             {
-                Some(active) if active.digest == authority_digest(&held) => {}
+                Some(active) if active.digest == authority_digest(held) => {}
                 _ => return Err(ServeError::CoordinatorUnavailable),
             }
         }
@@ -2166,21 +2207,20 @@ impl CoordLive {
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
-        let replay_permit = if sampling.is_some() {
-            match live_replay_permit(&mut *store, action_key, &manifest_key)
+        // Preview and install must consult the same durable replay budget.
+        // Otherwise preview advertises a hit whose installation can only fail,
+        // instead of directing the caller to a fresh compiler comparison. This
+        // is a non-spending precheck, not a permit reservation: final installation
+        // rechecks and spends under the metadata lock after private staging.
+        if sampling.is_some()
+            && live_replay_permit(&mut *store, action_key, &manifest_key)
                 .map_err(|error| ServeError::Store(format!("{error:?}")))?
-            {
-                Some(permit) => Some(permit),
-                None => {
-                    return Ok(ServeOutcome::ExecutePrivately(
-                        ReplayRefusal::FreshVerificationRequired,
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
+                .is_none()
+        {
+            return Ok(ServeOutcome::ExecutePrivately(
+                ReplayRefusal::FreshVerificationRequired,
+            ));
+        }
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.
@@ -2192,60 +2232,124 @@ impl CoordLive {
         if mode == ServeMode::Preview {
             return Ok(ServeOutcome::Servable);
         }
-        if let Some(permit) = replay_permit {
-            // Spend durably while holding the same lock as admission and
-            // installation. A failed/partial install conservatively spends its
-            // allowance; a crash must never grant it a second time.
-            store
-                .record_decision_receipt(
-                    LIVE_INSTALL_RECEIPT,
-                    &permit.subject,
-                    permit.seq,
-                    "install",
-                    &manifest_key,
-                )
-                .map_err(|error| ServeError::Store(format!("{error:?}")))?;
-        }
         if plan.outputs.is_empty() {
+            if sampling.is_some() {
+                let Some(permit) = live_replay_permit(&mut *store, action_key, &manifest_key)
+                    .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                else {
+                    return Ok(ServeOutcome::ExecutePrivately(
+                        ReplayRefusal::FreshVerificationRequired,
+                    ));
+                };
+                store
+                    .record_decision_receipt(
+                        LIVE_INSTALL_RECEIPT,
+                        &permit.subject,
+                        permit.seq,
+                        "install",
+                        &manifest_key,
+                    )
+                    .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+            }
             return Ok(ServeOutcome::Served { files: Vec::new() });
         }
 
-        // D031: reserve every destination all-or-nothing before any
-        // install, so a concurrent serve into an overlapping path is
-        // refused rather than interleaved.
+        // D031: reserve every destination all-or-nothing before any staging or
+        // install. The reservation stays live across the metadata-lock handoff,
+        // so another subscriber cannot race private preparation into the same
+        // final namespace.
         let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
         use rabs_protocol::raw_bytes::RawBytes;
         use std::os::unix::ffi::OsStrExt;
-        // BYTES, not a lossy decode. A destination is an arbitrary byte
-        // sequence on Unix, and `to_string_lossy` mapped every one that
-        // differed only in invalid UTF-8 onto the same U+FFFD-bearing
-        // key — so two concurrent serves writing genuinely different
-        // files conflicted, and the refusal named a path that was not
-        // the path either of them asked for (bd-1rofg). It also made
-        // this the one lossy decode in a pipeline T026/R89 exists to
-        // keep byte-exact.
         let paths: Vec<Vec<u8>> = plan
             .outputs
             .iter()
             .map(|out| out.destination.as_os_str().as_bytes().to_vec())
             .collect();
-        // The guard releases on drop, so the reservation cannot outlive
-        // this call however it ends — including an unwind, which
-        // previously stranded the paths for the process's lifetime
-        // (bd-v9ho1). Bound to a name, not `_`, so it lives until the
-        // end of the scope rather than being dropped immediately.
         let _reservation = reserve_scoped(&self.arbiter, bundle, &paths).map_err(|conflict| {
             ServeError::DestinationConflict {
-                // Escaped rather than lossily decoded, so the operator
-                // sees a path they can tell apart from its neighbours
-                // and map back to real bytes. Same treatment the
-                // virtual-path refusals already give (`RawBytes`).
                 path: RawBytes::new(conflict.path).escaped(),
                 holder: conflict.holder.0,
             }
         })?;
-        let files = output_install::install(&mut *store, &plan)?;
-        Ok(ServeOutcome::Served { files })
+
+        // Select exact non-quarantined replicas while metadata is authoritative,
+        // then release the global store mutex for expensive copy/hash/derivation.
+        // The staged owner exposes no final destination and carries no serving
+        // authority. A corrupt replica is settled only after reacquiring metadata.
+        let selected = output_install::select_for_install(&mut *store, &plan)?;
+        drop(store);
+        let prepared = match output_install::stage_for_install(selected, &plan) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let mut store = cas
+                    .store()
+                    .lock()
+                    .map_err(|_| ServeError::StoreUnavailable)?;
+                return Err(output_install::settle_stage_failure(&mut *store, failure));
+            }
+        };
+
+        // Bytes may have taken arbitrarily long to stage. Re-enter every mutable
+        // authority/gating boundary before the FIRST rename. The prepared CAS
+        // owner independently rechecks object quarantine, selected locations and
+        // private file generations during install.
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| ServeError::StoreUnavailable)?;
+        declare_coordinator_domains(&mut *store);
+        if let Some(ref held) = replay_authority {
+            match store
+                .active_authority()
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            {
+                Some(active) if active.digest == authority_digest(held) => {}
+                _ => return Err(ServeError::CoordinatorUnavailable),
+            }
+        }
+        let standing = release_standing(
+            store
+                .release_verdict(&self.build_identity)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                .as_ref(),
+            &self.build_identity,
+            now_unix_micros,
+            now_epoch,
+        );
+        if !standing.permits_serving(self.release_mode) {
+            return Ok(ServeOutcome::ReleaseUnauthorized { standing });
+        }
+        match serving_gate(&mut *store, &key, now_unix_micros, now_epoch)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            ServeDecision::Servable => {}
+            decision => return Ok(ServeOutcome::NotServable(decision)),
+        }
+        if let Some(policy) = sampling
+            && let Some(refusal) = live_replay_gate(&mut *store, action_key, &policy)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
+        }
+        match store
+            .published_manifest_key(action_key)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            Some(current) if current == manifest_key => {}
+            Some(current) => return Ok(ServeOutcome::ManifestUnavailable { key: current }),
+            None => return Ok(ServeOutcome::NoCommit),
+        }
+        // Spend only after the post-staging gates pass. A failed/partial
+        // install still conservatively consumes this durable allowance.
+        finish_replay_install(
+            &mut *store,
+            action_key,
+            &manifest_key,
+            sampling.is_some(),
+            &plan,
+            prepared,
+        )
     }
 
     /// Allocate a pin id unique to this incarnation.
@@ -2669,6 +2773,236 @@ mod tests {
         coord.acquire_boot_authority("submission-tests").unwrap();
         coord.mark_up();
         (state, coord)
+    }
+
+    fn replay_coordinator() -> (tempfile::TempDir, CoordLive, OfferPreparedActionResult, i64) {
+        use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+        use rabs_cas::test_support::{
+            FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
+            install_offer_closure, offer_serving_object, sample_action_key,
+        };
+        use rabs_protocol::generation::ActionGenerationId;
+
+        let (state, coord) = submission_coordinator();
+        let cas = coord.cas.as_ref().unwrap();
+        let authority = coord.authority().unwrap();
+        let put = |bytes: &[u8]| {
+            let object = digest_set(bytes, DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id;
+            put_if_absent(
+                cas.layout(),
+                &mut *cas.store().lock().unwrap(),
+                &object,
+                &mut &bytes[..],
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap();
+            ObjectId(object)
+        };
+        let artifact = put(b"verified preview artifact");
+        {
+            let mut store = cas.store().lock().unwrap();
+            install_admission_world(&mut *store, &authority);
+            store
+                .record_decision_receipt(
+                    "rabs-live-action-class-v1",
+                    &digest_key(&sample_action_key()),
+                    0,
+                    "rustc-dependency-compile",
+                    "synthetic descriptor binding",
+                )
+                .unwrap();
+        }
+        let (offer, bytes) = offer_serving_object(&authority, &artifact);
+        assert_eq!(put(&bytes), offer.manifest_id);
+        install_offer_closure(&mut *cas.store().lock().unwrap(), &offer);
+        assert!(matches!(
+            coord
+                .commit_offer(&offer, &sample_expected_descriptor())
+                .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        for number in 1..=2 {
+            let ids = FixtureAttemptIds {
+                generation: 11 + number,
+                attempt: 20 + number,
+                lease: 30 + number,
+            };
+            install_admission_world_with_ids(&mut *cas.store().lock().unwrap(), &authority, ids);
+            let mut comparison = offer.clone();
+            comparison.authority.action_generation.generation_id =
+                ActionGenerationId(ids.generation);
+            comparison.authority.attempt_id = AttemptId(ids.attempt);
+            comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
+            assert_eq!(
+                coord
+                    .commit_offer(&comparison, &sample_expected_descriptor())
+                    .unwrap(),
+                PublicationOutcome::IdempotentEvidenceAppended
+            );
+        }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+        )
+        .unwrap();
+        (state, coord, offer, now)
+    }
+
+    #[test]
+    fn replay_preview_observes_the_install_budget_without_spending_or_creating_outputs() {
+        use rabs_cas::test_support::sample_action_key;
+
+        let (state, coord, _offer, now) = replay_coordinator();
+        let cas = coord.cas.as_ref().unwrap();
+        let destination = state.path().join("preview-only");
+        for used in 0..=LIVE_REPLAY_INSTALL_LIMIT {
+            let before = cas.store().lock().unwrap().differential_snapshot().unwrap();
+            let expected = if used < LIVE_REPLAY_INSTALL_LIMIT {
+                ServeOutcome::Servable
+            } else {
+                ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired)
+            };
+            // Repeated previews cannot reserve, consume, or replenish allowance.
+            for _ in 0..3 {
+                assert_eq!(
+                    coord
+                        .serve_for_subscriber(
+                            &sample_action_key(),
+                            &destination,
+                            &ExpectedOutputs::WhateverWasCommitted,
+                            now,
+                            ServeMode::Preview,
+                        )
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert!(!destination.exists());
+            assert_eq!(
+                cas.store().lock().unwrap().differential_snapshot().unwrap(),
+                before
+            );
+            if used < LIVE_REPLAY_INSTALL_LIMIT {
+                let installed = state.path().join(format!("install-{used}"));
+                assert!(matches!(
+                    coord
+                        .serve_for_subscriber(
+                            &sample_action_key(),
+                            &installed,
+                            &ExpectedOutputs::WhateverWasCommitted,
+                            now,
+                            ServeMode::Install,
+                        )
+                        .unwrap(),
+                    ServeOutcome::Served { .. }
+                ));
+                assert_eq!(
+                    std::fs::read(installed.join("out/lib.rlib")).unwrap(),
+                    b"verified preview artifact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_delivery_keeps_its_durable_permit_and_exhaustion_does_not_spend_again() {
+        use rabs_cas::test_support::sample_action_key;
+
+        let (state, coord, offer, _now) = replay_coordinator();
+        let cas = coord.cas.as_ref().unwrap();
+        let action = sample_action_key();
+        let manifest_key = digest_key(&offer.manifest_id.0);
+        let destination = state.path().join("failed-delivery");
+        let stage = || {
+            let mut store = cas.store().lock().unwrap();
+            let plan = output_install::prepare(
+                &mut *store,
+                &offer.manifest,
+                &destination,
+                &ExpectedOutputs::WhateverWasCommitted,
+            )
+            .unwrap()
+            .unwrap();
+            let selected = output_install::select_for_install(&mut *store, &plan).unwrap();
+            drop(store);
+            let prepared = output_install::stage_for_install(selected, &plan).unwrap();
+            (plan, prepared)
+        };
+        let (plan, prepared) = stage();
+        assert!(!destination.exists());
+        // Inject the filesystem obstruction AFTER real private staging. This
+        // isolates the production receipt/delivery boundary deterministically,
+        // without races, test-only callbacks, or fake materializer results.
+        std::fs::write(&destination, b"late unrelated file").unwrap();
+        let mut store = cas.store().lock().unwrap();
+        let first = live_replay_permit(&mut *store, &action, &manifest_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.seq, 0);
+        assert!(matches!(
+            finish_replay_install(&mut *store, &action, &manifest_key, true, &plan, prepared),
+            Err(ServeError::Preparation { .. })
+        ));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"late unrelated file");
+        let next = live_replay_permit(&mut *store, &action, &manifest_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.seq, 1, "a failed delivery cannot refund its receipt");
+        assert_eq!(next.subject, first.subject);
+        drop(store);
+        // Remove only this fixture's injected file; the production failure did
+        // not alter or remove it. Install the remaining allowance normally.
+        std::fs::remove_file(&destination).unwrap();
+        for _ in 1..LIVE_REPLAY_INSTALL_LIMIT {
+            let (plan, prepared) = stage();
+            assert!(matches!(
+                finish_replay_install(
+                    &mut *cas.store().lock().unwrap(),
+                    &action,
+                    &manifest_key,
+                    true,
+                    &plan,
+                    prepared,
+                )
+                .unwrap(),
+                ServeOutcome::Served { .. }
+            ));
+        }
+        let (plan, prepared) = stage();
+        let mut store = cas.store().lock().unwrap();
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            finish_replay_install(&mut *store, &action, &manifest_key, true, &plan, prepared)
+                .unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired)
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        let receipts = store
+            .query(
+                "SELECT seq, decision, reason FROM decision_receipts \
+             WHERE kind = ?1 AND subject = ?2 ORDER BY seq",
+                &[
+                    SqlValue::Text(LIVE_INSTALL_RECEIPT.into()),
+                    SqlValue::Text(first.subject),
+                ],
+            )
+            .unwrap();
+        assert_eq!(receipts.len(), LIVE_REPLAY_INSTALL_LIMIT as usize);
+        for (seq, row) in receipts.iter().enumerate() {
+            assert_eq!(
+                row,
+                &vec![
+                    SqlValue::Int(seq as i64),
+                    SqlValue::Text("install".into()),
+                    SqlValue::Text(manifest_key.clone())
+                ]
+            );
+        }
     }
 
     #[test]

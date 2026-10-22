@@ -37,6 +37,10 @@ esac
 
 LOG_FILE=${RCH_E2E_LOG:-/tmp/rch_e2e_self_test_full_$(date -u +%Y%m%dT%H%M%SZ).jsonl}
 TEST_LOG=${LOG_FILE%.jsonl}.cargo.log
+# The first per-scenario line count is a real empty transcript, not a failed
+# redirection hidden behind wc's stderr. Preserve existing appended evidence.
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$TEST_LOG")"
+: >>"$TEST_LOG"
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
 PASS=0

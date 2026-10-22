@@ -32,6 +32,20 @@ struct RuntimeEntry {
 const ALLOWED_RUNTIME_ENTRIES: &[RuntimeEntry] = &[
     RuntimeEntry {
         file: "rabs-asupersync/src/daemon_runtime.rs",
+        function: "block_on_top_level",
+        constructs: 0,
+        enters: 1,
+        reason: "shared synchronous CLI/operator adapter borrows the owned runtime and asserts Cx::current is absent before entry",
+    },
+    RuntimeEntry {
+        file: "rabs-wkr/src/main.rs",
+        function: "block_on_worker_runtime",
+        constructs: 0,
+        enters: 1,
+        reason: "worker reconnect supervisor borrows its single runtime; this adapter rejects an active Cx before driving any future",
+    },
+    RuntimeEntry {
+        file: "rabs-asupersync/src/daemon_runtime.rs",
         function: "run_daemon",
         constructs: 1,
         enters: 1,
@@ -134,7 +148,7 @@ fn call_kind(path: &syn::Path) -> Option<Kind> {
         .nth(1)
         .map(|s| s.ident.to_string());
     match last.as_str() {
-        "block_on" => Some(Kind::Enter),
+        "block_on" | "block_on_top_level" | "block_on_worker_runtime" => Some(Kind::Enter),
         "new_current_thread" | "new_multi_thread" => Some(Kind::Construct),
         "new" | "current_thread" | "multi_thread"
             if matches!(owner.as_deref(), Some("Runtime" | "RuntimeBuilder")) =>
@@ -166,7 +180,10 @@ impl Scanner {
                 continue;
             };
             let name = name.to_string();
-            if name == "block_on" {
+            if matches!(
+                name.as_str(),
+                "block_on" | "block_on_top_level" | "block_on_worker_runtime"
+            ) {
                 self.record(Kind::Enter, true);
             } else if matches!(name.as_str(), "new_current_thread" | "new_multi_thread")
                 || (matches!(name.as_str(), "Runtime" | "RuntimeBuilder")
@@ -407,6 +424,35 @@ fn reviewed_function_cannot_hide_nested_calls_or_exempt_its_neighbors() {
     let scanned = scan("fn run_daemon() { runtime.block_on(async {}); }");
     assert_eq!(scanned.sites.len(), 1);
     assert!(allowed(file, &scanned.sites[0]));
+}
+
+#[test]
+fn guarded_runtime_adapters_are_still_entries_not_static_detection_bypasses() {
+    for helper in ["block_on_top_level", "block_on_worker_runtime"] {
+        for source in [
+            format!("async fn run_daemon() {{ crate::{helper}(&runtime, work()); }}"),
+            format!(
+                "fn run_daemon() {{ let f = async {{ crate::{helper}(&runtime, work()); }}; }}"
+            ),
+            format!("fn run_daemon() {{ call!(crate::{helper}(&runtime, work())); }}"),
+            format!("fn neighbor() {{ crate::{helper}(&runtime, work()); }}"),
+        ] {
+            let found = scan(&source);
+            assert_eq!(found.sites.len(), 1, "{source}");
+            assert_eq!(found.sites[0].kind, Kind::Enter);
+            assert!(!allowed(
+                Path::new("rabs-asupersync/src/daemon_runtime.rs"),
+                &found.sites[0]
+            ));
+        }
+        let source = format!("fn run_daemon() {{ crate::{helper}(&runtime, work()); }}");
+        let found = scan(&source);
+        assert_eq!(found.sites.len(), 1);
+        assert!(allowed(
+            Path::new("rabs-asupersync/src/daemon_runtime.rs"),
+            &found.sites[0]
+        ));
+    }
 }
 
 #[test]

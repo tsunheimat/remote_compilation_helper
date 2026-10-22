@@ -3,7 +3,191 @@
 //! Handles synchronizing project files to remote workers, executing compilation
 //! commands, and retrieving build artifacts.
 
+#[cfg(test)]
+#[path = "transfer/node_prepare_tests.rs"]
+mod node_prepare_tests;
+mod retrieval_space;
+#[cfg(all(test, unix))]
+mod retrieval_space_tests;
 pub(crate) mod source_content_barrier;
+
+fn artifact_header_probe_script(
+    remote: &str,
+    cargo_target_root: Option<&str>,
+    paths: &[String],
+) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+    const MAX_HEADER_CANDIDATES: usize = 16_384;
+    const MAX_HEADER_PATH_BYTES: usize = 4_096;
+    anyhow::ensure!(
+        paths.len() <= MAX_HEADER_CANDIDATES,
+        "artifact platform preflight selected too many executable candidates"
+    );
+    anyhow::ensure!(
+        paths.iter().all(|path| {
+            !path.is_empty()
+                && path.len() <= MAX_HEADER_PATH_BYTES
+                && !path.starts_with('/')
+                && !path.chars().any(char::is_control)
+                && path
+                    .split('/')
+                    .all(|component| !matches!(component, "" | "." | ".."))
+        }),
+        "artifact platform preflight selected an unsafe path"
+    );
+    let bytes = serde_json::to_vec(&(remote, cargo_target_root, paths))?;
+    let mut payload = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(payload, "{byte:02x}")?;
+    }
+    Ok(format!(
+        r#"python3 -I - <<'RCH_ARTIFACT_HEADERS'
+import json, os, stat
+root_name, target_name, paths = json.loads(bytes.fromhex('{payload}'))
+
+def require(condition, detail):
+    if not condition:
+        raise RuntimeError(detail)
+
+def same_inode(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+def generation(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def open_root(path):
+    resolved = os.path.realpath(path)
+    descriptor = os.open(
+        resolved, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    try:
+        require(same_inode(os.fstat(descriptor), os.stat(path)),
+                'artifact probe root changed while opening')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+root = open_root(root_name)
+target = None
+result = []
+try:
+    for path in paths:
+        parts = path.split('/')
+        require(parts and all(part not in ('', '.', '..') for part in parts),
+                'artifact path is not a literal relative path')
+        opened = [os.dup(root)]
+        directory = opened[0]
+        chain = []
+        file_descriptor = None
+        target_alias = False
+        try:
+            if parts[0] == 'target' and len(parts) > 1:
+                selected = os.stat('target', dir_fd=root, follow_symlinks=False)
+                if stat.S_ISLNK(selected.st_mode):
+                    require(target_name is not None, 'target alias has no authorized root')
+                    if target is None:
+                        target = open_root(target_name)
+                    require(same_inode(
+                        os.stat('target', dir_fd=root, follow_symlinks=True),
+                        os.fstat(target)
+                    ), 'target alias has a different authorized root')
+                    directory = os.dup(target)
+                    opened.append(directory)
+                    parts = parts[1:]
+                    target_alias = True
+
+            for part in parts[:-1]:
+                next_directory = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+                opened.append(next_directory)
+                chain.append((directory, part, next_directory))
+                directory = next_directory
+
+            file_descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                | os.O_NONBLOCK | os.O_NOCTTY,
+                dir_fd=directory,
+            )
+            before = os.fstat(file_descriptor)
+            require(stat.S_ISREG(before.st_mode), 'artifact header is not a regular file')
+            wanted = min(64, before.st_size)
+            prefix = bytearray()
+            while len(prefix) < wanted:
+                chunk = os.read(file_descriptor, wanted - len(prefix))
+                require(chunk, 'artifact header was truncated while reading')
+                prefix.extend(chunk)
+
+            after = os.fstat(file_descriptor)
+            named = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+            require(
+                generation(before) == generation(after) == generation(named),
+                'artifact changed while reading its header',
+            )
+            for parent, name, child in reversed(chain):
+                require(
+                    same_inode(
+                        os.stat(name, dir_fd=parent, follow_symlinks=False),
+                        os.fstat(child),
+                    ),
+                    'artifact directory changed while reading its header',
+                )
+            if target_alias:
+                require(
+                    same_inode(
+                        os.stat('target', dir_fd=root, follow_symlinks=True),
+                        os.fstat(target),
+                    ),
+                    'target alias changed while reading its header',
+                )
+            result.append([path, list(prefix)])
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+
+    require(same_inode(os.fstat(root), os.stat(root_name)),
+            'artifact probe root changed before response')
+    if target is not None:
+        require(same_inode(os.fstat(target), os.stat(target_name)),
+                'authorized target root changed before response')
+    print(json.dumps(result, separators=(',', ':')))
+finally:
+    if target is not None:
+        os.close(target)
+    os.close(root)
+RCH_ARTIFACT_HEADERS
+"#
+    ))
+}
+
+/// Keep the production selection rules but never hash or transfer payloads.
+fn artifact_header_selection_command(planned: Command) -> Command {
+    let planned = planned.as_std();
+    let mut command = Command::new(planned.get_program());
+    command
+        .arg("--ignore-times")
+        .arg("--dry-run")
+        .args(planned.get_args().filter(|arg| *arg != "--checksum"));
+    for (key, value) in planned.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    if let Some(directory) = planned.get_current_dir() {
+        command.current_dir(directory);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+}
 
 use crate::error::TransferError;
 use anyhow::{Context, Result};
@@ -31,7 +215,7 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::Instant as TokioInstant;
 use tokio::time::sleep;
@@ -90,35 +274,7 @@ fn is_windows_drive_abs_path(path: &str) -> bool {
         && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
-pub(crate) async fn read_bounded_output_stream<R>(
-    mut reader: R,
-    max_bytes: usize,
-) -> std::io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut output = Vec::new();
-    let mut chunk = [0_u8; 16 * 1024];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(output);
-        }
-        let next_len = output.len().checked_add(read).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "command output size overflow",
-            )
-        })?;
-        if next_len > max_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("command output exceeded {max_bytes} bytes"),
-            ));
-        }
-        output.extend_from_slice(&chunk[..read]);
-    }
-}
+pub(crate) use crate::process_output::read_bounded_output_stream;
 
 async fn run_source_content_rsync_capture(
     mut cmd: Command,
@@ -230,6 +386,9 @@ struct ArtifactFilters {
 
 impl ArtifactFilters {
     fn selects(&self, path: &str) -> bool {
+        if is_internal_source_archive(Path::new(path)) {
+            return false;
+        }
         self.priority
             .iter()
             .any(|filter| filter.matches(path, false))
@@ -239,6 +398,11 @@ impl ArtifactFilters {
                 .any(|filter| filter.matches(path, false))
                 && !self.excludes.iter().any(|filter| filter.excludes(path)))
     }
+}
+
+pub(crate) fn is_internal_source_archive(path: &Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str() == ".rch-clean-overlay-base.tar")
 }
 
 fn windows_artifact_relative_path(path: &str) -> Result<&str> {
@@ -487,8 +651,8 @@ async fn run_windows_artifact_process<W: tokio::io::AsyncWrite + Unpin>(
                 written
             };
             let receive = async {
-                let mut out_buffer = [0_u8; 32 * 1024];
-                let mut err_buffer = [0_u8; 8192];
+                let mut out_buffer = vec![0_u8; 32 * 1024];
+                let mut err_buffer = vec![0_u8; 8192];
                 let mut out_open = true;
                 let mut err_open = true;
                 while out_open || err_open {
@@ -584,14 +748,23 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     // root must not wipe another build's in-flight Go cache.
     ".rch-go/",
     ".franken_whisper/tools/ffmpeg/",
+    ".rch_dep_fingerprint.json",
+    ".rch_dep_fingerprint.json.tmp",
+    ".rch_prepare_logs/",
 ];
 // Host-local language environments are neither source nor portable build
 // inputs.  They commonly contain absolute symlinks (for example
 // `.venv-*/lib64`) that rsync would otherwise copy into a foreign workspace
 // proof root.  Keep these exclusions unconditional even when a user replaces
 // the configurable default list.
-const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
-    &[".venv/", ".venv-*/", "venv/", "venv-*/", "__pycache__/"];
+const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] = &[
+    ".venv/",
+    ".venv-*/",
+    "venv/",
+    "venv-*/",
+    "__pycache__/",
+    "node_modules/",
+];
 
 /// Age floors (minutes) for worker-side runtime state reaped at transfer
 /// start (bd-wfumv). TMPDIR scratch under `.rch-tmp/` goes stale within a
@@ -626,10 +799,11 @@ fn pooled_target_prune_max_age_mins(idle_hours: u32) -> Option<u64> {
 /// scratch, orphaned per-worker Cargo caches, and superseded
 /// `.rch-target-*-pool-*` stores cannot grow without bound or feed stale
 /// manifests into later builds (bd-wfumv). All sweeps are age-bounded
-/// `-maxdepth 1` finds: anything in active use is minutes old and can never
-/// match (per-worker Cargo caches additionally refresh their own mtime on
-/// every job via `add_cargo_isolation`). Failures are swallowed — pruning is
-/// opportunistic hygiene and must never fail a transfer.
+/// `-maxdepth 1` finds; age alone is not proof that a job has stopped using a
+/// directory. Durable source-granted uploads omit this prefix entirely via
+/// `source_sync_prune_prefix`, as they also omit sibling-target pruning.
+/// Transfers without durable source grants retain these configured sweeps.
+/// Failures are swallowed — pruning is opportunistic and must never fail a transfer.
 fn worker_cache_prune_rsync_path_prefix(
     escaped_remote_path: &str,
     pooled_target_idle_hours: u32,
@@ -756,6 +930,80 @@ pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&Rem
             .as_ref()
             .and_then(find_remote_upload_disk_full)
     })
+}
+
+/// The receiver guard's first word on a refused sync (bd-fbtws).
+const LIVE_CHECKOUT_REFUSAL_MARKER: &str = "RCH_SYNC_LIVE_CHECKOUT_REFUSED: ";
+
+/// A worker's source receiver refused this upload because the destination is
+/// a declared live checkout. Only a failed source rsync's own stderr is read;
+/// a build's output never becomes a `SyncFailed`.
+pub(crate) fn sync_refused_by_live_checkout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<LiveCheckoutRefused>().is_some()
+            || matches!(
+                cause.downcast_ref::<TransferError>(),
+                Some(TransferError::SyncFailed { stderr, .. })
+                    if stderr.lines().any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
+            )
+    }) || error
+        .downcast_ref::<TransferAttemptsExhausted>()
+        .and_then(|exhausted| exhausted.cause.as_ref())
+        .is_some_and(sync_refused_by_live_checkout)
+}
+
+/// The pre-sync destination safety check refused a declared live checkout
+/// (bd-fbtws). It runs before rsync, so its refusal never becomes a
+/// `SyncFailed`. Without this type the release carried no refusal, rchd never
+/// fenced the pair, and css re-selected hz2 for one project 1,148 times in two
+/// hours (2026-10-15).
+#[derive(Debug)]
+pub(crate) struct LiveCheckoutRefused(pub(crate) String);
+
+impl std::fmt::Display for LiveCheckoutRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LiveCheckoutRefused {}
+
+/// Another owner kept this worker's source authority past the admission wait
+/// (bd-p3kuz): a lock wait timed out or an overlapping durable claim never
+/// retired. The holder is often a client that is alive but stopped (SIGSTOP by
+/// a disk guard), so it can hold the worker's source for hours while rchd,
+/// having retired its build, routes every later build of the project there.
+/// On css (2026-10-15) three such holders produced ~290 refusals in 5 hours.
+#[derive(Debug)]
+pub(crate) struct SourceAuthorityBusy(pub(crate) String);
+
+impl std::fmt::Display for SourceAuthorityBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SourceAuthorityBusy {}
+
+/// The attempt failed because another owner held this worker's source.
+pub(crate) fn source_authority_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SourceAuthorityBusy>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<SourceAuthorityBusy>().is_some())
+}
+
+/// The safety check's failure as an error, typed when its stderr carries the
+/// receiver guard's marker line (a quoted marker inside a sentence does not).
+pub(crate) fn destination_check_refusal(message: String, stderr: &str) -> anyhow::Error {
+    if stderr
+        .lines()
+        .any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
+    {
+        anyhow::Error::new(LiveCheckoutRefused(message))
+    } else {
+        anyhow::anyhow!(message)
+    }
 }
 
 /// Modern rsync's rsyserr identifies the process role and terminates with
@@ -885,6 +1133,75 @@ fn remote_path_probe_script(path: &str) -> String {
     )
 }
 
+/// A worker whose canonical source roots hold editors' checkouts (a host that
+/// is also a dispatcher) declares it with this file. Only declared hosts get
+/// the Git-checkout fence: on a pure worker a `.git` at a canonical root is
+/// rch's own repo-convergence checkout (`hook::repo_updater`), and refusing it
+/// would refuse every multi-repo closure on the fleet (bd-tali9).
+pub(crate) const LIVE_CHECKOUT_HOST_MARKER: &str = "/etc/rch/live-checkouts";
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_CHECKOUT_HOST_MARKER_FOR_TEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn live_checkout_host_marker() -> String {
+    #[cfg(test)]
+    if let Some(marker) = LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|m| m.borrow().clone()) {
+        return marker;
+    }
+    LIVE_CHECKOUT_HOST_MARKER.to_owned()
+}
+
+/// Receiver-side safety fence for dual-role Unix workers (bd-fbtws).
+/// Root and dot-component destinations are always refused. On hosts that
+/// declare [`LIVE_CHECKOUT_HOST_MARKER`], also inspect physical ancestors
+/// (including aliases), linked-worktree markers, and nested repositories
+/// before *any* upload setup or pruning. Never infer permission to replace an
+/// editor's checkout from a clean `git status`.
+pub(crate) fn live_checkout_sync_guard(path: &str) -> String {
+    format!(
+        r#"(set -eu
+rch_destination={path}
+rch_sync_refuse() {{
+    printf 'RCH_SYNC_LIVE_CHECKOUT_REFUSED: %s (%s); use an isolated source mirror\n' "$rch_destination" "$1" >&2
+    exit 73
+}}
+case "$rch_destination" in /*) ;; *) rch_sync_refuse 'destination is not absolute';; esac
+case "$rch_destination" in
+    *[!/]*) ;;
+    *) rch_sync_refuse 'destination is the filesystem root';;
+esac
+# Do not resolve dot components through a missing ancestor. Setup could create
+# that ancestor and make the same spelling enter a previously hidden checkout.
+# Reject instead of lexical normalization, which changes symlink semantics.
+case "$rch_destination/" in
+    */./*|*/../*) rch_sync_refuse 'destination contains dot components';;
+esac
+[ -e {marker} ] || exit 0
+rch_ancestor=$rch_destination
+while [ ! -e "$rch_ancestor" ] && [ ! -L "$rch_ancestor" ]; do
+    rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
+done
+rch_ancestor=$(CDPATH='' cd -P "$rch_ancestor" && pwd -P) || rch_sync_refuse 'unresolvable destination'
+while :; do
+    if [ -e "$rch_ancestor/.git" ] || [ -L "$rch_ancestor/.git" ]; then
+        rch_sync_refuse "Git checkout at $rch_ancestor"
+    fi
+    [ "$rch_ancestor" = / ] && break
+    rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
+done
+if [ -d "$rch_destination" ]; then
+    rch_nested=$(find -H "$rch_destination" -name .git -print -quit) || rch_sync_refuse 'cannot inspect destination'
+    [ -z "$rch_nested" ] || rch_sync_refuse "nested Git checkout at $rch_nested"
+fi
+)"#,
+        path = escape(Cow::from(path)),
+        marker = escape(Cow::from(live_checkout_host_marker()))
+    )
+}
+
 /// Removes every file the durable supervisor writes beside `path`; the claim
 /// is an empty `mkdir` directory. Succeeds when nothing is left.
 fn recovery_completion_cleanup_script(path: &str) -> String {
@@ -906,6 +1223,8 @@ fn recovery_completion_cleanup_script(path: &str) -> String {
 pub(crate) struct CargoArtifactEvidence {
     pub(crate) stdout: Vec<u8>,
     pub(crate) remote_root: PathBuf,
+    /// Present only when the caller explicitly requests Cargo JSON paths.
+    pub(crate) remote_project_root: Option<PathBuf>,
 }
 
 /// A completed reader proved that this attempt cannot supply valid output
@@ -919,13 +1238,40 @@ const MAX_CARGO_ARTIFACT_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CARGO_ARTIFACT_ROOT_BYTES: usize = 4096;
 const CARGO_ARTIFACT_EVIDENCE_REJECTION: &str = "RCH_CARGO_ARTIFACT_EVIDENCE_REJECTED";
 
+#[derive(Clone, Copy)]
+enum CargoOutputLog {
+    Stdout,
+    Stderr,
+}
+
+impl CargoOutputLog {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 fn cargo_artifact_evidence_script(
     path: &str,
     identity: &str,
     remote_output_root: &str,
+    remote_project_root: Option<&str>,
     max_bytes: usize,
+    expected_exit: i32,
+    log: CargoOutputLog,
 ) -> String {
     let quote = |value: &str| escape(Cow::from(value)).into_owned();
+    // Ordinary detached recovery does not reconstruct a source pipeline.
+    // Do not add a source-path requirement to its existing receipt contract.
+    let project_resolution = match remote_project_root {
+        Some(project) => format!(
+            "project=$(CDPATH= cd -- {} && pwd -P) || reject 'Cargo source root is unavailable';",
+            quote(project)
+        ),
+        None => "project='';".to_owned(),
+    };
     // The identity receipt is immutable after completion. Check it before and
     // after copying the log, and frame the exact byte count so neither a lost
     // connection nor a changing log can turn a prefix into output authority.
@@ -939,14 +1285,15 @@ fn cargo_artifact_evidence_script(
          size=$(wc -c < {out}); size=$((size + 0)); \
          {{ [ \"$size\" -ge 0 ] && [ \"$size\" -le {max_bytes} ]; }} || reject 'Cargo output log exceeds size limit'; \
          root=$(CDPATH= cd -- {root} && pwd -P) || reject 'Cargo output root is unavailable'; \
-         printf '%s %s\\n%s\\n' {identity} \"$size\" \"$root\"; \
+         {project_resolution} \
+         printf '%s %s\\n%s\\n%s\\n' {identity} \"$size\" \"$root\" \"$project\"; \
          cat -- {out}; \
          [ \"$(wc -c < {out})\" -eq \"$size\" ] || reject 'Cargo output log changed during collection'; \
          {{ [ -f {done} ] && [ ! -L {done} ] && [ -f {out} ] && [ ! -L {out} ]; }} || reject 'receipt or log changed during collection'; \
          [ \"$(cat -- {done})\" = \"$expected\" ] || reject 'completion changed during collection'",
         done = quote(path),
-        out = quote(&format!("{path}.stdout")),
-        expected = quote(&format!("{identity} 0")),
+        out = quote(&format!("{path}.{}", log.suffix())),
+        expected = quote(&format!("{identity} {expected_exit}")),
         identity = quote(identity),
         root = quote(remote_output_root),
         rejection = quote(CARGO_ARTIFACT_EVIDENCE_REJECTION),
@@ -993,12 +1340,43 @@ fn parse_cargo_artifact_evidence(
     anyhow::ensure!(
         remote_root.is_absolute()
             && !root.chars().any(char::is_control)
+            && !root
+                .split('/')
+                .any(|component| matches!(component, "." | ".."))
             && remote_root.components().all(|component| {
                 matches!(component, Component::RootDir | Component::Normal(_))
             }),
         "Cargo artifact evidence has an invalid canonical output root"
     );
-    let body_start = root_start + root_length + 1;
+    let project_start = root_start + root_length + 1;
+    let project_length = bytes[project_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("Cargo artifact evidence has no complete source root")?;
+    anyhow::ensure!(
+        project_length <= MAX_CARGO_ARTIFACT_ROOT_BYTES,
+        "Cargo artifact evidence source root exceeds its size limit"
+    );
+    let project = std::str::from_utf8(&bytes[project_start..project_start + project_length])?;
+    let remote_project_root = if project.is_empty() {
+        None
+    } else {
+        let root = PathBuf::from(project);
+        anyhow::ensure!(
+            root.is_absolute()
+                && root.parent().is_some()
+                && !project.chars().any(char::is_control)
+                && !project
+                    .split('/')
+                    .any(|component| matches!(component, "." | ".."))
+                && root.components().all(|component| {
+                    matches!(component, Component::RootDir | Component::Normal(_))
+                }),
+            "Cargo artifact evidence has an invalid canonical source root"
+        );
+        Some(root)
+    };
+    let body_start = project_start + project_length + 1;
     anyhow::ensure!(
         bytes.len() - body_start == length,
         "Cargo artifact evidence log is incomplete or changed during collection"
@@ -1006,6 +1384,7 @@ fn parse_cargo_artifact_evidence(
     Ok(CargoArtifactEvidence {
         stdout: bytes[body_start..].to_vec(),
         remote_root,
+        remote_project_root,
     })
 }
 
@@ -1024,7 +1403,7 @@ async fn collect_cargo_artifact_evidence(
         "invalid Cargo artifact evidence identity"
     );
     let framed_limit = max_bytes
-        .checked_add(MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
+        .checked_add(2 * MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
         .context("Cargo artifact evidence size limit overflow")?;
     command
         .stdin(Stdio::null())
@@ -1145,7 +1524,9 @@ pub(crate) fn parse_remote_timeout_kill_output(stdout: &str) -> Option<RemoteTim
         match line.trim() {
             "RCH_E104_KILL=verified_dead" => return Some(RemoteTimeoutCleanup::Verified),
             // A missing record cannot exclude a delayed, still-starting job.
-            "RCH_E104_KILL=no_pgid_file" => return Some(RemoteTimeoutCleanup::Unverified),
+            "RCH_E104_KILL=no_pgid_file" | "RCH_E104_KILL=record_absent" => {
+                return Some(RemoteTimeoutCleanup::Unverified);
+            }
             "RCH_E104_KILL=still_alive" => return Some(RemoteTimeoutCleanup::Unverified),
             _ => {}
         }
@@ -1236,7 +1617,9 @@ fn project_declares_cargo_build_jobs(project_root: &Path) -> bool {
         })
 }
 
-const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
+/// Shared with the worker-wide sweep, which collects it as a pooled dir.
+const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str =
+    rch_common::stale_target_reap::DEFAULT_TARGET_NAME;
 
 /// Environment variables whose values we ALWAYS rewrite to a managed,
 /// worker-scoped path under the synchronized remote project root — regardless of
@@ -1276,6 +1659,80 @@ const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     (".core.*", ".core.[0-9]*"),
     (".git/objects/", ".git/"),
 ];
+
+/// Build-output directory excludes that rch applies by basename at any depth.
+/// They exist to skip generated trees, never tracked inputs.
+const BUILD_OUTPUT_DIR_EXCLUDES: &[&str] = &["build/", "dist/", "coverage/"];
+/// `target/` is Cargo's own output; only a Cargo package of that name is an input.
+const CARGO_TARGET_DIR_EXCLUDE: &str = "target/";
+
+/// Root-anchored, directory-only includes for tracked inputs that a default
+/// build-output exclude would cut off.
+/// - #113: the default `build/` dropped a workspace member at `crates/build`,
+///   and dependency preflight then failed with RCH-E410 on every worker.
+/// - bd-xmgez: `coverage/` dropped asupersync's tracked
+///   `formal/lean/coverage/*.json`, read by `include_str!`.
+///
+/// A `build/`, `dist/` or `coverage/` directory holding any tracked file is
+/// part of the source (a fresh clone has it). Generated output is untracked,
+/// so it stays excluded. A `target/` directory is readmitted only as a Cargo
+/// package (a tracked `Cargo.toml` directly inside). A directory include keeps
+/// every other rule in force for the files inside (secret patterns, nested
+/// `target/`). User-chosen excludes keep their exact meaning. Without git,
+/// nothing changes.
+fn tracked_input_dir_includes(project_root: &Path, effective_excludes: &[String]) -> Vec<String> {
+    let names: Vec<&str> = effective_excludes
+        .iter()
+        .filter(|pattern| BUILD_OUTPUT_DIR_EXCLUDES.contains(&pattern.as_str()))
+        .filter_map(|pattern| pattern.strip_suffix('/'))
+        .collect();
+    let target_name = effective_excludes
+        .iter()
+        .any(|pattern| pattern == CARGO_TARGET_DIR_EXCLUDE)
+        .then_some("target");
+    if names.is_empty() && target_name.is_none() {
+        return Vec::new();
+    }
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["ls-files", "-z"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut includes = std::collections::BTreeSet::new();
+    for path in output.stdout.split(|byte| *byte == 0) {
+        let Ok(path) = std::str::from_utf8(path) else {
+            continue;
+        };
+        let Some((dir, file)) = path.rsplit_once('/') else {
+            continue;
+        };
+        // An rsync pattern treats these as wildcards; never widen a match.
+        if dir.contains(['*', '?', '[', '\\']) {
+            continue;
+        }
+        let components: Vec<&str> = dir.split('/').collect();
+        let mut prefix = String::new();
+        for (index, component) in components.iter().enumerate() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            let cargo_package = file == "Cargo.toml" && index + 1 == components.len();
+            if names.contains(component) || (cargo_package && target_name == Some(*component)) {
+                includes.insert(format!("/{prefix}/"));
+            }
+        }
+    }
+    includes.into_iter().collect()
+}
 
 fn normalize_config_exclude_pattern(pattern: &str) -> &str {
     CONFIG_EXCLUDE_REWRITES
@@ -2128,6 +2585,9 @@ pub struct TransferPipeline {
     sync_delete: bool,
     /// Whether uploads must compare file contents instead of size and mtime.
     sync_checksum: bool,
+    /// The caller holds the source pair and proved a fresh materialization.
+    /// Source preparation must not prune or delete any retained data.
+    owned_source_materialization: bool,
     /// Build ID for tracking and cancellation.
     build_id: Option<u64>,
     /// Remote worker OS family. Selects transport (rsync vs tar) and path
@@ -2260,6 +2720,7 @@ impl TransferPipeline {
             sync_include_patterns: None,
             sync_delete: true,
             sync_checksum: false,
+            owned_source_materialization: false,
             build_id: None,
             worker_platform: WorkerPlatform::Posix,
             pooled_target_prune_idle_hours:
@@ -2321,8 +2782,8 @@ impl TransferPipeline {
             let mut stderr = child.stderr.take().context("retrieval stderr missing")?;
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let mut out_buffer = [0_u8; 8192];
-            let mut err_buffer = [0_u8; 8192];
+            let mut out_buffer = vec![0_u8; 8192];
+            let mut err_buffer = vec![0_u8; 8192];
             let mut out_open = true;
             let mut err_open = true;
             let collected = async {
@@ -2410,12 +2871,40 @@ impl TransferPipeline {
         }
     }
 
+    /// A durable source grant is not permission for opportunistic cache
+    /// reclamation. Keep all transfer-start sweeps out of its activity; source
+    /// synchronization and the explicit retirement protocol remain separate.
+    fn source_sync_prune_prefix(&self, escaped_remote_path: &str) -> String {
+        if self.source_authority_prefix.is_some() || self.owned_source_materialization {
+            return String::new();
+        }
+        worker_cache_prune_rsync_path_prefix(
+            escaped_remote_path,
+            self.pooled_target_prune_idle_hours,
+            self.escaped_pooled_target_override_parent().as_deref(),
+        )
+    }
+
     /// rsync appends its server argv to this shell fragment. Forward those
     /// arguments inside the lease, after any destination setup has completed.
     fn source_rsync_path(&self, command: String) -> String {
+        // Source leases serialize RCH jobs, not editors on dual-role workers.
+        // Fence the receiver before even cache pruning or mkdir can run. A
+        // clean worktree is protected too: a status-based check would race an
+        // editor and would still delete new, untracked files (bd-fbtws).
+        let command = if self.worker_platform.is_windows() {
+            command
+        } else {
+            format!(
+                "{} || exit 73; {command}",
+                live_checkout_sync_guard(&self.remote_path())
+            )
+        };
         self.source_rsync_path_at(command, &self.remote_path())
     }
 
+    // Activity fencing also wraps read-only retrieval. Keep the upload safety
+    // check out of that path: a test result may legitimately contain .git.
     fn source_rsync_path_at(&self, command: String, remote_path: &str) -> String {
         let command = self
             .resolved_rsync()
@@ -2557,20 +3046,45 @@ impl TransferPipeline {
         // Once the workload has finished, followers that make no progress
         // for `stall_secs` are killed. Any live reader drains 1 MiB well
         // within that window.
+        // TERM can arrive after the pipeline forks but before h=$! binds its
+        // final writer. Remember cancellation instead of exiting in that gap;
+        // once bound, stop and reap that writer even when wait was interrupted.
+        // Cancellation is final for this disposable copy helper. Use KILL so
+        // an inherited/transitioning TERM disposition cannot leave it blocked
+        // on an unread transport. This does not signal the workload group.
+        // Suppress only wait's own helper-termination diagnostic: writing it
+        // into the same stalled channel would deadlock cleanup all over again.
+        // Only follower helpers are signalled. Live workload descendants keep
+        // their inherited activity lock and continue to fence recovery.
+        //
+        // Wait for the supervisor we spawned, not for the receipt it intends
+        // to publish (bd-t5c8p). A killed supervisor or failed receipt write
+        // cannot create that file later. Polling for it kept this shell and
+        // both followers alive forever, so recovery could never acquire the
+        // activity lock to prove the execution lost. Reap the followers on
+        // that failure too; surviving workload descendants still inherit the
+        // lock and continue to fence recovery until they actually exit. Keep
+        // the failure diagnostic in the saved log: even a short write to an
+        // abandoned SSH channel can block before the EXIT cleanup runs.
+        // Exit 255 keeps the caller's source ownership unconfirmed; an
+        // ordinary compiler failure would incorrectly authorize release.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
              p=$!; \
-             rch_follow() {{ h=; trap '[ -z \"$h\" ] || kill \"$h\" 2>/dev/null; exit 1' TERM; \
-               o=0; while :; do if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
+             rch_follow() {{ h=; cancelled=; trap 'cancelled=1; [ -z \"$h\" ] || kill -KILL \"$h\" 2>/dev/null || :' TERM; \
+               o=0; while :; do [ -z \"$cancelled\" ] || return 1; if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
                if [ \"$s\" -gt \"$o\" ]; then n=$((s - o)); [ \"$n\" -le 1048576 ] || n=1048576; \
-               tail -c +$((o + 1)) -- \"$1\" | head -c \"$n\" & h=$!; wait \"$h\" || :; h=; \
+               tail -c +$((o + 1)) -- \"$1\" | head -c \"$n\" & h=$!; \
+               if [ -n \"$cancelled\" ]; then kill -KILL \"$h\" 2>/dev/null || :; fi; \
+               wait \"$h\" 2>/dev/null || :; \
+               if [ -n \"$cancelled\" ]; then trap '' TERM; wait \"$h\" 2>/dev/null || :; return 1; fi; h=; \
                o=$((o + n)); echo \"$o\" > \"$2\"; continue; fi; \
                [ -n \"$d\" ] && {{ echo done > \"$2\"; return 0; }}; sleep 0.2 2>/dev/null || sleep 1; done; }}; \
              rch_follow {out} {out_progress} & a=$!; rch_follow {err} {err_progress} >&2 & b=$!; \
-             trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
-             while [ ! -f {done} ]; do sleep 1; done; \
+             trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
+             [ -f {done} ] && [ ! -L {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt; execution outcome remains unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -2641,6 +3155,64 @@ impl TransferPipeline {
         worker: &WorkerConfig,
         remote_output_root: &str,
     ) -> Result<CargoArtifactEvidence> {
+        self.read_cargo_evidence(worker, remote_output_root, 0, None, CargoOutputLog::Stdout)
+            .await
+    }
+
+    /// Read this invocation's exact stdout even on a compiler failure. The
+    /// caller supplies the already-confirmed completion status; accepting a
+    /// different status would turn another attempt's log into Cargo output.
+    pub(crate) async fn read_cargo_stdout_evidence(
+        &self,
+        worker: &WorkerConfig,
+        remote_output_root: &str,
+        expected_exit: i32,
+    ) -> Result<CargoArtifactEvidence> {
+        let project = self.remote_path();
+        self.read_cargo_evidence(
+            worker,
+            remote_output_root,
+            expected_exit,
+            Some(&project),
+            CargoOutputLog::Stdout,
+        )
+        .await
+    }
+
+    /// Collect complete diagnostic bytes from the same immutable completion.
+    /// Failed Cargo may never create a target tree, so resolve its executed
+    /// source root. The shared frame carries this log on transport stdout;
+    /// these bytes are returned only as diagnostics, never Cargo artifact JSON.
+    pub(crate) async fn read_cargo_stderr_evidence(
+        &self,
+        worker: &WorkerConfig,
+        expected_exit: i32,
+    ) -> Result<Vec<u8>> {
+        let project = self.remote_path();
+        let evidence = self
+            .read_cargo_evidence(
+                worker,
+                &project,
+                expected_exit,
+                Some(&project),
+                CargoOutputLog::Stderr,
+            )
+            .await?;
+        Ok(evidence.stdout)
+    }
+
+    async fn read_cargo_evidence(
+        &self,
+        worker: &WorkerConfig,
+        remote_output_root: &str,
+        expected_exit: i32,
+        remote_project_root: Option<&str>,
+        log: CargoOutputLog,
+    ) -> Result<CargoArtifactEvidence> {
+        anyhow::ensure!(
+            (0..=255).contains(&expected_exit),
+            "invalid expected Cargo completion status"
+        );
         let (path, identity) = self
             .recovery_completion
             .as_ref()
@@ -2658,7 +3230,10 @@ impl TransferPipeline {
             path,
             identity,
             remote_output_root,
+            remote_project_root,
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            expected_exit,
+            log,
         );
         let command =
             self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))]);
@@ -2857,13 +3432,22 @@ impl TransferPipeline {
 
     /// Control whether sync-to-remote deletes extraneous remote files.
     pub fn with_sync_delete(mut self, delete: bool) -> Self {
-        self.sync_delete = delete;
+        self.sync_delete = delete && !self.owned_source_materialization;
         self
     }
 
     /// Force content checks for sync-to-remote uploads.
     pub fn with_sync_checksum(mut self, checksum: bool) -> Self {
-        self.sync_checksum = checksum;
+        self.sync_checksum = checksum || self.owned_source_materialization;
+        self
+    }
+
+    /// Select retained fresh-source uploads after source-pair acquisition.
+    /// The caller must prove the container absent before materialization.
+    pub(crate) fn with_owned_source_materialization(mut self) -> Self {
+        self.owned_source_materialization = true;
+        self.sync_delete = false;
+        self.sync_checksum = true;
         self
     }
 
@@ -2960,24 +3544,48 @@ impl TransferPipeline {
         worker: &WorkerConfig,
         remote_path: &str,
         patterns: &[String],
-    ) -> RetryConfig {
-        let fallback = self.effective_rsync_retry_config();
-        // An explicit operator ceiling remains the whole retrieval budget:
-        // do not spend an additional planning window before starting it.
-        if self
-            .transfer_config
-            .max_transfer_time_ms
-            .is_some_and(|ms| ms > 0)
-        {
-            return fallback;
+    ) -> Result<RetryConfig> {
+        // Both artifact builders use the same flavour-specific integrity
+        // policy. Only checksummed staging can earn allocation reuse credit.
+        self.retrieval_retry_config_inner(
+            || self.build_retrieve_command(worker, remote_path, patterns),
+            Self::artifact_integrity_arg(self.resolved_rsync().flavor) == "--checksum",
+        )
+        .await
+    }
+
+    async fn retrieval_retry_config(&self, command: impl Fn() -> Command) -> Result<RetryConfig> {
+        self.retrieval_retry_config_inner(command, false).await
+    }
+
+    /// Openrsync does not universally implement --checksum. Never fall back
+    /// to metadata equality: force a refresh and budget the complete set.
+    fn artifact_integrity_arg(flavor: RsyncFlavor) -> &'static str {
+        match flavor {
+            RsyncFlavor::Rsync { .. } => "--checksum",
+            RsyncFlavor::OpenRsync { .. } | RsyncFlavor::Unknown => "--ignore-times",
         }
+    }
+
+    async fn retrieval_retry_config_inner(
+        &self,
+        command: impl Fn() -> Command,
+        checksummed: bool,
+    ) -> Result<RetryConfig> {
+        let fallback = self.effective_rsync_retry_config();
         let estimate = self
             .execute_retrieval_rsync(
                 &fallback,
                 "estimate_artifact_retrieval",
                 || {
-                    let mut cmd = self.build_retrieve_command(worker, remote_path, patterns);
-                    cmd.arg("--dry-run");
+                    let mut cmd = command();
+                    // The builders leave stdio to each execution site. Unpiped,
+                    // the controlled path failed "retrieval stdout missing" and
+                    // the plain path printed the dry run into the hook's stdout,
+                    // so no estimate was ever parsed.
+                    cmd.arg("--dry-run")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
                     cmd
                 },
                 |_| {},
@@ -2988,13 +3596,25 @@ impl TransferPipeline {
                 if let Some(bytes) =
                     parse_rsync_selected_size(&String::from_utf8_lossy(&output.stdout))
                 {
+                    // Only credit checksum-verified existing staging, never
+                    // the caller's unowned output tree or ambiguous stats.
+                    // Network/delta bytes are NOT replacement allocation.
+                    let plan = if checksummed
+                        && self.project_root != self.retrieval_reference_root
+                        && output.stderr.is_empty()
+                    {
+                        retrieval_space::RsyncStoragePlan::parse(&output.stdout)
+                    } else {
+                        None
+                    };
+                    self.check_retrieval_space_for_plan(bytes, plan)?;
                     let retry = self.artifact_retry_config_for_size(bytes);
                     info!(
                         selected_bytes = bytes,
                         total_timeout_ms = retry.total_timeout_ms,
                         "Artifact retrieval budget from selected remote files"
                     );
-                    return retry;
+                    return Ok(retry);
                 }
                 warn!("Artifact size estimate missing; retaining configured retrieval budget");
             }
@@ -3006,7 +3626,74 @@ impl TransferPipeline {
                 "Artifact size estimate failed: {error}; retaining configured retrieval budget"
             ),
         }
-        fallback
+        // Durable staging must fail closed if its selected size cannot be
+        // established. Ordinary non-staged transfers retain the old fallback.
+        anyhow::ensure!(
+            self.project_root == self.retrieval_reference_root,
+            "cannot establish artifact size for durable retrieval staging; outputs and ownership retained"
+        );
+        Ok(fallback)
+    }
+
+    fn check_retrieval_space(&self, selected_bytes: u64) -> Result<()> {
+        // Windows archive spooling and other full-copy consumers cannot
+        // reuse rsync staging; retain their complete allocation requirement.
+        self.check_retrieval_space_for_plan(selected_bytes, None)
+    }
+
+    fn check_retrieval_space_for_plan(
+        &self,
+        selected_bytes: u64,
+        plan: Option<retrieval_space::RsyncStoragePlan>,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(&self.project_root)?;
+            let stats = rustix::fs::statvfs(&self.project_root)?;
+            let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+            let required = retrieval_space::required_bytes(
+                selected_bytes,
+                plan,
+                stats.f_frsize,
+                self.transfer_config.retrieval_min_free_bytes,
+            )
+            .context("retrieval staging size overflow")?;
+            anyhow::ensure!(
+                available >= required,
+                "insufficient controller retrieval storage at {}: need {} bytes, available {}; outputs and ownership retained",
+                self.project_root.display(),
+                required,
+                available
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = (selected_bytes, plan);
+        Ok(())
+    }
+
+    fn windows_retrieval_archive(
+        &self,
+        selected_bytes: u64,
+        files: u32,
+    ) -> Result<(tempfile::NamedTempFile, u64)> {
+        let bound = selected_bytes
+            .checked_add(u64::from(files).saturating_mul(8192))
+            .and_then(|bytes| bytes.checked_add(1024 * 1024))
+            .context("artifact archive size overflow")?;
+        // The archive and extracted outputs coexist until validation finishes.
+        // Stage both on the configured filesystem rather than spooling through
+        // an unrelated, possibly full TMPDIR/controller root filesystem.
+        std::fs::create_dir_all(&self.project_root)?;
+        self.check_retrieval_space(
+            selected_bytes
+                .checked_add(bound)
+                .context("artifact staging size overflow")?,
+        )?;
+        let archive = tempfile::Builder::new()
+            .prefix("rch-windows-artifacts-")
+            .suffix(".tar.gz")
+            .tempfile_in(&self.project_root)?;
+        Ok((archive, bound))
     }
 
     fn source_sync_attempt_timeout(&self, effective_excludes: &[String]) -> std::time::Duration {
@@ -3287,6 +3974,16 @@ impl TransferPipeline {
                 continue;
             }
 
+            // This is captured from the WORKER before managed TMPDIR and cd.
+            // Forwarding it would overwrite that authoritative physical base
+            // inside the workload shell and turn a durable cache into scratch.
+            // Profile validation already reserves it; raw allowlists must too.
+            if key == rch_common::RCH_CARGO_HOME_BASE_VAR {
+                info!("Rejecting env var '{}': worker-owned Cargo cache base", key);
+                rejected.push(key.to_owned());
+                continue;
+            }
+
             // Profile defaults do not implicitly forward the controller's environment.
             let forwarded = self
                 .env_allowlist
@@ -3531,12 +4228,23 @@ impl TransferPipeline {
 
     fn append_sync_filter_args(&self, cmd: &mut Command, effective_excludes: &[String]) {
         if let Some(include_patterns) = &self.sync_include_patterns {
+            for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS
+                .iter()
+                .chain(SOURCE_EPHEMERAL_EXCLUDE_PATTERNS)
+            {
+                cmd.arg("--exclude").arg(pattern);
+            }
             cmd.arg("--prune-empty-dirs");
             for pattern in include_patterns {
                 cmd.arg("--include").arg(pattern);
             }
             cmd.arg("--exclude").arg("*");
         } else {
+            // rsync is first-match-wins: carve Cargo packages out of the
+            // build-output excludes before any exclude is emitted (#113).
+            for pattern in tracked_input_dir_includes(&self.project_root, effective_excludes) {
+                cmd.arg("--include").arg(pattern);
+            }
             for pattern in effective_excludes {
                 cmd.arg("--exclude").arg(pattern);
             }
@@ -3638,6 +4346,7 @@ impl TransferPipeline {
         &self,
         worker: &WorkerConfig,
         effective_excludes: &[String],
+        owned_managed_timestamps: Option<bool>,
     ) -> Command {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
@@ -3648,6 +4357,11 @@ impl TransferPipeline {
         );
 
         let (mut cmd, capabilities) = self.rsync_command();
+        let receiver = if owned_managed_timestamps.is_some() {
+            self.source_rsync_path("rsync".to_owned())
+        } else {
+            self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path))
+        };
         cmd.arg("-azn")
             .arg("--checksum")
             .arg("--itemize-changes")
@@ -3656,10 +4370,13 @@ impl TransferPipeline {
             .arg("-e")
             .arg(ssh_command)
             .arg("--rsync-path")
-            .arg(self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path)));
+            .arg(receiver);
         add_portable_rsync_archive_args(&mut cmd);
-        if self.sync_delete {
+        if self.sync_delete || owned_managed_timestamps.is_some() {
             cmd.arg("--delete");
+        }
+        if owned_managed_timestamps == Some(true) {
+            cmd.arg("--no-times");
         }
         self.append_sync_filter_args(&mut cmd, effective_excludes);
         cmd.arg(format!("{}/", self.project_root.display()))
@@ -3680,11 +4397,40 @@ impl TransferPipeline {
             anyhow::bail!("source-content receipts require the rsync transport");
         }
         let effective_excludes = self.get_effective_excludes();
-        let cmd = self.build_source_content_rsync_barrier_command(worker, &effective_excludes);
+        let cmd =
+            self.build_source_content_rsync_barrier_command(worker, &effective_excludes, None);
 
         let output = run_source_content_rsync_capture(
             cmd,
             "source-content rsync no-delta barrier",
+            self.source_sync_attempt_timeout(&effective_excludes),
+        )
+        .await?;
+        source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
+    }
+
+    /// Verify a freshly owned source tree without creating receiver paths.
+    /// Surplus selected entries always refuse, even when uploads retain all
+    /// existing files. Only an explicit completed freshness ledger may ignore
+    /// mtime deltas; type, content, permissions and namespace stay strict.
+    pub(crate) async fn verify_owned_source_content_rsync_barrier(
+        &self,
+        worker: &WorkerConfig,
+        managed_timestamps: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "owned source-content verification requires the Unix source grant"
+        );
+        let effective_excludes = self.get_effective_excludes();
+        let cmd = self.build_source_content_rsync_barrier_command(
+            worker,
+            &effective_excludes,
+            Some(managed_timestamps),
+        );
+        let output = run_source_content_rsync_capture(
+            cmd,
+            "owned source-content rsync no-delta barrier",
             self.source_sync_attempt_timeout(&effective_excludes),
         )
         .await?;
@@ -3851,22 +4597,9 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
-        let managed_execution =
-            self.execution_storage.enabled() || !self.remote_environment.is_empty();
-        // Dependency preparation needs the same cache/proxy/tmp environment and
-        // deadline as the workload. Keep it inside the tracked process group.
-        let toolchain_command = if managed_execution {
-            format!(
-                "sh -c {}",
-                escape(Cow::Owned(format!(
-                    "{}{}",
-                    self.node_modules_bootstrap(),
-                    toolchain_command
-                )))
-            )
-        } else {
-            toolchain_command
-        };
+        // Dependency preparation belongs inside the workload's environment,
+        // timeout and process group, including managed cache and scratch policy.
+        let toolchain_command = self.wrap_with_dependency_preparation(toolchain_command);
 
         let env_plan = self.build_remote_env_plan(&remote_path);
         if !env_plan.env_prefix.applied.is_empty() {
@@ -3875,11 +4608,17 @@ impl TransferPipeline {
         if !env_plan.env_prefix.rejected.is_empty() {
             warn!("Skipping env vars: {:?}", env_plan.env_prefix.rejected);
         }
-        let env_command = if env_plan.env_prefix.prefix.is_empty() {
-            toolchain_command
-        } else {
-            format!("{}{}", env_plan.env_prefix.prefix, toolchain_command)
-        };
+        // Apply the environment before the workload shell parses expansions,
+        // redirections, pipelines or compound commands. Prefixing raw source
+        // with NAME=value affects only its first simple command and expands
+        // "$NAME" against the wrong shell environment. An explicit shell also
+        // keeps builtins and authored assignments valid under color/timeout's
+        // env(1) wrappers. Authored assignments inside the workload still win.
+        let env_command = format!(
+            "{}sh -c {}",
+            env_plan.env_prefix.prefix,
+            escape(Cow::Owned(toolchain_command)),
+        );
 
         // Apply color mode environment variables
         let colored_command = wrap_command_with_color(&env_command, self.color_mode);
@@ -4053,16 +4792,11 @@ setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
         };
 
         let execution = format!(
-            "export LC_ALL=C; {}{}touch {} && cd {} && {}{}{}{{ {}; }}",
+            "export LC_ALL=C; {}{}touch {} && cd {} && {}{}{{ {}; }}",
             cargo_home_base,
             build_jobs_fragment,
             escaped_remote_path,
             escaped_remote_path,
-            if managed_execution {
-                ""
-            } else {
-                self.node_modules_bootstrap()
-            },
             ensure_dirs_command,
             private_path_preflight,
             execution_command
@@ -4105,40 +4839,17 @@ setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
         remote_build_jobs_fragment(policy, LINUX_MEMINFO_PATH)
     }
 
-    /// Provision `node_modules` on the worker for TypeScript kinds.
-    ///
-    /// The project sync deliberately EXCLUDES `node_modules/` (see
-    /// `default_excludes`), and that exclusion is correct: node_modules holds
-    /// platform-native binaries, so rsyncing a macOS tree onto a Linux worker
-    /// would ship unusable `.node` files. rch-wkr has a `prepare()` hook that
-    /// installs dependencies — but the hook's build path executes the command
-    /// over plain SSH and never invokes `rch-wkr execute`, so on this path
-    /// nothing provisions them.
-    ///
-    /// Without this, `tsc --noEmit` on a worker finds no project-local
-    /// TypeScript, and `npx` silently downloads the unrelated `tsc` stub package
-    /// from the registry — which prints "This is not the tsc command you are
-    /// looking for" and exits 1, turning a passing local typecheck into a failing
-    /// remote build.
-    ///
-    /// Install only when `node_modules` is absent. The worker's project directory
-    /// persists between builds, so this is a one-time cost per project. `npm ci`
-    /// is preferred (lockfile-exact, so the worker typechecks with the SAME
-    /// TypeScript version as local); `npm install` is the fallback for projects
-    /// with no lockfile. Installer output is routed to stderr so it can never
-    /// pollute the command's stdout.
-    ///
-    /// Deliberately scoped to `Tsc` only: Bun kinds keep their existing behavior.
-    fn node_modules_bootstrap(&self) -> &'static str {
-        match self.compilation_kind {
-            Some(CompilationKind::Tsc) => {
-                "if [ -f package.json ] && [ ! -d node_modules ]; then \
-                 (npm ci --no-audit --no-fund --loglevel=error || \
-                  npm install --no-audit --no-fund --loglevel=error) 1>&2 || exit 1; \
-                 fi && "
-            }
-            _ => "",
-        }
+    /// Prepare TypeScript and Bun dependencies through the worker's fingerprint
+    /// and transaction checks, including when `node_modules` already exists.
+    fn wrap_with_dependency_preparation(&self, command: String) -> String {
+        let runtime = match self.compilation_kind {
+            Some(CompilationKind::Tsc) => "node",
+            Some(CompilationKind::BunTest | CompilationKind::BunTypecheck) => "bun",
+            _ => return command,
+        };
+        let script = escape(Cow::Borrowed(include_str!("transfer/node_prepare.sh")));
+        let command = escape(Cow::from(command.as_str()));
+        format!("sh -c {script} rch-prepare {runtime} sh -c {command}")
     }
 
     /// Wrap a command with an external timeout to prevent zombie/stuck processes.
@@ -4485,15 +5196,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Create remote directory implicitly using rsync-path wrapper
         // This saves a separate SSH handshake for 'mkdir -p'. The same remote
-        // shell invocation also reaps stale worker-side runtime state
-        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        // shell invocation includes pruning only without a durable
+        // source grant (bd-wfumv); ownership-bound transfers omit all sweeps.
         cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(
-                escaped_remote_path,
-                self.pooled_target_prune_idle_hours,
-                self.escaped_pooled_target_override_parent().as_deref()
-            ),
+            self.source_sync_prune_prefix(escaped_remote_path),
             escaped_remote_path
         )));
 
@@ -4550,15 +5257,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
 
         // Create remote directory implicitly using rsync-path wrapper; the
-        // same remote shell invocation reaps stale worker-side runtime state
-        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        // same remote shell invocation includes pruning only without a
+        // durable source grant (bd-wfumv); ownership-bound transfers omit it.
         cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(
-                escaped_remote_path,
-                self.pooled_target_prune_idle_hours,
-                self.escaped_pooled_target_override_parent().as_deref()
-            ),
+            self.source_sync_prune_prefix(escaped_remote_path),
             escaped_remote_path
         )));
 
@@ -4697,7 +5400,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
         let extraction_script = format!(
-            "umask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            "{guard} || exit 73\numask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            guard = live_checkout_sync_guard(&remote_path),
             path = escaped_remote_path,
             archive = escaped_remote_archive
         );
@@ -4735,7 +5439,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .arg(ssh_command)
                             .arg("--rsync-path")
                             .arg(self.source_rsync_path_at(
-                                format!("mkdir -p {escaped_remote_path} && rsync"),
+                                format!(
+                                    "{} || exit 73; mkdir -p {escaped_remote_path} && rsync",
+                                    live_checkout_sync_guard(&remote_root)
+                                ),
                                 &remote_archive_path,
                             ))
                             .arg(archive_path)
@@ -4830,12 +5537,29 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().context("spawn ssh sh -s")?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            drop(stdin);
-        }
-        let out = child.wait_with_output().await.context("ssh sh -s wait")?;
+        let stdin = child.stdin.take();
+
+        // The remote shell may emit diagnostics before consuming the complete
+        // script. Poll upload and wait_with_output together so neither SSH
+        // direction can fill its pipe while the other side is not being
+        // serviced. worker_ssh_command sets kill_on_drop, so an upload failure
+        // cancels the collection future and closes the local channel.
+        let upload = async move {
+            if let Some(mut stdin) = stdin {
+                stdin
+                    .write_all(script.as_bytes())
+                    .await
+                    .context("write remote sh script")?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("finalize remote sh script")?;
+                drop(stdin);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let collect = async move { child.wait_with_output().await.context("ssh sh -s wait") };
+        let (_, out) = tokio::try_join!(upload, collect)?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
                 "remote sh script failed (exit {:?}): {}",
@@ -5107,18 +5831,13 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 .fold(0_u64, |total, size| total.saturating_add(*size));
             let retry = self.artifact_retry_config_for_size(selected_size);
             let deadline = started + Duration::from_millis(retry.total_timeout_ms);
-            let archive = tempfile::Builder::new()
-                .prefix("rch-windows-artifacts-")
-                .suffix(".tar.gz")
-                .tempfile()?;
+            let (archive, archive_bound) = self.windows_retrieval_archive(selected_size, count)?;
             let mut output = tokio::fs::File::from_std(archive.reopen()?);
             bytes = run_windows_artifact_process(
                 self.worker_ssh_command(worker, &["sh", "-s"]),
                 &windows_artifact_archive_script(remote_path, &selected),
                 &mut output,
-                selected_size
-                    .saturating_add(u64::from(count).saturating_mul(8192))
-                    .saturating_add(1024 * 1024),
+                archive_bound,
                 deadline,
                 cancel.clone(),
                 on_line,
@@ -5556,17 +6275,32 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let mut child = cmd
                 .spawn()
                 .map_err(|e| format!("failed to spawn kill ssh: {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(script.as_bytes())
+            let stdin = child.stdin.take();
+
+            // Recovery must not inherit the build transport's historical
+            // upload-before-drain deadlock. Poll script upload and output
+            // collection together inside REMOTE_TIMEOUT_KILL_BUDGET so a
+            // diagnostic-producing remote shell cannot fill stdout/stderr
+            // while this side is still blocked writing the cancellation script.
+            let upload = async move {
+                if let Some(mut stdin) = stdin {
+                    stdin
+                        .write_all(script.as_bytes())
+                        .await
+                        .map_err(|e| format!("failed to write kill script: {e}"))?;
+                    drop(stdin);
+                }
+                Ok::<(), String>(())
+            };
+            let collect = async move {
+                child
+                    .wait_with_output()
                     .await
-                    .map_err(|e| format!("failed to write kill script: {e}"))?;
-                drop(stdin);
-            }
-            let output = child
-                .wait_with_output()
-                .await
-                .map_err(|e| format!("failed to await kill ssh: {e}"))?;
+                    .map_err(|e| format!("failed to await kill ssh: {e}"))
+            };
+            let (upload, output) = tokio::join!(upload, collect);
+            upload?;
+            let output = output?;
             if !output.status.success() {
                 return Err(format!(
                     "kill channel exited with {}: {}",
@@ -5650,75 +6384,44 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let start = std::time::Instant::now();
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            // Feed the script, then close stdin so `sh -s` begins execution.
-            stdin
-                .write_all(remote_script.as_bytes())
-                .await
-                .context("Failed to write remote script to ssh stdin")?;
-            stdin
-                .write_all(b"\n")
-                .await
-                .context("Failed to finalize remote script")?;
-            drop(stdin);
-        }
-
+        // Take every pipe before uploading the script. SSH and the remote shell
+        // can produce diagnostics while stdin is still being consumed; draining
+        // stdout/stderr only after write_all() lets those pipes fill and deadlock
+        // the upload outside the command timeout.
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
-        enum StreamEvent {
-            Stdout(String),
-            Stderr(String),
-        }
-
-        // Spawn stdout reader
+        // This API is a text preview, not the durable binary transcript. Read
+        // bytes before rendering: read_line(String) used to discard a non-UTF-8
+        // line and silently stop draining the rest of that SSH output stream.
+        // JoinSet owns both readers on every return/cancellation path; a read
+        // error or panic is a transport failure, never a successful early EOF.
+        let mut readers = tokio::task::JoinSet::new();
         if let Some(out) = stdout {
             let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(out);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stdout(line.clone())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+            readers.spawn(async move {
+                pump_ssh_preview(out, tx, StreamOrigin::Stdout)
+                    .await
+                    .context("SSH stdout preview failed")
             });
         }
-
-        // Spawn stderr reader
         if let Some(err) = stderr {
             let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(err);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if tx.send(StreamEvent::Stderr(line.clone())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+            readers.spawn(async move {
+                pump_ssh_preview(err, tx, StreamOrigin::Stderr)
+                    .await
+                    .context("SSH stderr preview failed")
             });
         }
 
@@ -5743,8 +6446,33 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let mut drain_deadline: Option<tokio::time::Instant> = None;
         let mut drain_cap: Option<tokio::time::Instant> = None;
 
+        // Readers above are already running when this future starts, so script
+        // upload and remote output progress concurrently. Keep upload under the
+        // same absolute command budget as execution: a blocked ssh stdin is a
+        // transport failure, not an unbounded pre-execution phase.
+        let upload = async move {
+            if let Some(mut stdin) = stdin {
+                stdin
+                    .write_all(remote_script.as_bytes())
+                    .await
+                    .context("Failed to write remote script to ssh stdin")?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("Failed to finalize remote script")?;
+                drop(stdin);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
         let status = match tokio::time::timeout(command_timeout, async {
+            let mut upload = Box::pin(upload);
+            let mut uploaded = false;
+            let mut streams_open = true;
             loop {
+                if uploaded && !streams_open {
+                    break;
+                }
                 let drain_expired = async move {
                     match drain_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -5752,8 +6480,23 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     }
                 };
                 let event = tokio::select! {
-                    event = rx.recv() => match event { Some(event) => event, None => break },
-                    _ = completion_tick.tick(), if self.recovery_completion.is_some() && durable_status.is_none() => {
+                    result = upload.as_mut(), if !uploaded => {
+                        result?;
+                        uploaded = true;
+                        continue;
+                    }
+                    event = rx.recv(), if streams_open => match event {
+                        Some(event) => event,
+                        None => {
+                            streams_open = false;
+                            continue;
+                        }
+                    },
+                    Some(reader) = readers.join_next(), if !readers.is_empty() => {
+                        reader.context("SSH preview reader panicked")??;
+                        continue;
+                    }
+                    _ = completion_tick.tick(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
                         if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
                             durable_status = Some(status);
                             let now = tokio::time::Instant::now();
@@ -5763,15 +6506,18 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                         continue;
                     }
                     () = drain_expired => {
-                        let _ = child.kill().await;
-                        break;
+                        // A durable exit code is not proof that this channel
+                        // delivered its tail. Use the existing unconfirmed-
+                        // transport path; never join backpressured readers or
+                        // authorize a replay after cutting their output short.
+                        anyhow::bail!("SSH output did not reach EOF after durable completion");
                     }
                 };
                 if let Some(cap) = drain_cap {
                     drain_deadline = Some((tokio::time::Instant::now() + COMPLETION_DRAIN_IDLE).min(cap));
                 }
                 match event {
-                    StreamEvent::Stdout(line) => {
+                    (line, StreamOrigin::Stdout) => {
                         on_stdout(&line);
                         if stdout_acc.len() < MAX_OUTPUT_SIZE {
                             stdout_acc.push_str(&line);
@@ -5780,7 +6526,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             }
                         }
                     }
-                    StreamEvent::Stderr(line) => {
+                    (line, StreamOrigin::Stderr) => {
                         on_stderr(&line);
                         if stderr_acc.len() < MAX_OUTPUT_SIZE {
                             stderr_acc.push_str(&line);
@@ -5792,11 +6538,27 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }
             }
 
+            while let Some(reader) = readers.join_next().await {
+                reader.context("SSH preview reader panicked")??;
+            }
             child.wait().await.context("Failed to wait for ssh command")
         })
         .await
         {
-            Ok(status) => status?,
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                // Some script bytes may already have reached sh -s and started
+                // work. Stop the local channel, then use the same identity-bound
+                // remote cleanup as timeout handling. Never convert an upload or
+                // stream failure into permission to replay elsewhere.
+                let _ = child.kill().await;
+                let (cleanup, detail) = self.kill_remote_process_group_after_timeout(worker).await;
+                return Err(error
+                    .context(format!(
+                        "SSH execution transport failed; remote cleanup: {cleanup} ({detail})"
+                    ))
+                    .context(RemoteExecutionUnconfirmed));
+            }
             Err(_) => {
                 // Best-effort: kill local ssh process first so the channel is closed.
                 let _ = child.kill().await;
@@ -5937,7 +6699,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // `.f` lines; without it an up-to-date no-op rebuild would look
         // indistinguishable from a zero-output miss. On openrsync / rsync 2.6.9
         // the `-vv` spelling is used instead (issue #66).
-        cmd.arg("-az");
+        // A retained partial or stale output may have the right size and
+        // timestamp. Both the planner and actual pull must compare bytes
+        // before reusing it; metadata equality is not completed delivery.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
             .arg("--timeout=30")
@@ -5947,6 +6713,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("-e")
             .arg(ssh_command);
         self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/"));
+
+        // Internal immutable source input is never an output, even for old
+        // recovery recipes or priority includes. Match the reserved basename
+        // at every depth before any include rule can select it.
+        cmd.arg("--exclude").arg(".rch-clean-overlay-base.tar");
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -6033,7 +6804,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
-        cmd.arg("-az");
+        // Match the integrity policy of the non-streaming planner/collector.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         // Flavour-specific spellings of progress / stats / per-file listing
         // (issue #66); see RsyncCapabilities for the mapping.
@@ -6048,6 +6821,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("-e")
             .arg(ssh_command);
         self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/"));
+        cmd.arg("--exclude").arg(".rch-clean-overlay-base.tar");
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -6181,6 +6955,76 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// Uses retry logic with exponential backoff for transient network errors.
     /// Returns the transfer [`SyncResult`] plus the per-file manifest the
     /// zero-build-output detector consumes (bd-mpbav); see [`ArtifactRetrieval`].
+    /// Select without downloading, then read at most 64 bytes from each of a
+    /// selected candidate files. Uses the same rsync filters and source
+    /// activity fence as collection, including custom target roots.
+    pub(crate) async fn artifact_header_probe(
+        &self,
+        worker: &WorkerConfig,
+        patterns: &[String],
+        candidate: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        if use_mock_transport(worker) || self.worker_platform.is_windows() {
+            return Ok(Vec::new());
+        }
+        let remote = self.remote_path();
+        let retry = self.effective_rsync_retry_config();
+        let selected = self
+            .execute_retrieval_rsync(
+                &retry,
+                "artifact_platform_preflight",
+                || {
+                    let planned = self.build_retrieve_command(worker, &remote, patterns);
+                    // Collection needs checksums; selection needs names only.
+                    // Do not hash tens of GB merely to inspect 64-byte headers.
+                    artifact_header_selection_command(planned)
+                },
+                |_| {},
+            )
+            .await?;
+        anyhow::ensure!(
+            selected.status.success(),
+            "artifact platform selection failed: {}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+        let paths: Vec<String> =
+            parse_rsync_itemized_regular_files(&String::from_utf8_lossy(&selected.stdout))
+                .into_iter()
+                .filter(|path| candidate(path))
+                .collect();
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Paths travel as JSON data, never shell arguments. Refuse symlinks and
+        // escapes; probing must not grant authority to read outside the output
+        // root. A missing/unreadable candidate is not evidence of compatibility.
+        let cargo_target_root = self.remote_cargo_target_dir();
+        let script = artifact_header_probe_script(&remote, Some(&cargo_target_root), &paths)?;
+        let mut command = self.worker_ssh_command(worker, &["sh", "-s"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("artifact header probe stdin missing")?;
+        let output = tokio::time::timeout(Duration::from_secs(30), async {
+            stdin.write_all(script.as_bytes()).await?;
+            drop(stdin);
+            child.wait_with_output().await
+        })
+        .await
+        .context("artifact header probe timed out")??;
+        anyhow::ensure!(
+            output.status.success(),
+            "artifact header probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).context("invalid artifact header evidence")
+    }
+
     pub async fn retrieve_artifacts(
         &self,
         worker: &WorkerConfig,
@@ -6226,7 +7070,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Execute rsync with retry logic for transient errors
         let retry_config = self
             .artifact_retry_config(worker, &remote_path, artifact_patterns)
-            .await;
+            .await?;
         let output = self
             .execute_retrieval_rsync(
                 &retry_config,
@@ -6316,10 +7160,15 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Same transport hardening as artifact retrieval: --safe-links blocks
         // symlink traversal out of the declared tree.
-        cmd.arg("-az");
+        // A retained report with matching size and mtime is not proof of its
+        // contents. Use the same integrity policy as artifact collection,
+        // including the forced-refresh fallback for non-upstream rsync.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
             .arg("--safe-links")
+            .arg("--exclude=.rch-clean-overlay-base.tar")
             .arg("-e")
             .arg(ssh_command);
 
@@ -6341,6 +7190,319 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd
+    }
+
+    /// Refresh a completely materialized owned closure once, including any
+    /// workspace-metadata ancestors of full package roots. Source, target and
+    /// control directory must all be in the same durable source grant.
+    pub(crate) async fn refresh_owned_source_closure(
+        &self,
+        worker: &WorkerConfig,
+        identity: &str,
+        source_container: &str,
+        control_dir: &str,
+        attempt: &str,
+    ) -> Result<()> {
+        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows()
+                && self.source_authority_prefix.as_deref() == Some(active.as_str()),
+            "owned source freshness requires this attempt's active Linux source grant"
+        );
+        let command = self.owned_source_freshness_command(
+            identity,
+            source_container,
+            control_dir,
+            attempt,
+            false,
+        )?;
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            self.run_remote_sh(worker, &command),
+        )
+        .await
+        .context("timed out proving owned source-closure freshness")?
+    }
+
+    /// Qualify this attempt's ledger only after the post-execution source
+    /// proof succeeds. Recovery without that proof must leave it unqualified.
+    pub(crate) async fn mark_owned_source_closure_verified(
+        &self,
+        worker: &WorkerConfig,
+        identity: &str,
+        source_container: &str,
+        control_dir: &str,
+        attempt: &str,
+    ) -> Result<()> {
+        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows()
+                && self.source_authority_prefix.as_deref() == Some(active.as_str()),
+            "owned source verification requires this attempt's active Linux source grant"
+        );
+        let script = self.owned_source_freshness_command(
+            identity,
+            source_container,
+            control_dir,
+            attempt,
+            true,
+        )?;
+        let quoted = escape(Cow::from(script));
+        let mut command = self.worker_ssh_command(worker, &["sh", "-c", &quoted]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_source_content_rsync_capture(
+            command,
+            "owned source freshness qualification",
+            Duration::from_secs(120),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success()
+                && output.stderr.is_empty()
+                && output.stdout == b"RCH_SOURCE_FRESHNESS_VERIFIED\n",
+            "owned source freshness qualification failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+        Ok(())
+    }
+
+    fn owned_source_freshness_command(
+        &self,
+        identity: &str,
+        source_container: &str,
+        control_dir: &str,
+        attempt: &str,
+        mark_verified: bool,
+    ) -> Result<String> {
+        anyhow::ensure!(
+            identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid owned source freshness identity"
+        );
+        anyhow::ensure!(
+            attempt.len() == 32
+                && attempt
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid owned source freshness attempt"
+        );
+        anyhow::ensure!(
+            self.remote_path() == source_container
+                && control_dir == format!("{source_container}.freshness"),
+            "owned source freshness requires the entire source container and its exact control sibling"
+        );
+        let program = if mark_verified {
+            Self::owned_source_refresh_preparation_script().to_owned()
+        } else {
+            format!(
+                "{}\n{}",
+                Self::owned_source_refresh_preparation_script(),
+                Self::clean_overlay_freshness_ledger_script()
+            )
+        };
+        Ok(format!(
+            "python3 -I -c {} {} {} {} {} {} {}",
+            escape(Cow::from(program)),
+            escape(Cow::from(source_container)),
+            escape(Cow::from(self.remote_cargo_target_dir())),
+            escape(Cow::from(format!("{control_dir}/epoch-v1"))),
+            escape(Cow::from(identity)),
+            escape(Cow::from(attempt)),
+            if mark_verified { "verify" } else { "refresh" },
+        ))
+    }
+
+    fn owned_source_refresh_preparation_script() -> &'static str {
+        r#"import hashlib, json, os, stat, sys
+
+def rch_owned_require(condition, reason):
+    if not condition:
+        raise RuntimeError('RCH: owned source freshness refused: ' + reason)
+
+rch_owned_require(sys.platform == 'linux', 'Linux worker required')
+rch_owned_require(len(sys.argv) == 7, 'invalid freshness arguments')
+rch_root, rch_pool, rch_epoch, rch_identity, rch_attempt, rch_operation = sys.argv[1:]
+rch_control = os.path.dirname(rch_epoch)
+def rch_literal(path):
+    return (path.startswith('/') and not path.endswith('/') and '\\' not in path
+            and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
+            and all(part not in ('', '.', '..') for part in path[1:].split('/')))
+rch_owned_require(all(rch_literal(path) for path in (rch_root, rch_pool, rch_control)),
+                  'nonliteral source, target or control path')
+rch_owned_require(rch_control == rch_root + '.freshness'
+                  and os.path.basename(rch_epoch) == 'epoch-v1',
+                  'control directory is outside its exact authority')
+rch_owned_require(rch_pool != rch_root and not rch_pool.startswith(rch_root + '/')
+                  and rch_pool != rch_control and not rch_pool.startswith(rch_control + '/'),
+                  'stable target must be outside source and control trees')
+rch_owned_require(len(rch_identity) == 64
+                  and all(ch in '0123456789abcdefABCDEF' for ch in rch_identity),
+                  'invalid freshness identity')
+rch_owned_require(len(rch_attempt) == 32
+                  and all(ch in '0123456789abcdef' for ch in rch_attempt),
+                  'invalid freshness attempt')
+rch_owned_require(rch_operation in ('refresh', 'verify'), 'invalid freshness operation')
+rch_owned_previous_qualified = False
+rch_intent = {'schema': 'rch.source_freshness_attempt.v1', 'source_root': rch_root,
+              'target_root': rch_pool, 'content_identity': rch_identity, 'attempt': rch_attempt}
+def rch_encoded(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
+
+def rch_sha256(value):
+    return hashlib.sha256(value).hexdigest()
+
+rch_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+rch_parent = os.open('/', rch_flags)
+try:
+    for rch_part in os.path.dirname(rch_root).split('/')[1:]:
+        if rch_part:
+            rch_child = os.open(rch_part, rch_flags, dir_fd=rch_parent)
+            os.close(rch_parent)
+            rch_parent = rch_child
+    rch_source_fd = os.open(os.path.basename(rch_root), rch_flags, dir_fd=rch_parent)
+    try:
+        rch_owned_require(os.fstat(rch_source_fd).st_uid == os.geteuid(),
+                          'source container has a foreign owner')
+    finally:
+        os.close(rch_source_fd)
+    if rch_operation == 'refresh':
+        try:
+            os.mkdir(os.path.basename(rch_control), mode=0o700, dir_fd=rch_parent)
+        except FileExistsError:
+            pass
+    rch_control_fd = os.open(os.path.basename(rch_control), rch_flags, dir_fd=rch_parent)
+    try:
+        rch_info = os.fstat(rch_control_fd)
+        rch_owned_require(rch_info.st_uid == os.geteuid()
+                          and stat.S_IMODE(rch_info.st_mode) & 0o077 == 0,
+                          'control directory must be private and owned by this worker user')
+        os.fsync(rch_control_fd)
+        os.fsync(rch_parent)
+
+        def rch_read_control(name, cap):
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                     dir_fd=rch_control_fd)
+            except FileNotFoundError:
+                return None
+            with os.fdopen(descriptor, 'rb') as stream:
+                before = os.fstat(stream.fileno())
+                rch_owned_require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid(),
+                                  'freshness control must be a regular owned file')
+                if before.st_size > cap:
+                    return None
+                data = stream.read(cap + 1)
+                after = os.fstat(stream.fileno())
+                rch_owned_require((before.st_dev, before.st_ino, before.st_size,
+                                   before.st_mtime_ns, before.st_ctime_ns)
+                                  == (after.st_dev, after.st_ino, after.st_size,
+                                      after.st_mtime_ns, after.st_ctime_ns)
+                                  and len(data) == before.st_size,
+                                  'freshness control changed while reading')
+                return data, before
+
+        def rch_decode_intent(encoded):
+            if encoded is None:
+                return None
+            try:
+                value = json.loads(encoded[0])
+                if (set(value) == set(rch_intent) and rch_encoded(value) == encoded[0]
+                    and value['schema'] == rch_intent['schema']
+                    and value['source_root'] == rch_root and value['target_root'] == rch_pool
+                    and isinstance(value['attempt'], str) and len(value['attempt']) == 32
+                    and all(ch in '0123456789abcdef' for ch in value['attempt'])
+                    and isinstance(value['content_identity'], str)
+                    and len(value['content_identity']) == 64
+                    and all(ch in '0123456789abcdefABCDEF' for ch in value['content_identity'])):
+                    return value
+            except (ValueError, TypeError, KeyError, UnicodeError):
+                pass
+            return None
+
+        def rch_qualification(intent):
+            if intent is None:
+                return None
+            epoch = rch_read_control('epoch-v1', 65)
+            ledger = rch_read_control('epoch-v1.files-v2', 64 * 1024**2)
+            if epoch is None or ledger is None:
+                return None
+            try:
+                document = json.loads(ledger[0])
+                payload = document['payload']
+                if (epoch[0] == (intent['content_identity'] + '\n').encode('ascii')
+                    and payload['identity'] == intent['content_identity']
+                    and payload['schema'] == 2 and payload['epoch_ns'] == epoch[1].st_mtime_ns
+                    and document['sha256'] == rch_sha256(rch_encoded(payload))):
+                    return rch_encoded({'schema': 'rch.source_freshness_verified.v1',
+                                        'intent': intent, 'epoch_sha256': rch_sha256(epoch[0]),
+                                        'ledger_sha256': rch_sha256(ledger[0]),
+                                        'epoch_mtime_ns': epoch[1].st_mtime_ns})
+            except (ValueError, TypeError, KeyError, UnicodeError):
+                pass
+            return None
+
+        def rch_stage_control(prefix, data):
+            name = prefix + '.pending.' + os.urandom(16).hex()
+            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=rch_control_fd)
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return name
+
+        current = rch_read_control('current-attempt-v1', 64 * 1024)
+        if rch_operation == 'refresh':
+            previous = rch_decode_intent(current)
+            expected = rch_qualification(previous)
+            if expected is not None and previous['attempt'] != rch_attempt:
+                proof = rch_read_control('verified-' + previous['attempt'] + '.json', 64 * 1024)
+                rch_owned_previous_qualified = proof is not None and proof[0] == expected
+            # Publish this unqualified attempt before the shared ledger changes
+            # source timestamps. A crash or failed post-proof cannot authorize
+            # the next invocation to reuse the previous successful attempt.
+            pending = rch_stage_control('current-attempt-v1', rch_encoded(rch_intent))
+            os.replace(pending, 'current-attempt-v1',
+                       src_dir_fd=rch_control_fd, dst_dir_fd=rch_control_fd)
+            os.fsync(rch_control_fd)
+        else:
+            rch_owned_require(current is not None and current[0] == rch_encoded(rch_intent),
+                              'verified attempt does not match the current preparation')
+            expected = rch_qualification(rch_intent)
+            rch_owned_require(expected is not None, 'verified attempt has no matching ledger and epoch')
+            name = 'verified-' + rch_attempt + '.json'
+            existing = rch_read_control(name, 64 * 1024)
+            if existing is None:
+                pending = rch_stage_control(name, expected)
+                try:
+                    # A hard link publishes the fully durable record without
+                    # replacing any existing entry. Keep its staging link too.
+                    os.link(pending, name, src_dir_fd=rch_control_fd,
+                            dst_dir_fd=rch_control_fd, follow_symlinks=False)
+                except FileExistsError:
+                    pass
+                existing = rch_read_control(name, 64 * 1024)
+            rch_owned_require(existing is not None and existing[0] == expected,
+                              'verified attempt conflicts with retained evidence')
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=rch_control_fd)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(rch_control_fd)
+            print('RCH_SOURCE_FRESHNESS_VERIFIED')
+            sys.exit(0)
+    finally:
+        os.close(rch_control_fd)
+finally:
+    os.close(rch_parent)
+# Keep the existing ledger's argument contract unchanged. Its optional gate
+# defaults to true for clean-overlay callers, which do not run this prelude.
+sys.argv = sys.argv[:5]
+"#
     }
 
     /// Apply a content epoch while the source-pair lease is held, after complete
@@ -6496,7 +7658,8 @@ def parent_fd(relative):
 epoch_info = regular_control(epoch)
 ledger_info = regular_control(ledger)
 previous = {}
-if epoch_info and ledger_info and ledger_info.st_size <= MAX_LEDGER:
+if (globals().get('rch_owned_previous_qualified', True)
+    and epoch_info and ledger_info and ledger_info.st_size <= MAX_LEDGER):
     try:
         with os.fdopen(os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
             encoded = stream.read(MAX_LEDGER + 1)
@@ -6641,6 +7804,255 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
 "#
     }
 
+    /// Read-only admission probe for retained source pairs. It checks the
+    /// actual Linux no-replace syscall through libc, never a guessed syscall
+    /// number or a replacing/copying fallback. The eventual filesystem rename
+    /// can still refuse; that leaves the durable source grant outstanding.
+    pub(crate) fn remote_tree_retention_capability_command() -> String {
+        format!(
+            "python3 -I -c {} probe",
+            escape(Cow::from(Self::remote_tree_retention_program()))
+        )
+    }
+
+    /// Move this invocation's owned source into its exact retained sibling.
+    ///
+    /// Both paths must already be in the durable activity grant. True means
+    /// the retained directory and its identity marker are durable and the old
+    /// source is absent. False is possible only for cancelled preparation that
+    /// was explicitly allowed to have created neither path.
+    pub(crate) async fn retain_remote_tree(
+        &self,
+        worker: &WorkerConfig,
+        root: &str,
+        retained_root: &str,
+        identity: &str,
+        allow_absent_before_materialization: bool,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "retained source retirement requires an active Linux source grant"
+        );
+        let active = crate::hook::source_authority_activity_prefix(identity)?;
+        let cleanup = crate::hook::source_authority_cleanup_prefix(identity)?;
+        anyhow::ensure!(
+            self.source_authority_prefix.as_deref() == Some(active.as_str())
+                || self.source_authority_prefix.as_deref() == Some(cleanup.as_str()),
+            "retained source identity does not match this pipeline's source grant"
+        );
+        let script = Self::remote_tree_retention_command(
+            root,
+            retained_root,
+            identity,
+            allow_absent_before_materialization,
+        )?;
+        let quoted = escape(Cow::from(script));
+        let mut command = self.worker_ssh_command(worker, &["sh", "-c", &quoted]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_source_content_rsync_capture(
+            command,
+            "owned source retention",
+            Duration::from_secs(120),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "remote source retention failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+        match output.stdout.as_slice() {
+            b"RCH_SOURCE_RETAINED\n" => Ok(true),
+            b"RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION\n"
+                if allow_absent_before_materialization =>
+            {
+                Ok(false)
+            }
+            _ => anyhow::bail!("remote source retention returned an invalid completion envelope"),
+        }
+    }
+
+    fn remote_tree_retention_command(
+        root: &str,
+        retained_root: &str,
+        identity: &str,
+        allow_absent_before_materialization: bool,
+    ) -> Result<String> {
+        let valid_path = |path: &str| {
+            path.starts_with('/')
+                && !path.ends_with('/')
+                && !path.chars().any(char::is_control)
+                && !path.contains('\\')
+                && path[1..]
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+        };
+        anyhow::ensure!(
+            valid_path(root)
+                && valid_path(retained_root)
+                && root != retained_root
+                && Path::new(root).parent() == Path::new(retained_root).parent(),
+            "retained source paths must be distinct absolute literal siblings"
+        );
+        anyhow::ensure!(
+            identity.len() == 32
+                && identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "retained source identity must be 32 lowercase hexadecimal characters"
+        );
+        Ok(format!(
+            "python3 -I -c {} retain {} {} {} {}",
+            escape(Cow::from(Self::remote_tree_retention_program())),
+            escape(Cow::from(root)),
+            escape(Cow::from(retained_root)),
+            escape(Cow::from(identity)),
+            u8::from(allow_absent_before_materialization),
+        ))
+    }
+
+    fn remote_tree_retention_program() -> &'static str {
+        r#"import ctypes
+import errno
+import hashlib
+import json
+import os
+import stat
+import sys
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+def run():
+    require(sys.platform == "linux", "Linux source retention required")
+    require(all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")),
+            "directory descriptor support unavailable")
+    require(all(function in os.supports_dir_fd for function in
+                (os.open, os.stat, os.symlink, os.readlink)),
+            "relative directory operations unavailable")
+    library = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(library, "renameat2", None)
+    require(rename is not None, "libc renameat2 unavailable")
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                       ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    # Linux renameat2(2), RENAME_NOREPLACE = 1. Empty names cannot mutate a
+    # path; ENOENT distinguishes an available syscall from ENOSYS/EPERM.
+    require(rename(-1, b"", -1, b"", 1) == -1 and ctypes.get_errno() == errno.ENOENT,
+            "Linux no-replace rename syscall unavailable")
+    if sys.argv[1:] == ["probe"]:
+        print("RCH_SOURCE_RETENTION_CAPABLE")
+        return
+    require(len(sys.argv) == 6 and sys.argv[1] == "retain", "invalid retention arguments")
+    root, retained, identity, allow_absent = sys.argv[2:]
+    def literal(path):
+        return (path.startswith("/") and not path.endswith("/") and "\\" not in path
+                and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
+                and all(part not in ("", ".", "..") for part in path[1:].split("/")))
+    require(literal(root) and literal(retained) and root != retained
+            and os.path.dirname(root) == os.path.dirname(retained), "invalid retained siblings")
+    require(len(identity) == 32 and all(ch in "0123456789abcdef" for ch in identity),
+            "invalid source identity")
+    require(allow_absent in ("0", "1"), "invalid absence policy")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent = os.open("/", flags)
+    try:
+        for component in os.path.dirname(root).split("/")[1:]:
+            if component:
+                try:
+                    descendant = os.open(component, flags, dir_fd=parent)
+                except FileNotFoundError:
+                    require(allow_absent == "1", "materialized source parent is missing")
+                    print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
+                    return
+                os.close(parent)
+                parent = descendant
+        source_name = os.path.basename(root)
+        retained_name = os.path.basename(retained)
+        marker_name = ".rch-retention-v1"
+        preimage = json.dumps(["rch.source_retention.v1", identity, root, retained],
+                             ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        marker_value = "rch-retention-v1:" + identity + ":" + hashlib.sha256(preimage).hexdigest()
+        def metadata(name):
+            try:
+                return os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+        def directory(name):
+            descriptor = os.open(name, flags, dir_fd=parent)
+            require(os.fstat(descriptor).st_uid == os.geteuid(), "source directory has a foreign owner")
+            return descriptor
+        def marker(descriptor, create):
+            if create:
+                try:
+                    # symlink creation is atomic and never replaces an entry.
+                    # Its target is metadata only; it is never followed.
+                    os.symlink(marker_value, marker_name, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            entry = os.stat(marker_name, dir_fd=descriptor, follow_symlinks=False)
+            require(stat.S_ISLNK(entry.st_mode) and entry.st_uid == os.geteuid()
+                    and os.readlink(marker_name, dir_fd=descriptor) == marker_value,
+                    "source retention marker does not bind this identity and both paths")
+            os.fsync(descriptor)
+        source = metadata(source_name)
+        destination = metadata(retained_name)
+        if source is None:
+            if destination is None:
+                require(allow_absent == "1", "materialized source and retained snapshot are both missing")
+                print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
+                return
+            descriptor = directory(retained_name)
+            try:
+                marker(descriptor, False)
+                os.fsync(parent)
+                require(metadata(source_name) is None, "source appeared during retention reconciliation")
+                current = metadata(retained_name)
+                held = os.fstat(descriptor)
+                require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
+                        "retained source changed during reconciliation")
+            finally:
+                os.close(descriptor)
+            print("RCH_SOURCE_RETAINED")
+            return
+        require(stat.S_ISDIR(source.st_mode), "source root is not a real directory")
+        require(destination is None, "retained destination already exists while source is present")
+        descriptor = directory(source_name)
+        try:
+            held = os.fstat(descriptor)
+            require((source.st_dev, source.st_ino) == (held.st_dev, held.st_ino),
+                    "source changed before retention")
+            marker(descriptor, True)
+            current = metadata(source_name)
+            require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
+                    "source changed before no-replace rename")
+            if rename(parent, os.fsencode(source_name), parent, os.fsencode(retained_name), 1) != 0:
+                code = ctypes.get_errno()
+                raise OSError(code, "source no-replace rename refused: " + os.strerror(code))
+            os.fsync(parent)
+            current = metadata(retained_name)
+            require(metadata(source_name) is None and current is not None
+                    and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
+                    "source retention did not preserve the exact directory")
+            marker(descriptor, False)
+        finally:
+            os.close(descriptor)
+        print("RCH_SOURCE_RETAINED")
+    finally:
+        os.close(parent)
+
+try:
+    run()
+except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+    sys.stderr.write("RCH_SOURCE_RETENTION_REFUSED: " + str(error) + "\n")
+    raise SystemExit(74)
+"#
+    }
+
     /// Best-effort removal of an isolated remote tree (bd-p1vlb).
     ///
     /// Unpooled clean-overlay roots are per-run. A pooled source path may be
@@ -6695,7 +8107,17 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
 
     fn remote_tree_retirement_command(root: &str) -> String {
         let root = escape(Cow::from(root));
-        format!("if [ -e {root} ] || [ -L {root} ]; then rm -rf -- {root}; fi")
+        // Go leaves its module cache read-only (0555 directories), so a
+        // non-root worker user cannot unlink inside it and `rm -rf` fails.
+        // Every retry failed the same way and the lease never settled (hz3,
+        // lumera_ai .rch-go, 2026-10-15). On failure, give the owner write
+        // permission on the tree's real directories only (find never follows
+        // a symlink, and a symlinked root is never traversed), then retry.
+        format!(
+            "if [ -e {root} ] || [ -L {root} ]; then rm -rf -- {root} 2>/dev/null || \
+             {{ [ -L {root} ] || find {root} -type d ! -perm -u=w -exec chmod u+w -- {{}} +; \
+             rm -rf -- {root}; }}; fi"
+        )
     }
 
     /// Retrieve one declared job result directory (bd-p0yoo).
@@ -6759,7 +8181,11 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
         }
 
         let start = std::time::Instant::now();
-        let retry_config = self.effective_rsync_retry_config();
+        let retry_config = self
+            .retrieval_retry_config(|| {
+                self.build_result_dir_retrieve_command(worker, &remote_path, rel)
+            })
+            .await?;
         let output = self
             .execute_retrieval_rsync(
                 &retry_config,
@@ -6881,7 +8307,7 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
         let retrieval_start = std::time::Instant::now();
         let retry_config = self
             .artifact_retry_config(worker, &remote_path, artifact_patterns)
-            .await;
+            .await?;
         let output = if self.retrieval_control.is_some() {
             let output = self
                 .execute_retrieval_rsync(
@@ -7441,6 +8867,69 @@ enum StreamOrigin {
     Stderr,
 }
 
+/// Text-only SSH preview, preserving delimiters, NULs and subsequent output
+/// after invalid UTF-8. Exact binary output belongs to retained logs/artifacts.
+/// Bound a newline-free fragment independently of the accumulated preview cap.
+async fn pump_ssh_preview<R>(
+    stream: R,
+    tx: tokio::sync::mpsc::Sender<(String, StreamOrigin)>,
+    origin: StreamOrigin,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    const MAX_FRAGMENT: usize = 64 * 1024;
+    let mut reader = BufReader::new(stream);
+    let mut pending = Vec::new();
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let eof = available.is_empty();
+        if !eof {
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1)
+                .min(MAX_FRAGMENT - pending.len());
+            pending.extend_from_slice(&available[..count]);
+            reader.consume(count);
+        }
+        if eof || pending.last() == Some(&b'\n') || pending.len() == MAX_FRAGMENT {
+            let mut end = pending.len();
+            if !eof && end == MAX_FRAGMENT {
+                // Do not replace a valid multibyte character merely because
+                // its remaining bytes land in the next bounded fragment.
+                if let Some(start) = pending.iter().rposition(|byte| byte & 0xc0 != 0x80)
+                    && std::str::from_utf8(&pending[start..])
+                        .is_err_and(|error| error.error_len().is_none())
+                {
+                    end = start;
+                }
+            }
+            if end != 0 {
+                tx.send((
+                    String::from_utf8_lossy(&pending[..end]).into_owned(),
+                    origin,
+                ))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "SSH preview consumer closed",
+                    )
+                })?;
+                pending.drain(..end);
+            }
+        }
+        if eof {
+            return Ok(());
+        }
+    }
+}
+
 /// Pump a child stream into the segment channel, splitting on BOTH `\n` and
 /// `\r`.
 ///
@@ -7460,7 +8949,7 @@ async fn pump_stream_segments<R>(
 {
     let mut reader = BufReader::new(stream);
     let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
+    let mut chunk = vec![0u8; 8192];
     loop {
         let read = match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
@@ -8128,6 +9617,89 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn ssh_preview_keeps_invalid_utf8_nuls_delimiters_and_the_final_tail() {
+        for origin in [StreamOrigin::Stdout, StreamOrigin::Stderr] {
+            let (mut writer, reader) = tokio::io::duplex(7);
+            let bytes = b"first\0\xff\nsecond\r\n\nlast \xf0\x9f\xa6\x80\xff";
+            let producer = tokio::spawn(async move {
+                for chunk in bytes.chunks(2) {
+                    writer.write_all(chunk).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let pump = tokio::spawn(pump_ssh_preview(reader, tx, origin));
+            let mut rendered = String::new();
+            while let Some((text, lane)) = rx.recv().await {
+                assert_eq!(lane, origin);
+                rendered.push_str(&text);
+            }
+            producer.await.unwrap();
+            pump.await.unwrap().unwrap();
+            assert_eq!(rendered, String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_preview_bounds_unterminated_fragments_without_splitting_unicode() {
+        let mut bytes = vec![b'x'; 65_535];
+        bytes.extend_from_slice("🦀".as_bytes());
+        bytes.extend(std::iter::repeat_n(b'\xff', 140_000));
+        bytes.extend_from_slice(b"\nlast");
+        let expected = String::from_utf8_lossy(&bytes).into_owned();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let pump = tokio::spawn(pump_ssh_preview(
+            std::io::Cursor::new(bytes),
+            tx,
+            StreamOrigin::Stdout,
+        ));
+        let mut rendered = String::new();
+        let mut fragments = 0;
+        while let Some((text, _)) = rx.recv().await {
+            // Each invalid byte can expand to the three-byte replacement char.
+            assert!(text.len() <= 3 * 65_536);
+            rendered.push_str(&text);
+            fragments += 1;
+        }
+        pump.await.unwrap().unwrap();
+        assert!(fragments >= 4);
+        assert_eq!(rendered, expected);
+    }
+
+    #[tokio::test]
+    async fn ssh_preview_read_errors_are_not_successful_eof() {
+        struct FailedReader;
+        impl tokio::io::AsyncRead for FailedReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let reader = std::io::Cursor::new(b"complete prefix\n").chain(FailedReader);
+        let result = pump_ssh_preview(reader, tx, StreamOrigin::Stderr).await;
+        assert_eq!(result.unwrap_err().to_string(), "injected read failure");
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            ("complete prefix\n".into(), StreamOrigin::Stderr)
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_preview_closed_consumer_stops_the_reader_with_an_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let error = pump_ssh_preview(&b"not delivered\n"[..], tx, StreamOrigin::Stdout)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
     /// Pins this thread to the real transport for the guard's lifetime. Mock
     /// mode falls back to a process-global override that other tests enable
     /// concurrently, which silently rerouted real-transport tests through the
@@ -8167,7 +9739,10 @@ mod tests {
             receipt,
             "job_id",
             alias.to_str().unwrap(),
+            Some(directory.path().to_str().unwrap()),
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            0,
+            CargoOutputLog::Stdout,
         );
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);
@@ -8181,6 +9756,33 @@ mod tests {
         .unwrap();
         assert_eq!(evidence.stdout, log);
         assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
+        assert_eq!(
+            evidence.remote_project_root,
+            Some(directory.path().canonicalize().unwrap())
+        );
+        // Ordinary collection must still succeed without reconstructing the
+        // source path from a generic detached-recovery pipeline.
+        let mut ordinary = Command::new("sh");
+        ordinary.arg("-c").arg(cargo_artifact_evidence_script(
+            receipt,
+            "job_id",
+            alias.to_str().unwrap(),
+            None,
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            0,
+            CargoOutputLog::Stdout,
+        ));
+        let evidence = collect_cargo_artifact_evidence(
+            ordinary,
+            "job_id",
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.stdout, log);
+        assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
+        assert_eq!(evidence.remote_project_root, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8200,7 +9802,10 @@ mod tests {
                 receipt,
                 "job",
                 directory.path().to_str().unwrap(),
+                Some(directory.path().to_str().unwrap()),
                 limit,
+                0,
+                CargoOutputLog::Stdout,
             );
             let mut command = Command::new("sh");
             command.arg("-c").arg(script);
@@ -8258,7 +9863,10 @@ mod tests {
                 receipt,
                 "job",
                 directory.path().to_str().unwrap(),
+                Some(directory.path().to_str().unwrap()),
                 64,
+                0,
+                CargoOutputLog::Stdout,
             ));
             assert!(
                 collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))
@@ -8271,20 +9879,35 @@ mod tests {
     #[test]
     fn cargo_artifact_evidence_framing_rejects_partial_or_mismatched_payloads() {
         for bytes in [
-            &b"job 3\n/target\nab"[..],
-            &b"job 2\n/target\nabc"[..],
-            &b"other 3\n/target\nabc"[..],
-            &b"job 3\ntarget\nabc"[..],
-            &b"job 3\n/target/../elsewhere\nabc"[..],
-            &b"job 3\n/target\r\nabc"[..],
+            &b"job 3\n/target\n/source\nab"[..],
+            &b"job 2\n/target\n/source\nabc"[..],
+            &b"other 3\n/target\n/source\nabc"[..],
+            &b"job 3\ntarget\n/source\nabc"[..],
+            &b"job 3\n/target/../elsewhere\n/source\nabc"[..],
+            &b"job 3\n/target/./elsewhere\n/source\nabc"[..],
+            &b"job 3\n/target\r\n/source\nabc"[..],
             &b"job 3\n/target"[..],
+            &b"job 3\n/target\n/source"[..],
+            &b"job 3\n/target\nsource\nabc"[..],
+            &b"job 3\n/target\n/source/../elsewhere\nabc"[..],
+            &b"job 3\n/target\n/source/./elsewhere\nabc"[..],
+            &b"job 3\n/target\n/\nabc"[..],
         ] {
             assert!(parse_cargo_artifact_evidence(bytes.to_vec(), "job", 64).is_err());
         }
         let evidence =
-            parse_cargo_artifact_evidence(b"job 3\n/target\nabc".to_vec(), "job", 64).unwrap();
+            parse_cargo_artifact_evidence(b"job 3\n/target\n/source\nabc".to_vec(), "job", 64)
+                .unwrap();
         assert_eq!(evidence.stdout, b"abc");
         assert_eq!(evidence.remote_root, Path::new("/target"));
+        assert_eq!(
+            evidence.remote_project_root.as_deref(),
+            Some(Path::new("/source"))
+        );
+        let ordinary =
+            parse_cargo_artifact_evidence(b"job 3\n/target\n\nabc".to_vec(), "job", 64).unwrap();
+        assert_eq!(ordinary.stdout, b"abc");
+        assert_eq!(ordinary.remote_project_root, None);
     }
 
     #[cfg(target_os = "linux")]
@@ -8489,6 +10112,285 @@ mod tests {
             .status()
             .unwrap();
         assert!(free.success(), "a leftover follower still holds the lock");
+    }
+
+    /// A successful workload is not a completed job until its receipt is
+    /// durable. Publication failure must stop the stream followers, preserve
+    /// the logs and start claim, and leave recovery able to prove it is lost.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_reaps_followers_if_receipt_cannot_be_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        let invocations = directory.path().join("invocations");
+        // An actual filesystem error at the publication boundary, after the
+        // workload ran; no completion is injected by the test.
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        let command = pipeline.durable_execution_command(format!(
+            "printf 'once\\n' >> {}; printf 'compiled\\n'; printf 'diagnostic\\n' >&2",
+            escape(Cow::from(invocations.to_str().unwrap()))
+        ));
+        let run = || {
+            // Bound the fixture's entire process group if the receipt loop
+            // regresses, so a failing test cannot leave idle followers behind.
+            std::process::Command::new("timeout")
+                .args(["--kill-after=2s", "10s", "flock", "-x"])
+                .arg(&lock)
+                .args(["sh", "-c", &command])
+                .output()
+                .unwrap()
+        };
+        let output = run();
+        assert_eq!(output.status.code(), Some(255), "{output:?}");
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("remote execution ended without a durable completion receipt"),
+            "{output:?}"
+        );
+        assert!(!Path::new(receipt).exists());
+        assert_eq!(
+            std::fs::read_to_string(format!("{receipt}.stdout")).unwrap(),
+            "compiled\n"
+        );
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("diagnostic\n")
+        );
+        assert!(Path::new(&format!("{receipt}.started")).is_dir());
+        assert!(
+            std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success(),
+            "failed publication left an activity holder alive"
+        );
+        // Reconnecting cannot launch the same command a second time just
+        // because no receipt was published.
+        assert!(!run().status.success());
+        assert_eq!(std::fs::read_to_string(invocations).unwrap(), "once\n");
+    }
+
+    /// Receipt publication may fail while a background workload descendant
+    /// remains alive. Only that descendant's exit can make recovery safe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_missing_receipt_preserves_descendant_fencing() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        let release = directory.path().join("release-workload");
+        let finished = directory.path().join("workload-finished");
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        // The supervisor exits naturally on the real receipt-write error.
+        // No test guesses or signals a parent process.
+        let descendant = format!(
+            "i=0; while [ ! -f {} ] && [ \"$i\" -lt 300 ]; do \
+             sleep 0.1; i=$((i + 1)); done; printf 'finished\\n' > {}",
+            escape(Cow::from(release.to_str().unwrap())),
+            escape(Cow::from(finished.to_str().unwrap()))
+        );
+        let command = pipeline.durable_execution_command(format!(
+            "sh -c {} </dev/null >/dev/null 2>&1 &",
+            escape(Cow::from(descendant))
+        ));
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=2s", "10s", "flock", "-x"])
+            .arg(&lock)
+            .args(["sh", "-c", &command])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(255), "{output:?}");
+        assert!(!Path::new(receipt).exists());
+        assert!(
+            !finished.exists(),
+            "workload ended before fencing was tested"
+        );
+        let lock_is_free = || {
+            std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(
+            !lock_is_free(),
+            "receipt failure released a surviving workload's activity lock"
+        );
+        std::fs::write(release, b"release\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock_is_free() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle followers retained the activity lock after the workload exited"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(finished).unwrap(), "finished\n");
+        assert!(!Path::new(receipt).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_missing_receipt_does_not_block_on_unread_stderr() {
+        assert_missing_receipt_releases_followers(false, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_cancellation_before_follower_pid_assignment_reaps_the_writer() {
+        assert_missing_receipt_releases_followers(true, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_cancellation_reaps_a_term_masked_copy_helper() {
+        assert_missing_receipt_releases_followers(false, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_missing_receipt_releases_followers(cancel_after_fork: bool, mask_copy_term: bool) {
+        use std::io::{ErrorKind, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        let marker = directory.path().join("cancel-point");
+        let workload = if cancel_after_fork || mask_copy_term {
+            format!(
+                "printf 'diagnostic\\n' >&2; i=0; while [ ! -f {marker} ] && [ \"$i\" -lt 200 ]; do \
+                 sleep 0.01; i=$((i + 1)); done; test -f {marker}",
+                marker = escape(Cow::Borrowed(marker.to_str().unwrap())),
+            )
+        } else {
+            "printf 'compiled\\n'; printf 'diagnostic\\n' >&2".to_string()
+        };
+        let mut command = pipeline.durable_execution_command(workload);
+        if cancel_after_fork {
+            // Force TERM in the actual generated shell's fork/assignment gap.
+            // Keep the real pipeline and saturated transport; do not release
+            // their descriptors to make the activity-lock assertion pass.
+            let boundary = " & h=$!;";
+            assert_eq!(command.matches(boundary).count(), 1);
+            command = command.replacen(
+                boundary,
+                &format!(
+                    " & printf ready > {}; read -r follower rest < /proc/self/stat; \
+                     kill -TERM \"$follower\"; h=$!;",
+                    escape(Cow::Borrowed(marker.to_str().unwrap())),
+                ),
+                1,
+            );
+        }
+        if mask_copy_term {
+            // Model cancellation while the disposable writer cannot act on
+            // TERM. The real head still writes to the saturated socket; only
+            // its signal disposition changes. Readiness precedes supervisor
+            // exit, and its PID survives exec, so no timing retry is needed.
+            let boundary = "| head -c \"$n\" & h=$!;";
+            assert_eq!(command.matches(boundary).count(), 1);
+            command = command.replacen(
+                boundary,
+                &format!(
+                    "| ( trap '' TERM; printf ready > {}; exec head -c \"$n\" ) & h=$!;",
+                    escape(Cow::Borrowed(marker.to_str().unwrap())),
+                ),
+                1,
+            );
+        }
+
+        // Fill a real transport before starting the wrapper; its peer remains
+        // open but never drains. A direct stderr diagnostic must block here.
+        let (mut writer, _unread_stderr) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let mut full = false;
+        for _ in 0..16_384 {
+            match writer.write(b"x") {
+                Ok(1) => {}
+                Ok(_) => panic!("stderr transport closed during prefill"),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("prefill stderr transport: {error}"),
+            }
+        }
+        assert!(full, "stderr transport did not reach backpressure");
+        writer.set_nonblocking(false).unwrap();
+        let status = std::process::Command::new("timeout")
+            .args(["--kill-after=2s", "10s", "flock", "-x"])
+            .arg(&lock)
+            .args(["sh", "-c", &command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(OwnedFd::from(writer)))
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(255), "{status:?}");
+        if cancel_after_fork || mask_copy_term {
+            assert_eq!(std::fs::read(marker).unwrap(), b"ready");
+        }
+        assert!(!Path::new(receipt).exists());
+        assert!(Path::new(&format!("{receipt}.started")).is_dir());
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("remote execution ended without a durable completion receipt")
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing receipt left activity holders after stderr backpressure"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -10374,6 +12276,280 @@ Number of files transferred: 42
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
     }
 
+    /// Points this test thread's guard at `path` as the live-checkout host
+    /// marker (a missing path means an undeclared host); restored on drop.
+    struct LiveCheckoutHostMarker(Option<String>);
+
+    impl LiveCheckoutHostMarker {
+        fn at(path: &Path) -> Self {
+            Self(LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|marker| {
+                marker
+                    .borrow_mut()
+                    .replace(path.to_str().unwrap().to_owned())
+            }))
+        }
+
+        fn declared_in(directory: &Path) -> Self {
+            let path = directory.join("live-checkouts");
+            std::fs::write(&path, b"").unwrap();
+            Self::at(&path)
+        }
+    }
+
+    impl Drop for LiveCheckoutHostMarker {
+        fn drop(&mut self) {
+            LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|marker| *marker.borrow_mut() = self.0.take());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_admits_convergence_checkouts_on_undeclared_hosts() {
+        // bd-tali9: a pure worker keeps rch's repo-convergence checkouts at the
+        // canonical roots, and multi-repo closures must still sync into them.
+        let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::at(&directory.path().join("undeclared"));
+        let checkout = directory.path().join("converged");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(checkout.join("vendor/nested/.git")).unwrap();
+        let run = |destination: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &live_checkout_sync_guard(destination)])
+                .output()
+                .unwrap()
+        };
+        for destination in [checkout.clone(), checkout.join("member")] {
+            let output = run(destination.to_str().unwrap());
+            assert!(output.status.success(), "{destination:?}: {output:?}");
+        }
+        // Path refusals do not depend on the host declaration.
+        for destination in ["/", "/data/projects/../projects/x", "relative/root"] {
+            let output = run(destination);
+            assert_eq!(output.status.code(), Some(73), "{destination}: {output:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_refuses_root_and_dot_components_before_setup() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let checkout = retained.join("worker's live checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{git:?}");
+        let edited = checkout.join("uncommitted.rs");
+        std::fs::write(&edited, b"worker's original edit\n").unwrap();
+        let missing = retained.join("missing");
+        let marker = retained.join("setup-ran");
+
+        for (destination, reason) in [
+            (missing.join("../worker's live checkout"), "dot components"),
+            (missing.join("./child"), "dot components"),
+            (PathBuf::from("/"), "filesystem root"),
+            (PathBuf::from("////"), "filesystem root"),
+            (PathBuf::from("/./"), "dot components"),
+        ] {
+            let command = format!(
+                "{} || exit 73; printf setup > {}",
+                live_checkout_sync_guard(destination.to_str().unwrap()),
+                escape(marker.to_string_lossy()),
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{destination:?}: {output:?}"
+            );
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostics.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
+            assert!(diagnostics.contains(reason), "{destination:?}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(!marker.exists());
+            assert!(!missing.exists());
+            assert_eq!(std::fs::read(&edited).unwrap(), b"worker's original edit\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_allows_literal_dot_names_and_physical_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let _host = LiveCheckoutHostMarker::declared_in(&retained);
+        let mirror = retained.join("mirror..cache's α");
+        std::fs::create_dir(&mirror).unwrap();
+        let original = mirror.join("existing.rs");
+        std::fs::write(&original, b"retained source\n").unwrap();
+        let alias = retained.join(".alias..cache");
+        symlink(&mirror, &alias).unwrap();
+
+        for (index, destination) in [
+            mirror.clone(),
+            mirror.join(".generated..cache/new"),
+            alias.join("newchild"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let marker = retained.join(format!("allowed-{index}"));
+            let command = format!(
+                "{} || exit 73; printf ready > {}",
+                live_checkout_sync_guard(destination.to_str().unwrap()),
+                escape(marker.to_string_lossy()),
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{destination:?}: {output:?}");
+            assert_eq!(std::fs::read(marker).unwrap(), b"ready");
+            assert_eq!(std::fs::read(&original).unwrap(), b"retained source\n");
+            assert!(!mirror.join(".generated..cache").exists());
+            assert!(!mirror.join("newchild").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_preserves_edits_and_allows_isolated_rsync() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::declared_in(directory.path());
+        let source = directory.path().join("incoming");
+        let checkout = directory.path().join("worker's live checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{git:?}");
+        std::fs::write(checkout.join("tracked.txt"), "committed\n").unwrap();
+        let staged = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["add", "tracked.txt"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success(), "{staged:?}");
+        std::fs::write(checkout.join("tracked.txt"), "worker edit\n").unwrap();
+        std::fs::write(checkout.join("untracked.txt"), "irreplaceable\n").unwrap();
+        std::fs::write(source.join("tracked.txt"), "dispatcher copy\n").unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&checkout, &alias).unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir_all(nested.join("project/.git")).unwrap();
+        let linked = directory.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /not/available\n").unwrap();
+        let broken = directory.path().join("broken");
+        symlink(directory.path().join("missing"), &broken).unwrap();
+
+        // Execute the exact receiver wrapper, followed by a real destructive
+        // rsync in this disposable fixture. The post-prune marker also catches
+        // shell-precedence bugs where a refused first command continues later.
+        let run = |destination: &Path| {
+            let pipeline = TransferPipeline::new(
+                source.clone(),
+                "guard-test".into(),
+                "abcdef".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(destination.to_str().unwrap());
+            let marker = directory.path().join("setup-ran");
+            let command = format!(
+                "printf touched > {}; mkdir -p {} && rsync -a --delete {}/ {}/",
+                escape(marker.to_string_lossy()),
+                escape(destination.to_string_lossy()),
+                escape(source.to_string_lossy()),
+                escape(destination.to_string_lossy()),
+            );
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(pipeline.source_rsync_path(command))
+                .output()
+                .unwrap()
+        };
+        for destination in [
+            &checkout,
+            &alias,
+            &checkout.join("new/subdir"),
+            &nested,
+            &linked,
+            &broken,
+        ] {
+            let output = run(destination);
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{destination:?}: {output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED")
+            );
+            assert!(!directory.path().join("setup-ran").exists());
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+                "worker edit\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("untracked.txt")).unwrap(),
+                "irreplaceable\n"
+            );
+            assert!(!checkout.join("new").exists());
+        }
+        let mirror = directory.path().join("isolated mirror");
+        let output = run(&mirror);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(mirror.join("tracked.txt")).unwrap(),
+            "dispatcher copy\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_does_not_block_read_only_result_retrieval() {
+        let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::declared_in(directory.path());
+        let result = directory.path().join("test-result-with-a-checkout");
+        std::fs::create_dir_all(result.join(".git")).unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "result-read".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(result.to_str().unwrap());
+        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        let read = pipeline.source_rsync_path_at(
+            "test \"$RCH_ACTIVITY_TEST\" = owned && printf readable".into(),
+            result.to_str().unwrap(),
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &read])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"readable");
+        let upload = pipeline.source_rsync_path("printf must-not-run".into());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &upload])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_activity_rsync_wrapper_preserves_server_argv_and_fences_setup() {
@@ -10928,7 +13104,7 @@ Number of files transferred: 42
                             let role = if final_exit == 0 { "receiver" } else { "sender" };
                             format!("printf '%s\\n' 'rsync: [{role}] write failed: No space left on device (28)' >&2\nexit {final_exit}")
                         };
-                        let output = Command::new("sh").args(["-c", &script])
+                        let output = Command::new("sh").args(["-c", &script]) // ubs:ignore[rust.security.shell-command] Fixed fault-injection text; role and exit are typed fixture values, not external shell input.
                             .current_dir(root).output().await?;
                         check_archive_upload_result(&output, worker, "/worker-source-volume/project")
                     }
@@ -10954,17 +13130,29 @@ Number of files transferred: 42
 
     #[cfg(unix)]
     #[test]
-    fn source_grant_does_not_authorize_pruning_sibling_target_pools() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut pipeline = TransferPipeline::new(
-            directory.path().to_owned(),
+    fn source_grant_does_not_authorize_transfer_start_or_sibling_pruning() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let pipeline = TransferPipeline::new(
+            directory,
             "activity".into(),
             "abcdef".into(),
             TransferConfig::default(),
         )
         .with_remote_path_override("/worker/sources/current")
-        .with_remote_cargo_target_dir_override("/worker/pools/.rch-target-current-pool-abcdef");
-        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        .with_remote_cargo_target_dir_override("/worker/pools/.rch-target-current-pool-abcdef")
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_rsync(ResolvedRsync {
+            path: PathBuf::from("rsync"),
+            flavor: RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            version_line: String::new(),
+            source: RsyncSource::Config,
+            shadowed: None,
+        });
         assert_eq!(pipeline.escaped_pooled_target_override_parent(), None);
         let worker = estimate_test_worker();
         for command in [
@@ -10989,9 +13177,99 @@ Number of files transferred: 42
                 .to_string_lossy();
             assert!(!wrapper.contains("find /worker/pools"), "{wrapper}");
             assert!(
-                wrapper.contains("find /worker/sources/current"),
+                !wrapper.contains("find /worker/sources/current"),
                 "{wrapper}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_sync_pruning_preserves_grant_fencing_and_ungranted_policy() {
+        // Command construction only: no remote claim, transport, deletion or
+        // compiler is executed, and this is not live-worker retention proof.
+        let worker = WorkerConfig {
+            id: WorkerId::new("pruning-argv-worker"),
+            host: "worker.example.invalid".into(),
+            user: "builder".into(),
+            identity_file: "/workspaces/fixture-key".into(),
+            total_slots: 1,
+            priority: 100,
+            tags: vec![],
+            tools: Vec::new(),
+        };
+        let root = "/worker/sources/current";
+        for mode in ["ungranted", "active", "cleanup"] {
+            for hours in [0, 168] {
+                for delete in [false, true] {
+                    let pipeline = TransferPipeline::new(
+                        PathBuf::from("/workspaces/project"),
+                        "project".into(),
+                        "abcdef".into(),
+                        TransferConfig::default(),
+                    )
+                    .with_remote_path_override(root)
+                    .with_remote_cargo_target_dir_override(
+                        "/worker/pools/.rch-target-current-pool-abcdef",
+                    )
+                    .with_pooled_target_prune_idle_hours(hours)
+                    .with_sync_delete(delete)
+                    .with_rsync(ResolvedRsync {
+                        path: PathBuf::from("rsync"),
+                        flavor: RsyncFlavor::Rsync {
+                            major: 3,
+                            minor: 2,
+                            patch: 7,
+                        },
+                        version_line: String::new(),
+                        source: RsyncSource::Config,
+                        shadowed: None,
+                    });
+                    let pipeline = match mode {
+                        "active" => pipeline.with_source_authority("ab12".into()).unwrap(),
+                        "cleanup" => pipeline
+                            .with_source_authority_cleanup("ab12".into())
+                            .unwrap(),
+                        _ => pipeline,
+                    };
+                    for command in [
+                        pipeline.build_sync_command(
+                            &worker,
+                            "builder@worker:/worker/sources/current",
+                            root,
+                            &[],
+                        ),
+                        pipeline.build_sync_streaming_command(
+                            &worker,
+                            "builder@worker:/worker/sources/current",
+                            root,
+                            &[],
+                        ),
+                    ] {
+                        let arguments: Vec<_> = command.as_std().get_args().collect();
+                        assert_eq!(arguments.iter().any(|arg| *arg == "--delete"), delete);
+                        let wrapper = arguments
+                            .windows(2)
+                            .find(|pair| pair[0] == "--rsync-path")
+                            .unwrap()[1]
+                            .to_string_lossy();
+                        assert!(wrapper.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
+                        assert!(wrapper.contains("mkdir -p /worker/sources/current && rsync"));
+                        if mode == "ungranted" {
+                            assert!(wrapper.contains("find /worker/sources/current/.rch-tmp"));
+                            assert!(wrapper.contains("-name 'rch-cargo-cache-*'"));
+                            assert_eq!(wrapper.contains("find /worker/pools"), hours != 0);
+                        } else {
+                            assert!(wrapper.contains("flock -x --"));
+                            assert!(wrapper.contains(&format!("ab12 {mode} sh -c ")));
+                            assert!(wrapper.contains("source grant is not active"));
+                            assert!(wrapper.contains("source grant content changed"));
+                            assert!(!wrapper.contains("-mmin +"));
+                            assert!(!wrapper.contains("find /worker/pools"));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -11036,7 +13314,8 @@ Number of files transferred: 42
 
         // bd-wfumv: every source upload reaps stale worker-side runtime state
         // ahead of the transfer, with durable caches on a much longer floor.
-        assert!(path_val.starts_with("find "));
+        assert!(path_val.starts_with("(set -eu\n"));
+        assert!(path_val.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
         assert!(path_val.contains(&format!(
             "find {root}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{WORKER_TMP_PRUNE_MAX_AGE_MINS}"
         )));
@@ -11275,6 +13554,66 @@ Number of files transferred: 42
     // =========================================================================
 
     #[test]
+    fn owned_source_uploads_keep_checksums_without_deletion_or_cache_pruning() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0)
+            .with_owned_source_materialization()
+            .with_sync_delete(true)
+            .with_sync_checksum(false);
+        let remote = pipeline.remote_path();
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        let escaped = escape(Cow::from(remote.as_str()));
+        for command in [
+            pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
+            pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
+        ] {
+            let args = command_args(&command);
+            assert!(args.contains(&"--checksum".to_owned()));
+            assert!(!args.iter().any(|arg| arg.starts_with("--delete")));
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(!receiver.contains("rm -rf"), "{receiver}");
+            assert!(!receiver.contains("-mmin"), "{receiver}");
+            assert!(
+                receiver.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"),
+                "{receiver}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_source_barriers_are_read_only_and_detect_surplus_after_retained_upload() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline =
+            flavour_test_pipeline(RsyncFlavor::Unknown, 0).with_owned_source_materialization();
+        for managed_times in [false, true] {
+            let args = command_args(&pipeline.build_source_content_rsync_barrier_command(
+                &worker,
+                &[],
+                Some(managed_times),
+            ));
+            for required in ["-azn", "--checksum", "--itemize-changes", "--delete"] {
+                assert!(args.iter().any(|arg| arg == required), "{args:?}");
+            }
+            assert_eq!(args.iter().any(|arg| arg == "--no-times"), managed_times);
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(!receiver.contains("mkdir"), "{receiver}");
+            assert!(!receiver.contains("rm -rf"), "{receiver}");
+            assert!(
+                receiver.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"),
+                "{receiver}"
+            );
+        }
+    }
+
+    #[test]
     fn source_content_barrier_changes_only_ssh_log_verbosity() {
         let _guard = test_guard!();
         let worker = flavour_test_worker();
@@ -11285,7 +13624,7 @@ Number of files transferred: 42
         let upload =
             command_args(&pipeline.build_sync_command(&worker, &destination, &escaped, &[]));
         let barrier =
-            command_args(&pipeline.build_source_content_rsync_barrier_command(&worker, &[]));
+            command_args(&pipeline.build_source_content_rsync_barrier_command(&worker, &[], None));
         let ssh = |args: &[String]| {
             args.windows(2)
                 .find(|pair| pair[0] == "-e")
@@ -11333,7 +13672,7 @@ Number of files transferred: 42
                     pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
                     pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
                     pipeline.build_estimate_command(&worker),
-                    pipeline.build_source_content_rsync_barrier_command(&worker, &[]),
+                    pipeline.build_source_content_rsync_barrier_command(&worker, &[], None),
                     pipeline.build_retrieve_command(&worker, &remote, &patterns),
                     pipeline.build_retrieve_streaming_command(&worker, &remote, &patterns),
                 ];
@@ -12122,6 +14461,21 @@ Number of files transferred: 42
                             source.join("forwarded-poison").to_str().unwrap().to_owned(),
                         ),
                     ]));
+                let environment = pipeline.build_remote_env_plan(source.to_str().unwrap());
+                assert!(
+                    environment
+                        .env_prefix
+                        .rejected
+                        .iter()
+                        .any(|key| key == "RCH_CH_BASE")
+                );
+                assert!(
+                    !environment
+                        .env_prefix
+                        .applied
+                        .iter()
+                        .any(|key| key == "RCH_CH_BASE")
+                );
                 let workload = crate::hook::add_cargo_isolation(
                     "printf 'cargo-home=%s\\ntmpdir=%s\\n' \"$CARGO_HOME\" \"$TMPDIR\"; printf 'cache-probe-stderr' >&2",
                     &worker,
@@ -12263,6 +14617,47 @@ Number of files transferred: 42
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn remote_environment_reaches_compound_shells_before_expansion_without_reparsing_values() {
+        let _guard = test_guard!();
+        let source = tempfile::tempdir().unwrap();
+        let literal = "space 'quote\" $dollar $(not-a-command); `not-a-command`";
+        let pipeline = cargo_home_boundary_pipeline(source.path())
+            .with_env_allowlist(vec!["RCH_TEST_PROXY".into(), "RCH_TEST_LITERAL".into()])
+            .with_env_overrides(HashMap::from([
+                ("RCH_TEST_PROXY".into(), "forwarded".into()),
+                ("RCH_TEST_LITERAL".into(), literal.into()),
+            ]))
+            .with_execution_environment(
+                ExecutionStorageConfig::default(),
+                std::collections::BTreeMap::from([("RCH_TEST_PROXY".into(), "default".into())]),
+            )
+            .unwrap();
+        let probe = r#"
+            printf '%s\n' "$RCH_TEST_PROXY";
+            false || printf '%s\n' "$RCH_TEST_PROXY";
+            printf '%s\n' "$RCH_TEST_PROXY" | sh -c 'test "$RCH_TEST_PROXY" = forwarded && cat';
+            RCH_TEST_PROXY=authored sh -c 'printf "%s\n" "$RCH_TEST_PROXY"';
+            printf '%s\n' "$RCH_TEST_PROXY";
+            printf '%s\0' "$RCH_TEST_LITERAL";
+            printf '%s' "$RCH_TEST_LITERAL" >&2;
+            exit 37
+        "#;
+        let output = std::process::Command::new("sh")
+            .args(["-c", &pipeline.build_remote_command(probe, None)])
+            .env("RCH_TEST_PROXY", "controller")
+            .env("RCH_TEST_LITERAL", "controller")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(37), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            format!("forwarded\nforwarded\nforwarded\nauthored\nforwarded\n{literal}\0").as_bytes()
+        );
+        assert_eq!(output.stderr, literal.as_bytes());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn managed_storage_dependency_prepare_uses_profile_and_scratch() {
         let _guard = test_guard!();
         use std::os::unix::fs::PermissionsExt;
@@ -12272,9 +14667,25 @@ Number of files transferred: 42
         std::fs::create_dir(&source).unwrap();
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(source.join("package.json"), "{}").unwrap();
-        let npm = bin.join("npm");
-        std::fs::write(&npm, "#!/bin/sh\ntest -d \"$NPM_CONFIG_CACHE\" && test -d \"$TMPDIR\" || exit 99\nprintf '%s\\n' \"$NPM_CONFIG_REGISTRY\" > prepared\nmkdir -p node_modules\n").unwrap();
-        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Run the real command-construction and preparation shell through a
+        // worker double. This checks wiring, not a real package installation.
+        let worker = bin.join("rch-wkr");
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+[ "$#" -eq 5 ] && [ "$1" = prepare ] && [ "$2" = --project ] && [ "$3" = . ] && [ "$4" = --runtime ] && [ "$5" = node ] || exit 98
+test -d "$NPM_CONFIG_CACHE" && test -d "$TMPDIR" || exit 99
+printf '%s\n' "$NPM_CONFIG_REGISTRY" > prepared
+printf 'called\n' >> prepare-calls
+mkdir -p node_modules/.bin
+printf '#!/bin/sh\nprintf prepared-tool\n' > node_modules/.bin/rch-fixture-tool
+chmod 755 node_modules/.bin/rch-fixture-tool
+printf 'preparation-diagnostic\n'
+exit "${RCH_PREPARE_FIXTURE_STATUS:-0}"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
         let pipeline = cargo_home_boundary_pipeline(&source)
             .with_compilation_kind(Some(CompilationKind::Tsc))
             .with_execution_environment(
@@ -12295,12 +14706,41 @@ Number of files transferred: 42
             )
             .unwrap();
         let output = std::process::Command::new("sh")
-            .args(["-c", &pipeline.build_remote_command("cat prepared", None)])
+            .args([
+                "-c",
+                &pipeline.build_remote_command("cat prepared; rch-fixture-tool", None),
+            ])
+            .env("RCH_PREPARE_FIXTURE_STATUS", "0")
             .output()
             .unwrap();
         assert!(output.status.success(), "{:?}", output);
-        assert_eq!(output.stdout, b"https://registry.example\n");
+        assert_eq!(output.stdout, b"https://registry.example\nprepared-tool");
+        assert_eq!(output.stderr, b"preparation-diagnostic\n");
+        assert_eq!(
+            std::fs::read(source.join("prepare-calls")).unwrap(),
+            b"called\n"
+        );
         assert!(source.join("node_modules").exists());
+        assert!(!Path::new(&pipeline.managed_job_tmp_dir().unwrap()).exists());
+
+        // An existing node_modules directory must not bypass preparation.
+        // A refusal must not start the workload or leak its managed scratch.
+        let refused = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &pipeline.build_remote_command("printf started > refused-workload", None),
+            ])
+            .env("RCH_PREPARE_FIXTURE_STATUS", "23")
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(121), "{refused:?}");
+        assert!(refused.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("preparation failed (exit 23)"));
+        assert!(!source.join("refused-workload").exists());
+        assert_eq!(
+            std::fs::read(source.join("prepare-calls")).unwrap(),
+            b"called\ncalled\n"
+        );
         assert!(!Path::new(&pipeline.managed_job_tmp_dir().unwrap()).exists());
     }
 
@@ -13242,6 +15682,587 @@ Number of files transferred: 42
             })
     }
 
+    #[test]
+    fn retained_source_command_requires_exact_sibling_paths_and_identity() {
+        let identity = "1234567890abcdef1234567890abcdef";
+        let retained = "/tmp/rch/pair-retained";
+        for root in [
+            "/",
+            "relative",
+            "/tmp/rch/pair/",
+            "/tmp/rch/./pair",
+            "/tmp/rch/../pair",
+            "/tmp//rch/pair",
+            "/tmp/rch/pair\n",
+            "/tmp/rch/pair\\alias",
+            "/tmp/peer/pair",
+            retained,
+        ] {
+            assert!(
+                TransferPipeline::remote_tree_retention_command(root, retained, identity, false)
+                    .is_err(),
+                "invalid retention source admitted: {root:?}"
+            );
+        }
+        for invalid in [
+            "",
+            "short",
+            "1234567890abcdef1234567890abcdeg",
+            "1234567890ABCDEF1234567890ABCDEF",
+        ] {
+            assert!(
+                TransferPipeline::remote_tree_retention_command(
+                    "/tmp/rch/pair",
+                    retained,
+                    invalid,
+                    false,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_retained_source(
+        source: &Path,
+        retained: &Path,
+        identity: &str,
+        allow_absent: bool,
+    ) -> std::process::Output {
+        let command = TransferPipeline::remote_tree_retention_command(
+            source.to_str().unwrap(),
+            retained.to_str().unwrap(),
+            identity,
+            allow_absent,
+        )
+        .unwrap();
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .output()
+            .expect("execute actual retained-source command")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_preserves_real_files_links_and_retry_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("source with ' quotes and α");
+        let retained = fixture.join("retained with ' quotes and α");
+        let identity = "1234567890abcdef1234567890abcdef";
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(source.join("nested")).unwrap();
+        let file = source.join("nested/input");
+        std::fs::write(&file, b"\0retained source\xff\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::hard_link(&file, source.join("hardlink")).unwrap();
+        symlink("nested/input", source.join("link")).unwrap();
+        symlink("../missing", source.join("dangling")).unwrap();
+        let before = std::fs::metadata(&file).unwrap();
+        let source_inode = std::fs::metadata(&source).unwrap().ino();
+        for _ in 0..2 {
+            let output = native_retained_source(&source, &retained, identity, false);
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(output.stdout, b"RCH_SOURCE_RETAINED\n");
+            assert!(!source.exists());
+            assert_eq!(std::fs::metadata(&retained).unwrap().ino(), source_inode);
+            assert_eq!(
+                std::fs::read(retained.join("nested/input")).unwrap(),
+                b"\0retained source\xff\n"
+            );
+            let after = std::fs::metadata(retained.join("nested/input")).unwrap();
+            assert_eq!(
+                (
+                    after.dev(),
+                    after.ino(),
+                    after.nlink(),
+                    after.mode(),
+                    after.mtime(),
+                    after.mtime_nsec()
+                ),
+                (
+                    before.dev(),
+                    before.ino(),
+                    before.nlink(),
+                    before.mode(),
+                    before.mtime(),
+                    before.mtime_nsec()
+                ),
+            );
+            assert_eq!(
+                std::fs::metadata(retained.join("hardlink")).unwrap().ino(),
+                before.ino()
+            );
+            assert_eq!(
+                std::fs::read_link(retained.join("link")).unwrap(),
+                Path::new("nested/input")
+            );
+            assert_eq!(
+                std::fs::read_link(retained.join("dangling")).unwrap(),
+                Path::new("../missing")
+            );
+        }
+        let foreign_identity = "abcdef1234567890abcdef1234567890";
+        let output = native_retained_source(&source, &retained, foreign_identity, false);
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(std::fs::metadata(&retained).unwrap().ino(), source_inode);
+
+        // Restore the same owned directory to the pre-rename state, with its
+        // already-durable marker, to exercise interruption reconciliation.
+        std::fs::rename(&retained, &source).unwrap();
+        let output = native_retained_source(&source, &retained, identity, false);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"RCH_SOURCE_RETAINED\n");
+        assert_eq!(std::fs::metadata(&retained).unwrap().ino(), source_inode);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_never_replaces_foreign_destinations_or_markers() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let identity = "1234567890abcdef1234567890abcdef";
+        for (index, foreign_file) in [false, true].into_iter().enumerate() {
+            let source = fixture.join(format!("source-{index}"));
+            let retained = fixture.join(format!("retained-{index}"));
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("input"), b"original source").unwrap();
+            std::fs::create_dir(&retained).unwrap();
+            if foreign_file {
+                std::fs::write(retained.join("foreign"), b"retained peer").unwrap();
+            }
+            let output = native_retained_source(&source, &retained, identity, false);
+            assert!(!output.status.success(), "{output:?}");
+            assert_eq!(
+                std::fs::read(source.join("input")).unwrap(),
+                b"original source"
+            );
+            assert!(!source.join(".rch-retention-v1").is_symlink());
+            assert_eq!(
+                std::fs::read_dir(&retained).unwrap().count(),
+                usize::from(foreign_file)
+            );
+            if foreign_file {
+                assert_eq!(
+                    std::fs::read(retained.join("foreign")).unwrap(),
+                    b"retained peer"
+                );
+            }
+        }
+        let source = fixture.join("marker-conflict");
+        let retained = fixture.join("marker-retained");
+        std::fs::create_dir(&source).unwrap();
+        symlink("foreign identity marker", source.join(".rch-retention-v1")).unwrap();
+        let output = native_retained_source(&source, &retained, identity, false);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!retained.exists());
+        assert_eq!(
+            std::fs::read_link(source.join(".rch-retention-v1")).unwrap(),
+            Path::new("foreign identity marker")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_distinguishes_unmaterialized_cancellation_and_missing_source() {
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let identity = "1234567890abcdef1234567890abcdef";
+        for parent in [fixture.clone(), fixture.join("uncreated-parent")] {
+            let source = parent.join("source");
+            let retained = parent.join("retained");
+            let output = native_retained_source(&source, &retained, identity, false);
+            assert!(!output.status.success(), "{output:?}");
+            let output = native_retained_source(&source, &retained, identity, true);
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION\n");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert!(!source.exists() && !retained.exists());
+        }
+        assert!(!fixture.join("uncreated-parent").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_owned_source_freshness(
+        pipeline: &TransferPipeline,
+        identity: &str,
+        source: &Path,
+        control: &Path,
+        attempt: &str,
+        mark_verified: bool,
+    ) -> std::process::Output {
+        let command = pipeline
+            .owned_source_freshness_command(
+                identity,
+                source.to_str().unwrap(),
+                control.to_str().unwrap(),
+                attempt,
+                mark_verified,
+            )
+            .unwrap();
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_closure_freshness_preserves_unchanged_inputs_and_invalidates_rollback() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("owned source with ' quotes");
+        let control = PathBuf::from(format!("{}.freshness", source.display()));
+        let pool = fixture.join("stable target");
+        std::fs::create_dir(&pool).unwrap();
+        let pipeline = TransferPipeline::new(
+            fixture.clone(),
+            "owned".into(),
+            "freshness".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(pool.to_str().unwrap());
+        let mut previous_input_time = None;
+        let mut metadata_time = None;
+        for (run, contents) in [
+            b"original".as_slice(),
+            b"original",
+            b"changed!",
+            b"original",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let identity = if contents == b"original" {
+                "1".repeat(64)
+            } else {
+                "2".repeat(64)
+            };
+            let attempt = format!("{:032x}", run + 1);
+            let workspace = source.join("projects/foreign");
+            let package = workspace.join("crates/member");
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            let metadata = workspace.join("Cargo.toml");
+            let input = package.join("src/lib.rs");
+            std::fs::write(&metadata, b"[workspace]\n").unwrap();
+            std::fs::write(&input, contents).unwrap();
+            let artifact = pool.join("prior-artifact");
+            std::fs::write(&artifact, format!("artifact before run {run}")).unwrap();
+            let artifact_time = std::fs::metadata(&artifact).unwrap().modified().unwrap();
+            let output = native_owned_source_freshness(
+                &pipeline, &identity, &source, &control, &attempt, false,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let input_time = std::fs::metadata(&input).unwrap().modified().unwrap();
+            if run == 1 {
+                assert_eq!(Some(input_time), previous_input_time);
+            } else {
+                assert!(input_time > artifact_time);
+            }
+            previous_input_time = Some(input_time);
+            let current_metadata = std::fs::metadata(&metadata).unwrap().modified().unwrap();
+            if let Some(expected) = metadata_time {
+                assert_eq!(current_metadata, expected);
+            } else {
+                metadata_time = Some(current_metadata);
+            }
+            assert_eq!(std::fs::read(&input).unwrap(), contents);
+            assert!(control.join("epoch-v1").is_file());
+            assert!(control.join("epoch-v1.files-v2").is_file());
+            assert_eq!(std::fs::metadata(&control).unwrap().mode() & 0o077, 0);
+            let proof = control.join(format!("verified-{attempt}.json"));
+            assert!(!proof.exists());
+            let output = native_owned_source_freshness(
+                &pipeline, &identity, &source, &control, &attempt, true,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"RCH_SOURCE_FRESHNESS_VERIFIED\n");
+            let before = std::fs::metadata(&proof).unwrap();
+            let expected = std::fs::read(&proof).unwrap();
+            let output = native_owned_source_freshness(
+                &pipeline, &identity, &source, &control, &attempt, true,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(std::fs::metadata(&proof).unwrap().ino(), before.ino());
+            assert_eq!(std::fs::read(&proof).unwrap(), expected);
+            let retained = fixture.join(format!("retained-{run}"));
+            let output = native_retained_source(
+                &source,
+                &retained,
+                "1234567890abcdef1234567890abcdef",
+                false,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                std::fs::read(retained.join("projects/foreign/crates/member/src/lib.rs")).unwrap(),
+                contents
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unverified_owned_attempts_force_freshness_beyond_cached_artifacts() {
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let identity = "1".repeat(64);
+        let first = "00000000000000000000000000000001";
+        let unfinished = "00000000000000000000000000000002";
+        let next = "00000000000000000000000000000003";
+        for boundary in [
+            "unverified-build",
+            "before-ledger",
+            "malformed-attempt",
+            "changed-ledger",
+        ] {
+            let case = fixture.join(boundary);
+            let source = case.join("source");
+            let control = case.join("source.freshness");
+            let pool = case.join("pool");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir(&pool).unwrap();
+            std::fs::write(source.join("input"), b"A").unwrap();
+            let pipeline = TransferPipeline::new(
+                case.clone(),
+                "owned".into(),
+                "qualified".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(source.to_str().unwrap())
+            .with_remote_cargo_target_dir_override(pool.to_str().unwrap());
+            for mark in [false, true] {
+                let output = native_owned_source_freshness(
+                    &pipeline, &identity, &source, &control, first, mark,
+                );
+                assert!(output.status.success(), "{boundary}: {output:?}");
+            }
+            let original_time = std::fs::metadata(source.join("input"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let original_proof =
+                std::fs::read(control.join(format!("verified-{first}.json"))).unwrap();
+            let output =
+                native_retained_source(&source, &case.join("first-retained"), first, false);
+            assert!(output.status.success(), "{boundary}: {output:?}");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("input"), b"A").unwrap();
+            match boundary {
+                "unverified-build" => {
+                    let output = native_owned_source_freshness(
+                        &pipeline, &identity, &source, &control, unfinished, false,
+                    );
+                    assert!(output.status.success(), "{output:?}");
+                    assert_eq!(
+                        std::fs::metadata(source.join("input"))
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                        original_time,
+                    );
+                    // Cargo may have consumed B while the receipt still names
+                    // A. No successful post-execution proof follows this edit.
+                    std::fs::write(source.join("input"), b"B").unwrap();
+                }
+                "before-ledger" => {
+                    // Run the exact durable preparation prefix but stop before
+                    // the shared ledger executes, as an interrupted SSH can.
+                    let output = std::process::Command::new("python3")
+                        .args([
+                            "-I",
+                            "-c",
+                            TransferPipeline::owned_source_refresh_preparation_script(),
+                        ])
+                        .arg(&source)
+                        .arg(&pool)
+                        .arg(control.join("epoch-v1"))
+                        .arg(&identity)
+                        .arg(unfinished)
+                        .arg("refresh")
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                }
+                "malformed-attempt" => {
+                    std::fs::write(control.join("current-attempt-v1"), b"incomplete attempt")
+                        .unwrap();
+                }
+                "changed-ledger" => {
+                    // Still-valid ledger JSON must not inherit qualification
+                    // when its exact bytes differ from the verified marker.
+                    let path = control.join("epoch-v1.files-v2");
+                    let mut data = std::fs::read(&path).unwrap();
+                    data.push(b'\n');
+                    std::fs::write(path, data).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(pool.join("artifact"), b"unverified cached output").unwrap();
+            let artifact_time = std::fs::metadata(pool.join("artifact"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let output = native_retained_source(
+                &source,
+                &case.join("unfinished-retained"),
+                unfinished,
+                false,
+            );
+            assert!(output.status.success(), "{boundary}: {output:?}");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("input"), b"A").unwrap();
+            let output =
+                native_owned_source_freshness(&pipeline, &identity, &source, &control, next, false);
+            assert!(output.status.success(), "{boundary}: {output:?}");
+            let input_time = std::fs::metadata(source.join("input"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            assert!(input_time > artifact_time, "{boundary}");
+            assert!(input_time > original_time, "{boundary}");
+            assert!(!control.join(format!("verified-{unfinished}.json")).exists());
+            assert_eq!(
+                std::fs::read(control.join(format!("verified-{first}.json"))).unwrap(),
+                original_proof,
+            );
+            assert_eq!(
+                std::fs::read(pool.join("artifact")).unwrap(),
+                b"unverified cached output",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_freshness_qualification_binds_attempt_and_never_replaces_evidence() {
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("source");
+        let control = fixture.join("source.freshness");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("input"), b"selected source").unwrap();
+        let pipeline = TransferPipeline::new(
+            fixture.clone(),
+            "owned".into(),
+            "qualification".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(fixture.join("pool").to_str().unwrap());
+        let identity = "1".repeat(64);
+        let foreign_identity = "2".repeat(64);
+        let attempt = "00000000000000000000000000000001";
+        let foreign_attempt = "00000000000000000000000000000002";
+        let output =
+            native_owned_source_freshness(&pipeline, &identity, &source, &control, attempt, false);
+        assert!(output.status.success(), "{output:?}");
+        for (content, owner) in [(&foreign_identity, attempt), (&identity, foreign_attempt)] {
+            let output =
+                native_owned_source_freshness(&pipeline, content, &source, &control, owner, true);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(!control.join(format!("verified-{owner}.json")).exists());
+        }
+        let ledger = control.join("epoch-v1.files-v2");
+        let original_ledger = std::fs::read(&ledger).unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&original_ledger).unwrap();
+        document["payload"]["identity"] = serde_json::Value::String(foreign_identity);
+        std::fs::write(&ledger, serde_json::to_vec(&document).unwrap()).unwrap();
+        let output =
+            native_owned_source_freshness(&pipeline, &identity, &source, &control, attempt, true);
+        assert!(!output.status.success(), "{output:?}");
+        std::fs::write(&ledger, original_ledger).unwrap();
+        let proof = control.join(format!("verified-{attempt}.json"));
+        std::fs::write(&proof, b"foreign retained evidence").unwrap();
+        let output =
+            native_owned_source_freshness(&pipeline, &identity, &source, &control, attempt, true);
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read(&proof).unwrap(), b"foreign retained evidence");
+        assert_eq!(
+            std::fs::read(source.join("input")).unwrap(),
+            b"selected source",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_closure_freshness_refuses_a_symlinked_control_authority() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("source");
+        let control = fixture.join("source.freshness");
+        let foreign = fixture.join("foreign");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(source.join("input"), b"owned source").unwrap();
+        std::fs::write(foreign.join("sentinel"), b"foreign original").unwrap();
+        symlink(&foreign, &control).unwrap();
+        let pipeline = TransferPipeline::new(
+            fixture.clone(),
+            "owned".into(),
+            "freshness".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(fixture.join("pool").to_str().unwrap());
+        let output = native_owned_source_freshness(
+            &pipeline,
+            &"1234567890abcdef".repeat(4),
+            &source,
+            &control,
+            "1234567890abcdef1234567890abcdef",
+            false,
+        );
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read(source.join("input")).unwrap(),
+            b"owned source"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("sentinel")).unwrap(),
+            b"foreign original"
+        );
+        assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 1);
+        assert_eq!(std::fs::read_link(&control).unwrap(), foreign);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_retirement_removes_read_only_go_module_caches_without_following_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let evidence = tempfile::tempdir().unwrap().keep();
+        let root = evidence.join("container with ' quotes");
+        let module = root.join(".rch-go/mod/lukechampine.com/blake3@v1.4.1/testdata");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("vectors.json"), "{}").unwrap();
+        let outside = evidence.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "foreign").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".rch-go/mod/link")).unwrap();
+        let read_only = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&outside, read_only.clone()).unwrap();
+        for dir in module.ancestors().take_while(|dir| *dir != root) {
+            std::fs::set_permissions(dir, read_only.clone()).unwrap();
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &TransferPipeline::remote_tree_retirement_command(root.to_str().unwrap()),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root.exists());
+        // The linked directory outside the tree keeps its mode and contents.
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555);
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"foreign");
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn source_pair_retirement_accepts_an_already_retired_root() {
@@ -13959,7 +16980,7 @@ fn main() {
         assert!(!script.contains("kill -KILL -- "));
         // Boot/start identity and a process-table observation guard group signals.
         assert!(script.contains("rch_remote_leader_matches || return 43"));
-        assert!(script.contains("ps -e -o pid= -o pgid= -o stat="));
+        assert!(script.contains("ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp="));
         assert!(script.contains("rch_remote_cancel \"$f\" 42 kill"));
         assert!(script.contains("RCH_E104_KILL=verified_dead"));
         assert!(script.contains("RCH_E104_KILL=still_alive"));
@@ -13970,6 +16991,11 @@ fn main() {
         );
         assert_eq!(
             parse_remote_timeout_kill_output("RCH_E104_KILL=no_pgid_file"),
+            Some(RemoteTimeoutCleanup::Unverified)
+        );
+        // At timeout a missing record may be a still-starting job.
+        assert_eq!(
+            parse_remote_timeout_kill_output("RCH_E104_KILL=record_absent"),
             Some(RemoteTimeoutCleanup::Unverified)
         );
         assert_eq!(
@@ -14060,9 +17086,11 @@ fn main() {
             let _ = child.wait();
         }
         let status = status.expect("deadline kill must not block on a full stderr pipe");
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(9),
+        // Linux launches run under the owned-group supervisor (02f769a9), which
+        // stays outside the killed group and reports it as 128+9.
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status) == Some(9)
+                || status.code() == Some(137),
             "{status:?}"
         );
     }
@@ -14234,9 +17262,8 @@ fn main() {
             Some(&ToolchainInfo::new("nightly", None, "")),
         );
 
-        assert!(
-            command.contains("RUSTFLAGS='-C target-cpu=native' rustup run nightly cargo build")
-        );
+        let workload = "RUSTFLAGS='-C target-cpu=native' rustup run nightly cargo build";
+        assert!(command.contains(&format!("sh -c {}", escape(Cow::Borrowed(workload)))));
         assert!(!command.contains("rustup run nightly RUSTFLAGS="));
     }
 
@@ -14299,9 +17326,14 @@ fn main() {
             command.contains("wait \"$__c\""),
             "watchdog must wait on the job"
         );
-        // The build_id path must NOT shell out to `timeout --foreground` (the bug).
+        // The build_id path must NOT run the workload under `timeout
+        // --foreground` (the bug). 181b61ef bounds one literal printf message
+        // writer that way, and documents it; nothing else may.
+        let without_message_writer = command
+            .replace("timeout --foreground --signal=KILL 1s /bin/sh -c '", "")
+            .replace("--foreground targets that one", "");
         assert!(
-            !command.contains("--foreground"),
+            !without_message_writer.contains("--foreground"),
             "build_id path must not use timeout --foreground: {command}"
         );
         // The timer subshell must detach stdio: its orphaned `sleep` otherwise
@@ -14896,6 +17928,7 @@ fn main() {
             let Ok(path) = which::which(name) else {
                 continue;
             };
+            // ubs:ignore[rust.security.command-executable] This native fixture resolves only the constant gfind/find names above through the trusted local tool PATH.
             let mut probe = Command::new(&path);
             probe
                 .arg("--version")
@@ -14973,7 +18006,15 @@ fn main() {
         };
         let selected = windows_artifact_selection(&inventory, &filters).unwrap();
         assert_eq!(selected.len(), 3);
-        let archive = tempfile::NamedTempFile::new().unwrap();
+        let pipeline = TransferPipeline::new(
+            destination.path().to_owned(),
+            "archive-fixture".into(),
+            "identity".into(),
+            TransferConfig::default(),
+        );
+        let (archive, archive_bound) = pipeline
+            .windows_retrieval_archive(selected.values().sum(), selected.len().try_into().unwrap())
+            .unwrap();
         let mut output = tokio::fs::File::from_std(archive.reopen().unwrap());
         let mut shell = Command::new("sh");
         shell.arg("-s");
@@ -14981,7 +18022,7 @@ fn main() {
             shell,
             &windows_artifact_archive_script(source.path().to_str().unwrap(), &selected),
             &mut output,
-            1024 * 1024,
+            archive_bound,
             TokioInstant::now() + Duration::from_secs(10),
             None,
             &mut |_| {},
@@ -15803,6 +18844,215 @@ Total file size: 123 bytes";
             parse_rsync_selected_size("Total file size: 0 bytes"),
             Some(0)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_overlay_staging_space_refuses_without_deleting_outputs() {
+        let stage = tempfile::tempdir().unwrap().keep();
+        let retained = stage.join("retained-output");
+        std::fs::write(&retained, b"successful worker output").unwrap();
+        let pipeline = TransferPipeline::new(
+            stage,
+            "space".into(),
+            "identity".into(),
+            TransferConfig {
+                retrieval_min_free_bytes: u64::MAX - 1,
+                ..Default::default()
+            },
+        );
+        let error = pipeline.check_retrieval_space(1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("insufficient controller retrieval storage")
+        );
+        assert_eq!(
+            std::fs::read(retained).unwrap(),
+            b"successful worker output"
+        );
+        assert!(
+            pipeline
+                .check_retrieval_space(2)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retrieval_archive_uses_durable_stage_and_refuses_insufficient_space() {
+        let stage = tempfile::tempdir().unwrap().keep();
+        let retained = stage.join("retained-output");
+        std::fs::write(&retained, b"retained worker bytes").unwrap();
+        let mut pipeline = TransferPipeline::new(
+            stage.clone(),
+            "archive".into(),
+            "identity".into(),
+            TransferConfig::default(),
+        );
+        let (archive, bound) = pipeline.windows_retrieval_archive(1024, 1).unwrap();
+        assert_eq!(archive.path().parent(), Some(stage.as_path()));
+        assert!(bound > 1024);
+        let (_file, archive_path) = archive.keep().unwrap();
+        pipeline.transfer_config.retrieval_min_free_bytes = u64::MAX / 2;
+        assert!(
+            pipeline
+                .windows_retrieval_archive(1024, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("insufficient controller retrieval storage")
+        );
+        assert!(
+            pipeline
+                .windows_retrieval_archive(u64::MAX, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        assert!(archive_path.exists());
+        assert_eq!(std::fs::read(retained).unwrap(), b"retained worker bytes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn clean_overlay_make_real_rsync_excludes_archive_and_preserves_outputs() {
+        let _guard = test_guard!();
+        let _transport = RealTransport::pin();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let source = retained.join("source");
+        let caller = retained.join("caller");
+        let stage = retained.join("durable-stage");
+        std::fs::create_dir_all(source.join("build")).unwrap();
+        std::fs::create_dir_all(&caller).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(caller.join("main.c"), b"caller source").unwrap();
+        std::fs::write(source.join("main.c"), b"worker source").unwrap();
+        std::fs::write(source.join("Makefile"), b"all:\n\tprintf output > build/unit\n\tprintf object > unit.o\n\tprintf library > libunit.a\n\tprintf executable > a.out\n").unwrap();
+        std::fs::copy(source.join("Makefile"), caller.join("Makefile")).unwrap();
+        assert!(
+            Command::new("make")
+                .arg("-C")
+                .arg(&source)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        std::fs::write(source.join("release.tar"), b"legitimate Make package").unwrap();
+        for archive in [
+            ".rch-clean-overlay-base.tar",
+            "build/.rch-clean-overlay-base.tar",
+        ] {
+            std::fs::File::create(source.join(archive))
+                .unwrap()
+                .set_len(112_000_000)
+                .unwrap();
+        }
+        let pipeline = TransferPipeline::new(
+            caller.clone(),
+            "make".into(),
+            "clean".into(),
+            TransferConfig::default(),
+        )
+        .with_local_root(stage.clone());
+        let worker = worker_with_os(None);
+        // An old recipe has only the broad include rules. Reserved exclusions
+        // must still apply to its dry-run, transfer and staged publication.
+        let patterns: Vec<_> = default_c_cpp_artifact_patterns()
+            .into_iter()
+            .filter(|pattern| !pattern.starts_with("- "))
+            .collect();
+        for streaming in [false, true] {
+            let mut cmd = if streaming {
+                pipeline.build_retrieve_streaming_command(
+                    &worker,
+                    source.to_str().unwrap(),
+                    &patterns,
+                )
+            } else {
+                pipeline.build_retrieve_command(&worker, source.to_str().unwrap(), &patterns)
+            };
+            cmd.args([
+                "-e",
+                r#"sh -c 'if [ "$1" = -l ]; then shift 2; fi; shift; exec "$@"' rch-local-peer"#,
+            ]);
+            let output = execute_rsync_attempt(cmd).await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!stage.join(".rch-clean-overlay-base.tar").exists());
+            assert!(!stage.join("build/.rch-clean-overlay-base.tar").exists());
+            for file in ["build/unit", "unit.o", "libunit.a", "a.out", "release.tar"] {
+                assert_eq!(
+                    std::fs::read(stage.join(file)).unwrap(),
+                    std::fs::read(source.join(file)).unwrap()
+                );
+            }
+            assert!(!stage.join("main.c").exists());
+            assert!(!stage.join("Makefile").exists());
+        }
+        let paths = vec![
+            PathBuf::from(".rch-clean-overlay-base.tar"),
+            PathBuf::from("build/.rch-clean-overlay-base.tar"),
+            PathBuf::from("build/unit"),
+        ];
+        let (admitted, outside) = pipeline
+            .partition_staged_artifact_paths(&paths, &patterns)
+            .unwrap();
+        assert_eq!(admitted, vec![PathBuf::from("build/unit")]);
+        assert_eq!(outside.len(), 2);
+        let priority = vec![
+            "+ .rch-clean-overlay-base.tar".into(),
+            "+ build/.rch-clean-overlay-base.tar".into(),
+        ];
+        assert!(
+            pipeline
+                .validate_staged_artifact_paths(&paths[..2], &priority)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(source.join(".rch-clean-overlay-base.tar"))
+                .unwrap()
+                .len(),
+            112_000_000
+        );
+        assert_eq!(
+            std::fs::read(caller.join("main.c")).unwrap(),
+            b"caller source"
+        );
+        // Exercise production preflight in both entry points, with an explicit
+        // timeout too: a budget override must not bypass the storage refusal.
+        use std::os::unix::fs::PermissionsExt;
+        let rsync_peer = retained.join("local-rsync-peer");
+        std::fs::write(&rsync_peer, r#"#!/bin/sh
+exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift; exec \"\$@\"' rch-local-peer"
+"#).unwrap();
+        std::fs::set_permissions(&rsync_peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut blocked = pipeline.with_remote_path_override(source.to_str().unwrap());
+        blocked.transfer_config.rsync_bin = Some(rsync_peer.to_string_lossy().into_owned());
+        blocked.transfer_config.max_transfer_time_ms = Some(900_000);
+        blocked.transfer_config.retrieval_min_free_bytes = u64::MAX / 2;
+        for streaming in [false, true] {
+            let result = if streaming {
+                blocked
+                    .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                    .await
+            } else {
+                blocked.retrieve_artifacts(&worker, &patterns).await
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("insufficient controller retrieval storage")
+            );
+            assert_eq!(std::fs::read(stage.join("a.out")).unwrap(), b"executable");
+            assert!(!stage.join(".rch-clean-overlay-base.tar").exists());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -17265,6 +20515,98 @@ Total file size: 123 bytes";
                 .to_string(),
             "source-content receipts require the rsync transport"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_output_excludes_keep_tracked_inputs() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("source fixture");
+        let write = |path: &str, body: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        for (path, body) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\", \"crates/build\", \"tools/target\"]\n",
+            ),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\n"),
+            ("app/src/lib.rs", "pub fn answer() {}\n"),
+            // #113: a workspace member in a directory named build/.
+            ("crates/build/Cargo.toml", "[package]\nname = \"helper\"\n"),
+            ("crates/build/src/lib.rs", "pub fn one() {}\n"),
+            ("crates/build/.env", "SECRET=1\n"),
+            // bd-xmgez: tracked data read by include_str!.
+            ("formal/lean/coverage/inventory.json", "{}\n"),
+            // A Cargo package named target is an input; other target/ trees are not.
+            ("tools/target/Cargo.toml", "[package]\nname = \"target\"\n"),
+            ("tools/target/src/lib.rs", "pub fn t() {}\n"),
+            ("vendor/target/readme.txt", "tracked, not a package\n"),
+        ] {
+            write(path, body);
+        }
+        for args in [&["init", "-q"][..], &["add", "-A"][..]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        // Generated output stays untracked.
+        for path in [
+            "build/generated.rs",
+            "app/dist/bundle.js",
+            "app/coverage/lcov.info",
+            "crates/build/target/debug/app",
+        ] {
+            write(path, "output\n");
+        }
+        let pipeline = TransferPipeline::new(
+            root.path().to_path_buf(),
+            "fixture".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+        let selected = pipeline
+            .enumerate_source_content_files()
+            .await
+            .expect("rsync selection");
+        let selected: Vec<String> = selected
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for kept in [
+            "crates/build/Cargo.toml",
+            "crates/build/src/lib.rs",
+            "app/src/lib.rs",
+            "formal/lean/coverage/inventory.json",
+            "tools/target/Cargo.toml",
+            "tools/target/src/lib.rs",
+        ] {
+            assert!(
+                selected.iter().any(|p| p == kept),
+                "{kept} missing: {selected:?}"
+            );
+        }
+        for dropped in [
+            "crates/build/.env",
+            "crates/build/target/debug/app",
+            "build/generated.rs",
+            "app/dist/bundle.js",
+            "app/coverage/lcov.info",
+            "vendor/target/readme.txt",
+        ] {
+            assert!(!selected.iter().any(|p| p == dropped), "{dropped} selected");
+        }
+        assert_eq!(
+            tracked_input_dir_includes(root.path(), &["build/".to_string()]),
+            ["/crates/build/"]
+        );
+        // A user's own exclude keeps its exact meaning.
+        assert!(tracked_input_dir_includes(root.path(), &["crates/".to_string()]).is_empty());
     }
 
     #[cfg(unix)]

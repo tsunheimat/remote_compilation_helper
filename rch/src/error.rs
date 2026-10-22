@@ -1666,18 +1666,42 @@ mod tests {
 
     #[test]
     fn test_daemon_connection_failed() {
-        let socket_path = rch_common::default_socket_path();
-        let err = DaemonError::ConnectionFailed {
-            socket_path: socket_path.clone(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "socket not found"),
-        };
+        for socket_path in [
+            rch_common::default_socket_path(),
+            format!(
+                "/a deliberately long 'quoted' directory/{}/rch.sock",
+                "nested/".repeat(20)
+            ),
+        ] {
+            let err = DaemonError::ConnectionFailed {
+                socket_path: socket_path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "socket not found"),
+            };
 
-        let code = err.code().map(|code| code.to_string());
-        let report = Report::new(err);
-        let formatted = format!("{:?}", report);
-
-        assert!(formatted.contains(&socket_path));
-        assert_eq!(code, Some("RCH-E302".to_string()));
+            let code = err.code().map(|code| code.to_string());
+            let report = Report::new(err);
+            // The graphical renderer legitimately wraps a long path at the
+            // terminal width. Check exact diagnostic data before presentation,
+            // then retain the rich renderer's error-code/cause/help contract.
+            assert_eq!(
+                report.to_string(),
+                format!("Failed to connect to daemon at {socket_path}")
+            );
+            assert_eq!(code, Some("RCH-E302".to_string()));
+            let rendered = format!("{report:?}");
+            for expected in [
+                "RCH-E302",
+                "socket not found",
+                "rch daemon status",
+                "rch daemon logs",
+                "rch daemon restart",
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected:?}: {rendered:?}"
+                );
+            }
+        }
     }
 
     // =========================================================================

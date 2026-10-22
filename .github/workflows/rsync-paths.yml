@@ -59,7 +59,7 @@ jobs:
       # Compile the exact production module, not a reimplementation of its
       # argument policy. This focused check remains runnable independently of
       # unrelated workspace dependencies; it does not replace the full-crate
-      # checks and transfer tests in rsync-transport.yml.
+      # checks and transfer tests in ci.yml.
       - name: Test and lint the production rsync module with real shell transport
         run: |
           set -euo pipefail

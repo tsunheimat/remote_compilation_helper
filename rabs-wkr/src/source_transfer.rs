@@ -631,6 +631,11 @@ mod tests {
     }
 
     fn cached_state(parent: &std::path::Path) -> SourceTransferState {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         SourceTransferState {
             cache_override: Some(cache::SourceCache::open(parent).unwrap()),
             ..SourceTransferState::default()

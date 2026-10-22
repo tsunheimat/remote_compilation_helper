@@ -60,6 +60,53 @@ impl Drop for UnadmittedProcess {
     }
 }
 
+/// The directly owned, unreaped child is a PID-reuse fence. Include terminal
+/// states when proving formation; this is NOT a claim that its group is quiet.
+#[cfg(target_os = "linux")]
+fn spawned_leader_from_proc(pid: u32) -> io::Result<GroupMember> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(format!("/proc/{pid}/stat"))?
+        .take(8193)
+        .read_to_end(&mut bytes)?;
+    formation_member(&bytes, pid, std::process::id())
+}
+
+#[cfg(target_os = "linux")]
+fn formation_member(bytes: &[u8], pid: u32, parent: u32) -> io::Result<GroupMember> {
+    let invalid = || {
+        io::Error::other(format!(
+            "process_group(0) not verified for owned leader {pid}"
+        ))
+    };
+    if bytes.len() > 8192 {
+        return Err(invalid());
+    }
+    // Only comm may contain non-UTF-8 bytes. Numeric identity fields must still
+    // parse exactly; lossy rendering cannot manufacture a PID, parent or group.
+    let stat = String::from_utf8_lossy(bytes);
+    let (comm, rest) = split_stat_fields(&stat).ok_or_else(invalid)?;
+    let recorded_pid = stat.split_once('(').ok_or_else(invalid)?.0.trim();
+    let mut fields = rest.split_whitespace();
+    let state = fields.next().ok_or_else(invalid)?;
+    let ppid = fields.next().and_then(|value| value.parse::<u32>().ok());
+    let group = fields.next().and_then(|value| value.parse::<u32>().ok());
+    if recorded_pid.parse::<u32>().ok() != Some(pid)
+        || ppid != Some(parent)
+        || group != Some(pid)
+        || state.len() != 1
+        || !b"RSDZTtXxKWPI".contains(&state.as_bytes()[0])
+    {
+        return Err(invalid());
+    }
+    Ok(GroupMember {
+        pid: i32::try_from(pid).map_err(|_| invalid())?,
+        ppid: i32::try_from(parent).map_err(|_| invalid())?,
+        state: char::from(state.as_bytes()[0]),
+        comm,
+    })
+}
+
 /// Signal delivered to a whole process group via `kill(1)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSignal {
@@ -163,6 +210,7 @@ impl ManagedProcessGroup {
         spec: &ProcessGroupSpec,
         configure: impl FnOnce(&mut Command),
     ) -> io::Result<Self> {
+        // ubs:ignore[rust.security.command-executable] This trusted-caller executor API intentionally accepts a program, like Command itself; args remain separate and admission owns authority.
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args);
         if let Some(dir) = &spec.working_dir {
@@ -180,31 +228,22 @@ impl ManagedProcessGroup {
     /// fresh group before handing the handle out.
     fn verify_group_formation(leader: Child, attribution: Attribution) -> io::Result<Self> {
         Self::admit_spawned(leader, attribution, |leader| {
-            let pgid = leader.id();
-            // A child that exits before the probe is fine; a still-running
-            // leader outside its requested fresh group must be refused.
+            // Verify the pinned child itself, not its presence in a best-effort
+            // host-wide scan that intentionally removes zombie leaders. A task
+            // can enter Z before waitpid reports it waitable; two try_wait calls
+            // do not make that filtered absence evidence of failed setpgid.
             #[cfg(target_os = "linux")]
-            let members = {
-                let probe = members_from_proc(pgid);
-                match leader.try_wait()? {
-                    Some(_) => {}
-                    None => {
-                        if !probe.iter().any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
-                            // Recheck exit: the first scan may have raced the
-                            // leader becoming a zombie (filtered by the scan).
-                            && leader.try_wait()?.is_none()
-                        {
-                            return Err(io::Error::other(format!(
-                                "process_group(0) not honored: live leader pid {pgid} not found in any /proc pgrp"
-                            )));
-                        }
-                    }
+            if let Err(error) = spawned_leader_from_proc(leader.id()) {
+                // An already completed direct child retains the prior
+                // admission behavior. Unknown LIVE identity still refuses
+                // and the armed guard kills/reaps the unadmitted process.
+                if leader.try_wait()?.is_none() {
+                    return Err(error);
                 }
-                probe
-            };
-            #[cfg(not(target_os = "linux"))]
-            let members = members_from_proc(pgid);
-            Ok(members)
+            }
+            // Preserve the existing initial membership observation for callers.
+            // Its filtered absence is no longer used as formation authority.
+            Ok(members_from_proc(leader.id()))
         })
     }
 
@@ -582,6 +621,134 @@ fn split_stat_fields(stat: &str) -> Option<(String, &str)> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn formation_checks_owned_identity_including_unwaited_terminal_states() {
+        for state in ["R", "S", "Z", "X"] {
+            let stat = format!("42 ((quoted) name) {state} 17 42 0 0");
+            let member = formation_member(stat.as_bytes(), 42, 17).unwrap();
+            assert_eq!(member.pid, 42);
+            assert_eq!(member.ppid, 17);
+            assert_eq!(member.comm, "(quoted) name");
+            assert_eq!(member.state.to_string(), state);
+            assert!(formation_member(stat.as_bytes(), 43, 17).is_err());
+            assert!(formation_member(stat.as_bytes(), 42, 18).is_err());
+        }
+        for stat in [
+            &b"42 (name) Z 17 41 0 0"[..],
+            &b"42 (name) ? 17 42 0 0"[..],
+            &b"42 (name) Z 17"[..],
+            &b"42 (name) Z 17 4\xff2"[..],
+        ] {
+            assert!(formation_member(stat, 42, 17).is_err());
+        }
+        assert!(formation_member(b"42 (binary\xff name) Z 17 42 0", 42, 17).is_ok());
+        assert!(formation_member(&vec![b'x'; 8193], 42, 17).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn formation_accepts_a_real_unreaped_zombie_without_a_live_scan_entry() {
+        let leader = Command::new("sh")
+            .args(["-c", "exit 23"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut pending = UnadmittedProcess(Some(leader));
+        let pid = pending.0.as_ref().unwrap().id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let member = spawned_leader_from_proc(pid).unwrap();
+            if member.state == 'Z' {
+                break;
+            }
+            assert!(Instant::now() < deadline, "leader did not terminate");
+            std::thread::yield_now();
+        }
+        assert!(
+            !members_from_proc(pid)
+                .iter()
+                .any(|member| member.pid as u32 == pid)
+        );
+        let mut group = ManagedProcessGroup::verify_group_formation(
+            pending.0.take().unwrap(),
+            Attribution::default(),
+        )
+        .unwrap();
+        assert_eq!(group.wait_leader().unwrap().code(), Some(23));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn formation_accepts_a_zombie_leader_with_a_live_unwaitable_thread() {
+        use std::os::unix::process::ExitStatusExt;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("leader.c");
+        std::fs::write(
+            &source,
+            r#"
+#include <pthread.h>
+#include <unistd.h>
+static void *survivor(void *unused) {
+    (void)unused;
+    for (;;) pause();
+    return 0;
+}
+int main(void) {
+    alarm(10);
+    pthread_t thread;
+    if (pthread_create(&thread, 0, survivor, 0)) return 97;
+    pthread_exit(0);
+}
+"#,
+        )
+        .unwrap();
+        let compiled = Command::new("cc")
+            .arg(&source)
+            .args(["-pthread", "-o"])
+            .arg(directory.path().join("leader-thread"))
+            .output()
+            .expect("Linux thread regression requires the native C compiler");
+        assert!(compiled.status.success(), "{compiled:?}");
+        let leader = Command::new("./leader-thread")
+            .current_dir(directory.path())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut pending = UnadmittedProcess(Some(leader));
+        let pid = pending.0.as_ref().unwrap().id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while spawned_leader_from_proc(pid).unwrap().state != 'Z' {
+            assert!(Instant::now() < deadline, "main pthread did not exit");
+            std::thread::yield_now();
+        }
+        // Reproduce the old refusal predicate without a timing race: its
+        // process-only scan filters this leader, and neither waitpid can reap
+        // the process while the surviving pthread is still alive.
+        assert!(members_from_proc(pid).is_empty());
+        assert!(pending.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(pending.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        let mut group = ManagedProcessGroup::verify_group_formation(
+            pending.0.take().unwrap(),
+            Attribution::default(),
+        )
+        .expect("terminal main thread does not undo the verified process group");
+        group.kill_leader().unwrap();
+        assert_eq!(group.wait_leader().unwrap().signal(), Some(9));
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn formation_rejects_a_real_live_child_outside_the_requested_group() {
+        let leader = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = leader.id();
+        let error = ManagedProcessGroup::verify_group_formation(leader, Attribution::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("not verified"), "{error}");
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
 
     #[test]
     fn caller_configuration_cannot_override_fresh_process_group_formation() {

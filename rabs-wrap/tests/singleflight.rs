@@ -177,8 +177,8 @@ fn follower_reuses_a_completed_result_without_running_its_compiler() {
     });
     let output = fixture.run(5000);
     daemon.join().unwrap();
-    assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
     assert_eq!(output.stderr, transcript);
     assert!(!fixture.marker.exists());
 }

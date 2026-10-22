@@ -1,5 +1,799 @@
 # Managed execution storage: local Codex handoff
 
+## October 21 continuation: certificate-trust security updates
+
+The refreshed audit for `bf6a2069` reported RUSTSEC-2026-0381, -0382 and
+-0383, published on October 20. Cargo updates only the affected lock records:
+`rustls-webpki` 0.103.15 -> 0.103.16, `webpki-roots` 1.0.9 -> 1.0.10 and
+`webpki-root-certs` 1.0.9 -> 1.0.10. All other package records, selected features,
+manifests, application code and test gates are unchanged. No advisory is ignored.
+
+On configured runner u25-agent-test, pinned nightly-2026-08-31, the patched
+lockfile passed formatting, workspace/all-target compiler checks, full strict
+all-feature Clippy and the complete rch binary unit target: 3,738 passed,
+zero failed, one existing ignored test, zero filtered. Evidence:
+`target/trust-patch-validation-necld605/`; Cargo update evidence is retained in
+`target/certificate-trust-patches-wyqwu8ku/`.
+
+The first audit attempt could not obtain a database lock on the shared NFS
+filesystem. Its replacement uses a new runner-local /tmp database, without
+disabling locking or advisory checks. Against the same 1,348-advisory snapshot
+(`4b587f00996ebe5c05a73eaef105ef241e876414`), the baseline has exactly the three
+vulnerabilities above and the candidate has zero; candidate audit exits zero.
+Both the advisory file digest and database Git HEAD are unchanged between runs.
+Evidence: `target/trust-audit-fixed-snapshot-gl9vyov7/`; remote job
+`rt-20261021-064732-tys7516n`. The unmaintained unsafe-libyaml and yanked
+yoke-derive warnings remain visible and are not reclassified as a clean scan.
+
+Validated Cargo.lock SHA-256:
+`1396b07e6d7b14e067f10d651a4da2e2ee96e1105f08f4bfd1fccbef8e51405d`.
+Hosted native, E2E, RABS and six-platform packaging still require results for
+the newly published head. No parent pass is promoted to final-head evidence.
+
+## October 21 continuation: durable follower cancellation
+
+At `13f9579859d29975280672c905d98625119611c2`, RABS run `39409758151`
+passed every gate. CI `39409758211` passed strict Clippy/formatting,
+security/integrity, Linux x64, both macOS workspace rows, both complete E2E
+jobs and aggregation. Linux ARM64 alone failed the unread-stderr durability
+test: after receipt failure, a copy helper still held the activity lock.
+Shipping and ci-success were correctly blocked; none of these gates is removed.
+
+The follower must remember TERM even between pipeline creation and PID binding.
+It now finishes cancellation by killing and reaping its disposable final writer,
+including a writer that cannot act on TERM. Its own wait diagnostics cannot block
+on the same unread channel. Workload descendants are not signalled or detached
+from their activity lock. Missing completion still exits 255, never fabricates a
+receipt, and never authorizes replay. The production timeout is unchanged.
+
+Two new native Rust/Python regressions force the assignment-gap cancellation and
+the TERM-masked-writer boundary in the actual generated shell, retaining the real
+saturated socket and inherited lock. A separate live process must survive. The
+existing descendant-fencing, binary-output, nonzero-status, umask, slow-reader,
+receipt-failure and replay-refusal assertions remain intact.
+
+The intermediate TERM-only candidate was rejected: its 200-case stress run had
+13 timeouts despite passing the small native suite. An observed failure retained
+a head process blocked on the socket. The final disposal choice passed 300 fixed
+stress cases, and a same-invocation controlled case failed with TERM but released
+the lock with KILL. This is not a claim that tracing proved every scheduler race.
+Evidence is retained in `target/durable-causal-9f73ovq_`,
+`target/durable-hang-observed-9_zn1t0v`, `target/durable-helper-kill-unlslsdt`
+and `target/durable-term-causal-svrh7hdf`.
+
+Final candidate validation on u25-agent-test, nightly-2026-08-31: formatting,
+workspace/all-target check, all-feature fatal-warning Clippy, 11 shell tests and
+all nine native durability tests passed. All 11 shell tests also passed with the
+outer follower executed by the owned Bash 3.2 binary on Linux; this is not native
+Darwin qualification. Evidence: `target/durable-custody-final-gvn5_h98` and
+`target/durable-shell-review-y7yalm88`. UBS baseline and candidate both exit 1
+with the same three critical labels (the restored umask and handles closed by
+tearDown). Five added warnings are regression assertions and witness processes
+also reaped by tearDown. No suppression is added; the raw scan is not called clean.
+
+Keep PR #3 draft until the newly published revision completes all required native,
+E2E, RABS and six-platform shipping checks. Main and deployed workers are unchanged.
+
+## October 20 continuation: executable and endpoint fixture custody
+
+The published baseline is `69b95b9d418d035ed8affa58b4d83163aa175b25`.
+[CI 39376800751](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39376800751)
+passed formatting/full fatal-warning Clippy, security/integrity, both macOS
+workspace rows, Linux ARM64, both complete E2E jobs and their aggregate.
+Linux x64 had exactly one failing test: the library toolchain-membership fixture
+could not launch its `-vV` probe (`Text file busy`, OS error 26). Shipping remained
+correctly gated. [RABS 39376800789](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39376800789)
+then completed every gate successfully, including M4 and doctor/overhead.
+These are baseline results, not results for the following test-only patch.
+
+The integration test's executable writer was already isolated, but the equivalent
+library helper still opened executable files in the multithreaded test process.
+A concurrent fork can inherit that writable descriptor until exec, even when the
+originating descriptor is CLOEXEC. The library helper now opens its writer only
+in a post-exec child, then reaps that child before any LiveFacts probe. Its second
+script-replacement caller uses the same helper. Script bytes, permissions,
+production probing and test parallelism are unchanged. The production prefix of
+`live_facts.rs` is byte-identical to the baseline.
+
+The new Linux regression deliberately retains an actual executable writer in an
+owned process. The real probe must refuse it with ETXTBSY without running the
+script. After the exact writer is released and reaped, the same unchanged bytes
+must probe successfully, retain current facts, and emit exactly the two expected
+identity-probe records. No production retry, timeout, guard or assertion is relaxed.
+
+A subsequent repeated run exposed the same custody mistake in the legacy-socket
+fixture: dropping its multithreaded-parent listener did not establish that an
+unrelated fork had released every inherited listening descriptor. That fixture
+now creates the listener after exec in a dedicated child, validates its readiness
+against the exact child PID, retains the live-refusal/unchanged-inode assertions,
+and releases and reaps that child before demanding ConnectionRefused and safe
+stale takeover. The fixture's control message does not depend on pipe EOF. Its
+owned-child guard also reaps on assertion failure. Production endpoint code and
+its one-second bind checks are unchanged; the modified file is `cfg(test)` only.
+
+On the configured `u25-agent-test` runner with pinned `nightly-2026-08-31`, the
+final two-file patch passed formatting, `cargo check --locked --workspace
+--all-targets`, and full-workspace/all-target/all-feature Clippy with fatal
+warnings. It then passed **eight complete `rabsd --lib` runs: 769 passed, zero
+failed, ignored or filtered in each run**, with normal parallel test execution.
+Logs and exact validated file hashes are retained in the owned ignored
+`target/fixture-custody-j6Di5E5X/` tree. Earlier runs, including the discovered
+socket failure, are retained under `target/remote-pinned-validation/lib-probe-writer-er4jaauj/`.
+The initial cold compilation batch reached its execution limit during Clippy;
+the independent final batch completed successfully without changing any gate.
+The runner's normalization of Cargo caches/builds to `/srv/remote-test` roots
+was honored throughout. No compilation or testing ran on the source host.
+
+UBS v5.5.3 static scans of the two changed Rust files and their unchanged parent
+both exit 1. The ten
+unchanged critical labels mistake filesystem `FileSig` values (device, inode,
+size and timestamps) for secret signatures. Newly reported findings are confined
+to test assertions/filesystem I/O and slash-containing shell strings; there are
+no new critical or production findings. Raw reports and comparison are retained
+under `target/ubs-fixture-custody-4jxha633/`. The scan is not described as clean;
+no suppressions or skipped categories were added. Compiler-backed checks are
+separate from this explicitly static scan.
+
+The 12-workflow graph is unchanged. Keep PR #3 draft until the final published
+revision passes all native rows, both E2E suites, RABS gates, six shipping targets
+and `ci-success`. Main and deployed workers are unchanged.
+
+## Upstream v2.1.34 integration — 2026-10-16
+
+This section supersedes the checkout/status statements below; older evidence
+remains historical. PR #2 was merged into `main` on October 12.
+
+Integration branch: `feat/upstream-v2.1.34-integration`. Its starting fork commit
+is `21c680abc36a07d1edbaf7c9e4c8f4e794165d9b`; its pinned upstream parent is
+`ff152a046086f26845cbd4e9b0541a7b782fc64f` (annotated release `v2.1.34`).
+The tag contributes 591 upstream-only commits. The moving upstream `main` was
+not used. Development is isolated in a CodePier worktree; unpublished edits in
+the original checkout, including new command-routing work, are not included.
+
+The integration retains configurable package-cache/scratch/HOME placement,
+private-workload `/tmp`, and persistent remote environment defaults. Source
+claims, Cargo target pools, process ownership and durable completion remain
+with their native RCH owners. Conflict reconciliation specifically combines:
+
+- Managed configuration keys with upstream local-slot and Layer-0 controls.
+- Upstream worker dependency preparation inside the managed environment,
+  timeout and process group, without the old duplicate bootstrap path.
+- Descriptor-relative recovery ownership with explicit lock release on drop.
+- RABS capture/publication capacity reservations with per-action diagnostics.
+- Upstream cold-build and package-verification tests instead of obsolete
+  fixture expectations, while preserving private-path and cleanup observations.
+- Both new RABS CI gates and the fork's existing resource diagnostics.
+
+The dependency-preparation regression now invokes the production preparation
+shell with a worker double. It checks exact argv/runtime, one preparation per
+invocation, cache/proxy/scratch inheritance, dependency executable PATH, clean
+workload stdout, refusal before workload start, and scratch removal on both
+success and refusal. This is not a real package-install or fleet acceptance claim.
+
+Validation at the initial integration checkpoint:
+
+| Check | Observed result |
+| --- | --- |
+| Git conflict index and conflict-marker scan | Clear |
+| `git diff --check` | Passed |
+| Remote `cargo fmt --all -- --check` after formatting | Passed on the runner's installed formatter |
+| Remote `cargo check --workspace --all-targets --locked` | Blocked before compilation: runner selects stable Rust 1.93 and rejects `-Z threads=4`; no rustup is installed |
+| Pinned-nightly compiler, Clippy and Rust regressions | Pending GitHub CI on the integration revision |
+| Real worker SSH, private-mount success, Nexus and fleet acceptance | Not performed |
+
+All commands that execute tests or compilation are sent to remote/CI tooling.
+Do not change the repository's `nightly-2026-08-31` pin to accommodate the
+remote runner. The formatter result does not establish pinned-toolchain parity.
+Keep the integration PR draft until its exact-revision checks and required
+worker acceptance are complete. No main-branch update or deployment is part
+of this checkpoint.
+
+### CI follow-up after workflow consolidation
+
+Observed on `1b9a330fe0b4123bc16134edbc88ddbaee54c268`:
+[CI 38889175124](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38889175124)
+passed security, bundle/workflow integrity and pinned formatting. Compiler-backed
+Clippy stopped at an oversized staging error and fixed-size journal chunking;
+the aggregate correctly failed and downstream native/E2E/package jobs did not run.
+[RABS 38889174619](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38889174619)
+built the release spine and passed the worker-cache, prepared-build, stream-drain,
+output/session and wrapper-size gates. Its sample-gate suite reported 19 passes
+and 8 failures, so later gates in that step were not executed.
+
+The follow-up fixes the observed causes rather than relaxing CI:
+
+- Keep the cold corruption attribution in a boxed payload, preserving the
+  original typed failure and exact replica quarantine settlement. Remove the
+  existing large-error suppression and add a Result-footprint regression.
+- Use fixed-size array chunks for the digest journal while retaining its torn
+  final-record handling and all existing byte-integrity checks.
+- Persist SPRT checkpoints as append-only, increasing receipt revisions instead
+  of overwriting the immutable `(kind, subject, seq=0)` record. Read the latest
+  revision through the existing primary-key index; refuse malformed latest state
+  and exhausted revision counters. Exact retries do not append, and consumed
+  attempt markers survive conservative checkpoint rollback and database reopen.
+- Initialize private-class and corruption cases independently rather than
+  replacing immutable evidence. Exercise both terminal serving quarantines in
+  fresh stores on both metadata backends and assert ordinary reset is rejected.
+- Add regressions for successive checkpoint history, immutable conflicting
+  writes, no self-generated journal churn, sequence exhaustion and invalid state.
+
+On follow-up `97fdb6b29aaa79804f2b301375c8ebc110eabf49`,
+[CI 38909444638](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38909444638)
+passed the previously failing production checks and reached two additional
+upstream test-only lints: a reference-count `>= readers + 1` comparison and an
+unnecessary cloned one-element expectation. Their repairs preserve the same
+reader admission and digest equality assertions. The main Clippy invocation now
+uses `--keep-going` to collect independent target diagnostics in one run, while
+retaining `--locked`, all targets/features and fatal warnings. A failed dependency
+still blocks its consumers; this is not error suppression or a new CI job.
+
+On `654c9ee8c38308c517bc6305cad455039afb1a33`,
+[CI 38910363670](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/38910363670)
+collected the independent target graph and reported three further test-only
+findings: an unused private-directory helper, a non-octal zero permission literal
+and a runtime assertion on a constant retry bound. The snapshot fixture now uses
+the existing private-directory helper; unreadable directories retain exactly mode
+`0o000`; the retry bound is enforced at compile time. No test or assertion is
+removed. This run passed pinned formatting and bundle/workflow integrity. The
+corresponding RABS run passed both native installer jobs and release spine build;
+its later Rust gates were still running when these findings were recorded.
+
+The real coordinator/edge SPRT suite also gets a regression for a newer reset or
+malformed checkpoint alongside an older 99-install qualification. It must refuse
+replay without touching the destination or overwriting the older receipt, and a
+conservative refusal must survive coordinator/database reopening. These are real
+CAS/filesystem fixture operations, not a fleet or compiler performance claim.
+
+The generic receipt immutability and quarantine-repair rules are unchanged. No
+feature flag, assertion threshold or ignored-test list is relaxed.
+The follow-up passed remote formatting and diff checks; its new Rust regressions
+must still be evaluated by exact-revision pinned-toolchain CI. No successful
+real-worker/Nexus/private-mount acceptance is implied by these fixture results.
+
+### Replay and managed-shell continuation after `2f812efa`
+
+The completed runs for `2f812efa63d979b11ebd3980004affc87ac96f60` are no longer
+pending: CI `38911081979` passed pinned formatting, full-workspace/all-target/
+all-feature Clippy and security/integrity checks. Native Linux/macOS tests and
+shell E2E failed; shipping validation was consequently skipped. RABS
+`38911081769` passed both installer jobs, release spine compilation and the
+worker-cache/preparation/output gates, then failed in replay verification.
+
+The next patch addresses observed runtime defects rather than changing replay
+budgets or accepting failed executions:
+
+- Preview now consults the same durable replay allowance as installation. An
+  exhausted fixed budget must request fresh verification, not advertise a hit
+  followed by `serve-failed`. Repeated preview is tested against actual CAS
+  publication and installation without consuming receipts or creating outputs.
+- Private staging uses an existing destination ancestor on the same filesystem;
+  it does not create the subscriber's missing parent directories. Only final
+  authorized installation creates those parents. Quarantine, abandonment and
+  concurrent budget exhaustion must leave an absent subscriber tree absent.
+  Exact-inode staging cleanup and partial-rename receipts remain intact.
+- The live installer rechecks every destination after the staging lock handoff.
+  A newly introduced symlink in a later output's parent must refuse the complete
+  plan before replacing its earlier metadata output or touching unrelated files.
+- Class-safety fixtures create bound generations before requesting live leases.
+  The corruption test follows the existing whole-bundle staging contract: both
+  fresh and populated subscriber trees remain untouched and the corrupt source
+  is quarantined. A separate actual rename-collision test retains prefix coverage.
+- Remote environment assignments now apply to a shell running the entire
+  authored workload, before its variable expansion or pipeline parsing. This
+  repairs the managed proxy/cache precedence failure. Tests retain inline
+  overrides, pipeline inheritance, literal shell metacharacters, NUL output,
+  stderr and nonzero status; no environment values are reparsed as source.
+
+New coordinator and output-install tests are included in the existing RABS job,
+not a new workflow. No warning, quarantine, lease, retry or replay limit is relaxed.
+The final remote formatting attempt was blocked by SSH public-key authentication;
+its fallback found no real Cargo executable and performed no build or test on
+this source host. Diff checks passed; pinned formatting and compiler-backed
+regressions must be assessed on the newly pushed revision by GitHub CI.
+
+Unrelated failures remain open, including runtime-entry policy coverage,
+platform-specific path/socket/process fixtures, Cargo package selection fixtures,
+conservative cleanup observability, the obsolete automerge workflow contract
+and native shell E2E. This patch is not a full-suite, fleet or deployment claim.
+Keep PR #3 draft and do not update main or deploy workers.
+
+### ZIP audit follow-up after `08875a2c`
+
+At `08875a2c932661d77a45996298c544e26567c71f`, pinned formatting, workflow
+integrity and both native RABS installer jobs passed. The audit database updated
+on October 17 then reported three vulnerabilities in `zip 8.6.0`:
+[RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367.html),
+[RUSTSEC-2026-0368](https://rustsec.org/advisories/RUSTSEC-2026-0368.html) and
+[RUSTSEC-2026-0369](https://rustsec.org/advisories/RUSTSEC-2026-0369.html).
+The older October 16 audit pass does not qualify the current revision.
+
+Upgrade the workspace and lock entry to patched `zip 9.0.0`. The registry's
+checksum was independently matched against the downloaded crate bytes; the
+selected no-default/deflate-flate2 dependency requirements are unchanged. No
+unrelated dependency was upgraded or advisory ignored. Final Cargo `--locked`
+and audit validation still belong to exact-revision CI, not this metadata check.
+The updater explicitly rejects symlinks before directory-name classification.
+Native extraction regressions preserve external bytes and permissions for both
+relative and absolute link targets, including directory-shaped link names, and
+prove archived SUID/SGID/sticky bits are present in the input but absent from
+extracted ordinary files/directories. Existing safe regular ZIP extraction stays
+covered. The unmaintained unsafe-libyaml and yanked yoke-derive warnings are
+separate unresolved dependency-maintenance findings, not hidden exclusions.
+
+### Permit-boundary and CI-policy follow-up after `44be5087`
+
+Completed evidence for `44be5087bf98d15ff6791fbc3b0e8b1f9b0d8ad8`:
+[CI 39150730505](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39150730505)
+passed the refreshed ZIP security audit and workflow integrity; two ZIP-test line
+wraps stopped pinned formatting before Clippy. Those exact wraps are corrected.
+[RABS 39150730517](https://github.com/tsunheimat/remote_compilation_helper/actions/runs/39150730517)
+passed both installer jobs, release compilation, 29 sampling tests, 14 staged
+materialization tests, 28 coordinator tests, 14 complete-output tests, both class
+safety tests and all five SPRT-budget tests. The replay target had six passes and
+one failure; later release gates were not executed after that failing step.
+
+The remaining replay test incorrectly treated a destination-arbiter refusal as
+an admitted installation. Arbitration now precedes staging and permit spending:
+that refusal leaves zero receipts, and the subsequent 24-way contention must
+produce exactly 16 installed outputs, eight refusals and 16 contiguous receipts.
+The test now checks these receipt identities as well as bytes and absent paths.
+It does not change the production replay limit.
+
+A separate deterministic regression preserves the opposite boundary: after real
+private staging, a late filesystem obstruction reaches the production terminal
+receipt/delivery function. The failure must retain its spent permit and leave
+the obstruction untouched; only the remaining 15 installations are allowed,
+and an exhausted retry cannot append another receipt. The production code is
+factored without changing the ordering of authority checks, spending or delivery;
+there is no test-only failure callback or mocked materializer success/error.
+
+The stale auto-merge YAML test is replaced by `ci_workflow_policy.rs`: validation
+contents stay read-only, privileged triggers/permissions and dangling job needs
+are rejected, E2E/shipping retain one reusable PR owner, and dependency proposals
+remain enabled without auto-merging. It includes 93 subprocess cases against the
+actual aggregate Python program, not a copied result evaluator. Those Python
+cases passed remotely; Rust YAML parsing and the new native regressions still
+require exact-revision compiler/test results. No workflow is added or test gate
+relaxed. Remote access is restored to configured `agnet-test` (hostname
+`u25-agent-test`); formatter execution passed there with a source-host refusal
+guard. This is not a pinned-toolchain or full-suite pass. Main and workers are
+unchanged; PR #3 remains draft.
+
+### Guarded-runtime and archive-contract reconciliation
+
+At `d40a133b3839fdcd33346608bce460816a51561f`, CI `39198658477` passed pinned
+formatting, security and workflow integrity. Clippy exposed ZIP 9's fallible
+`ZipFile::name()` signature. Extraction now maps a decoding failure to a typed
+installation refusal before any path is selected; it does not use lossy names.
+A regression creates and successfully extracts a valid ZIP, changes only the
+local/central filename bytes and UTF-8 flags, then verifies malformed extraction
+cannot create a replacement-character output. The unchanged valid extraction
+remains byte-identical. No dependency rollback or advisory exemption is used.
+
+The older native failure log also exposed static review drift after runtime
+entry was moved behind guarded adapters. The AST scanner now treats calls to
+`block_on_top_level` and `block_on_worker_runtime` as runtime entry, including
+opaque macros; original reviewed caller counts remain unchanged. Only the two
+actual adapter bodies are newly reviewed entry owners, each borrowing an owned
+runtime and rejecting an active Cx before calling block_on. New detector fixtures
+reject both adapters from async/nested/macro/unreviewed contexts. Three split-out
+fixture modules explicitly declare `#![cfg(test)]`, matching their already-gated
+parent module declarations; all src files continue to be scanned independently.
+
+Cargo archive expectations now distinguish the existing contracts rather than
+widening production delivery: `cargo package` returns only final root archives;
+`cargo publish --dry-run` may return tmp-registry/tmp-crate archives too. Both
+managed/unmanaged cases assert exact selected and excluded path sets. The real
+Cargo package/rsync fixture still verifies extracted-source provenance and final
+archive byte equality, and now asserts scratch archives are not returned.
+
+Remote formatting and diff checks passed. These changes do not establish native
+runtime/packaging/ZIP-test success: those require the next pinned CI revision.
+The d40 RABS run `39198658478` passed installers, release build and early worker
+checks and was still executing replay verification at this checkpoint. No new
+workflow, ignored test, warning exemption, runtime permission or artifact type
+is introduced. Main and deployed workers remain unchanged.
+
+### Native cancellation and stale-endpoint fixtures
+
+Revision `5426abf4a07bafa773c01aff42281d2a7fdd38bd` passed pinned formatting,
+full-workspace/all-target/all-feature Clippy with fatal warnings, the security
+audit and workflow integrity in CI `39199931539`. Both native RABS installer
+jobs and release spine compilation passed in `39199931558`. Native workspace
+and E2E jobs started; their success is not yet established.
+
+Two remaining older native failures are fixture/protocol mismatches. The paused
+supervision daemon used to panic when a correctly cancelled wrapper closed its
+socket before the delayed decision reply. It now accepts only BrokenPipe or
+ConnectionReset, and only after the test explicitly confirms killing and reaping
+the original caller. Ordinary replies, timeouts and unrelated errors remain
+fatal. The test exercises both the original cancellation/reply race and an
+already-exited wrapper before reply; neither may start a compiler, create the
+forbidden output or report successful completion. Production supervision and
+its cancellation deadlines are unchanged.
+
+The stale-socket takeover fixture previously left a raw listener's umask-derived
+permissions, although the real endpoint owner leaves mode 0600 and refuses to
+retire a non-private socket. The positive fixture now reproduces that real mode.
+A new real-daemon negative test supplies a connect-refused but mode-0660 socket
+and requires a named privacy refusal without changing its inode, device, owner,
+link count, permissions or ctime. A refused connect alone never grants cleanup
+authority. No production endpoint policy or timeout is relaxed.
+
+Remote formatting and diff validation passed; these two native regressions must
+still pass in the exact final CI revision. The changes are in the existing
+workspace suite, with no added workflow. Broader Cargo reuse, cleanup-activity
+observability and shell E2E findings remain open until reproduced and resolved.
+Do not merge main or deploy workers on the basis of intermediate Clippy passes.
+
+### Completed native results and resumed integration after `1f374f02`
+
+CI `39200654564` passed pinned formatting, fatal-warning full-workspace Clippy,
+security and workflow integrity, but native suites and shell E2E failed. RABS
+`39200654559` passed the replay/endpoint/maintenance/capture/input and real Cargo
+layout gates; its large-input worktree case failed on missing readiness telemetry.
+The final doctor/overhead gate did not run. These are failures, not acceptance.
+
+The resumed batch reviews and retains the unpublished worktree repairs alongside
+new native regression fixes. Both concurrent input warmers are now represented
+by their actually observed `BothPending` state and `also_pending` diagnostic;
+no additional polling delay is introduced. The cold Cargo test requires every
+pending observation before execution and retains its full real-artifact ladder.
+An unexplained debug-only toolchain refusal now retains complete daemon decisions
+instead of only a tally; it remains open until its cause or final result is known.
+
+Worker-owned `RCH_CH_BASE` cannot be overwritten through raw allowlists. ZIP names
+flagged UTF-8 are validated as raw UTF-8 before decoding, while hostile permission
+fixtures inspect raw archive attributes rather than ZIP 9's sanitized accessor.
+macOS fixtures use physical temporary roots, bounded socket paths, actual flock
+and timeout tools, and exact native EILSEQ refusal with lossy-neighbor protection.
+The lifecycle socket fixture explicitly selects blocking reads on accepted streams
+and adds a fragmented-request regression. Production endpoint authority is unchanged.
+
+Positive cleanup fixtures re-execute the entire original test in an owned PID/proc
+namespace so real CWD holders remain visible. Unknown host activity still refuses
+cleanup. Linux thread-census and Darwin process-census fixtures use their actual
+argument/column contracts; missing threads still retain records. Scoped sudo-unshare
+requires an explicit ephemeral-CI opt-in, not a workstation or host policy change.
+The Cargo placement gate now selects its actual module and rejects zero listed tests.
+All 12 workflow owners and existing required checks are retained.
+
+Remote `u25-agent-test` validation: four extracted-production activity cases passed
+(idle, live CWD, recent write, unavailable process), 46 actual source-registry tests
+passed, and all 93 cases against the actual CI aggregate passed. Stable remote
+formatting and shell/diff checks passed. These are not pinned Rust/native-macOS or
+whole-worker acceptance; exact published-revision CI must validate the new batch.
+Original-checkout edits, main and deployed workers remain untouched. Keep PR draft.
+
+### Pinned native validation and FIFO portability after `89cfa4ed`
+
+At `89cfa4edd57261057c38583a82f82c38f223afa6`, CI `39210558778` passed
+pinned formatting, fatal-warning full-workspace Clippy, security and integrity.
+The Linux x64 native workspace job completed successfully. The complete Linux
+E2E job also passed: Cargo true-E2E, explicit mock SSH and all 41 native shell
+scenarios. The retained `e2e-ubuntu-latest` artifact (12168890907) contains 41
+passing status records, including the formerly failing cleanup scenario.
+
+Both macOS native jobs stopped during compilation because rustix does not expose
+`mkfifoat` for that target. The excluded-tree regression now creates the same real
+kernel FIFO through native `mkfifo -m 600`, then checks its type and exact mode.
+Selected FIFOs still refuse capture, and excluded FIFOs still prove that no walk
+occurs. No platform test is disabled and no production snapshot policy changes.
+
+Pinned Rust is now installed in an owned directory under the remote validation
+`target/` tree, not over the worker's system compiler and not through shell
+profile changes. Installation used rustup 1.29.1 with its official checksum and
+`--no-modify-path`. Tests report the repository-pinned nightly-2026-08-31 compiler
+`90850177249efe0321573c569aec5d12b257f8d6`, and run only on `u25-agent-test`.
+The temporary root of a remote job is private; setup and execution use one owned
+persistent validation tree. No compiler/test falls back to the source machine.
+
+Against the 89cfa4ed tree plus the FIFO change, pinned remote execution passed:
+
+| Actual test selection | Passed / failed |
+| --- | --- |
+| Excluded-directory real-FIFO regression | 1 / 0 |
+| `rchd` cleanup module, including owned PID/proc namespaces | 55 / 0 |
+| `daemon_stop_safety`, including fragmented native socket requests | 8 / 0 |
+| Extraction-related tests, including ZIP/tar safety and filename guards | 33 / 0 |
+| Managed storage/environment/scratch regressions | 11 / 0 |
+| Cargo-home boundary tests | 4 / 0 |
+| Compound environment and authored inline override | 1 / 0 each |
+| Complete real Cargo worktree target, including large inputs and tracked OUT_DIR reads | 10 / 0 |
+
+All selections were nonempty and returned exit 0 without ignored tests. Pinned
+formatting passed. Evidence and source hashes remain in the ignored remote
+validation tree, under `evidence-owned-tools-8mm93nf3` and
+`runtime-evidence-7osr51sz`. These are targeted native-Linux results, not proof of
+macOS, six-platform shipping or a full final-revision CI pass. The broader RABS
+release job had reached the real layout tests at this checkpoint. Final revision
+CI must still qualify the FIFO portability correction and all remaining gates.
+Main, original-checkout edits and deployed workers remain unchanged; PR is draft.
+
+### Native shell loading, UUID authority and heartbeat observation after `63425131`
+
+Baseline `634251316f056f347ac9b206ba02be27b45df6c9` completed the entire RABS
+release workflow `39216702473`, including actual Cargo reuse and final overhead
+checks. CI `39216702477` passed pinned formatting, fatal-warning Clippy, security,
+integrity and the complete Linux E2E job. The four native workspace rows and
+macOS shell E2E still failed, so packaging was skipped and the PR was not ready.
+
+The next batch fixes an actual Bash 3.2 loading defect in both shared control
+scripts: unbalanced case patterns inside command substitutions break when the
+literal protocol is evaluated, although `sh -n` on the outer heredoc passes.
+Balanced POSIX case patterns preserve the existing stat commands, error status,
+receipt checks and permissions. The existing syntax regression now actually
+loads the compiled protocol directly and in a cleanup subshell, retaining opaque
+caller arguments. Cleanup now reports a failed protocol bootstrap as an error
+instead of swallowing stderr and presenting zero removals as a successful scan.
+Its new negative case leaves the original aged process record untouched.
+
+The macOS source-sweep fixture incorrectly assumed missing Linux procfs meant
+ownership was unavailable, despite the existing native uuidgen fallback. It now
+exercises failed, malformed and valid native UUID generation with exact directory,
+claim and byte checks. Production also checks the generator's exit status before
+normalization: a failed uuidgen that emits a plausible UUID must never acquire
+authority just because the final tr process succeeds. A separate Unix regression
+exercises that exact failure and success boundary without deleting its sentinel.
+
+The preflight heartbeat test accounts for its independently scheduled executor:
+Drop cannot retract a complete immediate heartbeat already in the socket. The
+explicit preflight flush is still required before rejection; at most two startup
+messages may arrive across two subsequent production intervals. A leaked periodic
+sender exceeds that bound. The positive control compares two post-transition
+periodic snapshots and still forbids invented progress. Production heartbeat
+periods and cancellation behavior are unchanged.
+
+Verification on `u25-agent-test`, pinned nightly-2026-08-31:
+
+- `cargo fmt --all -- --check` and full-workspace/all-target/all-feature Clippy
+  with `--locked --keep-going -- -D warnings` passed.
+- The new UUID-status test, three protocol/quoting tests, preflight-heartbeat
+  regression and all 14 cleanup-command tests passed. Evidence is retained under
+  `target/remote-pinned-validation/{uuid-fallback-current,parser-regression-current,
+  heartbeat-current,cleanup-commands-current,current-full-clippy}.log`.
+- In one before/after invocation, 12 parser comparisons covered dash, modern
+  Bash and a private Linux build of GNU Bash 3.2, with direct and subshell loading.
+  Both old-Bash baseline cases failed with exit 125; the patched cases and both
+  baseline/current modern-shell cases passed with unchanged arguments. This is
+  actual shell-parser reproduction, not native macOS execution or fleet proof.
+  Evidence: `target/remote-pinned-validation/bash32-parser-comparison.log`.
+- The unchanged capture suite passed once and in eight fixed CPU-constrained,
+  traced repetitions of all eight tests. That non-reproduction does not resolve
+  the earlier CI exit-1-versus-122 failure. No assertion or deadline was relaxed.
+
+The ARM cold-Cargo refusal remains unexplained; the fixture now preserves the
+actual daemon refusal detail when it fails instead of destroying the log after
+printing only a tally. The macOS full-hook 10 ms performance gate also remains
+unchanged and unresolved. The final native CI revision must qualify these changes;
+no former run is relabeled as a new-revision pass. All 12 workflow owners remain,
+and main, original-checkout work and deployed workers are untouched.
+
+### Direct process formation and complete SSH previews after `798cb378`
+
+Published baseline `798cb3781294f99dad0b65ae63c86c4021f127fb` completed
+CI `39235058108`: pinned fatal-warning Clippy, formatting, security, integrity,
+Linux x64 workspace tests, and both Linux and macOS E2E jobs passed. The macOS
+E2E result includes the unchanged full-hook timing gate. Both macOS native rows
+failed the UUID sweep fixture, ARM macOS additionally failed the cold-wait
+rollover fixture, and Linux ARM failed real vendored Cargo reuse. Shipping was
+therefore correctly skipped. RABS `39235058119` also failed its real-Cargo M4
+phase, despite passing the preceding release and lifecycle gates.
+
+The preserved Linux ARM and release daemon logs identify the same refusal:
+`process_group(0) not honored: live leader ... not found in any /proc pgrp`.
+Formation used a best-effort host scan that excludes zombie leaders and then
+assumed two nonterminal waitpid observations made a missing scan entry proof of
+failed setpgid. The new proof reads the directly owned, unreaped child's bounded
+stat record and checks PID, parent and process group, including terminal states.
+It preserves the initial full membership observation separately. Formation is
+not quiescence, unknown live identity still refuses, and the existing armed
+unadmitted-child guard still kills/reaps on failure or unwind. Regression coverage
+includes a real unreaped zombie, a real live child in the wrong group, malformed
+identities and the existing descendant, unwind and bounded-output cases. A native
+pthread fixture deterministically reproduces the exact old refusal predicate:
+the main thread is Z, another thread remains alive, the process-only scan is
+empty and two waitpid polls are nonterminal. The corrected production formation
+check accepts the same owned process; the test then kills and reaps it. The
+fixture also has its own natural alarm bound. All 18 process-group tests pass.
+
+The actual RCH -> daemon -> SSH qualification exposed a separate data-loss defect:
+`read_line(String)` silently ended the SSH preview reader on invalid UTF-8 and
+lost the later output. Both lanes now read bounded byte fragments before text
+rendering, retain valid split UTF-8 and delimiters, and report real I/O errors.
+A JoinSet owns the readers through cancellation and checks their terminal results;
+cutting off a post-completion output tail is unconfirmed transport, not success.
+The text-preview contract remains unchanged: workload text goes to stderr and
+stdout remains the protocol surface. Exact binary data is returned as artifacts,
+not misrepresented as a lossless Unicode preview. New tests cover both lanes,
+NUL/invalid bytes, unterminated tails, bounded long fragments, read failures and
+closed consumers.
+
+The UUID fixture now requires exit 1 and no successful metrics for failed or
+malformed UUID admission. A successful native sweep removes only the two stale
+targets and checks exact retired-claim contents, including the fresh job whose
+ordinary TTL activity check runs after ownership acquisition. This test now runs
+on every Unix host. Production admission/retirement policy is unchanged.
+
+The cold-wait rollover failure remains unproven locally: 35 singleflight tests
+pass, including exactly 60 preparation replies before reconnect. Its test now
+retains phase/reply counts, elapsed time and typed I/O refusal diagnostics, without
+changing timeouts, retries, protocol authority or release-wrapper logging.
+Capture's stalled-stream fixture likewise retains the non-stalled diagnostic
+instead of discarding it; its exit-122 and unread-consumer assertions are intact.
+
+Additional maintenance keeps the async CLI frame outside the pass-through entry
+and separates the SSH fixture's local inetd audit log from actual remote stderr.
+The same-invocation Linux development comparison was 5.55 ms versus 5.02 ms over
+50 samples per binary, with all 14 real-process behavior cases unchanged. This is
+not release/fleet performance evidence. All 54 real SSH/rsync policy cases and
+nine imported Rust receipt-policy tests passed; spoofed server notices on remote
+stderr still refuse, as do changed host keys and failed authentication.
+
+Pinned `nightly-2026-08-31` validation on `u25-agent-test` passed all four new SSH
+reader tests, all 18 process-group tests, all 35 singleflight tests, the complete
+10-test real-Cargo worktree target and full workspace/all-target/all-feature
+Clippy with `--locked --keep-going -- -D warnings`. Logs are under
+`target/remote-pinned-validation/merge-ready-*.log`. The aggregate driver initially
+failed only because its second SSH job correctly rejected missing native worker
+topology configuration; the real capability probe has independent
+`RCH_WKR_CANONICAL_ROOT`/`RCH_WKR_ALIAS_ROOT` settings, not the client's TOML.
+The fixture now configures these owned paths and verifies the real worker's
+healthy topology before starting its daemon; it does not disable preflight.
+
+The corrected actual SSH run `rt-20261019-131320-x7y42kzg` passed failure (23) and
+success (0) jobs, complete text previews, exact NUL/non-UTF-8 binary artifacts,
+opaque argv, managed persistent cache/environment, distinct source inodes and
+mount namespaces, and scratch removal. The daemon terminated cleanly. Evidence
+and binary/source identities are in the owned
+`managed-ssh-gcttlho6/verified-preview-b0tkg869` directory. No persistent worker
+service, source-host compiler, global SSH configuration or deployed binary was
+changed; this is isolated runner qualification, not fleet rollout.
+
+UBS was unavailable on both hosts. A private source checkout pinned to
+`3729ccf088dc4fbdcf45d9193dfb8a939a08ea06` runs static analysis on changed files;
+its Cargo phases are explicitly separate from the pinned checks above. Its five
+critical reports were present at the published baseline: three fixed test shell
+protocols, the intentionally caller-configured process executor API, and a native
+fixture resolving only literal gfind/find tool names. Each boundary is reviewed
+and documented with a single-rule source annotation, not a global rule disable.
+The default static scanner verdict is now exit 0 with zero unsuppressed critical
+findings; other findings remain visible. Required compiler warnings, audit rules,
+assertions, deadlines, platform selections and all 12 workflow owners are intact.
+
+These working-tree results do not qualify a later commit automatically. Keep PR
+#3 draft until its exact published revision passes native CI, both E2E jobs,
+RABS release gates and all six shipping platforms. Main and the original
+checkout's unrelated edits remain untouched.
+
+### Diagnostic rendering and publication-timer qualification after `63f591cb`
+
+The full remote RCH unit run exposed a reproducible presentation-test defect:
+the default runner socket path wraps across two graphical diagnostic lines.
+The underlying error still contains the complete path. The regression now
+checks the exact unwrapped diagnostic for both the default and an explicitly
+long quoted path, then checks the rendered code, cause and all recovery commands.
+Production formatting and socket selection are unchanged.
+
+A controlled default-concurrency run (96 visible/affined CPUs) also isolated a
+publication-test false attribution: its timer fired after 26.818 ms, but the
+one-second timeout later cancelled durable publication (1.103 s overall). The
+revised test polls both actual publishers against an independently held output
+lock and retains the SAME one-second responsiveness limit and two-second owner
+watchdog. It rejects any publisher completing before release, verifies untouched
+outputs at the timer, then finishes both original publication futures and checks
+all exact bytes, complete journals and removed stages. Slow subsequent fsyncs
+are not misreported as a blocked lock-wait reactor. The production publisher,
+lock budget and cancellation custody are unchanged.
+
+Negative control: temporarily restoring a blocking `File::lock` before the real
+lock loop made this revised test fail with `runtime timer stalled: 2.043 s`.
+The mutation was removed, and the restored file's SHA-256 exactly matched the
+previously passing source. No intentionally broken implementation is committed.
+The local-build-alarm ordering test only gains explicit state-error diagnostics;
+its deadline, failure assertions and scan/transition policy remain unchanged.
+
+Pinned remote validation after restoration passed formatting, workspace/all-target
+`cargo check --locked`, complete workspace/all-target/all-feature Clippy with
+`--keep-going -- -D warnings`, and all 3,736 RCH unit tests (zero failed, one
+pre-existing ignored). The full unit target also passed before the mutation;
+all 29 diagnostic tests and 65 SSH/source-ownership tests passed independently.
+No CI parallelism, workflow, test-selection or production setting was altered.
+Evidence is under `target/remote-pinned-validation/`:
+`resume-phase-observation-tu3133xe`, `resume-causal-publication-cw6sJu61`,
+`publication-blocking-negative-k6gma2w2.log`, and
+`resume-final-validation-7z68ie4n`.
+
+The auxiliary UBS scan returned exit 1 on eight critical-labelled findings in
+unchanged code; the baseline scan of the same three files returned those exact
+eight findings too (`resume-static-baseline-5voyf58x`). Context review identifies
+seven comparisons of public exit codes, counts or fixture state strings, not
+secret authentication values, and one execution of a fixed, freshly compiled
+Go fixture beneath its owned temporary directory. No critical finding was
+introduced, no comparison was obscured, and no scanner rule was suppressed.
+This is a recorded false-positive review, NOT a clean scanner exit claim.
+
+The running hosted native/E2E/release validation remains tied to its published
+revision; these local results cannot qualify a later commit by themselves.
+Keep the integration draft until the final published revision's required checks
+complete. Main, the original checkout and deployed workers remain unchanged.
+
+### Worker jobserver EOF and retained release-gate evidence
+
+Published `63f591cbf55a3351b478a1097150e38766f7f41f` completed all 41 macOS
+shell E2E scenarios, as well as Linux E2E. The Linux x64 workspace's remaining
+failure was `rabs-wkr --lib`'s `bridge_kernel_credit_plus_implicit_slot_equals_the_grant`:
+its final read observed WouldBlock, not EOF, while unrelated parallel tests
+could temporarily retain the writer between fork and exec. The kernel-credit
+fixture now runs its exact assertions in a child that creates all its FIFOs
+after exec. It also deliberately retains a cloned writer, proves unlinking does
+NOT authorize EOF, then requires EOF only after the final writer closes. Token
+counts, the implicit slot, path cleanup, and all production bridge code remain
+unchanged. A child completion marker prevents a zero-test process from passing.
+
+An earlier saved validation invoked this library-only test through the binary
+and selected zero tests; that output is not qualification. The corrected pinned
+remote invocation explicitly selected `--lib` and `--exact`: 1 passed. The full
+worker library then passed all 158 tests with no failures, ignored or filtered
+cases, followed by full-workspace/all-target/all-feature Clippy with fatal
+warnings and formatting. Evidence: `worker-bridge-final-db7bJDD9` under
+`target/remote-pinned-validation/`.
+
+RABS's hosted release M4 gate is still a separate open failure; a previous local
+development-profile pass is not release qualification. The existing release
+workflow now retains M4, doctor and overhead logs as an artifact using pipefail,
+without changing their commands, thresholds, selection, or failure handling.
+There is no new workflow. Keep draft until the final published revision completes
+its native, E2E, RABS release and six-platform shipping gates.
+
+### Final native failure isolation after `ca74bf55` — October 20
+
+The completed `ca74bf55258c83214700eddb4e0cacf51aa877b9` hosted runs narrowed the
+remaining blockers. RABS `39283814245` passed every job and gate, including real
+Cargo worktree reuse, doctor and enforcing overhead. CI `39283814010` passed
+Clippy/format/integrity, both ARM64 workspace rows, both complete E2E jobs and
+aggregation. Shipping correctly remained skipped because the two x64 workspace
+rows each failed one test. The security job found zero vulnerabilities but its
+GitHub check-update API returned 404; a targeted rerun passed without changing
+any dependency, advisory rule or audit configuration.
+
+Linux x64 failed `live_output_capture` while probing a newly replaced fixture
+compiler: `Text file busy (os error 26)`. Executable writers now open only after
+exec in a dedicated child, and that child is reaped before LiveFacts probes it.
+This prevents an unrelated parallel fixture's fork from retaining the parent's
+CLOEXEC writer. The equal-byte replacement still verifies identical content and
+a different inode; stale observation rejection and all publication assertions
+remain. No production retry or toolchain-admission policy changed.
+
+macOS x64 failed the actual singleflight wrapper after a cache hit was accepted.
+Its assertion did not retain stderr, so the particular hosted error could not
+be reconstructed. The adapter nevertheless had a concrete Darwin close race:
+Apple's [sosetoptlock implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_socket.c#L4749-L4754)
+rejects timeout updates with EINVAL after both halves close, even with a final
+reply still queued. The Apple-only branch now performs a single nonblocking
+read after that precise error and restores blocking mode. An empty live socket
+returns the original error, never fabricated EOF or an unbounded read. Absolute
+deadlines, ownership checks, strict framing and post-acceptance fail-closed
+semantics are unchanged. Native peer-close tests and a forced timeout-error
+adapter test cover these boundaries; the integration assertion now retains its
+complete process result. Native macOS execution is still required to qualify
+this change and determine whether the hosted symptom is fully resolved.
+
+Pinned remote job `rt-20261020-054300-abxaw80i` on `u25-agent-test` passed 92 wrapper
+unit cases plus 8 capture, 8 live-protocol and 7 singleflight integration cases.
+All 12 live-output-capture cases passed once, then eight more fixed repetitions
+with normal parallelism. Full-workspace/all-target check, all-feature fatal-warning
+Clippy and formatting also passed. Evidence is retained under the existing
+ignored `target/remote-pinned-validation/peer-close-fixture-1QOze2eK/` directory.
+These Linux results are not macOS or final shipping qualification. The requested
+precommit UBS invocation was unavailable on the authorized runner (exit 127);
+no UBS pass is claimed. No workflow, production timeout, warning policy or test
+exclusion changed. Keep the PR draft until the newly published revision passes
+its full required graph.
+
+## Historical October 12 handoff
+
 Snapshot: 2026-10-12 UTC, local development continuation. Consumer: the draft PR
 reviewer and the user's next local session. The user requested continued
 development and said they will deploy later. Keep PR #2 draft. Deployment and

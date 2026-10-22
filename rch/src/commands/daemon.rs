@@ -54,13 +54,32 @@ fn reload_success_default() -> bool {
 }
 
 async fn require_restart_admission() -> Result<()> {
-    let response = send_daemon_command("POST /restart-admission\n")
-        .await
-        .context("daemon did not acknowledge restart admission barrier")?;
-    let body =
-        extract_json_body(&response).context("restart admission response was missing JSON")?;
-    let admission: RestartAdmissionResponse =
-        serde_json::from_str(body).context("restart admission response was malformed")?;
+    let verdict = async {
+        let response = send_daemon_command("POST /restart-admission\n")
+            .await
+            .context("daemon did not acknowledge restart admission barrier")?;
+        let body =
+            extract_json_body(&response).context("restart admission response was missing JSON")?;
+        serde_json::from_str::<RestartAdmissionResponse>(body)
+            .context("restart admission response was malformed")
+    }
+    .await;
+    let admission = match verdict {
+        Ok(admission) => admission,
+        Err(error) => {
+            // The daemon may have closed the barrier before its reply was lost,
+            // late or garbled. This restart is abandoned, so reopen admission
+            // rather than leave every later worker selection refused.
+            if let Err(release_error) =
+                send_daemon_command("POST /restart-admission/release\n").await
+            {
+                tracing::warn!(
+                    "failed to release a possibly-closed restart-admission barrier: {release_error}"
+                );
+            }
+            return Err(error);
+        }
+    };
     if admission.restart_permitted {
         return Ok(());
     }
@@ -200,6 +219,102 @@ async fn restart_via_systemd(scope: SystemdUnitScope) -> std::result::Result<(),
     } else {
         Err("systemd restarted rchd but no daemon responded on the socket".to_string())
     }
+}
+
+/// The launchd agent that `rch daemon install`-style setups (and the fleet's
+/// Macs) use to keep rchd alive: `~/Library/LaunchAgents/com.rch.daemon.plist`,
+/// `KeepAlive = true`.
+#[cfg(target_os = "macos")]
+const RCHD_LAUNCHD_LABEL: &str = "com.rch.daemon";
+
+/// The loaded launchd service target (`gui/<uid>/com.rch.daemon`) managing
+/// rchd on this Mac, if any (bd-5pmwm). Like the systemd case, the manual
+/// shutdown + `nohup rchd` spawn fights KeepAlive's own respawn, so Mac
+/// rollouts used launchctl directly, without draining, and killed queued
+/// builds. Restarting through launchd keeps `--drain` meaningful on Macs.
+#[cfg(target_os = "macos")]
+async fn detect_rchd_launchd_target() -> Option<String> {
+    // Effective UID without unsafe code: the kernel reports our own
+    // credentials on our own socket pair.
+    let (socket, _peer) = tokio::net::UnixStream::pair().ok()?;
+    let uid = socket.peer_cred().ok()?.uid();
+    let target = format!("gui/{uid}/{RCHD_LAUNCHD_LABEL}");
+    let printed = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())?;
+    // Only a job whose live process listens on the configured socket is the
+    // daemon being restarted. Without this check, a CLI pointed at another
+    // socket (a second daemon, a test sandbox) kickstarted the user's rchd.
+    let pid = launchd_job_pid(&String::from_utf8_lossy(&printed.stdout))?;
+    let socket = configured_socket_path().ok()?;
+    process_listens_on_unix_socket(pid, std::path::Path::new(&socket))
+        .await
+        .then_some(target)
+}
+
+/// The job's own `pid = N` line (one tab deep) in `launchctl print` output.
+#[cfg(target_os = "macos")]
+fn launchd_job_pid(printed: &str) -> Option<u32> {
+    printed
+        .lines()
+        .find_map(|line| line.strip_prefix("\tpid = ")?.trim().parse().ok())
+}
+
+/// Whether `pid` holds a Unix socket bound at `socket`, per `lsof -Fn`.
+#[cfg(target_os = "macos")]
+async fn process_listens_on_unix_socket(pid: u32, socket: &std::path::Path) -> bool {
+    let Ok(output) = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-U", "-Fn"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+    else {
+        return false;
+    };
+    let wanted = [Some(socket.to_path_buf()), socket.canonicalize().ok()];
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.strip_prefix('n').is_some_and(|name| {
+            wanted
+                .iter()
+                .flatten()
+                .any(|path| path.as_os_str() == std::ffi::OsStr::new(name))
+        })
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn detect_rchd_launchd_target() -> Option<String> {
+    None
+}
+
+/// `launchctl kickstart -k` the agent (launchd re-execs the plist's binary,
+/// so a freshly installed rchd takes over), then wait for a live listener.
+/// rchd re-adopts in-flight builds from durable ownership on startup, which
+/// can take a few seconds, so this waits longer than the systemd path.
+async fn restart_via_launchd(target: &str) -> std::result::Result<(), String> {
+    let status = Command::new("/bin/launchctl")
+        .args(["kickstart", "-k", target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("failed to invoke launchctl: {e}"))?;
+    if !status.success() {
+        return Err(format!("launchctl kickstart -k {target} exited {status}"));
+    }
+    for _ in 0..200 {
+        if daemon_responds_on_configured_socket().await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err("launchd restarted rchd but no daemon responded on the socket within 20s".to_string())
 }
 
 fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
@@ -1176,7 +1291,47 @@ pub async fn daemon_restart(opts: StopOptions, ctx: &OutputContext) -> Result<()
         }
     }
 
-    // Manual path: user-launched daemon (no unit) and macOS launchd hosts.
+    if let Some(target) = detect_rchd_launchd_target().await {
+        match restart_via_launchd(&target).await {
+            Ok(()) => {
+                let socket_path_str = configured_socket_path()?;
+                if ctx.is_json() {
+                    let _ = ctx.json(&ApiResponse::ok(
+                        "daemon restart",
+                        DaemonActionResponse {
+                            action: "restart".to_string(),
+                            success: true,
+                            socket_path: socket_path_str,
+                            message: Some(format!(
+                                "Daemon restarted via launchctl kickstart -k {target}"
+                            )),
+                        },
+                    ));
+                } else {
+                    println!(
+                        "{}",
+                        StatusIndicator::Success
+                            .with_label(style, "Daemon restarted via its launchd agent.")
+                    );
+                    println!(
+                        "  {} {} {}",
+                        style.key("Agent"),
+                        style.muted(":"),
+                        style.value(&target)
+                    );
+                }
+                return Ok(());
+            }
+            Err(reason) => {
+                eprintln!(
+                    "rch: launchd agent restart did not complete ({reason}); \
+                     falling back to manual stop+start"
+                );
+            }
+        }
+    }
+
+    // Manual path: user-launched daemon (no unit or launchd agent).
     // Pass true for skip_confirm since we already prompted above.
     daemon_stop(
         StopOptions {
@@ -1441,6 +1596,22 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_job_pid_reads_only_the_job_line() {
+        let printed = "gui/501/com.rch.daemon = {\n\tactive count = 1\n\tstate = running\n\
+                       \tendpoints = {\n\t\tpid = 99\n\t}\n\tpid = 10447\n}\n";
+        assert_eq!(super::launchd_job_pid(printed), Some(10447));
+        assert_eq!(super::launchd_job_pid("\tstate = not running\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_process_without_the_socket_is_not_its_listener() {
+        let socket = std::path::Path::new("/nonexistent/rch-test/daemon.sock");
+        assert!(!super::process_listens_on_unix_socket(std::process::id(), socket).await);
+    }
 
     #[test]
     fn daemon_start_args_pin_configured_socket_path() {

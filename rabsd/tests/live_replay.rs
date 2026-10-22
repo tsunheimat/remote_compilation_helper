@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
-use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
+use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue, digest_key};
 use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome, authority_digest};
 use rabs_cas::serving_state::ServeDecision;
 use rabs_cas::test_support::{
@@ -262,7 +262,7 @@ fn live_replay_budget_survives_restart_and_only_new_comparisons_renew_it() {
 }
 
 #[test]
-fn live_replay_budget_is_atomic_and_failed_installation_spends_its_permit() {
+fn live_replay_budget_is_atomic_and_pre_admission_conflict_spends_no_permit() {
     use rabsd::edge::destination_arbiter::{BundleId, reserve_scoped};
     use std::os::unix::ffi::OsStrExt;
 
@@ -274,6 +274,19 @@ fn live_replay_budget_is_atomic_and_failed_installation_spends_its_permit() {
     let paths = vec![blocked.join("out/lib.rlib").as_os_str().as_bytes().to_vec()];
     let reservation =
         reserve_scoped(coord.arbiter(), BundleId("other-writer".into()), &paths).unwrap();
+    let receipts = || {
+        cas.store()
+            .lock()
+            .unwrap()
+            .query(
+                "SELECT subject, seq, decision, reason FROM decision_receipts \
+             WHERE kind = ?1 ORDER BY subject, seq",
+                &[SqlValue::Text("rabs-live-replay-install-v1".into())],
+            )
+            .unwrap()
+    };
+    let before = receipts();
+    assert!(before.is_empty());
     assert!(matches!(
         coord.edge_subscriber().serve_action(
             &sample_action_key(),
@@ -285,6 +298,9 @@ fn live_replay_budget_is_atomic_and_failed_installation_spends_its_permit() {
         Err(ServeError::DestinationConflict { .. })
     ));
     assert!(!blocked.exists());
+    // Arbitration now precedes private staging and final receipt spending.
+    // A request that never obtains its destinations cannot consume allowance.
+    assert_eq!(receipts(), before);
     drop(reservation);
 
     let outcomes = std::thread::scope(|scope| {
@@ -332,7 +348,14 @@ fn live_replay_budget_is_atomic_and_failed_installation_spends_its_permit() {
             other => panic!("unexpected concurrent replay outcome: {other:?}"),
         }
     }
-    assert_eq!((served, refused), (15, 9));
+    assert_eq!((served, refused), (16, 8));
+    let spent = receipts();
+    assert_eq!(spent.len(), served);
+    for (seq, row) in spent.iter().enumerate() {
+        assert_eq!(row[1], SqlValue::Int(seq as i64));
+        assert_eq!(row[2], SqlValue::Text("install".into()));
+        assert_eq!(row[3], SqlValue::Text(digest_key(&offer.manifest_id.0)));
+    }
 }
 
 #[test]
