@@ -10915,12 +10915,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn raw_transport_full_output_socket_does_not_block_deadline() {
-        let (mut writer, mut consumer) = std::os::unix::net::UnixStream::pair().unwrap();
-        // Darwin records the first write as the kernel-only FWASWRITTEN flag
-        // (xnu bsd/sys/fcntl.h). Prime and drain one byte before snapshotting,
-        // so restoring user flags is not mistaken for erasing kernel history.
-        // Keep the exact full-flag comparison below; do not mask unknown bits.
-        std::io::Write::write_all(&mut writer, b"x").unwrap();
+        let (writer, mut consumer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Darwin records write(2) in its kernel-only FWASWRITTEN flag (xnu
+        // bsd/sys/fcntl.h). UnixStream's Write implementation uses send(2),
+        // which does not prime that history. Use the SAME write(2) primitive as
+        // RawOutputSink before taking the full-flag snapshot; never mask flags
+        // or mistake restoring user settings for erasing kernel write history.
+        assert_eq!(rustix::io::write(&writer, b"x").unwrap(), 1);
         let mut primed = [0];
         std::io::Read::read_exact(&mut consumer, &mut primed).unwrap();
         assert_eq!(primed, *b"x");

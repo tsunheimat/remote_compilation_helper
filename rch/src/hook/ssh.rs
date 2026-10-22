@@ -4186,16 +4186,56 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         std::fs::write(source.join("keep"), "source bytes").unwrap();
         let policy = PathTopologyPolicy::new(mirror.clone(), root.join("alias"))
             .with_source_root(source.clone());
-        let run = |root: PathBuf| {
-            std::process::Command::new("sh")
+        // This is a Linux-worker command: readlink -m is a required GNU
+        // primitive, not BSD readlink's interface. Native macOS CI already
+        // installs coreutils as greadlink; select and exercise that REAL tool,
+        // without replacing the resolver with a test implementation.
+        let resolver = ["readlink", "greadlink"]
+            .into_iter()
+            .find_map(|name| {
+                let found = std::process::Command::new("/bin/sh")
+                    .args(["-c", "command -v \"$1\"", "rch-resolver", name])
+                    .output()
+                    .ok()?;
+                if !found.status.success() {
+                    return None;
+                }
+                let path = PathBuf::from(String::from_utf8(found.stdout).ok()?.trim());
+                let resolved = std::process::Command::new(&path)
+                    .args(["-m", "--"])
+                    .arg(&root)
+                    .output()
+                    .ok()?;
+                (resolved.status.success()
+                    && String::from_utf8_lossy(&resolved.stdout).trim() == root.to_string_lossy())
+                .then_some(path)
+            })
+            .expect("worker probe fixture requires real GNU readlink (coreutils/greadlink)");
+        let tools = root.join("worker-tools");
+        std::fs::create_dir(&tools).unwrap();
+        std::os::unix::fs::symlink(resolver, tools.join("readlink")).unwrap();
+        let run = |destination: PathBuf, path: &Path| {
+            std::process::Command::new("/bin/sh")
+                .env("PATH", path)
                 .arg("-c")
-                .arg(topology_source_separation_cmd(&policy, &[root]))
+                .arg(topology_source_separation_cmd(&policy, &[destination]))
                 .output()
                 .unwrap()
         };
-        assert!(run(mirror.join("new/repo")).status.success());
+        let positive = run(mirror.join("new/repo"), &tools);
+        assert!(
+            positive.status.success(),
+            "worker resolver refused safe path: {positive:?}"
+        );
+        // Missing required resolver still refuses before any source mutation.
+        let absent = root.join("empty-tools");
+        std::fs::create_dir(&absent).unwrap();
+        assert_eq!(
+            run(mirror.join("new/repo"), &absent).status.code(),
+            Some(49)
+        );
         std::os::unix::fs::symlink(&source, mirror.join("escape")).unwrap();
-        let output = run(mirror.join("escape/repo"));
+        let output = run(mirror.join("escape/repo"), &tools);
         assert_eq!(output.status.code(), Some(49));
         assert!(String::from_utf8_lossy(&output.stderr).contains("SOURCE_OVERLAP"));
         assert!(!source.join("repo").exists());
@@ -4206,7 +4246,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         let outside = root.join("other");
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, mirror.join("outside")).unwrap();
-        let output = run(mirror.join("outside/repo"));
+        let output = run(mirror.join("outside/repo"), &tools);
         assert_eq!(output.status.code(), Some(49));
         assert!(String::from_utf8_lossy(&output.stderr).contains("MIRROR_ESCAPE"));
     }

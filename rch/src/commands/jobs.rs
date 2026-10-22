@@ -822,21 +822,46 @@ mod tests {
         use crate::ui::writer::OutputWriter;
         use std::os::unix::net::UnixStream;
 
+        const CHILD: &str = "RCH_JOB_OUTPUT_CLOSED_PEER_CHILD";
+        const COMPLETE: &str = "all eight real closed-peer output assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            // Create sockets only in a dedicated process. CLOEXEC does not stop
+            // parallel tests from inheriting a peer at fork, and shutdown is
+            // not final peer closure on every Unix kernel.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::jobs::tests::job_output_reports_real_closed_socket_write_and_flush_failures",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stderr).contains(COMPLETE),
+                "closed-peer child did not execute every assertion: {output:?}"
+            );
+            return;
+        }
+
         for mode in [OutputMode::Json, OutputMode::Plain] {
             for format in [OutputFormat::Json, OutputFormat::Toon] {
                 for buffered in [false, true] {
-                    let (socket, peer) = UnixStream::pair().unwrap();
+                    let (mut socket, peer) = UnixStream::pair().unwrap();
                     socket
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    // Closing one descriptor does not close a peer inherited by
-                    // a concurrent test's fork (CLOEXEC acts only at exec).
-                    // Hold an explicit duplicate to exercise that boundary;
-                    // shutdown closes the endpoint for every descriptor and
-                    // makes both immediate writes and buffered flushes fail.
-                    let retained_peer = peer.try_clone().unwrap();
-                    peer.shutdown(std::net::Shutdown::Both).unwrap();
+                    // Prove that closing one handle is insufficient, then close
+                    // the FINAL peer. No other test can fork this descriptor.
+                    let mut retained_peer = peer.try_clone().unwrap();
                     drop(peer);
+                    std::io::Write::write_all(&mut socket, b"x").unwrap();
+                    let mut observed = [0];
+                    std::io::Read::read_exact(&mut retained_peer, &mut observed).unwrap();
+                    assert_eq!(observed, *b"x");
+                    drop(retained_peer);
                     let stdout = if buffered {
                         // The small payload fits in the buffer; the real socket
                         // failure must be observed when the writer flushes.
@@ -861,10 +886,10 @@ mod tests {
                     };
                     assert_eq!(cause.kind(), std::io::ErrorKind::BrokenPipe);
                     assert!(format!("{error:#}").contains("job output could not be delivered"));
-                    drop(retained_peer);
                 }
             }
         }
+        eprintln!("{COMPLETE}");
     }
 
     #[cfg(unix)]
