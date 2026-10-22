@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Core-only, unsigned Linux candidate; never installs, deploys, or deletes files.
+# Core-only, unsigned Linux candidate; clean source by default. Never deploys or deletes files.
 # Python 3.11+ supplies TOML/JSON and exclusive, atomic publication without jq.
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -133,12 +133,15 @@ def publish(path, data):
     os.link(staged, path)
 
 
-def package(repo, output, runner=run, synthetic=False):
+def package(repo, output, runner=run, synthetic=False, *, allow_dirty=False):
     require(sys.platform == "linux", "Only native Linux candidates are supported")
     repo = repo.resolve()
     require(git(repo, "rev-parse", "--show-toplevel").decode().strip() == str(repo),
             "Run from a Git workspace root")
     source = manifest(repo)
+    require(not source["dirty"] or allow_dirty,
+            "Uncommitted source cannot be packaged by default; commit the candidate first. "
+            "Use --allow-dirty only for an explicitly inspected development overlay.")
     source_bytes = encoded(source)
     source_id = sha(source_bytes)
     config = tomllib.loads((repo / "rust-toolchain.toml").read_text())
@@ -249,7 +252,8 @@ def package(repo, output, runner=run, synthetic=False):
     install_args = ["bash", str(repo / "install.sh"), "--offline", str(archive),
                     "--version", tag.removeprefix("v")]
     receipt = {"schema": "rch-linux-candidate-receipt-v1", "status": "complete",
-               "classification": "unsigned dirty candidate (not a signed release)",
+               "classification": ("unsigned dirty candidate (not a signed release)" if source["dirty"]
+                                  else "unsigned clean-commit candidate (not a signed release)"),
                "proof": "synthetic-fixture-only; NOT real binaries" if synthetic else "native-build-and-cli-smoke-only",
                "created_utc": timestamp, "tag": tag, "workspace_version": version,
                "target": target, "toolchain": channel, "rustc": rustc.strip(), "cargo": cargo,
@@ -341,7 +345,25 @@ def self_test(root):
             exclusive_file(binary, fixture.encode(), 0o755)
         return None
 
-    candidate = package(repo, root / "candidate", fake, synthetic=True)
+    # A clean checkout builds without an overlay exception; the original dirty
+    # source must refuse before any build or output-directory creation.
+    clean = root / "clean-source"
+    run(["git", "clone", "--quiet", "--local", str(repo), str(clean)], cwd=root)
+    clean_candidate = package(clean, root / "clean-candidate", fake, synthetic=True)
+    clean_receipt = json.loads((clean_candidate / "receipt.json").read_text())
+    require(clean_receipt["source_dirty"] is False and len(calls) == 4,
+            "Clean commit did not use the normal pinned build path")
+    calls.clear()
+    try:
+        package(repo, root / "dirty-refused", fake, synthetic=True)
+    except RuntimeError as error:
+        require("Uncommitted source" in str(error), str(error))
+    else:
+        raise RuntimeError("Dirty source was implicitly accepted")
+    require(not calls and not (root / "dirty-refused").exists(),
+            "Dirty-source refusal happened after build/output mutation")
+
+    candidate = package(repo, root / "candidate", fake, synthetic=True, allow_dirty=True)
     receipt = json.loads((candidate / "receipt.json").read_text())
     require("synthetic" in receipt["proof"], "Synthetic proof was mislabeled")
     require(len(calls) == 4, "Unexpected Rust tool invocations")
@@ -354,7 +376,7 @@ def self_test(root):
     require((candidate / (archive.name + ".sha256")).read_text() == f"{file_sha(archive)}  {archive.name}\n",
             "Checksum sidecar does not match release format")
     try:
-        package(repo, candidate, fake, synthetic=True)
+        package(repo, candidate, fake, synthetic=True, allow_dirty=True)
     except FileExistsError:
         pass
     else:
@@ -380,17 +402,18 @@ def self_test(root):
         return result
 
     try:
-        package(repo, root / "changed-during-build", changing_build, synthetic=True)
+        package(repo, root / "changed-during-build", changing_build, synthetic=True, allow_dirty=True)
     except RuntimeError as error:
         require("Source changed during packaging" in str(error), str(error))
     else:
         raise RuntimeError("Source change during build was accepted")
     require(not (root / "changed-during-build/receipt.json").exists(), "Failed build published receipt")
-    print(f"PASS: synthetic packaging/source-drift/no-clobber/smoke-isolation checks; NO real Rust builds. Fixtures retained: {root}")
+    print(f"PASS: synthetic clean-commit/explicit-overlay/source-drift/no-clobber/smoke-isolation checks; NO real Rust builds. Fixtures retained: {root}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Package ONLY rch/rchd/rch-wkr as an unsigned dirty Linux candidate. Never deploy, configure hooks, or clean up. Python 3.11+, Git and an installed pinned Rust toolchain required.")
+    parser = argparse.ArgumentParser(description="Package ONLY rch/rchd/rch-wkr as an unsigned Linux candidate from a clean commit by default. Never deploy, configure hooks, or clean up. Python 3.11+, Git and an installed pinned Rust toolchain required.")
+    parser.add_argument("--allow-dirty", action="store_true", help="explicit development-only exception for a fingerprinted working-tree overlay; not a signed release")
     parser.add_argument("--output-dir", type=Path, help="absolute NEW candidate directory; default /mnt/hdd-vibe-coding-share/rch-candidates/<candidate-tag>")
     parser.add_argument("--verify-source", type=Path, metavar="CANDIDATE_DIR", help="read-only verification against current HEAD/diff/source and archived bytes; no build")
     parser.add_argument("--self-test", action="store_true", help="hermetic fake Rust tools/binaries, real Git/tar; retained new fixture directory, no actual cargo")
@@ -398,6 +421,8 @@ def main():
     args = parser.parse_args(sys.argv[2:])
     require(not (args.self_test and args.verify_source), "Choose self-test OR source verification")
     require(not (args.verify_source and args.output_dir), "Source verification has no output directory")
+    require(not (args.allow_dirty and (args.self_test or args.verify_source)),
+            "--allow-dirty applies only to an actual candidate build")
     os.umask(0o077)
     if args.self_test:
         root = args.output_dir or DEFAULT_ROOT / ("self-test-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
@@ -406,7 +431,7 @@ def main():
     elif args.verify_source:
         verify_source(repo, args.verify_source.resolve())
     else:
-        package(repo, args.output_dir)
+        package(repo, args.output_dir, allow_dirty=args.allow_dirty)
 
 
 try:

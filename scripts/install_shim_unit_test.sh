@@ -180,13 +180,13 @@ printf 'PASS: unit fixture routes repair into existing fleet service or creates 
 generic_home="$fixture/generic home's"
 mkdir -p "$generic_home"
 HOME="$generic_home" "$rch_test_binary" --json shim install --tools all --dry-run |
-    jq -e '.dry_run == true and (.tools | length) == 19'
+    jq -e '.dry_run == true and (.tools | length) == 20 and (.tools | index("rtk")) != null'
 [[ ! -e "$generic_home/.rch" ]]
 HOME="$generic_home" "$rch_test_binary" --json shim status |
-    jq -e '(.generic_tools | length) == 19 and all(.generic_tools[]; .installed == false)'
+    jq -e '(.generic_tools | length) == 20 and all(.generic_tools[]; .installed == false)'
 [[ ! -e "$generic_home/.rch" ]]
 HOME="$generic_home" "$rch_test_binary" shim install --tools all
-for tool in go swift npm pnpm bun pytest python python3 node make npx bunx vitest jest tsc eslint prettier playwright vite; do
+for tool in rtk go swift npm pnpm bun pytest python python3 node make npx bunx vitest jest tsc eslint prettier playwright vite; do
     [[ -x "$generic_home/.rch/shims/$tool" ]]
 done
 [[ ! -e "$generic_home/.rch/shims/cargo" && ! -e "$generic_home/.bashrc" ]]

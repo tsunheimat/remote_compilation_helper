@@ -33,7 +33,7 @@ log() {
 pass() { TESTS_PASSED=$((TESTS_PASSED + 1)); log "PASS: $1"; }
 fail() { TESTS_FAILED=$((TESTS_FAILED + 1)); log "FAIL: $1"; }
 start_test() { TESTS_RUN=$((TESTS_RUN + 1)); log "Test $TESTS_RUN: $1"; }
-cleanup() { log "Fixture files retained (no deletion): $TEST_DIR"; }
+cleanup() { log "Retaining test directory and all fixture bytes: $TEST_DIR"; }
 trap '_test_lib_cleanup; cleanup' EXIT
 
 log "=== RCH Installer No-Downgrade Unit Tests ==="
@@ -119,9 +119,9 @@ else
     fail "fresh install unaffected (VERSION=$VERSION SKIP=$SKIP_INSTALL_NO_DOWNGRADE)"
 fi
 
-# Real retained-byte/source tests remain alongside the request doubles below.
-# A public upstream release floor is not the release authority for this fork;
-# exact requested tags, no downgrade and invalid-source refusal are checked here.
+# These additions use actual retained files and the installer's real digest
+# helper. The older version-guard cases above use an explicit fake CLI; this
+# script is not real-service installer, native-build or ACFS qualification.
 start_test "release URLs remain on the requested tag for every archive name"
 url_ok=true
 for version in 2.1.16 v2.1.16 2.1.17-rc.1; do
@@ -189,7 +189,7 @@ if $checksum_ok; then pass "actual digest verification and preserved archive byt
 
 start_test "actual source checkout must equal the requested release tag"
 source_root="$TEST_DIR/release-source"
-git init --initial-branch=main "$source_root"
+git -c init.defaultBranch=main init "$source_root"
 git -C "$source_root" -c user.name=InstallerTest -c user.email=installer-test@example.invalid \
     commit --allow-empty -m 'retained release fixture'
 git -C "$source_root" tag v2.1.16
@@ -210,6 +210,10 @@ if verify_source_release "$source_root" v2.1.16; then source_ok=false; fi
 [[ "$(git -C "$source_root" rev-parse HEAD)" == "$head_before" ]] || source_ok=false
 if $source_ok; then pass "actual tag and checkout comparison, no source mutation"; else fail "actual tag and checkout comparison, no source mutation"; fi
 
+# This fork's release channel is independent of the upstream's moving latest
+# tag. Retain the real no-downgrade and exact-source checks above; exercise
+# unavailable, stale and malformed releases deterministically below instead
+# of using unrelated upstream publication as a release-authority assertion.
 # Hermetic FIXTURE evidence only: no release, network, or signer is live here.
 # Block all network/build/install/deletion side effects, even on regressions.
 curl() {
@@ -235,6 +239,9 @@ curl() {
                 mismatch) printf '%064d  %s\n' 0 "$ASSET" ;;
                 wrong_name) printf '%s  other.tar.gz\n' "$DIGEST" ;;
                 dist_prefix) printf '%s  dist/%s\n' "$DIGEST" "$ASSET" ;;
+                bare_sidecar) printf '%s\n' "$DIGEST" ;;
+                duplicate_sidecar) printf '%s  %s\n%s  %s\n' "$DIGEST" "$ASSET" "$DIGEST" "$ASSET" ;;
+                unrelated_sidecar) printf '%s  unrelated\n%s  %s\n' "$DIGEST" "$DIGEST" "$ASSET" ;;
                 *) printf '%s  %s\n' "$DIGEST" "$ASSET" ;;
             esac ;;
         */SHA256SUMS)
@@ -244,6 +251,8 @@ curl() {
         *.tar.gz)
             [[ "$SCENARIO" != unavailable ]] || return 22
             if [[ "$SCENARIO" == legacy || "$SCENARIO" == legacy_triple ]]; then
+                # This release contains exactly the selected legacy asset, not
+                # every filename requested by the installer candidate search.
                 [[ "${url##*/}" == "$ASSET" ]] || return 22
             fi
             printf 'fixture archive\n' > "$output" ;;
@@ -320,9 +329,9 @@ run_release_case() {
     if [[ "$scenario" != unavailable && -f "$CASE_DIR/git" ]]; then fail "integrity failure reached source fallback"; fi
 }
 
-for scenario in valid manifest dist_prefix legacy legacy_triple; do run_release_case "$scenario" optional true; done
+for scenario in valid manifest dist_prefix bare_sidecar legacy legacy_triple; do run_release_case "$scenario" optional true; done
 run_release_case unavailable required false
-for scenario in missing malformed mismatch wrong_name manifest_duplicate bad_signature; do
+for scenario in missing malformed mismatch wrong_name duplicate_sidecar unrelated_sidecar manifest_duplicate bad_signature; do
     run_release_case "$scenario" optional false
 done
 for scenario in missing_bundle no_cosign; do

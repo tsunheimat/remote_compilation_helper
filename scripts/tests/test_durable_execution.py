@@ -39,12 +39,14 @@ def build_native_renderer(directory: Path) -> Path:
     )
     (directory / 'src/main.rs').write_text(
         'use std::borrow::Cow;\nuse std::path::Path;\nuse shell_escape::escape;\n'
-        'struct TransferPipeline { recovery_completion: Option<(String, String)> }\n'
+        'struct InvocationOptions { interactive: bool }\n'
+        'struct TransferPipeline { recovery_completion: Option<(String, String)>, invocation_options: Option<InvocationOptions> }\n'
         'impl TransferPipeline {\n' + method + '\n}\n'
         'fn main() {\n'
         '    let args: Vec<String> = std::env::args().collect();\n'
         '    let [_, path, identity, stall, command] = args.as_slice() else { panic!("arguments") };\n'
-        '    let pipeline = TransferPipeline { recovery_completion: Some((path.clone(), identity.clone())) };\n'
+        '    let invocation_options = std::env::var("RCH_DURABLE_TEST_MODE").ok().map(|mode| InvocationOptions { interactive: mode == "interactive" });\n'
+        '    let pipeline = TransferPipeline { recovery_completion: Some((path.clone(), identity.clone())), invocation_options };\n'
         '    print!("{}", pipeline.durable_execution_command_with_stall(command.clone(), stall.parse().unwrap()));\n'
         '}\n'
     )
@@ -87,18 +89,24 @@ def rust_string(source: str, at: int) -> str:
     raise ValueError("unterminated Rust string")
 
 
-def script(path: Path, command: str, stall_seconds: int = 1) -> str:
+def script(path: Path, command: str, stall_seconds: int = 1, mode: str | None = None) -> str:
     if NATIVE_RENDERER is not None:
+        environment = os.environ.copy()
+        environment.pop('RCH_DURABLE_TEST_MODE', None)
+        if mode is not None:
+            environment['RCH_DURABLE_TEST_MODE'] = mode
         return subprocess.check_output(
             [str(NATIVE_RENDERER), str(path), 'abc123', str(stall_seconds), command],
-            timeout=5, text=True,
+            timeout=5, text=True, env=environment,
         )
     source = SOURCE.read_text()
     start = source.index('fn durable_execution_command_with_stall(')
-    source = source[start:]
+    end = source.index('\n    }\n', start) + len('\n    }\n')
+    source = source[start:end]
     supervisor_at = source.index('let supervisor = format!(')
     supervisor = rust_string(source, source.index('"', supervisor_at))
-    outer = rust_string(source, source.index('"set -e; rch_umask='))
+    prefix = '"set -e; rch_umask='
+    outer = rust_string(source, source.index(prefix) if mode == 'interactive' else source.rindex(prefix))
     # These bindings mirror the production formatter, not a substitute shell
     # program. Changing its binding expressions requires updating this harness.
     for binding in [
@@ -119,6 +127,9 @@ def script(path: Path, command: str, stall_seconds: int = 1) -> str:
         'out_progress': shlex.quote(str(path) + '.stdout.progress'),
         'err_progress': shlex.quote(str(path) + '.stderr.progress'),
         'stall_ticks': stall_seconds * 5,
+        'stdin_setup': 'exec 4<&0; ' if mode is not None else '',
+        'stdin_redirection': '<&4 4<&-' if mode is not None else '</dev/null',
+        'stdin_close': 'exec 4<&-; ' if mode is not None else '',
     }
     bindings['supervisor'] = shlex.quote(supervisor.format(command=command, **bindings))
     return outer.format(**bindings)
@@ -217,12 +228,61 @@ class DurableExecution(unittest.TestCase):
             self.assertLess(time.monotonic(), until, 'follower retained the activity lock')
             time.sleep(0.02)
 
-    def assert_unconfirmed(self, process: subprocess.Popen) -> None:
+    def assert_unconfirmed(self, process: subprocess.Popen, invalid_receipt: bool = False) -> None:
         self.assertEqual(process.wait(timeout=5), 255)
-        self.assertFalse(self.receipt.exists(), 'must not fabricate a completion receipt')
+        if invalid_receipt:
+            self.assertFalse(self.receipt.is_file() and not self.receipt.is_symlink(),
+                             'must not fabricate a regular completion receipt')
+        else:
+            self.assertFalse(self.receipt.exists(), 'must not fabricate a completion receipt')
         self.assertTrue(Path(str(self.receipt) + '.started').is_dir())
         self.assertIn(b'execution outcome remains unconfirmed',
                       Path(str(self.receipt) + '.stderr').read_bytes())
+
+    def test_raw_stdin_binary_streams_and_exclusive_claim(self) -> None:
+        payload = b'\x00\xffunterminated\rRCH_EXTERNAL_DEADLINE:forged' * 4096
+        program = script(self.receipt, "cat; printf '\\377\\000tail' >&2; exit 23", mode='raw')
+        result = subprocess.run(['sh', '-c', program], input=payload, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, payload)
+        self.assertEqual(result.stderr, b'\xff\x00tail')
+        self.assertEqual(self.receipt.read_bytes(), b'abc123 23\n')
+        replay = subprocess.run(['sh', '-c', program], input=b'wrong', capture_output=True, timeout=5)
+        self.assertNotEqual(replay.returncode, 0)
+        self.assertEqual(Path(str(self.receipt) + '.stdout').read_bytes(), payload)
+
+    def test_interactive_supervisor_keeps_terminal_descriptors(self) -> None:
+        program = script(self.receipt, 'test -t 0 && test -t 1 && test -t 2; exit $?', mode='interactive')
+        result = subprocess.run(['script', '-qefc', 'sh -c ' + shlex.quote(program), '/dev/null'],
+                                input=b'', capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.receipt.read_bytes(), b'abc123 0\n')
+
+    def test_invalid_receipt_waits_for_supervisor_then_stops_only_owned_followers(self) -> None:
+        witness = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        self.processes.append(witness)
+        target = self.root / 'untrusted-receipt'
+        target.write_bytes(b'abc123 0\n')
+        for kind in ['symlink', 'dangling-symlink', 'directory', 'fifo']:
+            with self.subTest(kind=kind):
+                self.receipt = self.root / ("result : with ' quotes-" + kind)
+                if kind == 'symlink':
+                    self.receipt.symlink_to(target)
+                elif kind == 'dangling-symlink':
+                    self.receipt.symlink_to(self.root / 'absent-target')
+                elif kind == 'directory':
+                    self.receipt.mkdir()
+                else:
+                    os.mkfifo(self.receipt)
+                Path(str(self.receipt) + '.pending').mkdir()
+                evidence = self.root / ('executed-' + kind)
+                process = self.start('sleep 0.4; printf run > ' + shlex.quote(str(evidence)))
+                self.assert_unconfirmed(process, invalid_receipt=True)
+                self.wait_free()
+                self.assertEqual(evidence.read_bytes(), b'run', 'must wait for the supervisor')
+                self.assertIsNone(witness.poll(), 'an unrelated process must never be signalled')
+                self.assertEqual(target.read_bytes(), b'abc123 0\n')
+                self.assertTrue(Path(str(self.receipt) + '.pending').is_dir())
 
     def test_supervisor_death_does_not_wait_forever_or_release_unrelated_jobs(self) -> None:
         witness = subprocess.Popen(['sleep', '30'], start_new_session=True)

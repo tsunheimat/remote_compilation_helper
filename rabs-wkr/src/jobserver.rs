@@ -111,8 +111,10 @@ pub fn replace_with_worker_local(env: &mut Vec<(String, String)>, slots: u32) {
 /// sandboxed descendants consume by PATH. No fd passthrough required.
 ///
 /// Drop unlinks the fifo and closes the writer: stranded readers see
-/// EOF after the final tokens, and no per-attempt node outlives the
-/// attempt. Source is never consulted or modified to establish coordination;
+/// EOF after the final tokens. Keep the bridge alive until clients have closed
+/// their readers: NFS retains an open unlinked FIFO as a `.nfs*` entry and can
+/// delay private-directory removal. Source is never consulted or modified to
+/// establish coordination;
 /// `.rabs-jobserver` remains an ordinary, usable source-file name.
 #[derive(Debug)]
 pub struct JobserverBridge {
@@ -299,7 +301,7 @@ mod tests {
         for grant in [0, 1, 2, 8, MAX_BRIDGE_TOKENS] {
             for retain_writer in [false, true] {
                 let workspace = tempfile::tempdir().unwrap();
-                let bridge = JobserverBridge::mint(grant, workspace.path()).unwrap();
+                let mut bridge = JobserverBridge::mint(grant, workspace.path()).unwrap();
                 let slots = grant.max(1);
                 assert!(
                     bridge
@@ -322,6 +324,14 @@ mod tests {
                 // A retained writer descriptor models fork's lifetime without
                 // guessing at a scheduler delay or treating WouldBlock as EOF.
                 let held_writer = retain_writer.then(|| bridge._writer.try_clone().unwrap());
+                // Exercise the real bridge Drop (unlink plus writer close), but
+                // retain its directory while this deliberately live reader and
+                // optional duplicated writer keep an NFS silly-rename alive.
+                // An unrelated empty fixture directory can retire immediately.
+                let backing = std::mem::replace(
+                    &mut bridge._directory,
+                    tempfile::tempdir_in(workspace.path()).unwrap(),
+                );
                 let path = bridge.host_path.clone();
                 drop(bridge);
                 assert!(!path.exists());
@@ -334,6 +344,8 @@ mod tests {
                 }
                 drop(held_writer);
                 assert_eq!(reader.read(&mut [0]).unwrap(), 0, "the final writer closed");
+                drop(reader);
+                drop(backing);
                 assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
             }
         }

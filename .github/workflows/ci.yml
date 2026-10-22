@@ -92,14 +92,23 @@ jobs:
           chmod +x scripts/check_release_assets.sh
           ./scripts/check_release_assets.sh --self-test
 
-      - name: Exercise exact original and rewritten shell semantics
-        run: python3 -I rch/src/hook/test_semantic.py
-      - name: Validate the inactive Hermes adapter protocol
-        run: python3 -I rch/src/agent/hermes_plugin.py
-      - name: Reject local or refused results in the remote acceptance validator
-        run: python3 -I scripts/validate_remote_execution.py --self-test
-      - name: Exercise installer release identity, checksums and refusal paths
+      - name: Verify fork installer integrity and explicit rollback
         run: bash scripts/install_no_downgrade_unit_test.sh
+      - name: Verify updater and release-workflow trust policy
+        # Source contract only; native updater tests retain their separate owner.
+        run: bash scripts/test_update_signature_verification.sh --source-only
+      - name: Reject local/refused results in the remote acceptance validator
+        run: python3 -I scripts/validate_remote_execution.py --self-test
+      - name: Verify candidate packaging identity and no-clobber contracts
+        # Real Git/archive/digest checks, synthetic Rust tools; no build or install.
+        shell: bash
+        run: |
+          fixture="$(mktemp -d "$RUNNER_TEMP/rch-package-contract.XXXXXX")"
+          bash scripts/package_linux_candidate.sh --self-test --output-dir "$fixture/cases"
+      - name: Verify semantic rewrite and Hermes adapter contracts
+        run: |
+          python3 -I rch/src/hook/test_semantic.py
+          python3 -I rch/src/agent/hermes_plugin.py
       - name: Check installer scripts (retained from notify-acfs)
         shell: bash
         run: |
