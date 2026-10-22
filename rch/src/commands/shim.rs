@@ -2816,6 +2816,33 @@ esac
     #[cfg(unix)]
     #[test]
     fn nightly_renamed_cargo_local_ide_v3_broke_v4_works() {
+        const CHILD: &str = "RCH_NIGHTLY_SHIM_FIXTURE_CHILD";
+        const COMPLETE: &str = "nightly shim v3 refusal and v4 real-cargo assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            // The rustc probe hides its stderr and can fall through to the
+            // deliberately broken proxy if a sibling test forks while this
+            // fixture writes rustc. Its inherited writer makes exec ETXTBSY,
+            // which the outer-shim retry helper cannot observe. Own all forks
+            // while creating these executables instead of retrying assertions.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::shim::tests::nightly_renamed_cargo_local_ide_v3_broke_v4_works",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stderr.contains(COMPLETE),
+                "isolated shim fixture did not finish its assertions: {}\n{}\n{stderr}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+            );
+            return;
+        }
         for (label, body) in [("v3", V3_SHIM_BODY), ("v4", cargo_shim_body(true).as_str())] {
             let dir = shim_sandbox(body, "cargo", &["build"]);
             let tc = dir.join("nightly-tc");
@@ -2839,6 +2866,26 @@ esac
                     "exit 1\n"
                 ),
             );
+            #[cfg(target_os = "linux")]
+            if label == "v4" {
+                // Reproduce the hidden probe failure with a concrete writable
+                // descriptor, not scheduler timing. Closing this exact writer
+                // must restore normal renamed-Cargo resolution below.
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.join("rustc"))
+                    .unwrap();
+                let busy = exec_shim(
+                    &dir,
+                    "cargo",
+                    &["build"],
+                    &[("RCH_SHIM_LOCAL_IDE", "1"), ("RCH_SHIM_REAL_CARGO", "")],
+                    Some(&home),
+                );
+                drop(writer);
+                assert_eq!(busy.status.code(), Some(1));
+                assert!(String::from_utf8_lossy(&busy.stderr).contains("not applicable"));
+            }
             let out = exec_shim(
                 &dir,
                 "cargo",
@@ -2874,6 +2921,7 @@ esac
                 );
             }
         }
+        eprintln!("{COMPLETE}");
     }
 
     #[cfg(unix)]

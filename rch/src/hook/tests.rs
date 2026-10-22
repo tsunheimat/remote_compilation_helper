@@ -3521,6 +3521,14 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
         "fixture toolchain identity",
     );
     let server_toolchain = toolchain.clone();
+    let remote_environment = std::collections::BTreeMap::from([
+        ("RUSTUP_HOME".to_string(), "/worker/toolchains".to_string()),
+        (
+            "RCH_RETRY_LITERAL".to_string(),
+            "spaces = $literal".to_string(),
+        ),
+    ]);
+    let server_environment = remote_environment.clone();
     let status = serde_json::json!({
         "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-endpoint", "socket_path": socket,
             "started_at": "2026-10-07T00:00:00Z", "workers_total": 1, "workers_healthy": 1,
@@ -3544,7 +3552,9 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 status.to_string()
             } else {
                 assert_retry_pending(&server_writer, &previous);
-                assert!(request.starts_with("GET /select-verified-tools/disk-budget?"));
+                // Environment-bound admission enforces the required tools as
+                // well as the exact compiler probe environment on failover.
+                assert!(request.starts_with("GET /select-toolchain-environment/disk-budget?"));
                 for parameter in [
                     "&cores=3",
                     "&disk_headroom_gib=12",
@@ -3566,6 +3576,9 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 let encoded_toolchain =
                     urlencoding_encode(&serde_json::to_string(&server_toolchain).unwrap());
                 assert!(request.contains(&format!("&toolchain={encoded_toolchain}")));
+                let encoded_environment =
+                    urlencoding_encode(&serde_json::to_string(&server_environment).unwrap());
+                assert!(request.contains(&format!("&toolchain_environment={encoded_environment}")));
                 assert!(!request.contains("&wait=1"));
                 serde_json::to_string(&SelectionResponse {
                     reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
@@ -3594,7 +3607,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             &[WorkerId::new("next-worker")],
             true,
             &["git".into(), "cmake".into()],
-            &Default::default(),
+            &remote_environment,
             &writer,
             true,
             &HookReporter::new(OutputVisibility::None),

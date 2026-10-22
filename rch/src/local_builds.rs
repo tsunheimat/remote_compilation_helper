@@ -505,6 +505,32 @@ mod tests {
     fn local_build_alarm_serializes_scans_before_recording_recovery() {
         use std::sync::mpsc;
 
+        const CHILD: &str = "RCH_ALARM_SCAN_ORDER_CHILD";
+        const COMPLETE: &str = "alarm scan ordering and both transition assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            // This test owns two in-process pollers, not unrelated forked
+            // children that can inherit the first poller's flock descriptor.
+            // Keep the actual concurrent pollers and original lock deadline,
+            // but create their lock after entering an isolated process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local_builds::tests::local_build_alarm_serializes_scans_before_recording_recovery",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stderr.contains(COMPLETE),
+                "isolated alarm pollers did not finish: {}\n{}\n{stderr}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("alarm");
         let (first_entered, first_scan) = mpsc::channel();
@@ -543,6 +569,7 @@ mod tests {
         );
         assert_eq!(first.transition, Some(AlarmTransition::Started));
         assert_eq!(second.transition, Some(AlarmTransition::Recovered));
+        eprintln!("{COMPLETE}");
     }
 
     #[test]

@@ -9,6 +9,10 @@ rch_test_binary=${1:?pass an already-built RCH binary}
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/rch-install-shim.XXXXXXXX")
 printf 'Retained installer fixture: %s\n' "$fixture"
 export HOME="$fixture/home" RUSTUP_HOME="$fixture/rustup"
+# Doctor may inspect the enclosing checkout's toolchain. Never let that probe
+# install a second real toolchain into this fixture or reach the network; this
+# test owns exactly one sentinel Cargo installation and exercises that one.
+export RUSTUP_AUTO_INSTALL=0
 export XDG_CONFIG_HOME="$fixture/xdg-config" XDG_CACHE_HOME="$fixture/xdg-cache"
 export XDG_DATA_HOME="$fixture/xdg-data" ZDOTDIR="$HOME"
 export RCH_CONFIG_DIR="$fixture/config" RCH_INSTALL_DIR="$fixture/install bin's"

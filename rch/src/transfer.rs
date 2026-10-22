@@ -2642,6 +2642,33 @@ pub(crate) struct RawTransportNotStarted(#[source] std::io::Error);
 // not a promise that every authored argument of this length is supported.
 const RAW_PROGRAM_LIMIT: usize = 120 * 1024;
 
+/// Encode one literal POSIX shell argument, choosing the shorter safe quoting
+/// form. Already-quoted nested programs contain many apostrophes; repeatedly
+/// single-quoting those expands each apostrophe into another shell fragment.
+/// Double quotes are equivalent when every expansion/escape byte is escaped.
+fn quote_nested_shell_program(value: &str) -> String {
+    let single = escape(Cow::Borrowed(value));
+    let double_len = value.len()
+        + 2
+        + value
+            .bytes()
+            .filter(|byte| matches!(byte, b'\\' | b'"' | b'$' | b'`'))
+            .count();
+    if double_len >= single.len() {
+        return single.into_owned();
+    }
+    let mut quoted = String::with_capacity(double_len);
+    quoted.push('"');
+    for character in value.chars() {
+        if matches!(character, '\\' | '"' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawTermination {
     Deadline,
@@ -4962,11 +4989,22 @@ impl TransferPipeline {
         // "$NAME" against the wrong shell environment. An explicit shell also
         // keeps builtins and authored assignments valid under color/timeout's
         // env(1) wrappers. Authored assignments inside the workload still win.
-        let env_command = format!(
-            "{}sh -c {}",
-            env_plan.env_prefix.prefix,
-            escape(Cow::Owned(toolchain_command)),
-        );
+        let env_command = if self.invocation_options.is_some()
+            && self.dependency_preparation_runtime().is_none()
+        {
+            // The explicit invocation above is already a single shell command
+            // whose authored body and assignments are quoted as one argument.
+            // Prefix that shell directly: another sh -c would quote the same
+            // body twice, multiplying nested RTK/JSON quotes on every wrapper
+            // layer until otherwise small workloads exceed the launch budget.
+            format!("{}{}", env_plan.env_prefix.prefix, toolchain_command)
+        } else {
+            format!(
+                "{}sh -c {}",
+                env_plan.env_prefix.prefix,
+                escape(Cow::Owned(toolchain_command)),
+            )
+        };
 
         // Apply color mode environment variables
         let colored_command = wrap_command_with_color(&env_command, self.color_mode);
@@ -5215,7 +5253,7 @@ setsid {}sh -c {} rch-build {} {} {} {} {} {} {}",
                 self.job_tmp_token,
                 mode,
                 u64::from(self.execution_storage.tmp_retention_hours) * 60,
-                escape(Cow::Owned(execution)),
+                quote_nested_shell_program(&execution),
             )
         } else {
             execution
@@ -5241,13 +5279,19 @@ setsid {}sh -c {} rch-build {} {} {} {} {} {} {}",
         remote_build_jobs_fragment(policy, LINUX_MEMINFO_PATH)
     }
 
+    fn dependency_preparation_runtime(&self) -> Option<&'static str> {
+        match self.compilation_kind {
+            Some(CompilationKind::Tsc | CompilationKind::NodeTest) => Some("node"),
+            Some(CompilationKind::BunTest | CompilationKind::BunTypecheck) => Some("bun"),
+            _ => None,
+        }
+    }
+
     /// Prepare Node, TypeScript and Bun dependencies through the worker's
     /// fingerprint and transaction checks, including existing `node_modules`.
     fn wrap_with_dependency_preparation(&self, command: String) -> String {
-        let runtime = match self.compilation_kind {
-            Some(CompilationKind::Tsc | CompilationKind::NodeTest) => "node",
-            Some(CompilationKind::BunTest | CompilationKind::BunTypecheck) => "bun",
-            _ => return command,
+        let Some(runtime) = self.dependency_preparation_runtime() else {
+            return command;
         };
         let script = escape(Cow::Borrowed(include_str!("transfer/node_prepare.sh")));
         let command = escape(Cow::from(command.as_str()));
@@ -10432,7 +10476,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn raw_transport_generated_live_wrapper_reproduces_quote_amplification() {
+    fn raw_transport_generated_private_mount_wrapper_fits_launch_budget() {
         let identity = "987b7cad-23eb-409a-814e-9c94ff499dff";
         let body = "import os,json,pathlib,runpy,socket; pathlib.Path('storage-env.json').write_text(json.dumps({'runtime_host':socket.gethostname(),'HOME':os.environ.get('HOME'),'TMPDIR':os.environ.get('TMPDIR')})); runpy.run_path('/mnt/vibe-coding-share/scratch/rch-rtk-live-01a1387e-20261015T044808Z-00d4c2/sigint/cancel.py',run_name='__main__')";
         assert_eq!(body.len(), 328);
@@ -10500,17 +10544,71 @@ mod tests {
             durable.len(),
             boundary.len()
         );
-        // Exercise execve's actual per-argument limit without executing any
-        // generated shell source or contacting a daemon/worker.
-        let error = std::process::Command::new("/usr/bin/true")
-            .arg(boundary.as_ref())
-            .status()
-            .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(7));
-        // The program itself fits; only the extra SSH quoting causes E2BIG.
         // Production uploads this inert program and launches a short filename.
+        // Require the unchanged generated-program budget AND actual execve
+        // acceptance. Do not require the historical, unnecessary SSH argument
+        // to fail: compact nesting can make that representation fit as well.
         assert!(durable.len() <= RAW_PROGRAM_LIMIT);
+        let status = std::process::Command::new("/usr/bin/true")
+            .arg(&durable)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Parse the complete generated source without running the authored
+        // workload, changing mounts, or contacting a daemon/worker.
+        let syntax = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(evidence.join("durable.sh"))
+            .output()
+            .unwrap();
+        assert!(syntax.status.success(), "{syntax:?}");
         eprintln!("raw boundary evidence: {}", evidence.display());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_shell_program_quoting_round_trips_without_expansion() {
+        let parts = [
+            "",
+            "plain",
+            "'''",
+            "\\\"",
+            "$HOME",
+            "$(exit 43)",
+            "`exit 44`",
+            "\\\n",
+            "\n\r\t",
+            "two words",
+            "a;b|c&d",
+            "路徑",
+        ];
+        let mut script = "printf '%s\\0'".to_string();
+        let mut expected = Vec::new();
+        for left in parts {
+            for right in parts {
+                let mut value = format!("{left}{right}");
+                for _ in 0..3 {
+                    let quoted = quote_nested_shell_program(&value);
+                    assert!(quoted.len() <= escape(Cow::Borrowed(&value)).len());
+                    script.push(' ');
+                    script.push_str(&quoted);
+                    expected.extend_from_slice(value.as_bytes());
+                    expected.push(0);
+                    value = quoted;
+                }
+            }
+        }
+        // One actual shell consumes all 432 independently encoded arguments;
+        // NUL separators retain empty values and trailing whitespace exactly.
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env("HOME", "must-not-expand")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(output.stdout, expected);
+        assert!(quote_nested_shell_program("''''").starts_with('"'));
     }
 
     #[cfg(unix)]

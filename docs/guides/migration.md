@@ -78,8 +78,10 @@ worker_root = "/mnt/vibe-coding-share"
 Use your actual worker ID and canonical mounted paths. Both endpoints must see
 the same backing tree; matching strings alone do not suffice. RCH verifies a
 fresh control nonce in both directions and rejects nested mounts beneath a
-mapping. Pre-create the tee root owner-only for the executing users; cache and
-registry credentials/toolchains must already be provisioned on the worker.
+mapping. `rtk_tee_root` is a private controller-side collection directory outside
+source inputs; it does not have to be mounted on the worker. Worker output is
+retrieved over SSH as described below. Cache and registry credentials/toolchains
+must already be provisioned on the worker.
 No mapping means an explicitly reported guarded-local fallback where policy
 permits it, or refusal under strict-remote/dispatcher policy. This fallback is
 limited to authorized no-start verification paths; a failed or uncertain remote
