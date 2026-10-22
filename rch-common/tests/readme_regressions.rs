@@ -18,7 +18,7 @@ fn readme_contains_quick_install_and_diagram() {
     let required = [
         (
             "easy_mode_curl_one_liner",
-            r#"curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode"#,
+            r#"curl -fsSL -A 'remote_compilation_helper-installer' "https://raw.githubusercontent.com/tsunheimat/remote_compilation_helper/main/install.sh" | bash -s -- --easy-mode"#,
         ),
         ("rch_diagram_webp_reference", "rch_diagram.webp"),
     ];
@@ -30,6 +30,15 @@ fn readme_contains_quick_install_and_diagram() {
         }
     }
 
+    // A replacement build must not advertise an installer from a repository
+    // that omits its custom dispatch and source-root interfaces. Preserve the
+    // positive quick-install check and reject an upstream substitution too.
+    assert!(
+        !readme.contains(
+            "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh"
+        ),
+        "README must not direct this fork's users to an incompatible upstream installer"
+    );
     assert!(
         missing.is_empty(),
         "README regression: missing snippet(s) in {}: {}",
