@@ -8151,13 +8151,14 @@ fn test_build_sync_closure_plan_deterministic_under_permutation() {
 #[test]
 fn separate_source_root_maps_project_and_sibling_dependency_to_mirror() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("sources");
+    let root = dir.path().canonicalize().unwrap();
+    let source = root.join("sources");
     let project = source.join("team/repo");
     let dependency = source.join("team/dep");
-    let mirror = dir.path().join("worker/projects");
+    let mirror = root.join("worker/projects");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&dependency).unwrap();
-    let policy = PathTopologyPolicy::new(mirror.clone(), dir.path().join("alias"))
+    let policy = PathTopologyPolicy::new(mirror.clone(), root.join("alias"))
         .with_source_root(source.clone());
     assert!(project_topology_local_reason(&policy, &project).is_none());
     let plan = build_sync_closure_plan(

@@ -701,6 +701,7 @@ EOF
 
     cp "$pkg_dir/rchd" "$pkg_dir/rch-wkr"
     tar -czf "$TEST_DIR/rch-easymode.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
+    write_fixture_checksum "$TEST_DIR/rch-easymode.tar.gz"
 
     # Run with easy mode
     local output status=0
@@ -711,7 +712,7 @@ EOF
              RCH_NO_HOOK=1 \
              RCH_NO_RC=1 \
              NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-easymode.tar.gz" --easy-mode --yes 2>&1) || status=$?
+             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-easymode.tar.gz" --version 0.1.0-test --easy-mode --yes 2>&1) || status=$?
     if [[ "$status" -ne 0 ]]; then
         log "Installer output: $output"
         fail "Easy-mode installer exited $status"
@@ -888,6 +889,7 @@ EOF
     cp "$pkg_dir/rch" "$pkg_dir/rch-wkr"
 
     tar -czf "$TEST_DIR/rch-config.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
+    write_fixture_checksum "$TEST_DIR/rch-config.tar.gz"
 
     # Install (sandboxed HOME + RCH_NO_RC: never touch the tester's real
     # shell rc — see run_install_case).
@@ -901,7 +903,7 @@ EOF
              RCH_NO_HOOK=1 \
              RCH_NO_RC=1 \
              NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-config.tar.gz" --yes 2>&1) || status=$?
+             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-config.tar.gz" --version 0.1.0-test --yes 2>&1) || status=$?
     if [[ "$status" != 0 ]]; then
         log "Installer output: $output"
         fail "Config-generation installer exited $status"

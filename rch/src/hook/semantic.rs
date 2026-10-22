@@ -248,15 +248,38 @@ mod tests {
             .tempdir()
             .unwrap()
             .keep();
+        // Resolve the actual PATH-selected interpreter before replacing PATH.
+        // /usr/bin/python3 may be a platform developer-tool launcher rather
+        // than that interpreter. Resolution is setup, not semantic planning;
+        // the real helper below still has the unchanged PLAN_TIMEOUT budget.
+        let interpreter = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new("python3")
+                .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
+                .env("RCH_SHIM_BYPASS", "1")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(interpreter.status.success(), "{interpreter:?}");
+        let interpreter = String::from_utf8(interpreter.stdout).unwrap();
+        let interpreter = std::path::Path::new(interpreter.trim());
+        assert!(interpreter.is_absolute() && interpreter.is_file());
+        let interpreter = shell_escape::escape(interpreter.to_string_lossy());
         let sentinel = fixture.join("python3");
         std::fs::write(
             &sentinel,
-            "#!/bin/sh\n\
-             test \"$RCH_SHIM_BYPASS\" = 1 || exit 81\n\
-             test \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 || exit 82\n\
-             test \"$1\" = -I || exit 83\n\
-             test \"$2\" = -c || exit 84\n\
-             exec /usr/bin/python3 \"$@\"\n",
+            format!(
+                "#!/bin/sh\n\
+                 test \"$RCH_SHIM_BYPASS\" = 1 || exit 81\n\
+                 test \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 || exit 82\n\
+                 test \"$1\" = -I || exit 83\n\
+                 test \"$2\" = -c || exit 84\n\
+                 exec {interpreter} \"$@\"\n"
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o755)).unwrap();

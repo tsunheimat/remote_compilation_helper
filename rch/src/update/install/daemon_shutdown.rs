@@ -715,7 +715,9 @@ deadline = time.monotonic() + 1.0
 while time.monotonic() < deadline:
     try:
         connection, _ = server.accept()
-    except TimeoutError:
+    except socket.timeout:
+        # Python 3.9 has a distinct socket timeout class; the TimeoutError
+        # alias starts in 3.10. A quiet poll is not a failed daemon handoff.
         continue
     with connection:
         connection.settimeout(0.2)

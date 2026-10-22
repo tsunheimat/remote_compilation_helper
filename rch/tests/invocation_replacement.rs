@@ -183,8 +183,10 @@ impl Fixture {
 #[test]
 fn rtk_hook_preserves_exact_literal_export_event_and_controls() {
     let fixture = Fixture::new();
-    // Exact sanitized PreToolUse bytes from the live rejection. Only planning
-    // runs here; neither this cwd nor its payload is executed or mutated.
+    // Keep the sanitized production command and tool-input fields exact. The
+    // request cwd is rebound to our real fixture: hook policy is loaded from
+    // that directory, and the historical code1 path is not present on CI.
+    // Only planning runs; no authored command or historical operand is executed.
     let event = br#"{"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rtk run -c 'export GOTOOLCHAIN=local GOSUMDB=off GOFLAGS=-mod=mod GOPROXY=file:///mnt/vibe-coding-share/scratch/rch-rtk-live-01a1387e-20261015T044808Z-00d4c2/module-proxy RCH_ACCEPT_LITERAL='\"'\"'literal value ; $HOME \u4e2d\u6587'\"'\"'; /usr/local/go/bin/go test -v -count=1 ./...'", "timeout": 120000, "description": "bounded RCH RTK deployment acceptance"}, "cwd": "/mnt/vibe-coding-share/scratch/rch-rtk-live-01a1387e-20261015T044808Z-00d4c2"}"#;
     let original: Value = serde_json::from_slice(event).unwrap();
     let exact = original["tool_input"]["command"].as_str().unwrap();
@@ -200,14 +202,20 @@ fn rtk_hook_preserves_exact_literal_export_event_and_controls() {
     {
         let mut request = original.clone();
         request["tool_input"]["command"] = command.clone().into();
-        let input = if index == 0 {
-            event.to_vec()
-        } else {
-            serde_json::to_vec(&request).unwrap()
-        };
+        request["cwd"] = fixture.project.to_string_lossy().into_owned().into();
+        if index == 0 {
+            assert_eq!(request["tool_input"], original["tool_input"]);
+        }
+        let input = serde_json::to_vec(&request).unwrap();
         let output = fixture.run(fixture.command().env("RCH_REQUIRE_REMOTE", "1"), &input);
         assert!(output.status.success(), "{:?}", output.stderr);
-        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "missing RTK hook rewrite for case {index}: {error}; stderr={:?}; fixture={}",
+                String::from_utf8_lossy(&output.stderr),
+                fixture.root.display()
+            )
+        });
         let mut expected = request["tool_input"].clone();
         expected["command"] = format!("rch exec --verification -- {command}").into();
         assert_eq!(response["hookSpecificOutput"]["updatedInput"], expected);
@@ -224,9 +232,21 @@ fn rtk_proxy_hook_preserves_exact_export_and_conditional_event() {
     let event = br#"{"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rtk proxy sh -c 'export GOTOOLCHAIN=local GOSUMDB=off GOFLAGS=-mod=mod GOPROXY=file:///mnt/vibe-coding-share/scratch/rch-rtk-live-01a1387e-20261015T044808Z-00d4c2/module-proxy RCH_ACCEPT_LITERAL='\"'\"'literal value ; $HOME \u4e2d\u6587'\"'\"'; go test -v -count=1 ./... && node --test probe.test.cjs'", "timeout": 120000, "description": "bounded RCH RTK deployment acceptance"}, "cwd": "/mnt/vibe-coding-share/scratch/rch-rtk-live-01a1387e-20261015T044808Z-00d4c2"}"#;
     assert_eq!(event.len(), 548);
     let original: Value = serde_json::from_slice(event).unwrap();
-    let output = fixture.run(fixture.command().env("RCH_REQUIRE_REMOTE", "1"), event);
+    let mut request = original.clone();
+    request["cwd"] = fixture.project.to_string_lossy().into_owned().into();
+    assert_eq!(request["tool_input"], original["tool_input"]);
+    let output = fixture.run(
+        fixture.command().env("RCH_REQUIRE_REMOTE", "1"),
+        &serde_json::to_vec(&request).unwrap(),
+    );
     assert!(output.status.success(), "{:?}", output.stderr);
-    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "missing RTK proxy rewrite: {error}; stderr={:?}; fixture={}",
+            String::from_utf8_lossy(&output.stderr),
+            fixture.root.display()
+        )
+    });
     let mut expected = original["tool_input"].clone();
     expected["command"] = format!(
         "rch exec --verification -- {}",

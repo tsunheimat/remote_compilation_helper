@@ -1410,8 +1410,12 @@ mod tests {
     #[test]
     fn hermes_migration_preserves_source_and_rolls_back_without_deletion() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rch-rewrite");
-        let legacy = dir.path().join("remote-test-rewrite");
+        // macOS exposes its temporary root through /var -> /private/var.
+        // Use the real owned directory for this positive fixture; the plugin
+        // installer must still reject symlinks in its supplied authority path.
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("rch-rewrite");
+        let legacy = root.join("remote-test-rewrite");
         std::fs::create_dir(&legacy).unwrap();
         let source = "def register(ctx):\n    ctx.register_hook('pre_tool_call', callback)\n";
         let manifest = "name: remote-test-rewrite\n";
@@ -1680,10 +1684,11 @@ mod tests {
     #[test]
     fn hermes_install_disable_and_reinstall_preserve_other_plugins() {
         let dir = tempfile::tempdir().unwrap();
-        let sibling = dir.path().join("unrelated-rewrite");
+        let root = dir.path().canonicalize().unwrap();
+        let sibling = root.join("unrelated-rewrite");
         std::fs::create_dir(&sibling).unwrap();
         std::fs::write(sibling.join("__init__.py"), "user plugin").unwrap();
-        let path = dir.path().join("rch-rewrite");
+        let path = root.join("rch-rewrite");
         assert!(matches!(
             install_hermes_hook_at_path(&path, true).unwrap(),
             IdempotentResult::WouldChange(_)
@@ -1725,7 +1730,7 @@ mod tests {
     #[test]
     fn hermes_refuses_user_modified_plugin_without_writing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rch-rewrite");
+        let path = dir.path().canonicalize().unwrap().join("rch-rewrite");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("__init__.py"), "user code").unwrap();
         assert!(install_hermes_hook_at_path(&path, false).is_err());

@@ -1397,7 +1397,9 @@ mod tests {
 
     #[cfg(unix)]
     fn generic_sandbox(tool: &str, rch: Option<&str>) -> (PathBuf, std::process::Command) {
-        let root = tempfile::tempdir().unwrap().keep();
+        // The shim resolves PATH directories physically; compare the same
+        // filesystem identity on systems with an aliased temporary directory.
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         for name in [
             ".rch/shims",
             "real",

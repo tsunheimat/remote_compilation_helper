@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn rtk_capture_rejects_replaced_directories_and_linked_output() {
         use std::os::unix::fs::{PermissionsExt, symlink};
-        let root = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let job = root.join("job");
         let identity = uuid::Uuid::new_v4().to_string();
@@ -1187,7 +1187,7 @@ mod tests {
     #[test]
     fn rtk_capture_budget_refuses_incomplete_logs_and_excess_commands() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = std::process::Command::new("/usr/bin/python3")
             .args([

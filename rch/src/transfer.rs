@@ -10915,9 +10915,24 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn raw_transport_full_output_socket_does_not_block_deadline() {
-        let (writer, _unread_consumer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut writer, mut consumer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Darwin records the first write as the kernel-only FWASWRITTEN flag
+        // (xnu bsd/sys/fcntl.h). Prime and drain one byte before snapshotting,
+        // so restoring user flags is not mistaken for erasing kernel history.
+        // Keep the exact full-flag comparison below; do not mask unknown bits.
+        std::io::Write::write_all(&mut writer, b"x").unwrap();
+        let mut primed = [0];
+        std::io::Read::read_exact(&mut consumer, &mut primed).unwrap();
+        assert_eq!(primed, *b"x");
+        let _unread_consumer = consumer;
         let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK));
         let mut sink = RawOutputSink::from_fd(&writer).unwrap();
+        assert!(
+            rustix::fs::fcntl_getfl(&writer)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK)
+        );
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec yes");
         let start = std::time::Instant::now();

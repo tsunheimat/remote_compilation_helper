@@ -4178,12 +4178,13 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[test]
     fn separate_source_worker_probe_rejects_symlinked_destination_before_mutation() {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        let mirror = dir.path().join("mirror");
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let mirror = root.join("mirror");
         std::fs::create_dir(&source).unwrap();
         std::fs::create_dir(&mirror).unwrap();
         std::fs::write(source.join("keep"), "source bytes").unwrap();
-        let policy = PathTopologyPolicy::new(mirror.clone(), dir.path().join("alias"))
+        let policy = PathTopologyPolicy::new(mirror.clone(), root.join("alias"))
             .with_source_root(source.clone());
         let run = |root: PathBuf| {
             std::process::Command::new("sh")
@@ -4202,7 +4203,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             std::fs::read_to_string(source.join("keep")).unwrap(),
             "source bytes"
         );
-        let outside = dir.path().join("other");
+        let outside = root.join("other");
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, mirror.join("outside")).unwrap();
         let output = run(mirror.join("outside/repo"));
