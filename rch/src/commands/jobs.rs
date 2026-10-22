@@ -829,6 +829,13 @@ mod tests {
                     socket
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
+                    // Closing one descriptor does not close a peer inherited by
+                    // a concurrent test's fork (CLOEXEC acts only at exec).
+                    // Hold an explicit duplicate to exercise that boundary;
+                    // shutdown closes the endpoint for every descriptor and
+                    // makes both immediate writes and buffered flushes fail.
+                    let retained_peer = peer.try_clone().unwrap();
+                    peer.shutdown(std::net::Shutdown::Both).unwrap();
                     drop(peer);
                     let stdout = if buffered {
                         // The small payload fits in the buffer; the real socket
@@ -854,6 +861,7 @@ mod tests {
                     };
                     assert_eq!(cause.kind(), std::io::ErrorKind::BrokenPipe);
                     assert!(format!("{error:#}").contains("job output could not be delivered"));
+                    drop(retained_peer);
                 }
             }
         }
