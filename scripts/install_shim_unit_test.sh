@@ -20,6 +20,29 @@ ln -s "$rch_test_binary" "$RCH_INSTALL_DIR/rch"
 source "$project_root/install.sh"
 export MODE=local
 export SHELL=/bin/bash
+[[ "$(cd "$project_root" && source_toolchain_channel)" == "nightly-2026-08-31" ]]
+
+# Exercise the installer entrypoint against the real Rust settings writer. Never
+# touch the caller's HOME, never compile, and retain all fixtures for inspection.
+mkdir -p "$HOME/.claude"
+printf '{ malformed user settings\n' > "$HOME/.claude/settings.json"
+ACTIVATE=false EASY_MODE=false configure_claude_hook
+[[ "$(cat "$HOME/.claude/settings.json")" == '{ malformed user settings' ]]
+[[ "$(find "$HOME/.claude" -type f | wc -l)" -eq 1 ]]
+if (ACTIVATE=true configure_claude_hook); then
+    printf 'FAIL: explicit activation accepted malformed JSON\n' >&2
+    exit 1
+fi
+[[ "$(cat "$HOME/.claude/settings.json")" == '{ malformed user settings' ]]
+printf '%s\n' '{"secret":"keep","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"audit"}]}]}}' > "$HOME/.claude/settings.json"
+chmod 600 "$HOME/.claude/settings.json"
+ACTIVATE=true configure_claude_hook
+jq -e '.secret == "keep" and .hooks.PreToolUse[0].hooks[0].command == "audit" and (.hooks.PreToolUse | length) == 2' "$HOME/.claude/settings.json"
+[[ "$(stat -c '%a' "$HOME/.claude/settings.json")" == 600 ]]
+settings_digest=$(sha256sum "$HOME/.claude/settings.json")
+ACTIVATE=true configure_claude_hook
+[[ "$(sha256sum "$HOME/.claude/settings.json")" == "$settings_digest" ]]
+printf 'PASS: hooks require opt-in; compiled installer preserves malformed JSON, unrelated settings, modes and idempotence\n'
 printf '[general]\nrole = "dispatcher"\n' > "$CONFIG_DIR/config.toml"
 printf 'workers = []\n' > "$CONFIG_DIR/workers.toml"
 doctor_shim_check() {
@@ -151,3 +174,47 @@ install_dispatcher_shim_watchdog
 grep -Fx 'ExecStartPost="%h/.rch/shim-watchdog"' "$XDG_CONFIG_HOME/systemd/user/rch-fleet-watchdog.service.d/50-rch-shim.conf"
 [[ "$(cat "$XDG_CONFIG_HOME/systemd/user/rch-shim-watchdog.timer")" == "$before_timer" ]]
 printf 'PASS: unit fixture routes repair into existing fleet service or creates fallback timer\n'
+
+# Generic frontends are an explicit, independent install: dry runs and status
+# cannot mutate Cargo, shell configuration, or toolchains.
+generic_home="$fixture/generic home's"
+mkdir -p "$generic_home"
+HOME="$generic_home" "$rch_test_binary" --json shim install --tools all --dry-run |
+    jq -e '.dry_run == true and (.tools | length) == 20 and (.tools | index("rtk")) != null'
+[[ ! -e "$generic_home/.rch" ]]
+HOME="$generic_home" "$rch_test_binary" --json shim status |
+    jq -e '(.generic_tools | length) == 20 and all(.generic_tools[]; .installed == false)'
+[[ ! -e "$generic_home/.rch" ]]
+HOME="$generic_home" "$rch_test_binary" shim install --tools all
+for tool in rtk go swift npm pnpm bun pytest python python3 node make npx bunx vitest jest tsc eslint prettier playwright vite; do
+    [[ -x "$generic_home/.rch/shims/$tool" ]]
+done
+[[ ! -e "$generic_home/.rch/shims/cargo" && ! -e "$generic_home/.bashrc" ]]
+HOME="$generic_home" "$rch_test_binary" --json shim status |
+    jq -e 'all(.generic_tools[]; .installed == true and .up_to_date == true)'
+printf 'PASS: generic install is opt-in, complete, and dry-run/status are read-only\n'
+
+collision_home="$fixture/collision-home"
+mkdir -p "$collision_home/.rch/shims"
+printf 'USER OWNED\n' > "$collision_home/.rch/shims/python"
+if HOME="$collision_home" "$rch_test_binary" shim install --tools go,python; then
+    printf 'FAIL: generic installer overwrote an unowned executable\n' >&2
+    exit 1
+fi
+[[ ! -e "$collision_home/.rch/shims/go" ]]
+grep -Fx 'USER OWNED' "$collision_home/.rch/shims/python"
+printf 'PASS: collisions refuse before any generic shim is written\n'
+
+# Query the actual CLI dispatcher for ordinary interpreter launchers. No real
+# language runtime executes: these record the exact argv and never compile.
+mkdir -p "$fixture/generic-real" "$fixture/generic-rch"
+ln -s "$rch_test_binary" "$fixture/generic-rch/rch"
+for tool in python python3 node; do
+    printf '#!/bin/sh\nprintf "%%s\\0" "$@"\n' > "$fixture/generic-real/$tool"
+    chmod +x "$fixture/generic-real/$tool"
+    HOME="$generic_home" PATH="$generic_home/.rch/shims:$fixture/generic-rch:$fixture/generic-real:/usr/bin:/bin" \
+        "$generic_home/.rch/shims/$tool" ordinary-script 'two words' '' '$(false)' > "$fixture/$tool-argv"
+    printf '%s\0' ordinary-script 'two words' '' '$(false)' > "$fixture/$tool-expected"
+    cmp "$fixture/$tool-expected" "$fixture/$tool-argv"
+done
+printf 'PASS: ordinary Python and Node launches preserve exact argv through real dispatch\n'
