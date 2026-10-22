@@ -30,6 +30,10 @@ asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/a
 rabs-action = { path = "../rabs-action" }
 rabs-protocol = { path = "../rabs-protocol" }
 rustls.workspace = true
+# Safe in-process group signals: cancellation must not spawn kill(1), whose
+# exec can block on shared executable storage before escalation can run.
+# Already locked transitively; introduces no new resolved package.
+rustix = { version = "=1.1.5", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"

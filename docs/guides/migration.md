@@ -97,7 +97,7 @@ rch exec --verification --shell 'npm test && npm run build' --timeout 30m
 ### Package the committed candidate
 
 On a compatible Linux build host with the pinned toolchain installed, use
-`scripts/package_linux_candidate.sh --output-dir /absolute/candidates/rch-COMMIT`
+`bash scripts/package_linux_candidate.sh --output-dir /absolute/candidates/rch-COMMIT`
 to build only `rch`, `rchd` and `rch-wkr`. It never activates binaries, hooks,
 PATH or services. By default it refuses uncommitted source **before** building
 or creating the candidate directory. Commit the replacement functionality and
@@ -425,6 +425,58 @@ any operator-approved cleanup. This pool is separate from Cargo/Go package cache
 Mocked SSH, local process regressions and this validator's `--self-test` are
 repository evidence only. Linux acceptance does not require fixing unrelated
 macOS/Windows releases.
+
+## Pre-upgrade working-tree reconciliation — 2026-10-22
+
+The old custom checkout contained 70 modified tracked files and 13 untracked
+files. The verified 83-file recovery snapshot is retained privately; the original
+checkout is not a deployable replacement release and is not overwritten during
+integration. Preservation does not mean blindly importing its older files.
+
+| Original snapshot group | Files | Disposition |
+| --- | ---: | --- |
+| RCH runtime, agents, configuration, daemon and invocation modules/tests | 58 | Reconcile onto the newer main in PR #4, including the already committed source-root port. Combined runtime compilation and execution acceptance remain separate gates. |
+| Installer, release workflow, documentation, packaging and acceptance tools | 12 | Retain useful behavior with main's stronger source/tag/checksum checks. Support checkpoint `538cdd28` supplies these changes for the same replacement PR. |
+| RABS process/stream control, jobserver and persistent toolchain cache | 7 | Retain after reconciling newer ownership/EOF tests. Direct safe kernel signals avoid launching a cancellation helper; completion markers avoid a directory-rename primitive unsupported by the tested NFS mount. |
+| Old CI, durable-execution and retired source-execution workflow edits | 3 | Do not restore the old graph. Move useful checks into the retained CI/E2E owners, preserving the 12-workflow layout and the newer read-only recovery owner. |
+| Old `Cargo.lock` | 1 | Do not copy old package versions. Resolve only the necessary dependency edges against the security-patched merged lockfile. |
+| `scripts/tests/test_durable_execution.py` | 1 | Reconcile with the runtime formatter, retaining both raw stdin/interactive cases and main's cancellation/saturated-writer regressions. |
+| `scripts/tests/test_recovery_workflows.py` | 1 | Exclude: it requires the retired `source-execution-recovery.yml` and would incorrectly require reintroducing obsolete infrastructure. |
+
+Discarded changes are excluded from the new implementation, not erased from the
+recovery archive. In particular, the old lockfile and stale workflow requirements
+must never be used to overwrite the newer security fixes or validation structure.
+
+The RABS support review preserved main's unreaped-child formation checks and
+isolated retained-writer EOF assertions. On `u25-agent-test`, pinned nightly
+validation passed 21 process-group, 12 stream-drain, 10 jobserver, 17 durable-cache
+and 3 dependency-budget tests. The 17 durable-cache and 10 jobserver tests also
+passed with fixtures on the actual NFS shared mount. A same-filesystem comparison
+observed the prior no-replace directory publication succeed under ordinary temp
+storage but return EINVAL on that NFS mount; the new cache path succeeded and
+reopened the exact verified objects in both cases. This is evidence for those
+fixtures and that mount, not power-loss, fleet performance or deployment proof.
+
+The initial aggregate validation reached successful strict Clippy and process/
+stream tests, then exhausted its command budget during worker-test compilation.
+The remaining worker suites completed separately without changing product
+limits. Evidence is retained under `target/overlay-rabs-validation-M7VUq8JU/`
+and `target/overlay-rabs-worker-GPPmJ6fY/`; worker job
+`rt-20261022-050224-jmql8lzx` completed with exit zero. Installer/packaging and
+source-policy evidence is recorded in PR #4. Synthetic packaging tools and source
+contract checks must not be described as actual release or cryptographic tests.
+
+Final pinned formatting, full-workspace/all-target `cargo check --locked` and
+full-workspace/all-target/all-feature Clippy with `-D warnings` passed in
+`rt-20261022-051210-t1hz69nq`; exact source hashes are retained in
+`target/overlay-workspace-final-2CBSLDLm/source.sha256`. The adapter adds one
+explicit, already-locked `rustix` process dependency to use safe kernel signal
+APIs; its direct-dependency budget changes from four to five for that concrete
+addition. No package version, other crate budget, timeout or warning gate changes.
+
+This review does not authorize deployment. The operator owns activation after
+the complete committed replacement is validated; support-only checkpoints are
+not substitutes for the existing code1 tool shims, agent hooks and worker paths.
 
 ## Pre-Migration Checklist
 

@@ -81,9 +81,26 @@ require('require_signature_support(' in production_download and
         'missing signing/verifier fails closed without explicit override')
 require('verification.signature_valid.or(' not in download,
         'no alternate upstream signature authorization')
-require('Dicklesworthstone/remote_compilation_helper' not in workflow and
+# The merged workflow deliberately denies this fork access to upstream-owned
+# crate publication. That exact exclusion is not an upstream download authority.
+# Retain it while rejecting every upstream URL/repository selection elsewhere.
+upstream = 'Dicklesworthstone/remote_compilation_helper'
+crate_guard = "if: github.repository == 'Dicklesworthstone/remote_compilation_helper' && !contains(needs.plan.outputs.tag, '-')"
+
+def fork_workflow_source(text):
+    prefix, separator, publish = text.partition('\n  publish-crates:\n')
+    references = [line.strip() for line in text.splitlines() if upstream in line]
+    return (not references or (references == [crate_guard] and separator and
+                              upstream not in prefix and crate_guard in publish))
+
+require(fork_workflow_source(workflow) and
         '$Repo = "${{ github.repository }}"' in workflow,
         'generated installer and release URLs follow publishing repository')
+for injected in [f'$Repo = "{upstream}"', f'https://github.com/{upstream}/releases/latest']:
+    require(not fork_workflow_source(workflow + '\n' + injected),
+            'upstream download authority is rejected despite retained crate guard')
+require(not fork_workflow_source(workflow.replace(crate_guard, 'if: true # ' + upstream)),
+        'upstream crate publication cannot lose its exact repository exclusion')
 require('--certificate-identity-regexp=".*"' not in workflow and
         '--certificate-oidc-issuer-regexp=".*"' not in workflow and
         '--certificate-identity="https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ needs.plan.outputs.tag }}"' in workflow,
