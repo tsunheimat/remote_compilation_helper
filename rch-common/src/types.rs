@@ -1175,6 +1175,11 @@ pub fn x86_64_microarch_level_from_flags(flags: &str) -> u8 {
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PathTopologyConfig {
+    /// Optional controller source tree, distinct from the worker mirror.
+    /// Relative project/dependency paths are preserved under `canonical_root`.
+    #[serde(default)]
+    pub source_root: Option<String>,
+
     /// Canonical project root directory.
     /// Defaults to `/data/projects` when absent.
     #[serde(default)]
@@ -1205,10 +1210,20 @@ impl PathTopologyConfig {
             .filter(|s| !s.is_empty())
             .map(|s| shellexpand::tilde(s).into_owned())
             .unwrap_or_else(|| crate::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string());
-        crate::path_topology::PathTopologyPolicy::new(
+        let policy = crate::path_topology::PathTopologyPolicy::new(
             PathBuf::from(canonical),
             PathBuf::from(alias),
-        )
+        );
+        match self
+            .source_root
+            .as_deref()
+            .filter(|source| !source.is_empty())
+        {
+            Some(source) => {
+                policy.with_source_root(PathBuf::from(shellexpand::tilde(source).into_owned()))
+            }
+            None => policy,
+        }
     }
 }
 

@@ -1031,12 +1031,12 @@ async fn execute_remote_compilation_inner(
         for entry in &mut sync_plan {
             let relative = entry
                 .local_root
-                .strip_prefix(topology_policy.canonical_root())
+                .strip_prefix(normalized_project.canonical_root())
                 .with_context(|| {
                     format!(
-                        "source-content root {} is outside canonical topology {}",
+                        "source-content root {} is outside controller source topology {}",
                         entry.local_root.display(),
-                        topology_policy.canonical_root().display()
+                        normalized_project.canonical_root().display()
                     )
                 })?;
             let relative = relative.to_str().ok_or_else(|| {
@@ -1448,7 +1448,12 @@ async fn execute_remote_compilation_inner(
     // Both isolated modes already name their complete staged source roots.
     // Converging canonical worker checkouts would mutate paths outside this
     // job's source grant and cannot prepare any of its selected destinations.
-    if clean_overlay.is_none() && !source_content_receipt {
+    // The repository updater assumes one namespace for local discovery and
+    // remote mutation. With a distinct source tree it could touch the original
+    // shared checkout instead of the mirror. The exact rsync plan owns that
+    // mirror's convergence; never authorize updater writes to the originals.
+    if clean_overlay.is_none() && !source_content_receipt && topology_policy.source_root().is_none()
+    {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
             &sync_roots,
@@ -1457,8 +1462,9 @@ async fn execute_remote_compilation_inner(
         )
         .await?;
     } else {
-        reporter
-            .verbose("[RCH] isolated sources selected; canonical repository convergence skipped");
+        reporter.verbose(
+            "[RCH] isolated or mapped sources selected; canonical repository convergence skipped",
+        );
     }
 
     let mut primary_pipeline: Option<TransferPipeline> = None;

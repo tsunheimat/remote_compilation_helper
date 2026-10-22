@@ -726,6 +726,7 @@ struct PartialRchConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialPathTopologyConfig {
+    source_root: Option<String>,
     canonical_root: Option<String>,
     alias_root: Option<String>,
 }
@@ -1826,6 +1827,12 @@ fn apply_layer(
     // strings are treated as unset to match `PathTopologyConfig::to_policy`
     // semantics — otherwise an accidentally-empty TOML value would
     // shadow the env var or default.
+    if let Some(source_root) = layer.path_topology.source_root.as_ref()
+        && !source_root.is_empty()
+    {
+        config.path_topology.source_root = Some(source_root.clone());
+        set_source(sources, "path_topology.source_root", source.clone());
+    }
     if let Some(canonical_root) = layer.path_topology.canonical_root.as_ref()
         && !canonical_root.is_empty()
     {
@@ -1915,6 +1922,16 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
     // — otherwise an accidentally-blank `canonical_root` in a project
     // TOML would clobber a valid value from the user TOML and force
     // an unwanted fallback to the compiled-in default.
+    if overlay
+        .path_topology
+        .source_root
+        .as_deref()
+        .is_some_and(|root| !root.is_empty())
+    {
+        base.path_topology
+            .source_root
+            .clone_from(&overlay.path_topology.source_root);
+    }
     if overlay
         .path_topology
         .canonical_root
@@ -2722,6 +2739,16 @@ fn apply_env_overrides_inner(
     }
 
     // Path topology overrides
+    if let Some(val) = get_env("RCH_SOURCE_PROJECT_ROOT") {
+        config.path_topology.source_root = Some(val);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "path_topology.source_root",
+                ConfigValueSource::EnvVar("RCH_SOURCE_PROJECT_ROOT".to_string()),
+            );
+        }
+    }
     let canonical_before_env = config
         .path_topology
         .to_policy()
@@ -4596,6 +4623,7 @@ max_concurrent_workers = 3
 [path_topology]
 canonical_root = "/home/alex/projects"
 alias_root = "/home/alex/dp"
+source_root = "/mnt/source"
 "#,
         )
         .expect("write user config");
@@ -4612,6 +4640,14 @@ alias_root = "/home/alex/dp"
             Some("/home/alex/dp"),
             "TOML alias_root should land in config.path_topology"
         );
+        assert_eq!(
+            loaded.config.path_topology.to_policy().source_root(),
+            Some(std::path::Path::new("/mnt/source"))
+        );
+        assert!(matches!(
+            loaded.sources.get("path_topology.source_root"),
+            Some(ConfigValueSource::UserConfig(_))
+        ));
         let canonical_source = loaded
             .sources
             .get("path_topology.canonical_root")

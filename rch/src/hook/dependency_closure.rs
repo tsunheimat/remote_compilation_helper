@@ -849,6 +849,9 @@ pub(super) fn workspace_metadata_sync_patterns() -> Vec<String> {
 }
 
 fn effective_sync_topology_roots(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
+    if let Some(source) = policy.source_root() {
+        return vec![std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf())];
+    }
     let mut roots = Vec::new();
     roots.push(policy.canonical_root().to_path_buf());
     roots.push(policy.alias_root().to_path_buf());
@@ -1328,6 +1331,60 @@ mod owned_layout_tests {
             &policy,
         );
         (temp, policy, plan)
+    }
+
+    #[test]
+    fn separate_source_root_maps_sibling_dependencies_without_local_worker_directories() {
+        let _guard = test_guard!();
+        let (temp, controller_policy, original) = fixture();
+        let source = controller_policy.canonical_root().to_path_buf();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let mirror = base.join("worker-only/projects");
+        let alias = base.join("worker-only/alias");
+        let policy =
+            PathTopologyPolicy::new(mirror.clone(), alias.clone()).with_source_root(source.clone());
+        // Pass the authored package roots, not the metadata-only parent that
+        // the planner discovers. Promoting that parent to Full would correctly
+        // be rejected as overlapping the explicitly selected workspace member.
+        let roots = [source.join("app"), source.join("foreign/crates/member")];
+        let plan = build_sync_closure_plan(&roots, &source.join("app"), "source-stamp-a", &policy);
+        assert_eq!(plan.len(), original.len());
+        assert!(plan.iter().any(|entry| {
+            entry.local_root == source.join("foreign")
+                && entry.mode == SyncClosureMode::WorkspaceMetadata
+        }));
+        for entry in &plan {
+            let relative = entry.local_root.strip_prefix(&source).unwrap();
+            assert_eq!(Path::new(&entry.remote_root), mirror.join(relative));
+            assert!(entry.local_root.exists());
+        }
+        let primary = plan.iter().find(|entry| entry.is_primary).unwrap();
+        let dependency = plan
+            .iter()
+            .find(|entry| entry.local_root.ends_with("foreign/crates/member"))
+            .unwrap();
+        assert_eq!(primary.remote_root, mirror.join("app").to_str().unwrap());
+        assert_eq!(
+            dependency.remote_root,
+            mirror.join("foreign/crates/member").to_str().unwrap()
+        );
+        assert!(!is_within_sync_topology(&mirror, &policy));
+        assert!(!is_within_sync_topology(&base.join("outside"), &policy));
+        let owned = build_owned_sync_closure_layout(&plan, &policy, "/tmp/rch", POOL).unwrap();
+        for entry in &owned.plan {
+            let relative = entry.local_root.strip_prefix(&source).unwrap();
+            assert_eq!(
+                Path::new(&entry.remote_root),
+                Path::new(&owned.source_root)
+                    .join("projects")
+                    .join(relative)
+            );
+        }
+        assert!(
+            !mirror.exists(),
+            "planning must not manufacture a worker path on the controller"
+        );
+        assert!(!alias.exists());
     }
 
     #[test]
