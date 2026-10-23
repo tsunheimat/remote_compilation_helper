@@ -60,6 +60,12 @@ jobs:
             TAG="${GITHUB_REF#refs/tags/}"
           fi
           VERSION="${TAG#v}"
+          # Installer/updater trust the exact release-tag workflow identity.
+          # Manual dispatch must select that tag, never a branch ref.
+          if [[ "$GITHUB_REF" != "refs/tags/$TAG" ]]; then
+            echo "Error: run this workflow at refs/tags/$TAG for the trusted signing identity"
+            exit 1
+          fi
 
           # Validate semver format
           if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
@@ -467,10 +473,10 @@ jobs:
         run: |
           cat > artifacts/install.ps1 << 'INSTALLER_EOF'
           # RCH Installer for Windows
-          # Usage: iwr https://github.com/Dicklesworthstone/remote_compilation_helper/releases/latest/download/install.ps1 | iex
+          # Usage: iwr https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex
           $ErrorActionPreference = "Stop"
 
-          $Repo = "Dicklesworthstone/remote_compilation_helper"
+          $Repo = "${{ github.repository }}"
           $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\rch" }
 
           Write-Host "RCH Installer - Remote Compilation Helper" -ForegroundColor Cyan
@@ -513,6 +519,18 @@ jobs:
           }
           Write-Host "Checksum verified." -ForegroundColor Green
 
+          # Authenticate the exact fork release workflow before extraction.
+          if (-not (Get-Command cosign -ErrorAction SilentlyContinue)) {
+              throw "cosign is required for release signature verification"
+          }
+          $BundleFile = "$TempFile.sigstore.json"
+          Invoke-WebRequest -Uri "$Url.sigstore.json" -OutFile $BundleFile
+          $Identity = "https://github.com/$Repo/.github/workflows/release.yml@refs/tags/$Version"
+          & cosign verify-blob --bundle $BundleFile --certificate-identity $Identity --certificate-oidc-issuer "https://token.actions.githubusercontent.com" $TempFile
+          if ($LASTEXITCODE -ne 0) {
+              throw "Release signature verification failed"
+          }
+
           # Extract
           New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
           Expand-Archive -Path $TempFile -DestinationPath $InstallDir -Force
@@ -552,12 +570,12 @@ jobs:
 
           ### Quick Install (Unix/macOS)
           \`\`\`bash
-          curl -fsSL https://github.com/Dicklesworthstone/remote_compilation_helper/releases/download/${{ needs.plan.outputs.tag }}/install.sh | sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/install.sh | sh
           \`\`\`
 
           ### Quick Install (Windows PowerShell)
           \`\`\`powershell
-          iwr https://github.com/Dicklesworthstone/remote_compilation_helper/releases/download/${{ needs.plan.outputs.tag }}/install.ps1 | iex
+          iwr https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/install.ps1 | iex
           \`\`\`
 
           ### Manual Download
@@ -609,7 +627,7 @@ jobs:
           Verify with:
           \`\`\`bash
           cosign verify-blob --bundle rch-${{ needs.plan.outputs.tag }}-<target>.tar.gz.sigstore.json \\
-            --certificate-identity="https://github.com/${{ github.workflow_ref }}" \\
+            --certificate-identity="https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ needs.plan.outputs.tag }}" \\
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \\
             rch-${{ needs.plan.outputs.tag }}-<target>.tar.gz
           \`\`\`

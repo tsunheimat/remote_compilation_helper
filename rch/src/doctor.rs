@@ -8587,6 +8587,28 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_daemon_fixture(path: &Path, script: &str) {
+        // A sibling test may fork while std::fs::write holds the executable
+        // open. Its inherited writer can make nohup fail with ETXTBSY before
+        // this readiness test is reached. Write in a dedicated process so no
+        // writable executable descriptor ever enters the libtest parent.
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                "rch-doctor-fixture",
+            ])
+            .arg(path)
+            .arg(script)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixture writer failed: {output:?}");
+        assert_eq!(std::fs::read(path).unwrap(), script.as_bytes());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn test_start_daemon_with_fake_rchd_rejects_regular_socket_file() {
         // A successful wrapper exit and a file at the requested `-s` path are
@@ -8608,14 +8630,16 @@ done\n\
 : > \"$sock\"\n\
 exit 0\n"
             .to_string();
-        std::fs::write(&fake_rchd, script).unwrap();
-        let mut perms = std::fs::metadata(&fake_rchd).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&fake_rchd, perms).unwrap();
+        write_daemon_fixture(&fake_rchd, &script);
 
         let error = start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_millis(50))
             .unwrap_err();
-        assert!(error.contains("did not accept connections"));
+        assert!(
+            error.contains("did not accept connections"),
+            "unexpected daemon-launch error: {error}; endpoint_is_file={}; fixture={}",
+            socket_path.is_file(),
+            tmp.path().display()
+        );
         // Under load the fake may still be finishing its `: > "$sock"` when
         // the (short, deliberate) 50ms socket wait gives up — poll briefly
         // rather than flake on scheduler timing.
@@ -8636,10 +8660,7 @@ exit 0\n"
         let socket_path = tmp.path().join("daemon.sock");
         let fake_rchd = tmp.path().join("rchd");
 
-        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nexit 42\n").unwrap();
-        let mut perms = std::fs::metadata(&fake_rchd).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&fake_rchd, perms).unwrap();
+        write_daemon_fixture(&fake_rchd, "#!/usr/bin/env sh\nexit 42\n");
 
         let err =
             start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_secs(1)).unwrap_err();

@@ -26,6 +26,29 @@ pub struct ToolchainInfo {
 }
 
 impl ToolchainInfo {
+    /// Explicit operator-selected native installation, without rustup. The
+    /// version is part of its identity, never a floating worker default.
+    pub fn native(version: &str) -> Option<Self> {
+        let parts = version.split('.').collect::<Vec<_>>();
+        (parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
+        .then(|| Self::new("native", None, version))
+    }
+
+    pub fn native_version(&self) -> Option<&str> {
+        (self.channel == "native" && self.date.is_none()).then_some(self.full_version.as_str())
+    }
+
+    /// Verify the native compiler, Cargo and clippy before admitting a job.
+    /// The same check runs in the execution shell, closing PATH/profile drift.
+    pub fn native_preflight(version: &str) -> String {
+        let version = shell_escape::escape(Cow::Borrowed(version));
+        format!(
+            "set -- $(rustc --version) && [ \"$1\" = rustc ] && [ \"$2\" = {version} ] && cargo --version >/dev/null && cargo clippy --version >/dev/null"
+        )
+    }
     /// Create a new ToolchainInfo.
     pub fn new(
         channel: impl Into<String>,
@@ -43,6 +66,9 @@ impl ToolchainInfo {
     ///
     /// Returns the toolchain identifier suitable for `rustup run <toolchain>`.
     pub fn rustup_toolchain(&self) -> String {
+        if let Some(version) = self.native_version() {
+            return format!("native:{version}");
+        }
         match &self.date {
             Some(date) => format!("{}-{}", self.channel, date),
             None => self.channel.clone(),
@@ -102,6 +128,12 @@ fn wrap_command_with_toolchain_policy(
         return insert_toolchain_runner(command, &runner);
     }
     match toolchain {
+        Some(tc) if tc.native_version().is_some() => format!(
+            "sh -c {} && {command}",
+            shell_escape::escape(Cow::Owned(ToolchainInfo::native_preflight(
+                tc.native_version().expect("native identity")
+            ))),
+        ),
         Some(tc) => insert_toolchain_runner(
             command,
             &format!(
@@ -341,6 +373,63 @@ pub fn wrap_command_with_color(command: &str, color_mode: ColorMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_identity_is_exact_and_does_not_invoke_rustup() {
+        let native = ToolchainInfo::native("1.93.1").unwrap();
+        assert_eq!(native.rustup_toolchain(), "native:1.93.1");
+        let command = wrap_command_with_toolchain("cargo test --offline", Some(&native));
+        assert!(!command.contains("rustup"));
+        assert!(command.contains("cargo clippy --version"));
+        assert!(command.ends_with("&& cargo test --offline"));
+        for invalid in ["", "stable", "1.93", "1.93.1-nightly", "1.93.1;true"] {
+            assert!(ToolchainInfo::native(invalid).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_preflight_refuses_wrong_version_or_missing_clippy_before_workload() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rustc = dir.path().join("rustc");
+        let cargo = dir.path().join("cargo");
+        std::fs::write(&rustc, "#!/bin/sh\nprintf 'rustc 1.93.1 (native)\\n'\n").unwrap();
+        std::fs::write(
+            &cargo,
+            "#!/bin/sh\n[ \"$1\" != clippy ] || [ \"$CLIPPY_AVAILABLE\" = yes ]\n",
+        )
+        .unwrap();
+        for p in [&rustc, &cargo] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for (version, available, succeeds) in [
+            ("1.93.1", "yes", true),
+            ("1.93.0", "yes", false),
+            ("1.93.1", "no", false),
+        ] {
+            let result = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "{} && printf workload",
+                    ToolchainInfo::native_preflight(version)
+                ))
+                .env_clear()
+                .env("PATH", dir.path())
+                .env("CLIPPY_AVAILABLE", available)
+                .output()
+                .unwrap();
+            assert_eq!(result.status.success(), succeeds);
+            assert_eq!(
+                result.stdout,
+                if succeeds {
+                    b"workload".as_slice()
+                } else {
+                    b""
+                }
+            );
+        }
+    }
 
     #[test]
     fn test_toolchain_info_new() {

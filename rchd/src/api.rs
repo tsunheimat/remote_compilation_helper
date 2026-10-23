@@ -106,6 +106,7 @@ fn format_wait_time(secs: u64) -> String {
 enum ApiRequest {
     SelectWorker {
         request: SelectionRequest,
+        toolchain_environment: Option<std::collections::BTreeMap<String, String>>,
         /// Client-minted identity supplied before daemon contact.
         local_wrapper_id: Option<String>,
         /// If true and all workers are busy, enqueue and wait for a worker.
@@ -790,7 +791,12 @@ async fn handle_connection_with_metrics(
     }
 
     let line = line.trim();
-    debug!("Received request: {}", line);
+    // Selection can carry remote environment defaults, including credentials.
+    // Log the route only; values must not enter daemon diagnostics.
+    debug!(
+        "Received request: {}",
+        line.split('?').next().unwrap_or(line)
+    );
 
     // Observe finite request handling, including error returns and cancellation.
     // Event subscriptions live until disconnect, so their lifetime is not a
@@ -803,6 +809,7 @@ async fn handle_connection_with_metrics(
     let (response_json, content_type) = match request {
         Ok(ApiRequest::SelectWorker {
             request,
+            toolchain_environment,
             local_wrapper_id,
             wait_for_worker,
             wait_timeout_secs,
@@ -810,6 +817,12 @@ async fn handle_connection_with_metrics(
             resume_queued,
         }) => {
             metrics::inc_requests("select-worker");
+            let mut ctx = ctx.clone();
+            if let Some(environment) = toolchain_environment {
+                let mut selector = (*ctx.worker_selector).clone();
+                selector.set_remote_environment(environment);
+                ctx.worker_selector = std::sync::Arc::new(selector);
+            }
             let response = if dry_run {
                 handle_select_worker_dry_run(&ctx, &request).await
             } else {
@@ -1947,29 +1960,69 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }
     }
 
-    let Some((query, resume_queued, disk_budget_route, tools_route)) = [
-        ("/select-worker", false, false, false),
-        ("/select-worker/resume-queued", true, false, false),
-        ("/select-worker/disk-budget", false, true, false),
+    let Some((query, resume_queued, disk_budget_route, tools_route, environment_route)) = [
+        ("/select-worker", false, false, false, false),
+        ("/select-worker/resume-queued", true, false, false, false),
+        ("/select-worker/disk-budget", false, true, false, false),
         (
             "/select-worker/resume-queued/disk-budget",
             true,
             true,
             false,
+            false,
         ),
-        ("/select-verified-tools", false, false, true),
-        ("/select-verified-tools/resume-queued", true, false, true),
-        ("/select-verified-tools/disk-budget", false, true, true),
+        ("/select-verified-tools", false, false, true, false),
+        (
+            "/select-verified-tools/resume-queued",
+            true,
+            false,
+            true,
+            false,
+        ),
+        (
+            "/select-verified-tools/disk-budget",
+            false,
+            true,
+            true,
+            false,
+        ),
         (
             "/select-verified-tools/resume-queued/disk-budget",
             true,
             true,
             true,
+            false,
+        ),
+        // Distinct from /select-worker so old prefix-based daemons cannot
+        // ignore environment constraints. Explicit tool requirements are also
+        // enforced by these routes, whether or not the caller supplied any.
+        ("/select-toolchain-environment", false, false, false, true),
+        (
+            "/select-toolchain-environment/resume-queued",
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            "/select-toolchain-environment/disk-budget",
+            false,
+            true,
+            false,
+            true,
+        ),
+        (
+            "/select-toolchain-environment/resume-queued/disk-budget",
+            true,
+            true,
+            false,
+            true,
         ),
     ]
     .into_iter()
-    .find_map(|(route, resume, disk_budget, tools)| {
-        query_for_exact_route(path, route).map(|query| (query, resume, disk_budget, tools))
+    .find_map(|(route, resume, disk_budget, tools, environment)| {
+        query_for_exact_route(path, route)
+            .map(|query| (query, resume, disk_budget, tools, environment))
     }) else {
         return Err(anyhow!("Unknown endpoint: {}", path));
     };
@@ -1982,6 +2035,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut job_mode = false;
     let mut wait_timeout_secs = None;
     let mut toolchain = None;
+    let mut toolchain_environment = None;
     let mut required_runtime = RequiredRuntime::default();
     let mut command_priority = CommandPriority::Normal;
     let mut classification_duration_us = None;
@@ -2023,6 +2077,17 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             "toolchain" => {
                 let json = percent_unescape_query_value(value);
                 toolchain = serde_json::from_str(&json).ok();
+            }
+            "toolchain_environment" => {
+                anyhow::ensure!(
+                    toolchain_environment.is_none(),
+                    "Duplicate toolchain_environment"
+                );
+                let environment = serde_json::from_str(&percent_unescape_query_value(value))
+                    .context("Invalid toolchain_environment")?;
+                rch_common::execution_storage::validate_remote_environment(&environment)
+                    .map_err(anyhow::Error::msg)?;
+                toolchain_environment = Some(environment);
             }
             "runtime" => {
                 // Parse required runtime (rust, bun, node)
@@ -2078,6 +2143,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     let project = project.ok_or_else(|| anyhow!("Missing 'project' parameter"))?;
+    anyhow::ensure!(
+        environment_route == toolchain_environment.is_some(),
+        "toolchain_environment requires its exact selection route"
+    );
+    anyhow::ensure!(
+        !environment_route || toolchain.is_some(),
+        "toolchain_environment requires a resolved toolchain"
+    );
     let estimated_cores = cores.unwrap_or(1);
     let disk_headroom_gib = disk_headroom_gib.unwrap_or(0);
     anyhow::ensure!(
@@ -2097,6 +2170,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     Ok(ApiRequest::SelectWorker {
+        toolchain_environment,
         request: SelectionRequest {
             project,
             command,
@@ -2608,6 +2682,25 @@ fn queue_selection_digest(
     Ok(digest.finalize().into())
 }
 
+fn queue_environment_digest(
+    ctx: &DaemonContext,
+    request: &SelectionRequest,
+    wait_timeout_secs: Option<u64>,
+) -> Result<[u8; 32]> {
+    let base = queue_selection_digest(request, wait_timeout_secs)?;
+    if request.toolchain.is_none() {
+        return Ok(base);
+    }
+    let key = ctx.worker_selector.toolchain_preflight_key("");
+    if key.is_empty() {
+        return Ok(base);
+    }
+    let mut digest = Sha256::new();
+    digest.update(base);
+    digest.update(key.as_bytes());
+    Ok(digest.finalize().into())
+}
+
 async fn handle_select_worker_mode(
     ctx: &DaemonContext,
     request: SelectionRequest,
@@ -2632,7 +2725,7 @@ async fn handle_select_worker_mode(
             request
                 .hook_pid
                 .ok_or_else(|| anyhow!("missing queued process"))?,
-            &queue_selection_digest(&request, wait_timeout_secs)?,
+            &queue_environment_digest(ctx, &request, wait_timeout_secs)?,
         )?;
         // One line per reattached waiter, so a restart can be checked for
         // queued rows that resumed versus refused (bd-w2qrp).
@@ -2987,7 +3080,7 @@ async fn handle_select_worker_mode(
 
     let effective_queue_timeout_secs =
         queue_wait_secs(request.job_mode, wait_timeout_secs, ctx.queue_timeout_secs);
-    let selection_digest = queue_selection_digest(&request, wait_timeout_secs)?;
+    let selection_digest = queue_environment_digest(ctx, &request, wait_timeout_secs)?;
     let admission = ctx.admission_barrier.read().await;
     if *admission || ctx.history.ownership_failed() {
         anyhow::ensure!(
@@ -5319,6 +5412,199 @@ mod tests {
         ] {
             assert!(parse_request(line).is_err(), "accepted {line}");
         }
+    }
+
+    #[test]
+    fn toolchain_environment_routes_validate_and_bind_queue_identity() {
+        let toolchain =
+            serde_json::to_string(&rch_common::ToolchainInfo::native("1.93.1").unwrap()).unwrap();
+        let environment = r#"{"PATH":"/private tools' bin:/usr/bin","LITERAL":"$(false); ' &"}"#;
+        let query = format!(
+            "project=p&toolchain={}&toolchain_environment={}",
+            urlencoding_encode(&toolchain),
+            urlencoding_encode(environment)
+        );
+        for (route, extra) in [
+            ("/select-toolchain-environment", ""),
+            (
+                "/select-toolchain-environment/disk-budget",
+                "&disk_headroom_gib=1",
+            ),
+            (
+                "/select-toolchain-environment/resume-queued",
+                "&wait=1&hook_pid=123&local_wrapper_id=rchw-env",
+            ),
+            (
+                "/select-toolchain-environment/resume-queued/disk-budget",
+                "&disk_headroom_gib=1&wait=1&hook_pid=123&local_wrapper_id=rchw-env",
+            ),
+        ] {
+            let ApiRequest::SelectWorker {
+                request,
+                toolchain_environment: Some(environment),
+                ..
+            } = parse_request(&format!("GET {route}?{query}{extra}")).unwrap()
+            else {
+                panic!("selection")
+            };
+            assert_eq!(environment["LITERAL"], "$(false); ' &");
+            // Environment-aware admission must retain explicit tools as hard
+            // constraints, including resumed and disk-budgeted requests.
+            let ApiRequest::SelectWorker {
+                request: combined, ..
+            } = parse_request(&format!(
+                "GET {route}?{query}{extra}&require_tool=cargo-clippy&require_tool=rustc"
+            ))
+            .unwrap()
+            else {
+                panic!("combined selection")
+            };
+            assert_eq!(combined.required_tools, vec!["cargo-clippy", "rustc"]);
+            assert!(combined.toolchain.is_some());
+            assert_eq!(combined.disk_headroom_gib, request.disk_headroom_gib);
+            let mut ctx = make_test_context(WorkerPool::new());
+            let original = queue_environment_digest(&ctx, &request, None).unwrap();
+            let mut selector = (*ctx.worker_selector).clone();
+            selector.set_remote_environment(environment);
+            ctx.worker_selector = Arc::new(selector);
+            let configured = queue_environment_digest(&ctx, &request, None).unwrap();
+            assert_ne!(
+                original, configured,
+                "queue recovery must bind tool environment"
+            );
+        }
+        assert!(parse_request(&format!("GET /select-worker?{query}")).is_err());
+        assert!(parse_request("GET /select-toolchain-environment?project=p").is_err());
+        assert!(
+            parse_request(&format!("GET /select-worker/toolchain-environment?{query}")).is_err()
+        );
+        assert!(
+            parse_request(&format!(
+                "GET /select-verified-tools?{query}&require_tool=rustc"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_request(&format!(
+                "GET /select-toolchain-environment?{query}&toolchain_environment=%7B%7D"
+            ))
+            .is_err()
+        );
+        for invalid in [
+            r#"{"PATH":"bad\npath"}"#,
+            r#"{"A;false":"x"}"#,
+            r#"{"CARGO_TARGET_DIR":"/shared/source"}"#,
+            "not-json",
+        ] {
+            assert!(parse_request(&format!("GET /select-toolchain-environment?project=p&toolchain={}&toolchain_environment={}", urlencoding_encode(&toolchain), urlencoding_encode(invalid))).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn toolchain_environment_reaches_probe_without_mutating_daemon_defaults() {
+        const CASE: &str = "RCH_TEST_TOOLCHAIN_ENVIRONMENT_API";
+        if std::env::var_os(CASE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "api::tests::toolchain_environment_reaches_probe_without_mutating_daemon_defaults", "--nocapture"])
+                .env(CASE, "1")
+                .env("RCH_MOCK_SSH", "1")
+                .env("RCH_MOCK_SSH_DELAY_MS", "0")
+                .output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("env-worker", 2)).await;
+        let worker = pool.get(&WorkerId::new("env-worker")).await.unwrap();
+        worker
+            .set_capabilities(WorkerCapabilities {
+                rustc_version: Some("1.93.1".into()),
+                projects_root_ok: Some(true),
+                ..Default::default()
+            })
+            .await;
+        let mut ctx = make_test_context(pool);
+        let mut config = rch_common::RchConfig::default();
+        config
+            .environment
+            .remote
+            .insert("PATH".into(), "/daemon/bin:/usr/bin".into());
+        ctx.worker_selector = Arc::new(crate::daemon_worker_selector(
+            &config,
+            ctx.history.clone(),
+            None,
+        ));
+        let unchanged_key = ctx.worker_selector.toolchain_preflight_key("native:1.93.1");
+        let toolchain = urlencoding_encode(
+            &serde_json::to_string(&rch_common::ToolchainInfo::native("1.93.1").unwrap()).unwrap(),
+        );
+        for path in [
+            Some("/project private/bin:/usr/bin"),
+            Some("/second/bin:/usr/bin"),
+            None,
+        ] {
+            let mut query = format!(
+                "project=env-project&command=cargo%20clippy&cores=1&runtime=rust&toolchain={toolchain}&dry_run=1"
+            );
+            let route = if let Some(path) = path {
+                let environment = std::collections::BTreeMap::from([("PATH", path)]);
+                query.push_str(&format!(
+                    "&toolchain_environment={}",
+                    urlencoding_encode(&serde_json::to_string(&environment).unwrap())
+                ));
+                "/select-toolchain-environment"
+            } else {
+                "/select-worker"
+            };
+            let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (shutdown_tx, _) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(handle_connection(server, ctx.clone(), shutdown_tx));
+            client
+                .write_all(format!("GET {route}?{query}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            tokio::io::AsyncReadExt::read_to_string(&mut client, &mut reply)
+                .await
+                .unwrap();
+            task.await.unwrap().unwrap();
+            let response: SelectionResponse =
+                serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(response.reason, SelectionReason::Success);
+            assert_eq!(response.worker.unwrap().id, WorkerId::new("env-worker"));
+            assert!(response.build_id.is_none());
+            let commands = rch_common::mock::global_ssh_invocations_snapshot()
+                .into_iter()
+                .filter_map(|call| call.command)
+                .collect::<Vec<_>>();
+            let command = commands.last().expect("preflight command");
+            let expected =
+                rch_common::ssh_utils::shell_escape_value(path.unwrap_or("/daemon/bin:/usr/bin"))
+                    .unwrap();
+            assert!(
+                command.starts_with(&format!("PATH={expected} sh -c ")),
+                "{command}"
+            );
+            assert!(command.contains("cargo clippy --version"), "{command}");
+            assert_eq!(
+                ctx.worker_selector.toolchain_preflight_key("native:1.93.1"),
+                unchanged_key
+            );
+            assert_eq!(worker.used_slots(), 0);
+            assert!(
+                ctx.history
+                    .active_workers_for_project("env-project")
+                    .is_empty()
+            );
+        }
+        let commands = rch_common::mock::global_ssh_invocations_snapshot()
+            .into_iter()
+            .filter_map(|call| call.command)
+            .count();
+        assert_eq!(
+            commands, 3,
+            "each distinct environment requires its own probe"
+        );
     }
 
     #[test]
@@ -9816,6 +10102,71 @@ mod tests {
                 .await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn requested_timeout_and_interrupt_release_only_the_owned_job_immediately() {
+        let _guard = test_guard!();
+        for exit in [124, 130] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            let ctx = make_test_context(pool.clone());
+            let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let build = ctx.history.start_active_build_with_wrapper(
+                "deadline-project".into(),
+                "worker1".into(),
+                "python3 slow.py".into(),
+                12345,
+                Some("deadline-owner".into()),
+                2,
+                rch_common::BuildLocation::Remote,
+            );
+            let bystander = ctx.history.start_active_build_with_wrapper(
+                "other-project".into(),
+                "worker1".into(),
+                "cargo test".into(),
+                12346,
+                Some("other-owner".into()),
+                2,
+                rch_common::BuildLocation::Remote,
+            );
+            assert!(worker.reserve_slots(4).await);
+            let request = || ReleaseRequest {
+                local_wrapper_id: Some("deadline-owner".into()),
+                worker_id: WorkerId::new("worker1"),
+                slots: 2,
+                build_id: Some(build.id),
+                exit_code: Some(exit),
+                duration_ms: Some(3100),
+                bytes_transferred: None,
+                timing: None,
+                worker_fault: false,
+                worker_disk_full: false,
+                worker_source_busy: false,
+                worker_live_checkout_refused: false,
+                worker_disk_roots: Vec::new(),
+            };
+            handle_release_worker(&ctx, request()).await.unwrap();
+            assert_eq!(worker.available_slots().await, 6);
+            assert!(ctx.history.active_build(build.id).is_none());
+            assert!(ctx.history.active_build(bystander.id).is_some());
+            assert_eq!(
+                ctx.history
+                    .recent(10)
+                    .iter()
+                    .find(|r| r.id == build.id)
+                    .unwrap()
+                    .exit_code,
+                exit
+            );
+            handle_release_worker(&ctx, request()).await.unwrap();
+            assert_eq!(
+                worker.available_slots().await,
+                6,
+                "duplicate release must not release the bystander"
+            );
+            assert!(worker.circuit_stats().await.recent_results().is_empty());
+        }
     }
 
     #[tokio::test]

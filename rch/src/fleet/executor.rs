@@ -1089,8 +1089,12 @@ async fn evaluate_signature_check(
     let Some(sig) = provenance.signature.as_ref() else {
         return SignatureCheck::Absent;
     };
+    let Some(release_id) = provenance.release_id.as_deref() else {
+        warn!("signed artifact has no release identity; refusing signature verification");
+        return SignatureCheck::Invalid;
+    };
     let bundle = PathBuf::from(&sig.bundle_ref);
-    match crate::update::verify::verify_signature(local_binary, &bundle).await {
+    match crate::update::verify::verify_signature(local_binary, &bundle, release_id).await {
         Ok(true) => SignatureCheck::Valid,
         Ok(false) => SignatureCheck::Invalid,
         Err(e) => {
@@ -3061,6 +3065,24 @@ mod tests {
         let path = dir.path().join("rch-wkr");
         std::fs::write(&path, content).unwrap();
         (dir, path)
+    }
+
+    #[tokio::test]
+    async fn declared_signature_without_release_identity_is_invalid() {
+        let mut provenance = ArtifactProvenance::dev_artifact("rch-wkr", TEST_TRIPLE);
+        provenance.signature = Some(SignatureMaterial {
+            bundle_ref: "/nonexistent/bundle.json".to_string(),
+            identity_pattern: ".*".to_string(),
+        });
+        assert_eq!(
+            evaluate_signature_check(&provenance, Path::new("/nonexistent/rch-wkr")).await,
+            SignatureCheck::Invalid
+        );
+        provenance.signature = None;
+        assert_eq!(
+            evaluate_signature_check(&provenance, Path::new("/nonexistent/rch-wkr")).await,
+            SignatureCheck::Absent
+        );
     }
 
     #[test]

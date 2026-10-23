@@ -4333,6 +4333,10 @@ flock -n "$__gc_source_registry/metadata.lock" true;
                 "{} __gc_source_begin \"$1\" || exit 1; rm -rf -- \"$1\"; __gc_source_end;",
                 source_claim_gate_fragment(registry.to_str().unwrap())
             );
+            // Retain diagnostics while observing the barrier; a piped but
+            // unread stderr can hide both launch failures and blocked writes.
+            let diagnostics = tmp.path().join("supervisor.stderr");
+            let diagnostic_file = std::fs::File::create(&diagnostics).unwrap();
             let mut child = Command::new("sh")
                 .args(["-c", &script, "gc-lifetime"])
                 .arg(&candidate)
@@ -4344,18 +4348,30 @@ flock -n "$__gc_source_registry/metadata.lock" true;
                 .env("RCH_GC_TEST_RESUME", &resume)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(diagnostic_file)
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             while !ready.exists() && Instant::now() < deadline {
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "source guard exited before deletion"
-                );
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(ready.exists(), "removal child failed to reach barrier");
+            if !ready.exists() {
+                // Release a possible late fixture child, reap our supervisor,
+                // and preserve evidence before failing the unchanged deadline.
+                std::fs::write(&resume, b"abort fixture").unwrap();
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                let stderr = std::fs::read(&diagnostics).unwrap();
+                let retained = tmp.keep();
+                panic!(
+                    "removal child failed to reach barrier: {signal}, {status}, stderr={}, retained={}",
+                    String::from_utf8_lossy(&stderr),
+                    retained.display()
+                );
+            }
             assert!(
                 Command::new("kill")
                     .args([signal, &child.id().to_string()])

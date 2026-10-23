@@ -942,6 +942,18 @@ mod tests {
 
     #[test]
     fn g007_drain_completes_after_group_cancellation_midstream() {
+        assert_midstream_cancellation("yes cancelled-flood-line-xxxxxxxxxxxxxxxx & sleep 30");
+    }
+
+    #[test]
+    fn g007_cancellation_waits_for_output_from_delayed_producer() {
+        // Force startup past the old 250ms guess without slowing the drain.
+        assert_midstream_cancellation(
+            "(sleep 0.4; exec yes cancelled-flood-line-xxxxxxxxxxxxxxxx) & sleep 30",
+        );
+    }
+
+    fn assert_midstream_cancellation(script: &str) {
         // An orphaned descendant holds the stdout pipe and keeps writing
         // after the leader would exit. Plain read-to-end would HANG here.
         // With managed groups: cancellation signals the whole GROUP (the
@@ -955,8 +967,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         // Leader backgrounds a flooder (same process GROUP via inherited
         // pgid), then sleeps; cancellation fires long before either ends.
-        cmd.arg("-c")
-            .arg("yes cancelled-flood-line-xxxxxxxxxxxxxxxx & sleep 30");
+        cmd.arg("-c").arg(script);
         cmd.process_group(0);
         let mut child = cmd
             .stdin(Stdio::null())
@@ -966,24 +977,72 @@ mod tests {
             .expect("managed-style spawn");
         let pgid = child.id();
 
-        let (out_lane, _err_lane) = spawn_lanes(&mut child, &limits);
-        // Let the flood start, then cancel MID-STREAM like a coordinator
-        // would: TERM the group, then run the escalating closer.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let term_ok = Command::new("kill")
-            .args(["-TERM", "--", &format!("-{pgid}")])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(term_ok, "group TERM delivered");
+        let (out_lane, err_lane) = spawn_lanes(&mut child, &limits);
+        // A fixed sleep does not prove the producer ran: under parallel test
+        // load TERM can arrive before its first write. Observe actual overflow
+        // BEFORE cancelling, so this really exercises mid-stream cancellation.
+        let spill_path = limits.spill_dir.join("stdout.spill");
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let saw_output = loop {
+            if std::fs::metadata(&spill_path).is_ok_and(|metadata| metadata.len() > 0) {
+                break true;
+            }
+            if std::time::Instant::now() >= ready_deadline
+                || out_lane
+                    .as_ref()
+                    .is_none_or(std::thread::JoinHandle::is_finished)
+            {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        // Attempt group cleanup before reporting readiness or signaling failure.
+        let term_ok = crate::process_groups::signal_process_group(
+            pgid,
+            crate::process_groups::GroupSignal::Term,
+        )
+        .is_ok();
         let residual = crate::process_groups::reap_residuals(pgid);
-
+        if !term_ok || residual != 0 {
+            let _ = child.kill();
+        }
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // Sample all three independently, rather than short-circuiting away
+            // the lane states while the leader is still running.
+            let leader_status = child.try_wait().expect("observe owned leader");
+            let stdout_done = out_lane
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            let stderr_done = err_lane
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if leader_status.is_some() && stdout_done && stderr_done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "cancelled group/drains did not finish: ready={saw_output}, TERM={term_ok}, residual={residual}, leader={leader_status:?}, stdout_done={stdout_done}, stderr_done={stderr_done}, spill={spill_path:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let status = child.wait().expect("leader reaped after cancellation");
-        let stdout = out_lane
+        let stdout = out_lane.map_or_else(|| Ok(LaneDrain::empty()), join_lane);
+        let stderr = err_lane
             .map_or_else(|| Ok(LaneDrain::empty()), join_lane)
-            .expect("lane completes after cancellation-forced EOF");
+            .expect("stderr completes after cancellation-forced EOF");
+        let stdout = stdout.expect("stdout completes after cancellation-forced EOF");
 
-        assert!(stdout.total_bytes() > 0, "pre-cancel output captured");
+        assert!(term_ok, "group TERM delivered");
+        assert!(
+            saw_output,
+            "flood never reached spill before cancellation; stderr: {}",
+            String::from_utf8_lossy(stderr.resident())
+        );
+        assert!(
+            stdout.total_bytes() > BOUND as u64,
+            "pre-cancel overflow captured"
+        );
         assert!(
             stdout.resident().len() <= BOUND,
             "bounded despite ongoing flood at cancel time"

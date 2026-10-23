@@ -13,6 +13,50 @@ use crate::ui::theme::StatusIndicator;
 // Agents Commands
 // =============================================================================
 
+/// Preview/apply an explicit migration of exactly owned legacy handlers.
+pub fn migrate(agent: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
+    migration_command(agent, dry_run, false, ctx)
+}
+
+/// Restore only migration-owned handlers, merging with current configuration.
+pub fn rollback(agent: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
+    migration_command(agent, dry_run, true, ctx)
+}
+
+fn migration_command(
+    agent: &str,
+    dry_run: bool,
+    rollback: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    use crate::agent::{AgentKind, migrate_hook, rollback_hook};
+    let kind =
+        AgentKind::from_id(agent).ok_or_else(|| anyhow::anyhow!("Unknown agent '{agent}'"))?;
+    let action = if rollback { "rollback" } else { "migrate" };
+    let result = if rollback {
+        rollback_hook(kind, dry_run)?
+    } else {
+        migrate_hook(kind, dry_run)?
+    };
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            format!("agents {action}"),
+            serde_json::json!({
+                "agent": kind.id(), "dry_run": dry_run, "result": format!("{result:?}"),
+                "restart_performed": false, "path_changed": false,
+            }),
+        ));
+    } else {
+        println!("{} {action}: {result:?}", kind.name());
+        if kind == AgentKind::Hermes {
+            eprintln!(
+                "Restart Hermes after applying migration or rollback; loaded callbacks are unchanged until restart."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// List detected AI coding agents and their RCH hook status.
 pub fn agents_list(all: bool, ctx: &OutputContext) -> Result<()> {
     use crate::agent::{AgentKind, HookStatus, check_hook_status, detect_agents};

@@ -66,6 +66,10 @@ jobs:
         run: |
           cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
           echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+      - name: Verify installer and generic dispatch with the compiled client
+        if: runner.os == 'Linux'
+        # The fixture owns an isolated HOME/configuration; no host activation.
+        run: bash scripts/install_shim_unit_test.sh "$GITHUB_WORKSPACE/target/release/rch"
       - name: Build debug support for the feature-gated Cargo harness
         if: runner.os == 'Linux'
         # The integration-test target builds its own feature-enabled CLI.

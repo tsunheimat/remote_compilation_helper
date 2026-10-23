@@ -102,6 +102,10 @@ pub(super) fn selected_manifest_root(
         return Ok(None);
     };
     anyhow::ensure!(
+        policy.source_root().is_none() || !Path::new(selected).is_absolute(),
+        "separate source-root mirrors require a relative --manifest-path; an absolute path would select the original shared source"
+    );
+    anyhow::ensure!(
         !changes_directory,
         "--manifest-path with env --chdir/-C or cargo -C requires an explicit working-directory mapping"
     );

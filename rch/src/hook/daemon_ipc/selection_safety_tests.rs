@@ -47,6 +47,7 @@ async fn query_fixture(
         &[],
         false,
         &[],
+        None,
         dry_run,
     );
     let (result, ()) = timeout(Duration::from_secs(3), async {
@@ -144,6 +145,7 @@ async fn failures_before_connect_do_not_invent_unconfirmed_ownership() {
                 &[],
                 false,
                 &[],
+                None,
             )
             .await
             .unwrap_err();
@@ -324,6 +326,7 @@ async fn unrequested_fixture(
         &requested,
         false,
         &[],
+        None,
         dry_run,
     );
     timeout(Duration::from_secs(3), async {
@@ -457,6 +460,8 @@ async fn resuming_query_fixture(
         WorkerId::new("worker-alternate"),
     ];
     let tools = ["tool+one&check".into(), "tool-two".into()];
+    let environment =
+        std::collections::BTreeMap::from([("PATH".into(), "/private rust/bin:/usr/bin".into())]);
     let client = query_daemon_with_mode(
         path.to_str().unwrap(),
         "queued project&variant=one",
@@ -473,6 +478,7 @@ async fn resuming_query_fixture(
         &workers,
         true,
         &tools,
+        Some(&environment),
         dry_run,
     );
     let result = timeout(Duration::from_secs(3), async {
@@ -506,17 +512,18 @@ async fn transport_loss_resumes_the_exact_original_queued_selection() {
     assert_eq!(response.build_id, Some(42));
     assert_eq!(requests.len(), 2);
     let original_query = requests[0]
-        .strip_prefix("GET /select-verified-tools?")
+        .strip_prefix("GET /select-toolchain-environment?")
         .unwrap();
     assert_eq!(
         requests[1],
-        format!("GET /select-verified-tools/resume-queued?{original_query}"),
+        format!("GET /select-toolchain-environment/resume-queued?{original_query}"),
         "only the endpoint changes; identity, constraints and timeout stay exact"
     );
     for required in [
         "project=queued%20project%26variant%3Done&cores=4",
         "&command=cargo%20%2Bnightly-2026-09-01%20test%20--features%20%27a%26b%27",
         "&toolchain=",
+        "&toolchain_environment=",
         "&runtime=rust",
         "&priority=high",
         "&classification_us=731",
@@ -560,8 +567,8 @@ async fn refused_or_lost_resume_reply_never_dispatches_a_third_request() {
             "a refused or lost resume must retain uncertain ownership: {error:#}"
         );
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("GET /select-verified-tools?"));
-        assert!(requests[1].starts_with("GET /select-verified-tools/resume-queued?"));
+        assert!(requests[0].starts_with("GET /select-toolchain-environment?"));
+        assert!(requests[1].starts_with("GET /select-toolchain-environment/resume-queued?"));
     }
 }
 
@@ -641,7 +648,7 @@ async fn resume_connects_when_the_daemon_socket_reappears() {
         (listener, request)
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let client = resume_queued_selection(path.to_str().unwrap(), query, deadline, 0, false);
+    let client = resume_queued_selection(path.to_str().unwrap(), query, deadline, 0, false, false);
     let (result, (listener, request)) = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
     })
@@ -675,6 +682,7 @@ async fn unavailable_resume_socket_exhausts_only_the_original_deadline() {
                 "project=queued",
                 started + budget,
                 0,
+                false,
                 false,
             ),
         )
@@ -718,9 +726,15 @@ async fn resumed_reply_wait_uses_time_left_after_reconnecting() {
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_millis(600);
     let client = async {
-        let result =
-            resume_queued_selection(path.to_str().unwrap(), "project=queued", deadline, 0, false)
-                .await;
+        let result = resume_queued_selection(
+            path.to_str().unwrap(),
+            "project=queued",
+            deadline,
+            0,
+            false,
+            false,
+        )
+        .await;
         finished_tx.send(()).unwrap();
         result
     };
@@ -761,6 +775,7 @@ async fn expired_resume_deadline_does_not_dispatch() {
         "project=queued",
         tokio::time::Instant::now() - Duration::from_millis(1),
         0,
+        false,
         false,
     )
     .await

@@ -10,7 +10,7 @@ use std::time::Duration;
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// Repository owner and name.
-const REPO_OWNER: &str = "Dicklesworthstone";
+const REPO_OWNER: &str = "tsunheimat";
 const REPO_NAME: &str = "remote_compilation_helper";
 
 /// Get the cache directory for version checks.
@@ -20,21 +20,51 @@ fn get_cache_dir() -> Option<PathBuf> {
 
 /// Get the cache file path for version checks.
 fn get_cache_file() -> Option<PathBuf> {
-    get_cache_dir().map(|d| d.join("version_check.json"))
+    // Never read the pre-fork cache, even when its version is still current.
+    get_cache_dir().map(|d| d.join(format!("version_check-{REPO_OWNER}-{REPO_NAME}.json")))
 }
 
 /// Read cached version check if valid (< 24 hours old).
 pub fn read_cached_check() -> Option<UpdateCheck> {
     let cache_file = get_cache_file()?;
     let content = fs::read_to_string(&cache_file).ok()?;
-    let cached: CachedCheck = serde_json::from_str(&content).ok()?;
+    parse_cached_check(&content)
+}
 
-    if cached.is_valid() {
-        Some(cached.result)
+fn parse_cached_check(content: &str) -> Option<UpdateCheck> {
+    let cached: CachedCheck = serde_json::from_str(content).ok()?;
+    (cached.is_valid() && validate_release_source(&cached.result).is_ok()).then_some(cached.result)
+}
+
+/// Reject upstream or mixed-source metadata before it can select a download.
+/// URL parsing also rejects userinfo, lookalike hosts and traversal paths.
+pub(super) fn validate_release_source(check: &UpdateCheck) -> Result<(), UpdateError> {
+    let release_prefix = format!("/{REPO_OWNER}/{REPO_NAME}/releases/tag/");
+    let download_prefix = format!("/{REPO_OWNER}/{REPO_NAME}/releases/download/");
+    let belongs_to_release = |value: &str, prefix: &str| {
+        reqwest::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("github.com")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.path().starts_with(prefix)
+                && url.path().len() > prefix.len()
+        })
+    };
+    if belongs_to_release(&check.release_url, &release_prefix)
+        && check
+            .assets
+            .iter()
+            .all(|asset| belongs_to_release(&asset.browser_download_url, &download_prefix))
+    {
+        Ok(())
     } else {
-        // Cache is stale, remove it
-        let _ = fs::remove_file(&cache_file);
-        None
+        Err(UpdateError::CheckFailed(format!(
+            "Release metadata must belong to {REPO_OWNER}/{REPO_NAME}"
+        )))
     }
 }
 
@@ -155,6 +185,8 @@ pub async fn check_for_updates(
         assets: latest.assets.clone(),
     };
 
+    validate_release_source(&check)?;
+
     // Write to cache for stable channel
     if channel == Channel::Stable {
         write_cache(&check);
@@ -201,7 +233,7 @@ async fn fetch_specific_version(
         None
     };
 
-    Ok(UpdateCheck {
+    let check = UpdateCheck {
         current_version: current.clone(),
         latest_version: target_version,
         update_available,
@@ -209,7 +241,9 @@ async fn fetch_specific_version(
         release_notes: release.body.clone(),
         changelog_diff,
         assets: release.assets.clone(),
-    })
+    };
+    validate_release_source(&check)?;
+    Ok(check)
 }
 
 /// Maximum attempts for a GitHub API metadata fetch.
@@ -296,7 +330,13 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, UpdateError> {
         let response = client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
+            .header(
+                "User-Agent",
+                format!(
+                    "rch/{} (+https://github.com/tsunheimat/remote_compilation_helper)",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            )
             .send()
             .await
             .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
@@ -328,7 +368,13 @@ async fn fetch_release_from_url(url: &str) -> Result<ReleaseInfo, UpdateError> {
         let response = client
             .get(url)
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
+            .header(
+                "User-Agent",
+                format!(
+                    "rch/{} (+https://github.com/tsunheimat/remote_compilation_helper)",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            )
             .send()
             .await
             .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
@@ -437,6 +483,65 @@ fn build_http_client() -> Result<reqwest::Client, UpdateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fork_check() -> UpdateCheck {
+        UpdateCheck {
+            current_version: Version::parse("1.0.0").unwrap(),
+            latest_version: Version::parse("1.1.0").unwrap(),
+            update_available: true,
+            release_url: "https://github.com/tsunheimat/remote_compilation_helper/releases/tag/v1.1.0".into(),
+            release_notes: None,
+            changelog_diff: None,
+            assets: vec![super::super::types::ReleaseAsset {
+                name: "rch.tar.gz".into(),
+                browser_download_url: "https://github.com/tsunheimat/remote_compilation_helper/releases/download/v1.1.0/rch.tar.gz".into(),
+                size: 1,
+                content_type: "application/gzip".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn cached_upstream_and_mixed_source_releases_are_rejected() {
+        let cached = CachedCheck {
+            result: fork_check(),
+            cached_at_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        let encode = |cached: &CachedCheck| serde_json::to_string(cached).unwrap();
+        assert!(parse_cached_check(&encode(&cached)).is_some());
+        for bad_url in [
+            "https://github.com/Dicklesworthstone/remote_compilation_helper/releases/download/v1.1.0/rch.tar.gz",
+            "https://github.com.evil.example/tsunheimat/remote_compilation_helper/releases/download/v1.1.0/rch.tar.gz",
+            "https://github.com/tsunheimat/other/releases/download/v1.1.0/rch.tar.gz",
+        ] {
+            let mut mixed = cached.clone();
+            mixed.result.assets[0].browser_download_url = bad_url.into();
+            assert!(parse_cached_check(&encode(&mixed)).is_none(), "{bad_url}");
+        }
+        let mut upstream = cached.clone();
+        upstream.result.release_url = upstream
+            .result
+            .release_url
+            .replace("tsunheimat", "Dicklesworthstone");
+        assert!(parse_cached_check(&encode(&upstream)).is_none());
+        let mut stale = cached;
+        stale.cached_at_secs = 0;
+        assert!(parse_cached_check(&encode(&stale)).is_none());
+        assert!(parse_cached_check("not JSON").is_none());
+    }
+
+    #[test]
+    fn cache_path_is_fork_scoped() {
+        if let Some(path) = get_cache_file() {
+            assert_eq!(
+                path.file_name().unwrap(),
+                "version_check-tsunheimat-remote_compilation_helper.json"
+            );
+        }
+    }
 
     #[test]
     fn test_get_current_version() {

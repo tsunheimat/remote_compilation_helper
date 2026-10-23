@@ -58,11 +58,13 @@ const BUDGETS: &[(&str, usize, &str)] = &[
     ),
     (
         "rabs-asupersync",
-        4,
+        5,
         "asupersync + protocol + rabs-action (delivery exposure frontiers) + \
          rustls (initialize the pinned Asupersync mutual-TLS verifier's \
-         process provider; the same locked TLS dependency and ring features \
-         already used by Asupersync, with no new transitive packages)",
+         process provider) + rustix (safe direct process-group signals: \
+         spawning kill(1) can block cancellation before escalation on shared \
+         executable storage). Both reuse locked dependencies; no new resolved \
+         packages. The fifth edge is explicitly counted, not hidden in a target table.",
     ),
     (
         "rabsd",

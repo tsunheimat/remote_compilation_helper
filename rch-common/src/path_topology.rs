@@ -19,6 +19,7 @@ pub const DEFAULT_ALIAS_PROJECT_ROOT: &str = "/dp";
 pub struct PathTopologyPolicy {
     canonical_root: PathBuf,
     alias_root: PathBuf,
+    source_root: Option<PathBuf>,
 }
 
 impl PathTopologyPolicy {
@@ -27,7 +28,19 @@ impl PathTopologyPolicy {
         Self {
             canonical_root,
             alias_root,
+            source_root: None,
         }
+    }
+
+    /// Admit local sources from a separate tree, preserving relative paths in
+    /// the worker mirror. This is not an alias of the mirror.
+    pub fn with_source_root(mut self, source_root: PathBuf) -> Self {
+        self.source_root = Some(source_root);
+        self
+    }
+
+    pub fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
     }
 
     /// Canonical root path.
@@ -46,6 +59,7 @@ impl Default for PathTopologyPolicy {
         Self {
             canonical_root: PathBuf::from(DEFAULT_CANONICAL_PROJECT_ROOT),
             alias_root: PathBuf::from(DEFAULT_ALIAS_PROJECT_ROOT),
+            source_root: None,
         }
     }
 }
@@ -264,6 +278,55 @@ pub fn normalize_project_path_with_policy(
     path: &Path,
     policy: &PathTopologyPolicy,
 ) -> Result<NormalizedProjectPath, PathNormalizationError> {
+    if let Some(source) = policy.source_root() {
+        let invalid = |detail: String| {
+            PathNormalizationError::new(
+                PathNormalizationErrorKind::OutsideCanonicalRoot,
+                path,
+                detail,
+                &[],
+            )
+        };
+        // Resolve existing ancestors too: a not-yet-created mirror below a
+        // symlink into the shared source tree must not pass this check.
+        let resolve = |root: &Path| -> Result<PathBuf, PathNormalizationError> {
+            if !root.is_absolute()
+                || root
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(invalid(format!(
+                    "topology root must be absolute without '..': {}",
+                    root.display()
+                )));
+            }
+            let ancestor = root
+                .ancestors()
+                .find(|p| p.exists())
+                .ok_or_else(|| invalid(format!("cannot resolve root {}", root.display())))?;
+            let resolved = std::fs::canonicalize(ancestor).map_err(|e| invalid(e.to_string()))?;
+            Ok(resolved.join(root.strip_prefix(ancestor).expect("ancestor prefix")))
+        };
+        let source = resolve(source)?;
+        let mirror = resolve(policy.canonical_root())?;
+        let alias = resolve(policy.alias_root())?;
+        if source.starts_with(&mirror)
+            || mirror.starts_with(&source)
+            || source.starts_with(&alias)
+            || alias.starts_with(&source)
+            || policy.alias_root().starts_with(&source)
+        {
+            return Err(invalid(format!(
+                "source root {} and worker mirror {} must be disjoint",
+                source.display(),
+                mirror.display()
+            )));
+        }
+        return normalize_project_path_with_policy(
+            path,
+            &PathTopologyPolicy::new(source.clone(), source),
+        );
+    }
     let mut decisions = vec![NormalizationDecision::ReceivedInput(path.to_path_buf())];
 
     if !path.is_absolute() {
@@ -743,6 +806,33 @@ mod tests {
                 .iter()
                 .any(|d| matches!(d, NormalizationDecision::CanonicalInputResolved(_)))
         );
+    }
+
+    #[test]
+    fn separate_source_root_preserves_local_identity_and_confinement() {
+        let fixture = TestFixture::new("separate-source", false, None);
+        let source = fixture.root.join("source");
+        let project = source.join("nested/repo");
+        fs::create_dir_all(&project).unwrap();
+        let policy = fixture.policy().with_source_root(source.clone());
+        let normalized = normalize_project_path_with_policy(&project, &policy).unwrap();
+        assert_eq!(normalized.canonical_path(), project);
+        assert_eq!(normalized.canonical_root(), source);
+        assert!(normalize_project_path_with_policy(&fixture.canonical_root, &policy).is_err());
+        assert!(normalize_project_path_with_policy(&source.join(".."), &policy).is_err());
+        let overlap = PathTopologyPolicy::new(source.join("mirror"), source.join("alias"))
+            .with_source_root(source.clone());
+        assert!(normalize_project_path_with_policy(&project, &overlap).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&fixture.canonical_root, source.join("escape")).unwrap();
+            assert!(normalize_project_path_with_policy(&source.join("escape"), &policy).is_err());
+            let link = fixture.root.join("mirror-link");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let overlap = PathTopologyPolicy::new(link.join("not-created"), link.clone())
+                .with_source_root(source);
+            assert!(normalize_project_path_with_policy(&project, &overlap).is_err());
+        }
     }
 
     #[cfg(unix)]

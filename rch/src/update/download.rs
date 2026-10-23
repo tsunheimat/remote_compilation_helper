@@ -48,15 +48,46 @@ impl Drop for UpdateDownloadDir {
     }
 }
 
-/// Download and verify a release.
-/// Decide whether to *enforce* sigstore signature verification for a release.
-///
-/// The signature is a hard gate only when a bundle is published, the operator
-/// has not passed `--skip-verify`, and `cosign` is available. On hosts without
-/// cosign (e.g. the worker fleet) verification degrades to a warning so
-/// `rch update` still works; the checksum is enforced regardless.
-fn should_enforce_signature(has_bundle: bool, skip_verify: bool, cosign_available: bool) -> bool {
-    has_bundle && !skip_verify && cosign_available
+/// Fork releases are authenticated only by the pinned Sigstore workflow.
+/// There is no fork minisign trust root, and upstream keys are not authority.
+fn require_signature_support(
+    has_bundle: bool,
+    skip_verify: bool,
+    cosign_available: bool,
+) -> Result<(), UpdateError> {
+    if skip_verify {
+        return Ok(());
+    }
+    if !has_bundle {
+        return Err(UpdateError::SignatureVerificationFailed(
+            "Fork release signing unavailable: required Sigstore bundle missing; minisign is not a configured fork authority".to_string(),
+        ));
+    }
+    if !cosign_available {
+        return Err(UpdateError::SignatureVerificationFailed(
+            "cosign not found in PATH; fork release signature verification is mandatory"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve the signed tag spelling: `Version` normalizes e.g. v01.2.3.
+/// Derive it only from validated repository metadata, and require agreement
+/// with the selected semantic version before it becomes a signer identity.
+fn exact_release_tag(update: &UpdateCheck) -> Result<String, UpdateError> {
+    super::check::validate_release_source(update)?;
+    let url = reqwest::Url::parse(&update.release_url)
+        .map_err(|e| UpdateError::CheckFailed(format!("Invalid release URL: {e}")))?;
+    let tag = url.path().rsplit('/').next().unwrap_or_default();
+    if !tag.starts_with('v')
+        || super::types::Version::parse(tag).ok().as_ref() != Some(&update.latest_version)
+    {
+        return Err(UpdateError::CheckFailed(
+            "Release URL tag does not match the selected version".to_string(),
+        ));
+    }
+    Ok(tag.to_string())
 }
 
 pub async fn download_release(
@@ -64,11 +95,26 @@ pub async fn download_release(
     update: &UpdateCheck,
     skip_verify: bool,
 ) -> Result<DownloadedRelease, UpdateError> {
-    // Find the asset for our platform.
-    let archive_asset = find_archive_asset(&update.assets, &update.latest_version.to_string())?;
+    let release_tag = exact_release_tag(update)?;
+    // Find the asset using the published tag, not a normalized version spelling.
+    let archive_asset = find_archive_asset(&update.assets, &release_tag)?;
 
-    // Find the checksum manifest or per-asset checksum file.
+    // Fail before downloading when required verification is unavailable.
     let checksum_asset = find_checksum_asset(&update.assets, archive_asset);
+    if checksum_asset.is_none() && !skip_verify {
+        return Err(UpdateError::ChecksumMissing {
+            asset: archive_asset.name.clone(),
+        });
+    }
+    let signature_bundle_asset = update
+        .assets
+        .iter()
+        .find(|a| a.name == format!("{}.sigstore.json", archive_asset.name));
+    require_signature_support(
+        signature_bundle_asset.is_some(),
+        skip_verify,
+        which::which("cosign").is_ok(),
+    )?;
 
     if !ctx.is_json() {
         println!(
@@ -122,56 +168,10 @@ pub async fn download_release(
 
         let expected_checksum = extract_checksum(&checksum_path, &archive_asset.name).await?;
 
-        // bd-oxxnk: the checksum comes from the same release, so it detects
-        // corruption, not tampering. dsr publishes a `.minisig` beside every
-        // archive; verify it against the pinned release key and refuse a bad
-        // one outright.
-        let minisign_asset = update
-            .assets
-            .iter()
-            .find(|a| a.name == format!("{}.minisig", archive_asset.name));
-        let minisign_verified = match minisign_asset {
-            Some(sig_asset) if !skip_verify => {
-                if !ctx.is_json() {
-                    println!("Verifying signature (minisign)...");
-                }
-                let sig_path = asset_temp_path(temp_dir.path(), &sig_asset.name)?;
-                download_with_retry(
-                    &sig_asset.browser_download_url,
-                    &sig_path,
-                    &sig_asset.name,
-                    sig_asset.size,
-                    MAX_DOWNLOAD_ATTEMPTS,
-                )
-                .await?;
-                let signature = tokio::fs::read_to_string(&sig_path).await.map_err(|e| {
-                    UpdateError::SignatureVerificationFailed(format!(
-                        "cannot read {}: {e}",
-                        sig_asset.name
-                    ))
-                })?;
-                super::verify::verify_minisign(&archive_path, &signature)?;
-                Some(true)
-            }
-            Some(_) => {
-                if !ctx.is_json() {
-                    println!(
-                        "Warning: skipping minisign verification (--skip-verify); checksum still enforced"
-                    );
-                }
-                None
-            }
-            None => None,
-        };
-
-        let signature_bundle_asset = update
-            .assets
-            .iter()
-            .find(|a| a.name == format!("{}.sigstore.json", archive_asset.name));
-
-        let cosign_available = which::which("cosign").is_ok();
+        // Only the fork's exact workflow/tag can authenticate this release.
+        // An upstream minisign key must not substitute for that authority.
         let signature_bundle_path = match signature_bundle_asset {
-            Some(sig_asset) if should_enforce_signature(true, skip_verify, cosign_available) => {
+            Some(sig_asset) if !skip_verify => {
                 if !ctx.is_json() {
                     println!("Verifying signature (sigstore bundle)...");
                 }
@@ -186,27 +186,10 @@ pub async fn download_release(
                 .await?;
                 Some(sig_path)
             }
-            Some(_) => {
-                // A bundle was published but verification is disabled — either the
-                // operator passed --skip-verify or cosign is unavailable on this
-                // host. Degrade to a warning; the checksum below is still enforced.
+            _ => {
                 if !ctx.is_json() {
-                    if skip_verify {
-                        println!(
-                            "Warning: skipping signature verification (--skip-verify); checksum still enforced"
-                        );
-                    } else {
-                        println!(
-                            "Warning: cosign not found in PATH; skipping signature verification (checksum still enforced)"
-                        );
-                    }
-                }
-                None
-            }
-            None => {
-                if !ctx.is_json() && minisign_verified.is_none() {
                     println!(
-                        "Warning: No signature (minisign or sigstore) available; checksum only"
+                        "Warning: skipping signature verification (--skip-verify); checksum still enforced"
                     );
                 }
                 None
@@ -214,15 +197,16 @@ pub async fn download_release(
         };
 
         let verification = if let Some(bundle_path) = signature_bundle_path.as_deref() {
-            verify_checksum_and_signature(&archive_path, &expected_checksum, Some(bundle_path))
-                .await?
+            verify_checksum_and_signature(
+                &archive_path,
+                &expected_checksum,
+                Some((bundle_path, &release_tag)),
+            )
+            .await?
         } else {
             verify_checksum(&archive_path, &expected_checksum).await?
         };
-        (
-            verification.checksum_valid,
-            verification.signature_valid.or(minisign_verified),
-        )
+        (verification.checksum_valid, verification.signature_valid)
     } else {
         if !ctx.is_json() {
             println!("Warning: No checksum file available for this release asset");
@@ -599,15 +583,75 @@ xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxps
     }
 
     #[test]
-    fn signature_enforced_only_with_bundle_cosign_and_no_skip() {
-        // Full enforcement: a bundle is published, no --skip-verify, cosign present.
-        assert!(should_enforce_signature(true, false, true));
-        // No bundle published -> nothing to enforce.
-        assert!(!should_enforce_signature(false, false, true));
-        // Operator opted out with --skip-verify.
-        assert!(!should_enforce_signature(true, true, true));
-        // cosign unavailable (e.g. the worker fleet) -> degrade to checksum-only.
-        assert!(!should_enforce_signature(true, false, false));
+    fn signature_tag_preserves_published_spelling_and_rejects_version_mismatch() {
+        let mut update = UpdateCheck {
+            current_version: super::super::types::Version::parse("1.0.0").unwrap(),
+            latest_version: super::super::types::Version::parse("v01.2.3").unwrap(),
+            update_available: true,
+            release_url:
+                "https://github.com/tsunheimat/remote_compilation_helper/releases/tag/v01.2.3"
+                    .into(),
+            release_notes: None,
+            changelog_diff: None,
+            assets: vec![],
+        };
+        assert_eq!(update.latest_version.to_string(), "1.2.3");
+        assert_eq!(exact_release_tag(&update).unwrap(), "v01.2.3");
+        assert!(
+            archive_asset_candidates(&exact_release_tag(&update).unwrap())[0]
+                .starts_with("rch-v01.2.3-")
+        );
+        update.release_url = update.release_url.replace("v01.2.3", "v1.2.4");
+        assert!(exact_release_tag(&update).is_err());
+        update.release_url = update
+            .release_url
+            .replace("v1.2.4", "v1.2.3")
+            .replace("tsunheimat", "Dicklesworthstone");
+        assert!(exact_release_tag(&update).is_err());
+    }
+
+    #[test]
+    fn signature_support_is_mandatory_unless_explicitly_skipped() {
+        assert!(require_signature_support(true, false, true).is_ok());
+        for (bundle, cosign) in [(false, true), (true, false), (false, false)] {
+            assert!(matches!(
+                require_signature_support(bundle, false, cosign),
+                Err(UpdateError::SignatureVerificationFailed(_))
+            ));
+            assert!(require_signature_support(bundle, true, cosign).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn minisign_only_release_cannot_authorize_fork_update() {
+        let archive = archive_asset_candidates("1.0.0")[0].clone();
+        let assets = [archive.clone(), format!("{archive}.sha256"), format!("{archive}.minisig")]
+            .into_iter()
+            .map(|name| ReleaseAsset {
+                browser_download_url: format!(
+                    "https://github.com/tsunheimat/remote_compilation_helper/releases/download/v1.0.0/{name}"
+                ),
+                ..test_asset(&name)
+            })
+            .collect();
+        let update = UpdateCheck {
+            current_version: super::super::types::Version::parse("0.9.0").unwrap(),
+            latest_version: super::super::types::Version::parse("1.0.0").unwrap(),
+            update_available: true,
+            release_url:
+                "https://github.com/tsunheimat/remote_compilation_helper/releases/tag/v1.0.0".into(),
+            release_notes: None,
+            changelog_diff: None,
+            assets,
+        };
+        // Must fail before any request, even if a .minisig is advertised.
+        let result =
+            download_release(&OutputContext::new(Default::default()), &update, false).await;
+        assert!(matches!(
+            result,
+            Err(UpdateError::SignatureVerificationFailed(message))
+                if message.contains("required Sigstore bundle missing")
+        ));
     }
 
     fn test_asset(name: &str) -> ReleaseAsset {

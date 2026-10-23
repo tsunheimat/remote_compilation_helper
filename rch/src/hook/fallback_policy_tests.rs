@@ -12,7 +12,10 @@ fn subprocess_entry() {
     let Ok(case) = std::env::var(CASE) else {
         return;
     };
-    remote_result::set_machine_output(std::env::var("RCH_TEST_MACHINE").as_deref() != Ok("0"));
+    let sink = remote_result::ExecOutputSink::new(
+        std::env::var("RCH_TEST_MACHINE").as_deref() != Ok("0"),
+        None,
+    );
     let command = if case == "signal" {
         "printf run >> \"$RCH_FALLBACK_PROBE\"; kill -TERM $$".to_owned()
     } else {
@@ -21,14 +24,16 @@ fn subprocess_entry() {
         )
     };
     let reason = std::env::var(REASON).expect("fixture reason");
-    exit_with_gated_local_fallback(
-        &command,
-        &HookReporter::new(OutputVisibility::None),
-        &reason,
-        std::env::var("RCH_TEST_REQUIRED").as_deref() == Ok("1"),
-        std::env::var("RCH_TEST_ALLOWED").as_deref() == Ok("1"),
-        Some("fixture remote failure"),
-    );
+    remote_result::EXEC_OUTPUT.sync_scope(sink, || {
+        exit_with_gated_local_fallback(
+            &command,
+            &HookReporter::new(OutputVisibility::None),
+            &reason,
+            std::env::var("RCH_TEST_REQUIRED").as_deref() == Ok("1"),
+            std::env::var("RCH_TEST_ALLOWED").as_deref() == Ok("1"),
+            Some("fixture remote failure"),
+        );
+    });
 }
 
 fn run_case(

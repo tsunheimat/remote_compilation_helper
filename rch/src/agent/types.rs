@@ -16,6 +16,8 @@ pub enum AgentKind {
     GeminiCli,
     /// Codex CLI (OpenAI)
     CodexCli,
+    /// Hermes terminal tool integration.
+    Hermes,
     /// Cursor (AI-powered IDE)
     Cursor,
     /// Continue.dev (VS Code extension)
@@ -34,6 +36,7 @@ impl AgentKind {
         AgentKind::ClaudeCode,
         AgentKind::GeminiCli,
         AgentKind::CodexCli,
+        AgentKind::Hermes,
         AgentKind::Cursor,
         AgentKind::ContinueDev,
         AgentKind::Windsurf,
@@ -47,6 +50,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "Claude Code",
             AgentKind::GeminiCli => "Gemini CLI",
             AgentKind::CodexCli => "Codex CLI",
+            AgentKind::Hermes => "Hermes",
             AgentKind::Cursor => "Cursor",
             AgentKind::ContinueDev => "Continue.dev",
             AgentKind::Windsurf => "Windsurf",
@@ -61,6 +65,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "claude-code",
             AgentKind::GeminiCli => "gemini-cli",
             AgentKind::CodexCli => "codex-cli",
+            AgentKind::Hermes => "hermes",
             AgentKind::Cursor => "cursor",
             AgentKind::ContinueDev => "continue-dev",
             AgentKind::Windsurf => "windsurf",
@@ -75,6 +80,7 @@ impl AgentKind {
             "claude-code" | "claude" => Some(AgentKind::ClaudeCode),
             "gemini-cli" | "gemini" => Some(AgentKind::GeminiCli),
             "codex-cli" | "codex" => Some(AgentKind::CodexCli),
+            "hermes" => Some(AgentKind::Hermes),
             "cursor" => Some(AgentKind::Cursor),
             "continue-dev" | "continue" => Some(AgentKind::ContinueDev),
             "windsurf" => Some(AgentKind::Windsurf),
@@ -90,6 +96,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => HookSupport::Full,
             AgentKind::GeminiCli => HookSupport::Full,
             AgentKind::CodexCli => HookSupport::Full,
+            AgentKind::Hermes => HookSupport::Full,
             AgentKind::ContinueDev => HookSupport::Partial,
             AgentKind::Cursor => HookSupport::DetectionOnly,
             AgentKind::Windsurf => HookSupport::DetectionOnly,
@@ -104,7 +111,8 @@ impl AgentKind {
         match self {
             AgentKind::ClaudeCode => Some(home.join(".claude").join("settings.json")),
             AgentKind::GeminiCli => Some(home.join(".gemini").join("settings.json")),
-            AgentKind::CodexCli => Some(home.join(".codex").join("config.toml")),
+            AgentKind::CodexCli => Some(home.join(".codex").join("hooks.json")),
+            AgentKind::Hermes => Some(home.join(".hermes").join("plugins").join("rch-rewrite")),
             AgentKind::ContinueDev => Some(home.join(".continue").join("config.json")),
             AgentKind::Cursor => Some(home.join(".cursor")),
             AgentKind::Windsurf => Some(home.join(".windsurf")),
@@ -237,8 +245,10 @@ mod tests {
     #[test]
     fn test_agent_kind_all() {
         eprintln!("TEST START: test_agent_kind_all");
-        assert_eq!(AgentKind::ALL.len(), 8);
-        eprintln!("TEST PASS: test_agent_kind_all - verified 8 agent kinds");
+        assert_eq!(AgentKind::ALL.len(), 9);
+        assert_eq!(AgentKind::from_id("hermes"), Some(AgentKind::Hermes));
+        assert_eq!(AgentKind::Hermes.hook_support(), HookSupport::Full);
+        eprintln!("TEST PASS: test_agent_kind_all - verified 9 agent kinds");
     }
 
     #[test]
@@ -694,7 +704,10 @@ mod tests {
                         match kind {
                             AgentKind::ClaudeCode => assert!(path_str.contains(".claude")),
                             AgentKind::GeminiCli => assert!(path_str.contains(".gemini")),
-                            AgentKind::CodexCli => assert!(path_str.contains(".codex")),
+                            AgentKind::CodexCli => assert!(path_str.ends_with(".codex/hooks.json")),
+                            AgentKind::Hermes => {
+                                assert!(path_str.ends_with(".hermes/plugins/rch-rewrite"))
+                            }
                             AgentKind::ContinueDev => assert!(path_str.contains(".continue")),
                             AgentKind::Cursor => assert!(path_str.contains(".cursor")),
                             AgentKind::Windsurf => assert!(path_str.contains(".windsurf")),

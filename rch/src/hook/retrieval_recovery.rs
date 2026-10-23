@@ -31,9 +31,19 @@ pub(in crate::hook) mod recovery_owner;
 #[path = "result_recovery.rs"]
 mod result_recovery;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryBackend {
+    #[default]
+    Mirror,
+    Shared,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecoveryRecipe {
     version: u32,
+    #[serde(default)]
+    backend: RecoveryBackend,
     wrapper_id: String,
     build_id: u64,
     worker: WorkerConfig,
@@ -76,6 +86,12 @@ pub(crate) struct RecoveryRecipe {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caller_delivery: Option<RetainedCargoDelivery>,
     phases: Vec<RecoveryPhase>,
+    /// Read-only shared effects; never create artifact publication phases.
+    #[serde(default)]
+    shared_result_dirs: Vec<PathBuf>,
+    /// Job-private RTK streams, retrieved independently of source mappings.
+    #[serde(default)]
+    rtk_output: Option<super::shared_job::RtkOutput>,
     exit_code: Option<i32>,
     returned: Option<i32>,
     /// Daemon accounting may have completed earlier through cancellation.
@@ -100,6 +116,45 @@ pub(crate) struct RecoveryRecipe {
     pair_released: bool,
     #[serde(default)]
     retired: bool,
+}
+
+impl RecoveryRecipe {
+    fn validate_backend(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.backend != RecoveryBackend::Shared
+                || (self.phases.is_empty()
+                    && self.retire_root.is_none()
+                    && self.pair.is_none()
+                    && self.kind.is_none()
+                    && self.retained_root.is_none()
+                    && self.retained_materialized.is_none()
+                    && self.cargo_output_capture.is_none()
+                    && self.cargo_stdout.is_none()
+                    && self.cargo_stderr.is_none()
+                    && self.caller_json_policy.is_none()
+                    && self.caller_delivery.is_none()),
+            "shared recovery cannot publish artifacts or retire a shared tree"
+        );
+        anyhow::ensure!(
+            self.shared_result_dirs.is_empty() || self.backend == RecoveryBackend::Shared,
+            "read-only shared results attached to mirror recovery"
+        );
+        anyhow::ensure!(
+            self.shared_result_dirs.iter().all(|dir| !dir.is_absolute()
+                && !dir
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))),
+            "shared recovery result path escapes source cwd"
+        );
+        if let Some(output) = &self.rtk_output {
+            anyhow::ensure!(
+                self.backend == RecoveryBackend::Shared,
+                "RTK output requires shared job ownership"
+            );
+            output.validate(&self.project_root, &self.source_roots, &self.identity)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -914,6 +969,7 @@ impl RecoverySession {
         );
         let recipe = RecoveryRecipe {
             version: 2,
+            backend: RecoveryBackend::Mirror,
             wrapper_id: lease.identity.local_wrapper_id,
             build_id,
             worker: worker.clone(),
@@ -937,6 +993,8 @@ impl RecoverySession {
             caller_json_policy: None,
             caller_delivery: None,
             phases: Vec::new(),
+            shared_result_dirs: Vec::new(),
+            rtk_output: None,
             exit_code: None,
             returned: None,
             daemon_exit_code: None,
@@ -985,6 +1043,7 @@ impl RecoverySession {
         )?;
         anyhow::ensure!(
             intent.version == 2
+                && intent.backend == RecoveryBackend::Mirror
                 && intent.identity == identity
                 && intent.wrapper_id == lease.identity.local_wrapper_id
                 && Some(intent.build_id) == lease.identity.remote_build_id
@@ -1091,6 +1150,7 @@ impl RecoverySession {
         let pinned_triple = explicit_target_triple_for_command(command);
         let recipe = RecoveryRecipe {
             version: 2,
+            backend: RecoveryBackend::Mirror,
             wrapper_id: lease.identity.local_wrapper_id,
             build_id,
             worker: worker.clone(),
@@ -1116,6 +1176,8 @@ impl RecoverySession {
             caller_json_policy: None,
             caller_delivery: None,
             phases,
+            shared_result_dirs: Vec::new(),
+            rtk_output: None,
             exit_code: None,
             returned: None,
             daemon_exit_code: None,
@@ -1136,7 +1198,93 @@ impl RecoverySession {
         Ok(session)
     }
 
+    /// Shared effects already exist at the controller. Persist no publication or
+    /// tree-retirement recipe, even for commands otherwise classified as builds.
+    pub(crate) fn prepare_shared(writer: &DurableLeaseWriter) -> anyhow::Result<Self> {
+        let mut recipe = load_recipe(writer)?;
+        anyhow::ensure!(
+            !recipe.prepared
+                && !recipe.execution_started
+                && !recipe.preparation_cancelled
+                && !recipe.retired
+                && recipe.phases.is_empty()
+                && recipe.pair.is_none()
+                && recipe.retire_root.is_none(),
+            "shared execution requires a fresh non-destructive source intent"
+        );
+        recipe.backend = RecoveryBackend::Shared;
+        recipe.prepared = true;
+        recipe.validate_backend()?;
+        let session = Self {
+            recipe,
+            writer: writer.clone(),
+        };
+        session.persist()?;
+        Ok(session)
+    }
+
+    pub(crate) fn declare_shared_results(&mut self, dirs: &[PathBuf]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.backend == RecoveryBackend::Shared && !self.recipe.execution_started,
+            "shared results must be declared before execution"
+        );
+        self.recipe.shared_result_dirs = dirs.to_vec();
+        self.persist()
+    }
+
+    fn validate_shared_results(&self) -> anyhow::Result<()> {
+        self.recipe.validate_backend()?;
+        for dir in &self.recipe.shared_result_dirs {
+            super::shared_job::result_stat(&self.recipe.project_root, dir).with_context(|| {
+                format!("required shared result is unavailable: {}", dir.display())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn declare_rtk_output(
+        &mut self,
+        output: Option<super::shared_job::RtkOutput>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.backend == RecoveryBackend::Shared && !self.recipe.execution_started,
+            "RTK output must be owned before execution"
+        );
+        self.recipe.rtk_output = output;
+        self.recipe.validate_backend()?;
+        self.persist()
+    }
+
+    pub(crate) async fn prepare_rtk_output(&mut self, worker: &WorkerConfig) -> anyhow::Result<()> {
+        if let Some(output) = &mut self.recipe.rtk_output {
+            output.prepare(worker).await?;
+        }
+        self.persist()
+    }
+
+    pub(crate) async fn collect_rtk_output(
+        &mut self,
+        worker: &WorkerConfig,
+    ) -> anyhow::Result<Option<ExecResultDirStat>> {
+        self.recipe.validate_backend()?;
+        if self.recipe.rtk_output.is_none() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.recipe.exit_code.is_some(),
+            "RTK collection requires verified completion"
+        );
+        let result = if let Some(output) = &mut self.recipe.rtk_output {
+            Some(output.collect(worker).await?)
+        } else {
+            None
+        };
+        self.persist()?;
+        Ok(result)
+    }
+
     fn persist(&self) -> anyhow::Result<()> {
+        self.recipe.validate_backend()?;
         self.writer
             .set_recovery(serde_json::to_value(&self.recipe)?)
     }
@@ -1807,6 +1955,23 @@ impl RecoverySession {
         next_recipe.execution_started = true;
         self.persist_next_recipe(next_recipe)
     }
+    /// Roll back only on the transport's OS proof that no child was created.
+    /// A crash before this durable write conservatively retains ownership.
+    pub(crate) fn transport_not_started(
+        &mut self,
+        _proof: &crate::transfer::RawTransportNotStarted,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.backend == RecoveryBackend::Shared
+                && self.recipe.execution_started
+                && self.recipe.exit_code.is_none()
+                && self.recipe.returned.is_none(),
+            "unstarted transport contradicts recorded execution"
+        );
+        self.recipe.execution_started = false;
+        self.recipe.preparation_cancelled = true;
+        self.persist()
+    }
     fn stage(&self, index: usize) -> PathBuf {
         self.recipe
             .transfer
@@ -2067,6 +2232,9 @@ impl RecoverySession {
         Ok(())
     }
     pub(crate) fn returned(&mut self, exit: i32) -> anyhow::Result<()> {
+        if self.recipe.backend == RecoveryBackend::Shared && exit != EXIT_ARTIFACT_TRANSFER_FAILED {
+            self.validate_shared_results()?;
+        }
         anyhow::ensure!(
             exit != 0
                 || self
@@ -2186,6 +2354,7 @@ impl RecoverySession {
         Ok(())
     }
     pub(crate) async fn retire_returned(&mut self) -> anyhow::Result<()> {
+        self.recipe.validate_backend()?;
         if self.recipe.retired {
             return Ok(());
         }
@@ -2345,6 +2514,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
             .recovery
             .context("job has no durable source/retrieval recipe")?,
     )?;
+    recipe.validate_backend()?;
     // Leases written before bd-4d1hs may carry a trailing-slash root that the
     // source-authority lock plan refuses; recover them under the canonical
     // spelling instead of failing forever.
@@ -2564,6 +2734,12 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
     session.sources_released()?;
     session.returned(EXIT_BUILD_ERROR)?;
     session.retired()?;
+    if session.recipe.preparation_cancelled && !session.recipe.execution_started {
+        // Inert upload bytes use the same identity-bound receipt namespace.
+        // Source fencing is already durable; deletion failure can leave only
+        // private preparation evidence, never an active reservation or replay.
+        session.discard_completion_receipts().await;
+    }
     Ok(true)
 }
 
@@ -2746,6 +2922,8 @@ async fn recover_owned_job_with_daemon(
             session.recipe.retired && lease.exit_code == Some(exit),
             "terminal recovery contradicts its retained delivery/retirement evidence"
         );
+        let worker = session.recipe.worker.clone();
+        session.collect_rtk_output(&worker).await?;
         return Ok(exit);
     }
     if !session.recipe.execution_started {
@@ -2755,6 +2933,8 @@ async fn recover_owned_job_with_daemon(
         return Ok(EXIT_BUILD_ERROR);
     }
     if let Some(exit) = session.recipe.returned {
+        let worker = session.recipe.worker.clone();
+        session.collect_rtk_output(&worker).await?;
         session.retire_returned().await?;
         writer.record_exit(exit)?;
         recovery_completion::finish(writer, &mut daemon).await?;
@@ -2844,8 +3024,15 @@ async fn recover_owned_job_with_daemon(
     .await?;
     let base = base.with_source_authority(session.recipe.identity.clone())?;
     session.completed(exit)?;
+    session.collect_rtk_output(&worker).await?;
     let command_exit = exit;
     session.collect_cargo_stderr(&base, &worker).await?;
+    if let Err(error) = session.validate_shared_results() {
+        eprintln!(
+            "[RCH] recovered shared result validation failed: {error:#}; no command replayed"
+        );
+        exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+    }
     // A wrapper can disappear after Cargo finishes but before it records the
     // output set locally. Re-read the complete same-attempt receipt; never
     // rerun Cargo and never silently downgrade to the old glob-only policy.
@@ -3181,29 +3368,109 @@ mod tests {
         (directory, writer, worker)
     }
 
+    #[test]
+    fn shared_recovery_rechecks_declared_results_without_publication() {
+        let (directory, writer, _worker) = preparation_fixture();
+        let mut session = RecoverySession::prepare_shared(&writer).unwrap();
+        session
+            .declare_shared_results(&[PathBuf::from("result")])
+            .unwrap();
+        let loaded = load_recipe(&writer).unwrap();
+        assert_eq!(loaded.shared_result_dirs, vec![PathBuf::from("result")]);
+        assert!(session.validate_shared_results().is_err());
+        assert!(session.returned(0).is_err());
+        std::fs::create_dir(directory.path().join("result")).unwrap();
+        std::fs::write(directory.path().join("result/value"), b"shared").unwrap();
+        assert!(session.validate_shared_results().is_ok());
+        assert!(session.recipe.phases.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path().join("result/value")).unwrap(),
+            b"shared"
+        );
+    }
+
+    #[test]
+    fn shared_recovery_has_no_publication_or_tree_retirement() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let session = RecoverySession::prepare_shared(&writer).unwrap();
+        assert!(session.recipe.backend == RecoveryBackend::Shared);
+        assert!(session.recipe.phases.is_empty());
+        assert!(session.recipe.retire_root.is_none());
+        assert!(session.recipe.kind.is_none());
+        assert!(load_recipe(&writer).is_ok());
+        assert!(RecoverySession::prepare_shared(&writer).is_err());
+    }
+
+    #[test]
+    fn shared_recovery_rejects_corrupted_cleanup_before_remote_access() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let session = RecoverySession::prepare_shared(&writer).unwrap();
+        let mut recipe = session.recipe;
+        recipe.retire_root = Some("/shared/source".into());
+        writer
+            .set_recovery(serde_json::to_value(&recipe).unwrap())
+            .unwrap();
+        assert!(load_recipe(&writer).is_err());
+        recipe.retire_root = None;
+        recipe.kind = Some(CompilationKind::CargoBuild);
+        writer
+            .set_recovery(serde_json::to_value(&recipe).unwrap())
+            .unwrap();
+        assert!(load_recipe(&writer).is_err());
+    }
+
+    #[test]
+    fn legacy_recovery_defaults_only_to_mirror() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let mut value = writer.snapshot().recovery.unwrap();
+        value.as_object_mut().unwrap().remove("backend");
+        writer.set_recovery(value).unwrap();
+        assert!(load_recipe(&writer).unwrap().backend == RecoveryBackend::Mirror);
+    }
+
     #[cfg(unix)]
     fn go_fixture_command(go: &str, args: &[&str], environment: &[&str]) -> String {
+        // Also isolate preflight, which executes this command without going
+        // through run_go_fixture's child environment.
+        let git_overrides = std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| key.starts_with("GIT_"))
+            .flat_map(|key| ["-u".to_string(), key])
+            .collect::<Vec<_>>();
         shell_words::join(
-            [
-                "env",
-                "GOENV=off",
-                "GOTOOLCHAIN=local",
-                "GOWORK=off",
-                "GOFLAGS=",
-                "GOOS=",
-                "GOARCH=",
-                "CGO_ENABLED=0",
-                "GOMAXPROCS=1",
-            ]
-            .into_iter()
-            .chain(environment.iter().copied())
-            .chain(std::iter::once(go))
-            .chain(args.iter().copied()),
+            std::iter::once("env")
+                .chain(git_overrides.iter().map(String::as_str))
+                .chain([
+                    "GIT_CONFIG_NOSYSTEM=1",
+                    "GIT_CONFIG_GLOBAL=/dev/null",
+                    "GOENV=off",
+                    "GOTOOLCHAIN=local",
+                    "GOWORK=off",
+                    "GOFLAGS=",
+                    "GOOS=",
+                    "GOARCH=",
+                    "CGO_ENABLED=0",
+                    "GOMAXPROCS=1",
+                ])
+                .chain(environment.iter().copied())
+                .chain(std::iter::once(go))
+                .chain(args.iter().copied()),
         )
     }
 
     #[cfg(unix)]
     async fn run_go_fixture(command: &mut tokio::process::Command) -> std::process::Output {
+        // Git discovery belongs to the fixture checkout, not the invoking
+        // agent's repository/index or user hooks and config. Keep Go's normal
+        // VCS stamping enabled while isolating only the child environment.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
         command.stdin(Stdio::null()).kill_on_drop(true);
         tokio::time::timeout(Duration::from_secs(120), command.output())
             .await
@@ -3524,6 +3791,16 @@ mod tests {
             );
         }
 
+        // A shared TMPDIR may have an invalid ancestor .git marker. Establish
+        // a valid, fixture-owned discovery boundary without disabling buildvcs.
+        // Keep its metadata ABOVE the wildcard packages so their embed inputs
+        // stay unchanged, and never mutate the shared temporary-directory root.
+        let mut init = Command::new("git");
+        init.args(["init", "--quiet", "--template="])
+            .current_dir(root);
+        let initialized = run_go_fixture(&mut init).await;
+        assert!(initialized.status.success(), "{initialized:?}");
+
         // Package loading must see exactly the caller's embed inputs. An
         // adjacent empty staging directory or a newly created output parent
         // changes `go:embed *` and makes an otherwise valid package fail.
@@ -3533,6 +3810,19 @@ mod tests {
         ] {
             let project = root.join(fixture);
             std::fs::create_dir(&project).unwrap();
+            let mut top_level = Command::new("git");
+            top_level
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(&project);
+            let discovered = run_go_fixture(&mut top_level).await;
+            assert!(discovered.status.success(), "{fixture}: {discovered:?}");
+            assert_eq!(
+                PathBuf::from(String::from_utf8(discovered.stdout).unwrap().trim())
+                    .canonicalize()
+                    .unwrap(),
+                root.canonicalize().unwrap(),
+                "Go's Git discovery must stay inside its owned fixture"
+            );
             std::fs::write(
                 project.join("go.mod"),
                 b"module fixture.invalid/embed\n\ngo 1.20\n",
@@ -6304,6 +6594,52 @@ mod tests {
             before,
             "a started attempt cannot contact the worker's cancellation path or rewrite its journal"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_spawn_failure_proof_durably_restores_preparation_only() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let mut session = RecoverySession::prepare_shared(&writer).unwrap();
+        session.starting_execution().unwrap();
+        // An actual execve E2BIG, not a fabricated transport-error string.
+        let mut command = tokio::process::Command::new("/usr/bin/true");
+        command.arg("x".repeat(256 * 1024));
+        let error = crate::transfer::collect_raw_process(
+            command,
+            None,
+            tokio::io::sink(),
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap_err();
+        let proof = error
+            .downcast_ref::<crate::transfer::RawTransportNotStarted>()
+            .unwrap();
+        session.transport_not_started(proof).unwrap();
+        let disk = load_recipe(&writer).unwrap();
+        assert!(!disk.execution_started);
+        assert!(disk.preparation_cancelled);
+        assert!(disk.exit_code.is_none());
+        assert!(!disk.sources_released && !disk.retired);
+        assert!(session.starting_execution().is_err());
+        assert!(
+            writer.acknowledge_terminal().is_err(),
+            "proof alone cannot release ownership before fencing preparation"
+        );
+
+        // A child did start, even if it exits 255 with misleading diagnostics.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'Argument list too long' >&2; exit 255"]);
+        let (status, _, _) = crate::transfer::collect_raw_process(
+            command,
+            None,
+            tokio::io::sink(),
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(255));
     }
 
     #[test]

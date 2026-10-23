@@ -1175,6 +1175,11 @@ pub fn x86_64_microarch_level_from_flags(flags: &str) -> u8 {
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PathTopologyConfig {
+    /// Optional controller source tree, distinct from the worker mirror.
+    /// Relative project/dependency paths are preserved under `canonical_root`.
+    #[serde(default)]
+    pub source_root: Option<String>,
+
     /// Canonical project root directory.
     /// Defaults to `/data/projects` when absent.
     #[serde(default)]
@@ -1205,10 +1210,20 @@ impl PathTopologyConfig {
             .filter(|s| !s.is_empty())
             .map(|s| shellexpand::tilde(s).into_owned())
             .unwrap_or_else(|| crate::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string());
-        crate::path_topology::PathTopologyPolicy::new(
+        let policy = crate::path_topology::PathTopologyPolicy::new(
             PathBuf::from(canonical),
             PathBuf::from(alias),
-        )
+        );
+        match self
+            .source_root
+            .as_deref()
+            .filter(|source| !source.is_empty())
+        {
+            Some(source) => {
+                policy.with_source_root(PathBuf::from(shellexpand::tilde(source).into_owned()))
+            }
+            None => policy,
+        }
     }
 }
 
@@ -1285,6 +1300,16 @@ pub struct JobsConfig {
     /// every build's worker pool would be a surprising way to lose the fleet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_tools: Vec<String>,
+    /// Explicit controller/worker roots for general verification with shared file effects.
+    #[serde(default)]
+    pub shared_workspaces: Vec<crate::invocation::SharedWorkspaceMapping>,
+    /// Controller-owned disk location for bounded local fallback leases.
+    #[serde(default)]
+    pub local_guard_root: Option<PathBuf>,
+    /// Controller destination for retrieved RTK raw output. Independent of
+    /// shared source mappings; defaults to the RCH job lease directory.
+    #[serde(default)]
+    pub rtk_tee_root: Option<PathBuf>,
 }
 
 /// Daemon status API over TCP (`[api]`).
@@ -2550,6 +2575,10 @@ impl CircuitStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompilationConfig {
+    /// Opt in to an exact worker-native Rust installation (for example 1.93.1).
+    /// Requires native Cargo and clippy; project/command rustup pins are refused.
+    #[serde(default)]
+    pub native_toolchain: Option<String>,
     /// Minimum confidence score to intercept (0.0-1.0).
     #[serde(default = "default_confidence")]
     pub confidence_threshold: f64,
@@ -2731,6 +2760,7 @@ impl<'de> Deserialize<'de> for RemoteBuildJobs {
 impl Default for CompilationConfig {
     fn default() -> Self {
         Self {
+            native_toolchain: None,
             confidence_threshold: 0.85,
             min_local_time_ms: 2000,
             remote_speedup_threshold: default_speedup_threshold(),
@@ -2805,9 +2835,11 @@ impl CompilationConfig {
                 self.bun_timeout_sec
             }
             // Other test commands use the standard test timeout
-            Some(CompilationKind::CargoTest) | Some(CompilationKind::CargoNextest) => {
-                self.test_timeout_sec
-            }
+            Some(
+                CompilationKind::CargoTest
+                | CompilationKind::CargoNextest
+                | CompilationKind::NodeTest,
+            ) => self.test_timeout_sec,
             // Nix derivation builds can take a long time (fetch + compile large
             // closures); give them the generous test-timeout bucket rather than
             // the short build timeout so legitimate builds are not killed early.
@@ -3178,6 +3210,8 @@ pub const BUILTIN_EXECUTION_BASES: &[&str] = &[
     "meson",
     // Bun
     "bun",
+    // Node built-in test runner
+    "node",
     // Nix (covers both `nix build` and the legacy `nix-build`)
     "nix",
     // Go
@@ -5924,6 +5958,10 @@ retry_max = 2
         let config = CompilationConfig::default();
 
         // Test commands should get test_timeout_sec
+        assert_eq!(
+            config.timeout_for_kind(Some(crate::CompilationKind::NodeTest)),
+            std::time::Duration::from_secs(config.test_timeout_sec)
+        );
         assert_eq!(
             config.timeout_for_kind(Some(crate::CompilationKind::CargoTest)),
             std::time::Duration::from_secs(1800)

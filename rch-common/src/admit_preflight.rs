@@ -154,6 +154,7 @@ fn family_token(kind: CompilationKind) -> &'static str {
         CompilationKind::Ninja => "ninja",
         CompilationKind::Meson => "meson",
         CompilationKind::BunTest => "bun_test",
+        CompilationKind::NodeTest => "node_test",
         CompilationKind::BunTypecheck => "bun_typecheck",
         CompilationKind::NixBuild => "nix_build",
         CompilationKind::GoBuild => "go_build",
@@ -196,7 +197,7 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
             kind,
             CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet
         );
-        req.needs_node = matches!(kind, CompilationKind::Tsc);
+        req.needs_node = matches!(kind, CompilationKind::Tsc | CompilationKind::NodeTest);
         // A zig cross-build additionally needs zig + cargo-zigbuild on the worker.
         // The requested `--target` std is captured by the needs_targets scan below,
         // exactly as for a plain `cargo build --target ...`.
@@ -551,6 +552,21 @@ mod tests {
         assert!(!observed.job_mode);
         assert!(observed.proof_policy);
         assert_eq!(observed.required.needs_tools, vec!["cargo-xwin", "llvm-ar"]);
+    }
+
+    #[test]
+    fn node_test_preflight_uses_existing_node_capability() {
+        let result = preflight("node --import setup.mjs --test", false);
+        assert!(result.is_compilation);
+        assert_eq!(result.family.as_deref(), Some("node_test"));
+        assert_eq!(result.base_recommendation, AdmitRecommendation::Offload);
+        assert!(result.required.needs_node);
+        assert!(!result.required.needs_bun);
+        assert!(!result.required.needs_cargo);
+        assert!(result.required.to_requirement(1).needs_node);
+        let script = preflight("node app.js --test", false);
+        assert!(!script.is_compilation);
+        assert_eq!(script.base_recommendation, AdmitRecommendation::Local);
     }
 
     #[test]

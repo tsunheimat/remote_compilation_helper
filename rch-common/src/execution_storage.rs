@@ -133,6 +133,39 @@ impl ExecutionStorageConfig {
     }
 }
 
+/// Resolve the configuration/forwarding layer before toolchain admission. The
+/// execution pipeline applies the same precedence, then assigns job-local tmp
+/// and target paths after it owns a job. Admission must not create those paths.
+pub fn toolchain_environment(
+    environment: &crate::EnvironmentConfig,
+    storage: &ExecutionStorageConfig,
+    mut get_env: impl FnMut(&str) -> Option<String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    validate_remote_environment(&environment.remote)?;
+    storage.validate()?;
+    let mut effective = environment.remote.clone();
+    for key in &environment.allowlist {
+        let key = key.trim();
+        if crate::ssh_utils::is_valid_env_key(key)
+            && !matches!(
+                key,
+                "CARGO_TARGET_DIR" | "RCH_CH_BASE" | "RCH_CARGO_WRAPPER_BYPASS"
+            )
+            && let Some(value) = get_env(key)
+        {
+            if crate::ssh_utils::shell_escape_value(&value).is_some() {
+                effective.insert(key.to_owned(), value);
+            } else {
+                // Execution rejects the forwarded assignment, including its
+                // lower-precedence default, rather than silently restoring it.
+                effective.remove(key);
+            }
+        }
+    }
+    effective.extend(storage.cache_env());
+    Ok(effective)
+}
+
 /// Validate persistent remote defaults before assembling any shell command.
 pub fn validate_remote_environment(
     environment: &std::collections::BTreeMap<String, String>,
@@ -229,6 +262,31 @@ exit "$status"
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn toolchain_environment_preserves_remote_path_and_forwarding_precedence() {
+        let mut environment = crate::EnvironmentConfig::default();
+        environment
+            .remote
+            .insert("PATH".into(), "/private/bin:/usr/bin".into());
+        environment
+            .remote
+            .insert("CARGO_HOME".into(), "/configured/home".into());
+        let storage = super::ExecutionStorageConfig::default();
+        let get_env = |_: &str| Some("/controller/bin".to_owned());
+        let effective = super::toolchain_environment(&environment, &storage, get_env).unwrap();
+        assert_eq!(effective["PATH"], "/private/bin:/usr/bin");
+        environment.allowlist.push(" PATH ".into());
+        let effective = super::toolchain_environment(&environment, &storage, get_env).unwrap();
+        assert_eq!(effective["PATH"], "/controller/bin");
+        let storage = super::ExecutionStorageConfig {
+            cache_root: Some("/cache".into()),
+            ..Default::default()
+        };
+        let effective = super::toolchain_environment(&environment, &storage, get_env).unwrap();
+        assert_eq!(effective["CARGO_HOME"], "/cache/cargo-home");
+        assert!(!effective.contains_key("CARGO_TARGET_DIR"));
+    }
+
     use super::*;
 
     #[test]
