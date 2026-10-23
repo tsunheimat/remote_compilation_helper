@@ -525,7 +525,10 @@ mod tests {
             .open(&state_path)
             .unwrap();
         drop(old_owner);
-        assert!(matches!(contender.try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
         retained.unlock().unwrap();
         contender.try_lock().unwrap();
         contender.unlock().unwrap();
@@ -534,7 +537,10 @@ mod tests {
         for unwind in [false, true] {
             let mut owner = lock_alarm_state(&state_path).unwrap();
             let retained = owner.file.try_clone().unwrap();
-            assert!(matches!(contender.try_lock(), Err(TryLockError::WouldBlock)));
+            assert!(matches!(
+                contender.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
             update_alarm_state(&mut owner.file, true).unwrap();
             if unwind {
                 let result = std::panic::catch_unwind(move || {
