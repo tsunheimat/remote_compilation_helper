@@ -123,19 +123,59 @@ fn observe_with_scan(
         Err(error) => observation.scan_error = Some(error.to_string()),
     }
     match state {
-        Ok(mut state) if observation.scan_error.is_none() => {
-            match update_alarm_state(&mut state, !observation.builds.is_empty()) {
-                Ok(transition) => observation.transition = transition,
-                Err(error) => observation.state_error = Some(error.to_string()),
+        Ok(mut state) => {
+            // Unknown scans must not clear an active episode, but must release
+            // their transaction just like a successful observation.
+            if observation.scan_error.is_none() {
+                match update_alarm_state(&mut state.file, !observation.builds.is_empty()) {
+                    Ok(transition) => observation.transition = transition,
+                    Err(error) => observation.state_error = Some(error.to_string()),
+                }
+            }
+            if let Err(error) = state.release() {
+                let detail = format!("could not release local build alarm lock: {error}");
+                if let Some(previous) = &mut observation.state_error {
+                    previous.push_str("; ");
+                    previous.push_str(&detail);
+                } else {
+                    observation.state_error = Some(detail);
+                }
             }
         }
-        Ok(_) => {} // Unknown scan must not clear an active episode.
         Err(error) => observation.state_error = Some(error.to_string()),
     }
     Some(observation)
 }
 
-fn lock_alarm_state(path: &Path) -> io::Result<File> {
+/// Own the alarm transaction, not the lifetime of every duplicate descriptor.
+/// A concurrent fork may inherit the open file before its close-on-exec takes
+/// effect. Closing only our descriptor can then leave a completed poll's flock
+/// held by an unrelated child. Explicit unlock ends this transaction; Drop also
+/// releases it when a scan unwinds. This does not shorten an active scan's lock.
+struct AlarmStateLock {
+    file: File,
+    locked: bool,
+}
+
+impl AlarmStateLock {
+    fn release(&mut self) -> io::Result<()> {
+        if self.locked {
+            self.file.unlock()?;
+            self.locked = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AlarmStateLock {
+    fn drop(&mut self) {
+        // The ordinary path reports unlock errors to its caller. During unwind
+        // we can only attempt release and then let File close its own handle.
+        let _ = self.release();
+    }
+}
+
+fn lock_alarm_state(path: &Path) -> io::Result<AlarmStateLock> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -150,7 +190,7 @@ fn lock_alarm_state(path: &Path) -> io::Result<File> {
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(AlarmStateLock { file, locked: true }),
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -462,6 +502,66 @@ mod tests {
         assert_eq!(std::fs::read(state_path).unwrap(), b"corrupt");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_build_alarm_transaction_ends_while_duplicate_descriptor_remains_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("alarm");
+
+        // Reproduce the old close-only lifetime with actual kernel locks. A
+        // duplicate models the open-file-description ownership inherited by
+        // fork without relying on a sibling process's scheduling window.
+        let old_owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&state_path)
+            .unwrap();
+        old_owner.try_lock().unwrap();
+        let retained = old_owner.try_clone().unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&state_path)
+            .unwrap();
+        drop(old_owner);
+        assert!(matches!(contender.try_lock(), Err(TryLockError::WouldBlock)));
+        retained.unlock().unwrap();
+        contender.try_lock().unwrap();
+        contender.unlock().unwrap();
+        drop(retained);
+
+        for unwind in [false, true] {
+            let mut owner = lock_alarm_state(&state_path).unwrap();
+            let retained = owner.file.try_clone().unwrap();
+            assert!(matches!(contender.try_lock(), Err(TryLockError::WouldBlock)));
+            update_alarm_state(&mut owner.file, true).unwrap();
+            if unwind {
+                let result = std::panic::catch_unwind(move || {
+                    let _owner = owner;
+                    panic!("injected scan unwind");
+                });
+                assert!(result.is_err());
+            } else {
+                owner.release().unwrap();
+                // The transaction ends before even its original File closes.
+                contender.try_lock().unwrap();
+                contender.unlock().unwrap();
+                drop(owner);
+            }
+            contender.try_lock().unwrap();
+            assert_eq!(std::fs::read(&state_path).unwrap(), b"1");
+            assert_eq!(retained.metadata().unwrap().len(), 1);
+            contender.unlock().unwrap();
+            let observation =
+                observe_with_scan(BoxRole::Dispatcher, Some(&state_path), || Ok(one_build()))
+                    .unwrap();
+            assert!(observation.state_error.is_none(), "{observation:?}");
+            assert_eq!(observation.transition, None);
+            drop(retained);
+        }
+    }
+
     #[test]
     fn local_build_alarm_concurrent_callers_emit_one_transition() {
         let dir = tempfile::tempdir().unwrap();
@@ -485,7 +585,8 @@ mod tests {
         assert!(
             observations
                 .iter()
-                .all(|observation| observation.state_error.is_none())
+                .all(|observation| observation.state_error.is_none()),
+            "concurrent alarm observations: {observations:#?}"
         );
         assert!(
             observations
