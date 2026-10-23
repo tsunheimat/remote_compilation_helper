@@ -393,14 +393,69 @@ fn hung_mid_frame_client_cannot_wedge_shutdown() {
     drop(hung);
 }
 
+// A close-on-exec listener can still be inherited between a sibling test's
+// fork and exec. Create these endpoints only after reexec, with no other tests
+// launching processes in the same address space. Do not poll away a live peer
+// or weaken ConnectionRefused into an arbitrary connection error.
+fn socket_case_in_isolated_process(name: &str) -> bool {
+    const CHILD: &str = "RABS_EDGE_STALE_SOCKET_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn isolated socket fixture");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("isolated socket fixture did not finish: {name}: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    let marker = format!("stale socket assertions completed: {name}");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stderr).contains(&marker),
+        "isolated socket fixture must execute every assertion: {name}: {output:?}"
+    );
+    true
+}
+
+fn create_proven_stale_socket(socket: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(mode)).unwrap();
+    // Reproduce the relevant descriptor-lifetime distinction deterministically:
+    // dropping one owner is insufficient while a duplicate still listens.
+    let retained = listener.try_clone().unwrap();
+    drop(listener);
+    drop(UnixStream::connect(socket).expect("retained listener must still be live"));
+    drop(retained);
+    assert_eq!(
+        UnixStream::connect(socket).unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "fixture must prove final listener closure before exercising the daemon"
+    );
+}
+
 #[test]
 fn unsafe_stale_socket_is_refused_without_unlinking_or_rewriting_it() {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    const NAME: &str = "unsafe_stale_socket_is_refused_without_unlinking_or_rewriting_it";
+    if socket_case_in_isolated_process(NAME) {
+        return;
+    }
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("untrusted.sock");
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660)).unwrap();
+    create_proven_stale_socket(&socket, 0o660);
     let before = std::fs::symlink_metadata(&socket).unwrap();
     assert!(before.file_type().is_socket());
     assert_eq!(
@@ -461,19 +516,22 @@ fn unsafe_stale_socket_is_refused_without_unlinking_or_rewriting_it() {
         UnixStream::connect(&socket).unwrap_err().kind(),
         std::io::ErrorKind::ConnectionRefused
     );
+    eprintln!("stale socket assertions completed: {NAME}");
 }
 
 #[test]
 fn stale_socket_takeover_and_live_daemon_refusal() {
+    const NAME: &str = "stale_socket_takeover_and_live_daemon_refusal";
+    if socket_case_in_isolated_process(NAME) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
 
     // Reproduce a dead real daemon's private endpoint, not a raw listener's
     // umask-dependent socket that startup is intentionally forbidden to repair.
-    use std::os::unix::fs::PermissionsExt;
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    create_proven_stale_socket(&socket, 0o600);
     assert!(socket.exists());
 
     let mut daemon = spawn_daemon(&socket, &marker);
@@ -507,4 +565,5 @@ fn stale_socket_takeover_and_live_daemon_refusal() {
 
     let (code, _) = terminate(&mut daemon);
     assert_eq!(code, 0);
+    eprintln!("stale socket assertions completed: {NAME}");
 }
