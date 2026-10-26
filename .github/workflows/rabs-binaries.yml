@@ -5,6 +5,7 @@
 # This workflow proves they compile, and runs the doctor + wrapper
 # overhead gates that only mean anything in release.
 name: RABS Binaries
+run-name: Diagnostic PR4 wrapper latency — not merge qualification
 
 on:
   push:
@@ -96,7 +97,7 @@ jobs:
           shared-key: rabs-release-gates
           cache-on-failure: true
       - name: Install bubblewrap (worker capability + sandbox tests)
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap strace
       - name: Release build the three spine binaries
         shell: bash
         run: |
@@ -148,6 +149,22 @@ jobs:
           rabs_sampler_pid=$!
           trap 'rabs_build_status=$?; trap - EXIT; kill "$rabs_sampler_pid" 2>/dev/null || true; wait "$rabs_sampler_pid" 2>/dev/null || true; exit "$rabs_build_status"' EXIT
           cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
+      - name: Trace unchanged release binaries (diagnostic branch only)
+        # Separate trace branch; not part of PR #4 and not a passing SLO claim.
+        # Every existing release gate remains below, including overhead_live.
+        timeout-minutes: 5
+        run: |
+          python3 -I scripts/diagnose_wrapper_latency.py \
+            --binaries "$GITHUB_WORKSPACE/target/release" \
+            --output "$GITHUB_WORKSPACE/target/test-logs/wrapper-latency-trace"
+      - name: Preserve trace before later release gates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrapper-latency-diagnostic-${{ github.sha }}
+          path: target/test-logs/wrapper-latency-trace/
+          if-no-files-found: warn
+          retention-days: 7
       - name: Worker-cache command assembly and opt-out parity
         run: cargo test --release -p rch-common --lib toolchain::worker_cache --locked
       - name: Coherent preparation to native worker-build handoff
