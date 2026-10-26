@@ -2702,8 +2702,11 @@ struct RawProcessTimedOut;
 #[cfg(test)]
 struct RawProcessCancelled;
 
-/// Pollable process output. Unlike Tokio's stdio adapter, a full pipe does not
-/// leave an uncancellable blocking-pool writer behind when the job times out.
+/// Cancellation-aware process output. Unlike Tokio's stdio adapter, a full
+/// pipe does not leave an uncancellable blocking-pool writer behind on timeout.
+/// Inherited descriptors may have aliases; do not register them through the
+/// unsound/deprecated generic AsyncFd constructors. Nonblocking writes are
+/// immediate when possible and use a bounded timer only while backpressured.
 #[cfg(unix)]
 pub(crate) struct RawOutputSink {
     descriptor: RawOutputDescriptor,
@@ -2712,7 +2715,10 @@ pub(crate) struct RawOutputSink {
 
 #[cfg(unix)]
 enum RawOutputDescriptor {
-    Pollable(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>),
+    Nonblocking {
+        fd: std::os::fd::OwnedFd,
+        retry: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    },
     File(std::os::fd::OwnedFd),
 }
 
@@ -2740,13 +2746,9 @@ impl RawOutputSink {
         }
         // dup shares the open-file flags. Restore them before returning control
         // to the caller; never leave its stdout/stderr nonblocking afterwards.
-        let pollable = tokio::io::unix::AsyncFd::new(fd)?;
-        rustix::fs::fcntl_setfl(
-            pollable.get_ref(),
-            original_flags | rustix::fs::OFlags::NONBLOCK,
-        )?;
+        rustix::fs::fcntl_setfl(&fd, original_flags | rustix::fs::OFlags::NONBLOCK)?;
         Ok(Self {
-            descriptor: RawOutputDescriptor::Pollable(pollable),
+            descriptor: RawOutputDescriptor::Nonblocking { fd, retry: None },
             original_flags,
         })
     }
@@ -2755,8 +2757,8 @@ impl RawOutputSink {
 #[cfg(unix)]
 impl Drop for RawOutputSink {
     fn drop(&mut self) {
-        if let RawOutputDescriptor::Pollable(fd) = &self.descriptor {
-            let _ = rustix::fs::fcntl_setfl(fd.get_ref(), self.original_flags);
+        if let RawOutputDescriptor::Nonblocking { fd, .. } = &self.descriptor {
+            let _ = rustix::fs::fcntl_setfl(fd, self.original_flags);
         }
     }
 }
@@ -2768,17 +2770,25 @@ impl tokio::io::AsyncWrite for RawOutputSink {
         cx: &mut std::task::Context<'_>,
         bytes: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        match &self.descriptor {
+        match &mut self.get_mut().descriptor {
             RawOutputDescriptor::File(fd) => {
                 std::task::Poll::Ready(rustix::io::write(fd, bytes).map_err(Into::into))
             }
-            RawOutputDescriptor::Pollable(fd) => loop {
-                let mut ready = std::task::ready!(fd.poll_write_ready(cx))?;
-                match ready.try_io(|fd| {
-                    rustix::io::write(fd.get_ref(), bytes).map_err(std::io::Error::from)
-                }) {
-                    Ok(result) => return std::task::Poll::Ready(result),
-                    Err(_) => continue,
+            RawOutputDescriptor::Nonblocking { fd, retry } => loop {
+                if let Some(delay) = retry.as_mut() {
+                    std::task::ready!(std::future::Future::poll(delay.as_mut(), cx));
+                    *retry = None;
+                }
+                match rustix::io::write(&*fd, bytes) {
+                    Ok(written) => return std::task::Poll::Ready(Ok(written)),
+                    Err(rustix::io::Errno::AGAIN) => {
+                        // No busy-loop, detached writer, or unsafe fd reactor
+                        // registration. Dropping the sink cancels this timer and
+                        // releases its owned descriptor immediately. The 1ms
+                        // retry delay applies only after an actual EAGAIN.
+                        *retry = Some(Box::pin(tokio::time::sleep(Duration::from_millis(1))));
+                    }
+                    Err(error) => return std::task::Poll::Ready(Err(error.into())),
                 }
             },
         }
@@ -10910,6 +10920,66 @@ mod tests {
             .unwrap();
         let mut sink = RawOutputSink::from_fd(file).unwrap();
         sink.write_all(b"\0\xffdiscarded").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_output_sink_resumes_binary_writes_after_backpressure() {
+        let (writer, mut consumer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Prime Darwin's kernel write-history flag before the exact flag check.
+        assert_eq!(rustix::io::write(&writer, b"x").unwrap(), 1);
+        let mut primed = [0];
+        std::io::Read::read_exact(&mut consumer, &mut primed).unwrap();
+        assert_eq!(primed, *b"x");
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        let mut sink = RawOutputSink::from_fd(&writer).unwrap();
+        let mut expected = Vec::new();
+        let block = [0xa5; 8192];
+        loop {
+            match rustix::io::write(&writer, &block) {
+                Ok(written) => {
+                    assert!(written > 0);
+                    expected.extend_from_slice(&block[..written]);
+                    assert!(expected.len() <= 32 * 1024 * 1024, "socket never filled");
+                }
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => panic!("fill real output socket: {error}"),
+            }
+        }
+        let payload = b"\0\xffnative output without a newline".repeat(4096);
+        expected.extend_from_slice(&payload);
+        let mut received = vec![0; expected.len()];
+        consumer.set_nonblocking(true).unwrap();
+        let mut consumer = tokio::net::UnixStream::from_std(consumer).unwrap();
+        let mut sending = Box::pin(sink.write_all(&payload));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(sending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (sent, read) = tokio::join!(sending, consumer.read_exact(&mut received));
+            sent.unwrap();
+            read.unwrap();
+        })
+        .await
+        .expect("backpressured writer must resume when the real consumer drains");
+        assert_eq!(received, expected);
+        drop(sink);
+        assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_output_sink_reports_closed_peer_without_retry_or_replay() {
+        let (writer, consumer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut sink = RawOutputSink::from_fd(&writer).unwrap();
+        drop(consumer);
+        let error = tokio::time::timeout(Duration::from_secs(1), sink.write_all(b"\0\xff"))
+            .await
+            .expect("closed peer is terminal, not retryable")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[cfg(unix)]
