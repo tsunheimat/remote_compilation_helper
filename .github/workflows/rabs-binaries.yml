@@ -103,14 +103,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/test-logs/wrapper-candidate-checks
+          checks="$RUNNER_TEMP/wrapper-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/checks"
+          mkdir -p "$checks"
           cargo fmt --all
           cargo fmt --all -- --check
-          cp rabs-wrap/src/main.rs target/test-logs/wrapper-candidate-checks/validated-main.rs
-          sha256sum rabs-wrap/src/main.rs > target/test-logs/wrapper-candidate-checks/source.sha256
-          git diff -- rabs-wrap/src/main.rs > target/test-logs/wrapper-candidate-checks/formatter.diff
-          cargo clippy --release --locked -p rabs-wrap --all-targets -- -D warnings 2>&1 | tee target/test-logs/wrapper-candidate-checks/clippy.log
-          cargo test --release --locked -p rabs-wrap --bin rabs-wrap -- --nocapture 2>&1 | tee target/test-logs/wrapper-candidate-checks/unit.log
+          cp rabs-wrap/src/main.rs "$checks/validated-main.rs"
+          sha256sum rabs-wrap/src/main.rs > "$checks/source.sha256"
+          git diff -- rabs-wrap/src/main.rs > "$checks/formatter.diff"
+          cargo clippy --release --locked -p rabs-wrap --all-targets -- -D warnings 2>&1 | tee "$checks/clippy.log"
+          cargo test --release --locked -p rabs-wrap --bin rabs-wrap -- --nocapture 2>&1 | tee "$checks/unit.log"
       - name: Release build the three spine binaries
         shell: bash
         run: |
@@ -173,7 +174,7 @@ jobs:
             --manifest-path "$RUNNER_TEMP/rabs-incumbent/Cargo.toml" -p rabs-wrap
           cp target/release/rabs-wrap "$RUNNER_TEMP/rabs-incumbent-wrapper"
           cargo build --release --locked -p rabs-wrap
-          sha256sum -c target/test-logs/wrapper-candidate-checks/source.sha256
+          sha256sum -c "$RUNNER_TEMP/wrapper-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/checks/source.sha256"
       - name: Trace and compare the fixed candidate against its live incumbent
         # Separate trace branch; not part of PR #4 and not a passing SLO claim.
         # Every existing release gate remains below, including overhead_live.
@@ -182,15 +183,13 @@ jobs:
           python3 -I scripts/diagnose_wrapper_latency.py \
             --binaries "$GITHUB_WORKSPACE/target/release" \
             --incumbent "$RUNNER_TEMP/rabs-incumbent-wrapper" \
-            --output "$GITHUB_WORKSPACE/target/test-logs/wrapper-latency-trace"
+            --output "$RUNNER_TEMP/wrapper-diagnostic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/trace"
       - name: Preserve trace before later release gates
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wrapper-latency-diagnostic-${{ github.sha }}
-          path: |
-            target/test-logs/wrapper-latency-trace/
-            target/test-logs/wrapper-candidate-checks/
+          path: ${{ runner.temp }}/wrapper-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 7
       - name: Worker-cache command assembly and opt-out parity

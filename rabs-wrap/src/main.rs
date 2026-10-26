@@ -459,7 +459,8 @@ fn store_outcome(path: &str, state: &BreakerState) -> io::Result<()> {
                 return Ok(false);
             }
             let mut bytes = Vec::new();
-            file.take(encoded.len() as u64 + 1).read_to_end(&mut bytes)?;
+            file.take(encoded.len() as u64 + 1)
+                .read_to_end(&mut bytes)?;
             let after = std::fs::symlink_metadata(path)?;
             Ok(after.is_file()
                 && after.dev() == before.dev()
@@ -2091,7 +2092,10 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(initial_names, final_names, "no pending files for unchanged outcomes");
+        assert_eq!(
+            initial_names, final_names,
+            "no pending files for unchanged outcomes"
+        );
         let failed = BreakerState::Closed {
             consecutive_failures: 1,
         };
@@ -2101,7 +2105,10 @@ mod tests {
         let failed_file = std::fs::File::open(path).unwrap();
         store_outcome(path, &BreakerState::fresh()).unwrap();
         assert_eq!(load_state(path), BreakerState::fresh());
-        assert_ne!(std::fs::metadata(path).unwrap().ino(), failed_file.metadata().unwrap().ino());
+        assert_ne!(
+            std::fs::metadata(path).unwrap().ino(),
+            failed_file.metadata().unwrap().ino()
+        );
         drop(guard);
         assert!(try_lock_breaker(path).is_some());
     }
@@ -2110,7 +2117,14 @@ mod tests {
     fn healthy_outcome_repairs_noncanonical_records_without_changing_link_targets() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
-        for kind in ["corrupt", "oversized", "extra-newline", "mode", "symlink", "hardlink"] {
+        for kind in [
+            "corrupt",
+            "oversized",
+            "extra-newline",
+            "mode",
+            "symlink",
+            "hardlink",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("breaker");
             let other = dir.path().join("unrelated");
@@ -2123,7 +2137,8 @@ mod tests {
                 "extra-newline" => std::fs::write(&path, format!("{healthy}\n")).unwrap(),
                 "mode" => {
                     std::fs::write(&path, healthy.as_bytes()).unwrap();
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
                 }
                 "symlink" => symlink(&other, &path).unwrap(),
                 "hardlink" => std::fs::hard_link(&other, &path).unwrap(),
@@ -2145,7 +2160,11 @@ mod tests {
             assert_ne!(repaired.ino(), old_inode, "{kind}");
             assert_eq!(std::fs::read(path).unwrap(), healthy.as_bytes(), "{kind}");
             assert_eq!(std::fs::read(&other).unwrap(), healthy.as_bytes(), "{kind}");
-            assert_eq!(std::fs::metadata(&other).unwrap().ino(), other_inode, "{kind}");
+            assert_eq!(
+                std::fs::metadata(&other).unwrap().ino(),
+                other_inode,
+                "{kind}"
+            );
         }
     }
 
@@ -2176,7 +2195,9 @@ mod tests {
                     }
                 };
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -2190,7 +2211,12 @@ mod tests {
         });
         for _ in 0..4 {
             assert!(matches!(
-                observe_with_breaker(socket.to_str().unwrap(), path, &["/tc/bin/rustc".to_owned()], None),
+                observe_with_breaker(
+                    socket.to_str().unwrap(),
+                    path,
+                    &["/tc/bin/rustc".to_owned()],
+                    None
+                ),
                 Live::PassThrough
             ));
             assert_eq!(load_state(path), BreakerState::fresh());
