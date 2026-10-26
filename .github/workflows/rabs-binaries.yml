@@ -91,6 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
@@ -98,6 +99,18 @@ jobs:
           cache-on-failure: true
       - name: Install bubblewrap (worker capability + sandbox tests)
         run: sudo apt-get update && sudo apt-get install -y bubblewrap strace
+      - name: Validate the trace-derived breaker correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/test-logs/wrapper-candidate-checks
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cp rabs-wrap/src/main.rs target/test-logs/wrapper-candidate-checks/validated-main.rs
+          sha256sum rabs-wrap/src/main.rs > target/test-logs/wrapper-candidate-checks/source.sha256
+          git diff -- rabs-wrap/src/main.rs > target/test-logs/wrapper-candidate-checks/formatter.diff
+          cargo clippy --release --locked -p rabs-wrap --all-targets -- -D warnings 2>&1 | tee target/test-logs/wrapper-candidate-checks/clippy.log
+          cargo test --release --locked -p rabs-wrap --bin rabs-wrap -- --nocapture 2>&1 | tee target/test-logs/wrapper-candidate-checks/unit.log
       - name: Release build the three spine binaries
         shell: bash
         run: |
@@ -149,20 +162,35 @@ jobs:
           rabs_sampler_pid=$!
           trap 'rabs_build_status=$?; trap - EXIT; kill "$rabs_sampler_pid" 2>/dev/null || true; wait "$rabs_sampler_pid" 2>/dev/null || true; exit "$rabs_build_status"' EXIT
           cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
-      - name: Trace unchanged release binaries (diagnostic branch only)
+      - name: Build the exact incumbent and restore the candidate wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          incumbent=b1a21a2f24ec5aa8674544df360859ba03fd8b3f
+          git fetch --no-tags origin "$incumbent"
+          git worktree add --detach "$RUNNER_TEMP/rabs-incumbent" "$incumbent"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked \
+            --manifest-path "$RUNNER_TEMP/rabs-incumbent/Cargo.toml" -p rabs-wrap
+          cp target/release/rabs-wrap "$RUNNER_TEMP/rabs-incumbent-wrapper"
+          cargo build --release --locked -p rabs-wrap
+          sha256sum -c target/test-logs/wrapper-candidate-checks/source.sha256
+      - name: Trace and compare the fixed candidate against its live incumbent
         # Separate trace branch; not part of PR #4 and not a passing SLO claim.
         # Every existing release gate remains below, including overhead_live.
         timeout-minutes: 5
         run: |
           python3 -I scripts/diagnose_wrapper_latency.py \
             --binaries "$GITHUB_WORKSPACE/target/release" \
+            --incumbent "$RUNNER_TEMP/rabs-incumbent-wrapper" \
             --output "$GITHUB_WORKSPACE/target/test-logs/wrapper-latency-trace"
       - name: Preserve trace before later release gates
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wrapper-latency-diagnostic-${{ github.sha }}
-          path: target/test-logs/wrapper-latency-trace/
+          path: |
+            target/test-logs/wrapper-latency-trace/
+            target/test-logs/wrapper-candidate-checks/
           if-no-files-found: warn
           retention-days: 7
       - name: Worker-cache command assembly and opt-out parity

@@ -157,10 +157,99 @@ def run_phase(phase: str, binaries: Path, evidence: Path, runtime: Path) -> None
         dump(out / "slowest-sample.json", slowest)
 
 
+def compare_incumbent(binaries: Path, incumbent: Path, evidence: Path, runtime: Path) -> None:
+    """Three fixed paired trials; incumbent is live, not historical benchmark data."""
+    failures = []
+    identities = {name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for name, path in {"incumbent": incumbent, "candidate": binaries / "rabs-wrap"}.items()}
+    dump(evidence / "paired-identities.json", identities)
+    for trial in range(3):
+        out = evidence / f"paired-{trial}"
+        out.mkdir()
+        owned = runtime / f"paired-{trial}"
+        owned.mkdir()
+        fake = owned / "fake-rustc"
+        fake.write_bytes(b"#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("RABS_")}
+        env.update({"RABS_SOCKET_PATH": str(owned / "rabsd.sock"),
+                    "RABS_STATE_DIR": str(owned / "state"),
+                    "RABS_BOOT_MARKER": str(owned / "boot"),
+                    "RABS_CONFIG": "/nonexistent-rabs-config"})
+        rows = []
+        dump(out / "before.json", system_observation())
+        with (out / "daemon.stderr").open("wb") as stderr:
+            daemon = subprocess.Popen([str(binaries / "rabsd")], env=env,
+                                      stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 10
+                while not Path(env["RABS_SOCKET_PATH"]).exists():
+                    if daemon.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("paired daemon not ready")
+                    time.sleep(.01)
+
+                def sample(name: str) -> int:
+                    command = [str(fake), "--crate-name", "fx"]
+                    current = dict(env)
+                    if name != "direct":
+                        executable = incumbent if name == "incumbent" else binaries / "rabs-wrap"
+                        command.insert(0, str(executable))
+                        current["RABS_BREAKER_FILE"] = str(owned / (name + "-breaker"))
+                    start = time.monotonic_ns()
+                    result = subprocess.run(command, env=current, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                    elapsed = (time.monotonic_ns() - start) // 1000
+                    if result.returncode:
+                        raise RuntimeError(f"paired {name} exit {result.returncode}: {result.stderr!r}")
+                    return elapsed
+
+                for _ in range(WARMUPS):
+                    sample("incumbent")
+                    sample("candidate")
+                before_inode = (owned / "candidate-breaker").stat().st_ino
+                for index in range(SAMPLES):
+                    names = ("incumbent", "candidate") if (index + trial) % 2 == 0 else ("candidate", "incumbent")
+                    row = {"index": index, "unix_ns": time.time_ns()}
+                    for name in names:
+                        row[name + "_us"] = sample(name)
+                    row["direct_us"] = sample("direct")
+                    rows.append(row)
+                after_inode = (owned / "candidate-breaker").stat().st_ino
+            finally:
+                dump(out / "samples.json", rows)
+                dump(out / "after.json", system_observation())
+                if daemon.poll() is None:
+                    os.killpg(daemon.pid, signal.SIGTERM)
+                try:
+                    daemon.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(daemon.pid, signal.SIGKILL)
+                    daemon.wait(timeout=5)
+                    raise RuntimeError("paired daemon cleanup failed")
+        receipts = (owned / "state/shadow-receipts.ndjson").read_bytes()
+        (out / "shadow-receipts.ndjson").write_bytes(receipts)
+        count = len(receipts.splitlines())
+        summary = {"trial": trial, "samples_per_variant": len(rows), "confirmed_consults": count,
+                   "daemon_exit": daemon.returncode, "candidate_inode_unchanged": before_inode == after_inode}
+        for name in ("incumbent", "candidate", "direct"):
+            summary[name + "_p95_us"] = sorted(row[name + "_us"] for row in rows)[57]
+        summary["candidate_gate_pass"] = (summary["candidate_p95_us"] < 10000
+            and summary["candidate_inode_unchanged"] and count == 2 * (SAMPLES + WARMUPS)
+            and daemon.returncode == 0)
+        dump(out / "summary.json", summary)
+        print(json.dumps(summary), flush=True)
+        if not summary["candidate_gate_pass"]:
+            failures.append(trial)
+    dump(evidence / "paired-failed-trials.json", failures)
+    if failures:
+        raise RuntimeError(f"paired candidate failed fixed trials {failures}; no reruns or sample removal")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binaries", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--incumbent", type=Path, help="exact baseline release wrapper for fixed paired trials")
     args = parser.parse_args()
     if platform.system() != "Linux" or not shutil.which("strace"):
         parser.error("Linux with strace is required")
@@ -177,6 +266,12 @@ def main() -> int:
     runtime = Path(tempfile.mkdtemp(prefix="rabs-trace-", dir="/tmp"))
     print("Diagnostic runtime retained at " + str(runtime), flush=True)
     failures = []
+    if args.incumbent:
+        try:
+            compare_incumbent(binaries, args.incumbent.resolve(strict=True), output, runtime)
+        except Exception as error:
+            failures.append({"phase": "paired", "error": repr(error)})
+            traceback.print_exc()
     for phase in PHASES:
         try:
             run_phase(phase, binaries, output, runtime)

@@ -438,6 +438,43 @@ fn store_state(path: &str, state: &BreakerState) -> io::Result<()> {
     std::fs::rename(staged, path)
 }
 
+/// Fold an outcome under the stable exclusive lock without republishing an
+/// already-canonical healthy record. Replacing that inode on every successful
+/// consult can block on filesystem metadata writeback even though no state
+/// changed. Missing/corrupt/aliased/permissive records still take atomic repair;
+/// failure counters and probe transitions are always published by store_state.
+fn store_outcome(path: &str, state: &BreakerState) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if *state == BreakerState::fresh() {
+        let encoded = encode_state(state);
+        let unchanged = || -> io::Result<bool> {
+            let before = std::fs::symlink_metadata(path)?;
+            if !before.is_file() || before.nlink() != 1 || before.mode() & 0o7777 != 0o600 {
+                return Ok(false);
+            }
+            let file = std::fs::File::open(path)?;
+            let opened = file.metadata()?;
+            if before.dev() != opened.dev() || before.ino() != opened.ino() {
+                return Ok(false);
+            }
+            let mut bytes = Vec::new();
+            file.take(encoded.len() as u64 + 1).read_to_end(&mut bytes)?;
+            let after = std::fs::symlink_metadata(path)?;
+            Ok(after.is_file()
+                && after.dev() == before.dev()
+                && after.ino() == before.ino()
+                && after.nlink() == 1
+                && after.mode() & 0o7777 == 0o600
+                && bytes == encoded.as_bytes())
+        };
+        if unchanged().unwrap_or(false) {
+            return Ok(());
+        }
+    }
+    store_state(path, state)
+}
+
 const HELLO: &str = "{\"kind\":\"hello\",\
     \"transport\":{\"minimum_compatible\":1,\"current\":1},\
     \"application\":{\"minimum_compatible\":1,\"current\":1}}";
@@ -977,7 +1014,7 @@ fn observe_with_breaker(
             // record is skipped — the breaker is advisory, never a queue.
             if let Some(_guard) = try_lock_breaker(path) {
                 let current = load_state(path);
-                let _ = store_state(path, &on_outcome(&policy, &current, attempt, now_ms()));
+                let _ = store_outcome(path, &on_outcome(&policy, &current, attempt, now_ms()));
             }
         }
     }
@@ -2028,6 +2065,141 @@ mod tests {
         // Corrupt: fresh closed, never an error.
         std::fs::write(&path, b"\xff\xfe garbage").unwrap();
         assert_eq!(load_state(path_str), BreakerState::fresh());
+    }
+
+    #[test]
+    fn healthy_outcome_keeps_the_published_inode_but_failures_still_replace_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breaker");
+        let path = path.to_str().unwrap();
+        let guard = try_lock_breaker(path).unwrap();
+        store_outcome(path, &BreakerState::fresh()).unwrap();
+        let original = std::fs::File::open(path).unwrap();
+        let inode = original.metadata().unwrap().ino();
+        let initial_names: std::collections::BTreeSet<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        for _ in 0..20 {
+            store_outcome(path, &BreakerState::fresh()).unwrap();
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+            assert!(try_lock_breaker(path).is_none());
+        }
+        let final_names: std::collections::BTreeSet<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(initial_names, final_names, "no pending files for unchanged outcomes");
+        let failed = BreakerState::Closed {
+            consecutive_failures: 1,
+        };
+        store_outcome(path, &failed).unwrap();
+        assert_eq!(load_state(path), failed);
+        assert_ne!(std::fs::metadata(path).unwrap().ino(), inode);
+        let failed_file = std::fs::File::open(path).unwrap();
+        store_outcome(path, &BreakerState::fresh()).unwrap();
+        assert_eq!(load_state(path), BreakerState::fresh());
+        assert_ne!(std::fs::metadata(path).unwrap().ino(), failed_file.metadata().unwrap().ino());
+        drop(guard);
+        assert!(try_lock_breaker(path).is_some());
+    }
+
+    #[test]
+    fn healthy_outcome_repairs_noncanonical_records_without_changing_link_targets() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        for kind in ["corrupt", "oversized", "extra-newline", "mode", "symlink", "hardlink"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("breaker");
+            let other = dir.path().join("unrelated");
+            let healthy = encode_state(&BreakerState::fresh());
+            std::fs::write(&other, healthy.as_bytes()).unwrap();
+            std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o600)).unwrap();
+            match kind {
+                "corrupt" => std::fs::write(&path, b"not a breaker").unwrap(),
+                "oversized" => std::fs::write(&path, vec![b'x'; 4096]).unwrap(),
+                "extra-newline" => std::fs::write(&path, format!("{healthy}\n")).unwrap(),
+                "mode" => {
+                    std::fs::write(&path, healthy.as_bytes()).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                "symlink" => symlink(&other, &path).unwrap(),
+                "hardlink" => std::fs::hard_link(&other, &path).unwrap(),
+                _ => unreachable!(),
+            }
+            if !matches!(kind, "mode" | "symlink" | "hardlink") {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let old_file = std::fs::File::open(&path).unwrap();
+            let old_inode = old_file.metadata().unwrap().ino();
+            let other_inode = std::fs::metadata(&other).unwrap().ino();
+            let path = path.to_str().unwrap();
+            let _guard = try_lock_breaker(path).unwrap();
+            store_outcome(path, &BreakerState::fresh()).unwrap();
+            let repaired = std::fs::symlink_metadata(path).unwrap();
+            assert!(repaired.is_file(), "{kind}");
+            assert_eq!(repaired.nlink(), 1, "{kind}");
+            assert_eq!(repaired.mode() & 0o7777, 0o600, "{kind}");
+            assert_ne!(repaired.ino(), old_inode, "{kind}");
+            assert_eq!(std::fs::read(path).unwrap(), healthy.as_bytes(), "{kind}");
+            assert_eq!(std::fs::read(&other).unwrap(), healthy.as_bytes(), "{kind}");
+            assert_eq!(std::fs::metadata(&other).unwrap().ino(), other_inode, "{kind}");
+        }
+    }
+
+    #[test]
+    fn successful_consults_reuse_healthy_state_without_skipping_the_daemon() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breaker");
+        let path = path.to_str().unwrap();
+        store_state(path, &BreakerState::fresh()).unwrap();
+        let original = std::fs::File::open(path).unwrap();
+        let before = original.metadata().unwrap();
+        let socket = dir.path().join("edge.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let daemon = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connected) => break connected,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "consult was skipped");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.contains("\"kind\":\"hello\""));
+                stream.write_all(b"{\"kind\":\"hello-ok\"}\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.contains("/tc/bin/rustc"));
+                stream.write_all(b"{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow\"}\n").unwrap();
+            }
+        });
+        for _ in 0..4 {
+            assert!(matches!(
+                observe_with_breaker(socket.to_str().unwrap(), path, &["/tc/bin/rustc".to_owned()], None),
+                Live::PassThrough
+            ));
+            assert_eq!(load_state(path), BreakerState::fresh());
+            let after = std::fs::metadata(path).unwrap();
+            assert_eq!(after.ino(), before.ino(), "healthy inode replaced");
+            assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+            assert!(try_lock_breaker(path).is_some());
+        }
+        daemon.join().unwrap();
     }
 
     #[test]
