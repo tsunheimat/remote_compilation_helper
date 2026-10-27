@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 const BYTES: &[u8] = b"compiler\0\xff";
 
 struct Fixture {
-    _owner: tempfile::TempDir,
+    _owner: PathBuf,
     source: PathBuf,
     cache: PathBuf,
     identity: ToolchainIdentity,
@@ -17,8 +17,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let owner = tempfile::tempdir().unwrap();
-        let root = owner.path().canonicalize().unwrap();
+        // Retain the real filesystem evidence on success and failure; persistent
+        // cache tests must not erase interrupted captures during unwinding.
+        let owner = tempfile::Builder::new()
+            .prefix("rabs-durable-toolchain-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let root = owner.canonicalize().unwrap();
+        eprintln!("retained durable toolchain fixture: {}", root.display());
         let source = root.join("installation");
         fs::create_dir_all(source.join("bin")).unwrap();
         fs::create_dir_all(source.join("lib/empty")).unwrap();
@@ -55,6 +62,44 @@ impl Fixture {
         paths.sort();
         paths
     }
+}
+
+#[test]
+fn durable_publication_does_not_require_noreplace_directory_renames() {
+    let f = Fixture::new();
+    // Measure the old production primitive on the SAME filesystem. Its failure
+    // is not waived in production and its success is not labeled an NFS failure:
+    // this records the host capability while exercising the new real cache path.
+    let legacy_source = f._owner.join("legacy-directory-source");
+    let legacy_target = f._owner.join("legacy-directory-target");
+    fs::create_dir(&legacy_source).unwrap();
+    fs::write(legacy_source.join("sentinel"), BYTES).unwrap();
+    let legacy = rabs_cas::materialization::publish_new_directory(&legacy_source, &legacy_target);
+    eprintln!("same-filesystem legacy directory publication: {legacy:?}");
+
+    let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+    let prepared = cache
+        .capture(&f.source, &f.identity, &|| false)
+        .unwrap()
+        .unwrap();
+    prepared.verify(|| false).unwrap();
+    assert_eq!(
+        fs::read(prepared.root().join("bin/compiler")).unwrap(),
+        BYTES
+    );
+    let marker = fs::symlink_metadata(f.entry().join(COMPLETE)).unwrap();
+    assert!(marker.is_file());
+    assert_eq!(marker.len(), 0);
+    assert_eq!(marker.mode() & 0o7777, 0o600);
+    drop(prepared);
+    drop(cache);
+    let reopened = DurableCache::open(&f.cache, 1024, 8).unwrap();
+    reopened
+        .load(&f.identity, &|| false)
+        .unwrap()
+        .unwrap()
+        .verify(|| false)
+        .unwrap();
 }
 
 #[test]
@@ -269,7 +314,8 @@ fn interrupted_reservations_remain_charged_and_are_never_adopted_on_restart() {
         .err()
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-    assert!(!f.entry().exists());
+    assert!(f.entry().is_dir());
+    assert!(!f.entry().join(COMPLETE).exists());
     let retained = f.objects();
     assert_eq!(retained.len(), 1);
     assert_eq!(cache.catalogue(&|| false).unwrap().bytes, f.identity.bytes);
@@ -303,7 +349,9 @@ fn a_complete_unpublished_tree_is_not_a_hit_but_post_publish_cancellation_is_rec
     let f = Fixture::new();
     let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
     let error = cache
-        .capture(&f.source, &f.identity, &|| f.entry().exists())
+        .capture(&f.source, &f.identity, &|| {
+            f.entry().join(COMPLETE).exists()
+        })
         .err()
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
@@ -327,6 +375,259 @@ fn a_complete_unpublished_tree_is_not_a_hit_but_post_publish_cancellation_is_rec
     assert_eq!(recaptured.root(), f.entry().join("tree"));
     assert!(pending.join("tree/bin/compiler").exists());
     assert_eq!(cache.catalogue(&|| false).unwrap().entries, 2);
+}
+
+#[test]
+fn complete_unmarked_entries_are_charged_but_never_adopted_or_overwritten() {
+    let f = Fixture::new();
+    let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+    make_directory(&f.entry()).unwrap();
+    let prepared = capture_toolchain(
+        &f.source,
+        &f.entry().join("tree"),
+        Some(&f.identity),
+        &ToolchainLimits::default(),
+        || false,
+    )
+    .unwrap();
+    prepared.sync(|| false).unwrap();
+    File::open(f.entry()).unwrap().sync_all().unwrap();
+    let inode = fs::metadata(f.entry().join("tree/bin/compiler"))
+        .unwrap()
+        .ino();
+    drop(prepared);
+    assert!(cache.load(&f.identity, &|| false).unwrap().is_none());
+    assert!(
+        cache
+            .capture(&f.source, &f.identity, &|| false)
+            .unwrap()
+            .is_none()
+    );
+    drop(cache);
+    let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+    assert_eq!(cache.catalogue(&|| false).unwrap().entries, 1);
+    assert_eq!(cache.catalogue(&|| false).unwrap().bytes, f.identity.bytes);
+    assert!(cache.load(&f.identity, &|| false).unwrap().is_none());
+    assert!(
+        cache
+            .capture(&f.source, &f.identity, &|| false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!f.entry().join(COMPLETE).exists());
+    assert_eq!(f.objects(), vec![f.entry()]);
+    assert_eq!(
+        fs::metadata(f.entry().join("tree/bin/compiler"))
+            .unwrap()
+            .ino(),
+        inode
+    );
+    assert_eq!(
+        fs::read(f.entry().join("tree/bin/compiler")).unwrap(),
+        BYTES
+    );
+}
+
+#[test]
+fn completion_marker_collisions_never_replace_or_poison_published_entries() {
+    let f = Fixture::new();
+    let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+    let lease = cache
+        .capture(&f.source, &f.identity, &|| false)
+        .unwrap()
+        .unwrap();
+    let marker_inode = fs::metadata(f.entry().join(COMPLETE)).unwrap().ino();
+    let tree_inode = fs::metadata(lease.root().join("bin/compiler"))
+        .unwrap()
+        .ino();
+    assert_eq!(
+        cache.publish(&f.entry(), &|| false).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    let next = cache.load(&f.identity, &|| false).unwrap().unwrap();
+    assert_eq!(
+        fs::metadata(next.root().join("bin/compiler"))
+            .unwrap()
+            .ino(),
+        tree_inode
+    );
+    assert_eq!(
+        fs::metadata(f.entry().join(COMPLETE)).unwrap().ino(),
+        marker_inode
+    );
+    assert_eq!(f.objects(), vec![f.entry()]);
+}
+
+#[test]
+fn completion_marker_corruption_links_and_permissions_fail_closed() {
+    for fault in 0..5 {
+        let f = Fixture::new();
+        let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+        drop(
+            cache
+                .capture(&f.source, &f.identity, &|| false)
+                .unwrap()
+                .unwrap(),
+        );
+        drop(cache);
+        let marker = f.entry().join(COMPLETE);
+        let retained = f.cache.parent().unwrap().join("retained-marker");
+        match fault {
+            0 => fs::write(&marker, b"not complete").unwrap(),
+            1 => fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap(),
+            2 => fs::hard_link(&marker, &retained).unwrap(),
+            3 => {
+                fs::rename(&marker, &retained).unwrap();
+                symlink(&retained, &marker).unwrap();
+            }
+            _ => {
+                fs::rename(&marker, &retained).unwrap();
+                fs::create_dir(&marker).unwrap();
+            }
+        }
+        let inode = fs::symlink_metadata(&marker).unwrap().ino();
+        let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+        assert!(cache.load(&f.identity, &|| false).is_err(), "fault {fault}");
+        assert!(
+            cache.capture(&f.source, &f.identity, &|| false).is_err(),
+            "fault {fault}"
+        );
+        assert_eq!(fs::symlink_metadata(&marker).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read(f.entry().join("tree/bin/compiler")).unwrap(),
+            BYTES
+        );
+    }
+}
+
+#[test]
+fn visible_marker_cannot_grant_a_lease_until_publication_sync_is_confirmed() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for fail_sync in [false, true] {
+        let f = Fixture::new();
+        let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+        make_directory(&f.entry()).unwrap();
+        let prepared = capture_toolchain(
+            &f.source,
+            &f.entry().join("tree"),
+            Some(&f.identity),
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        prepared.sync(|| false).unwrap();
+        File::open(f.entry()).unwrap().sync_all().unwrap();
+        let inode = fs::metadata(prepared.root().join("bin/compiler"))
+            .unwrap()
+            .ino();
+        drop(prepared);
+        std::thread::scope(|scope| {
+            let (created_tx, created_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let cache_ref = &cache;
+            let fixture = &f;
+            let publisher = scope.spawn(move || {
+                cache_ref.publish_with_sync(&fixture.entry(), &|| false, |marker, directory| {
+                    created_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    marker.sync_all()?;
+                    if fail_sync {
+                        // A deterministic I/O fault after marker visibility, not
+                        // a claim to emulate a filesystem/server power loss.
+                        return Err(io::Error::other("injected directory sync failure"));
+                    }
+                    directory.sync_all()
+                })
+            });
+            created_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(f.entry().join(COMPLETE).is_file());
+            assert!(matches!(
+                cache.publication_confirmed.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            let (started_tx, started_rx) = mpsc::sync_channel(1);
+            let (loaded_tx, loaded_rx) = mpsc::sync_channel(1);
+            let reader = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                loaded_tx
+                    .send(cache_ref.load(&fixture.identity, &|| false))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                loaded_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            // A different lookup must still observe cancellation while the
+            // real publication path holds the gate around its sync operation.
+            let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
+            let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_ref = std::sync::Arc::clone(&cancelled);
+            let waiter = scope.spawn(move || {
+                let checkpoints = std::sync::atomic::AtomicUsize::new(0);
+                let result = cache_ref.load(&fixture.identity, &|| {
+                    use std::sync::atomic::Ordering;
+                    // Initial load check is zero; check two is a retry after
+                    // the first failed publication-lock acquisition.
+                    if checkpoints.fetch_add(1, Ordering::SeqCst) == 2 {
+                        waiting_tx.send(()).unwrap();
+                    }
+                    cancel_ref.load(Ordering::SeqCst)
+                });
+                cancelled_tx.send(result).unwrap();
+            });
+            waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            let cancellation = cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                cancellation.err().unwrap().kind(),
+                io::ErrorKind::Interrupted
+            );
+            waiter.join().unwrap();
+            assert!(matches!(
+                cache.publication_confirmed.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            release_tx.send(()).unwrap();
+            let published = publisher.join().unwrap();
+            let loaded = loaded_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            reader.join().unwrap();
+            if fail_sync {
+                assert!(
+                    published
+                        .unwrap_err()
+                        .to_string()
+                        .contains("injected directory sync failure")
+                );
+                assert!(
+                    loaded
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("durability unconfirmed")
+                );
+                assert!(cache.capture(&f.source, &f.identity, &|| false).is_err());
+            } else {
+                published.unwrap();
+                loaded.unwrap().unwrap().verify(|| false).unwrap();
+            }
+        });
+        drop(cache);
+        // Reopening really syncs the marker and parent before reusing the exact
+        // original verified inode after an uncertain prior publication.
+        let cache = DurableCache::open(&f.cache, 1024, 8).unwrap();
+        let lease = cache.load(&f.identity, &|| false).unwrap().unwrap();
+        assert_eq!(
+            fs::metadata(lease.root().join("bin/compiler"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+        lease.verify(|| false).unwrap();
+    }
 }
 
 #[test]

@@ -9,7 +9,8 @@
 //! |-------|--------------|-----------|
 //! | Claude Code | PreToolUse (JSON) | Full |
 //! | Gemini CLI | pre_tool_use (JSON) | Full |
-//! | Codex CLI | Hooks (TOML) | Full |
+//! | Codex CLI | PreToolUse (hooks.json) | Full |
+//! | Hermes | pre_tool_call (Python plugin) | Full |
 //! | Cursor | Unknown | Detection only |
 //! | Continue.dev | config.json | Partial |
 //! | Windsurf | Unknown | Detection only |
@@ -33,5 +34,7 @@ mod hook;
 mod types;
 
 pub use detect::{detect_agents, detect_single_agent};
-pub use hook::{HookStatus, check_hook_status, install_hook, uninstall_hook};
+pub use hook::{
+    HookStatus, check_hook_status, install_hook, migrate_hook, rollback_hook, uninstall_hook,
+};
 pub use types::{AgentKind, DetectedAgent, HookSupport};

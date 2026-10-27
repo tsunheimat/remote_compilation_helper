@@ -63,6 +63,13 @@ use super::*;
 #[path = "cargo_manifest.rs"]
 mod cargo_manifest;
 
+#[path = "shared_job.rs"]
+mod shared_job;
+pub(super) use shared_job::uses_rtk;
+
+use rch_common::invocation::{InvocationOptions, WorkspaceMode};
+use std::io::Write;
+
 #[path = "retrieval_recovery.rs"]
 pub(crate) mod recovery;
 
@@ -542,6 +549,23 @@ async fn preflight_artifact_platform(
     }))
 }
 
+/// Forward one line from the remote streaming transport without changing its
+/// bytes. The callback split is kept in one small function so the automatic
+/// CLI route can be tested independently from SSH and the hook route can keep
+/// stdout reserved for its protocol response.
+pub(super) fn dispatch_workload_line(
+    line: &str,
+    workload_stderr: bool,
+    stdout: &mut dyn FnMut(&str),
+    stderr: &mut dyn FnMut(&str),
+) {
+    if workload_stderr {
+        stderr(line);
+    } else {
+        stdout(line);
+    }
+}
+
 /// Execute a compilation command on a remote worker.
 ///
 /// This function:
@@ -585,6 +609,8 @@ pub(super) async fn execute_remote_compilation(
     // Configured `[remediation.pooled_target] store_base` (issue #64):
     // `None` keeps pooled stores inside the project mirror.
     pooled_target_store_base: Option<&str>,
+    invocation: Option<&InvocationOptions>,
+    jobs: &rch_common::JobsConfig,
 ) -> anyhow::Result<RemoteExecutionResult> {
     // The pipeline's state machine is large; held inline, debug builds moved
     // it across a 2 MiB thread stack and overflowed (bd-uz82c). Keep it on
@@ -612,6 +638,8 @@ pub(super) async fn execute_remote_compilation(
         layer0_env,
         pooled_target_prune_idle_hours,
         pooled_target_store_base,
+        invocation,
+        jobs,
     ))
     .await;
     // The inner future has dropped every local holder before cleanup tries to
@@ -666,7 +694,30 @@ async fn execute_remote_compilation_inner(
     layer0_env: &[(String, String)],
     pooled_target_prune_idle_hours: u32,
     pooled_target_store_base: Option<&str>,
+    invocation: Option<&InvocationOptions>,
+    jobs: &rch_common::JobsConfig,
 ) -> anyhow::Result<RemoteExecutionResult> {
+    if let Some(invocation) = invocation.filter(|value| value.workspace == WorkspaceMode::Shared) {
+        anyhow::ensure!(
+            clean_overlay.is_none() && !source_content_receipt,
+            "shared workspaces cannot use mirror source overlays or source-content receipts"
+        );
+        return Box::pin(shared_job::execute_shared_invocation(
+            worker,
+            invocation,
+            jobs,
+            transfer_config,
+            environment,
+            execution_storage,
+            reporter,
+            socket_path,
+            build_id,
+            local_wrapper_id,
+            durable_lease,
+            result_dirs,
+        ))
+        .await;
+    }
     let worker_config = selected_worker_to_config(worker);
     let caller_command = command;
     // The build is already registered. Source validation and fingerprinting can
@@ -1031,12 +1082,12 @@ async fn execute_remote_compilation_inner(
         for entry in &mut sync_plan {
             let relative = entry
                 .local_root
-                .strip_prefix(topology_policy.canonical_root())
+                .strip_prefix(normalized_project.canonical_root())
                 .with_context(|| {
                     format!(
-                        "source-content root {} is outside canonical topology {}",
+                        "source-content root {} is outside controller source topology {}",
                         entry.local_root.display(),
-                        topology_policy.canonical_root().display()
+                        normalized_project.canonical_root().display()
                     )
                 })?;
             let relative = relative.to_str().ok_or_else(|| {
@@ -1448,7 +1499,12 @@ async fn execute_remote_compilation_inner(
     // Both isolated modes already name their complete staged source roots.
     // Converging canonical worker checkouts would mutate paths outside this
     // job's source grant and cannot prepare any of its selected destinations.
-    if clean_overlay.is_none() && !source_content_receipt {
+    // The repository updater assumes one namespace for local discovery and
+    // remote mutation. With a distinct source tree it could touch the original
+    // shared checkout instead of the mirror. The exact rsync plan owns that
+    // mirror's convergence; never authorize updater writes to the originals.
+    if clean_overlay.is_none() && !source_content_receipt && topology_policy.source_root().is_none()
+    {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
             &sync_roots,
@@ -1457,8 +1513,9 @@ async fn execute_remote_compilation_inner(
         )
         .await?;
     } else {
-        reporter
-            .verbose("[RCH] isolated sources selected; canonical repository convergence skipped");
+        reporter.verbose(
+            "[RCH] isolated or mapped sources selected; canonical repository convergence skipped",
+        );
     }
 
     let mut primary_pipeline: Option<TransferPipeline> = None;
@@ -2214,8 +2271,16 @@ async fn execute_remote_compilation_inner(
                     }
                 }
             } else {
-                // Write stdout lines to stderr (hook stdout is for protocol)
-                eprint!("{}", line);
+                let workload_stderr = super::remote_result::workload_streams_to_stderr();
+                let mut stdout = |value: &str| {
+                    print!("{value}");
+                    let _ = std::io::stdout().flush();
+                };
+                let mut stderr = |value: &str| eprint!("{value}");
+                // Hook and machine-output callers reserve stdout for their
+                // protocol. Ordinary CLI executions preserve the workload's
+                // stdout so shell redirection and pipelines remain exact.
+                dispatch_workload_line(line, workload_stderr, &mut stdout, &mut stderr);
             }
         },
         move |line| {
@@ -3281,6 +3346,7 @@ async fn execute_remote_compilation_inner(
     disk_roots.sort();
     disk_roots.dedup();
     Ok(RemoteExecutionResult {
+        interrupted: false,
         deadline_triggered: exit_code == 137 && deadline_triggered.get(),
         exit_code,
         stderr: stderr_capture,

@@ -53,8 +53,11 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.runs-on }}
-    # Cold macOS split-profile builds can exceed 30 minutes before smoke tests.
-    timeout-minutes: 60
+    # The cold Intel macOS CLI took 49m11s in run 39920156662; the
+    # independent daemon profile was still linking at the 60-minute job cutoff.
+    # Budget both shipped profiles and packaging on that runner. This is build
+    # orchestration, not the wrapper runtime SLO, whose 10ms gate is unchanged.
+    timeout-minutes: ${{ matrix.target == 'x86_64-apple-darwin' && 90 || 60 }}
 
     steps:
       - uses: actions/checkout@v4

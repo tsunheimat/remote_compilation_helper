@@ -498,6 +498,31 @@ pub fn load_config() -> Result<RchConfig> {
     Ok(config)
 }
 
+/// Load the usual user/project/environment/CLI layers for an explicit cwd.
+/// The ambient-cwd cache is deliberately not reused and the process directory
+/// is never changed (other asynchronous invocations may be running).
+pub(crate) fn load_config_for_cwd(cwd: &Path) -> Result<RchConfig> {
+    anyhow::ensure!(
+        cwd.is_absolute() && cwd.is_dir(),
+        "configuration cwd must be an absolute directory"
+    );
+    let user_path = config_dir().map(|dir| dir.join("config.toml"));
+    let project_path = find_project_config_from(cwd);
+    let config = load_config_uncached_from_paths(
+        user_path.as_deref().filter(|path| path.exists()),
+        project_path.as_deref(),
+    )?;
+    let mut config = apply_env_overrides(config);
+    crate::self_healing_overrides::apply_to(&mut config.self_healing);
+    if cfg!(test) && config.general.socket_path == rch_common::default_socket_path() {
+        config.general.socket_path = unit_test_isolation_dir()
+            .join("rchd.sock")
+            .to_string_lossy()
+            .into_owned();
+    }
+    Ok(config)
+}
+
 /// Validation issues grouped by file.
 #[derive(Debug, Clone, Default)]
 pub struct FileValidation {
@@ -722,10 +747,21 @@ struct PartialRchConfig {
     // same trap issue #10 documented for path_topology.
     #[serde(default)]
     layer0: PartialLayer0Config,
+    #[serde(default)]
+    jobs: PartialJobsConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialJobsConfig {
+    required_tools: Option<Vec<String>>,
+    shared_workspaces: Option<Vec<rch_common::invocation::SharedWorkspaceMapping>>,
+    local_guard_root: Option<PathBuf>,
+    rtk_tee_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialPathTopologyConfig {
+    source_root: Option<String>,
     canonical_root: Option<String>,
     alias_root: Option<String>,
 }
@@ -761,6 +797,7 @@ struct PartialSelectionWeights {
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialCompilationConfig {
+    native_toolchain: Option<String>,
     confidence_threshold: Option<f64>,
     min_local_time_ms: Option<u64>,
     remote_speedup_threshold: Option<f64>,
@@ -1108,6 +1145,13 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
     {
         validation.error("transfer.retrieval_staging_dir must be absolute".to_string());
     }
+    if let Some(version) = &config.compilation.native_toolchain
+        && rch_common::ToolchainInfo::native(version).is_none()
+    {
+        validation.error(
+            "compilation.native_toolchain must be an exact major.minor.patch version".to_string(),
+        );
+    }
     if let Some(sync_timeout_ms) = config.transfer.sync_timeout_ms
         && !TransferConfig::valid_sync_timeout_ms(sync_timeout_ms)
     {
@@ -1454,6 +1498,10 @@ fn default_sources_map() -> ConfigSourceMap {
         "transfer.source_sync_silence_timeout_secs",
         "transfer.rsync_bin",
         "environment.allowlist",
+        "jobs.required_tools",
+        "jobs.shared_workspaces",
+        "jobs.local_guard_root",
+        "jobs.rtk_tee_root",
         "execution.storage.root",
         "execution.storage.cache_root",
         "execution.storage.tmp_root",
@@ -1518,6 +1566,10 @@ fn apply_layer(
         set_source(sources, "general.socket_path", source.clone());
     }
 
+    if let Some(version) = &layer.compilation.native_toolchain {
+        config.compilation.native_toolchain = Some(version.clone());
+        set_source(sources, "compilation.native_toolchain", source.clone());
+    }
     if let Some(threshold) = layer.compilation.confidence_threshold {
         config.compilation.confidence_threshold = threshold;
         set_source(sources, "compilation.confidence_threshold", source.clone());
@@ -1826,6 +1878,12 @@ fn apply_layer(
     // strings are treated as unset to match `PathTopologyConfig::to_policy`
     // semantics — otherwise an accidentally-empty TOML value would
     // shadow the env var or default.
+    if let Some(source_root) = layer.path_topology.source_root.as_ref()
+        && !source_root.is_empty()
+    {
+        config.path_topology.source_root = Some(source_root.clone());
+        set_source(sources, "path_topology.source_root", source.clone());
+    }
     if let Some(canonical_root) = layer.path_topology.canonical_root.as_ref()
         && !canonical_root.is_empty()
     {
@@ -1837,6 +1895,23 @@ fn apply_layer(
     {
         config.path_topology.alias_root = Some(alias_root.clone());
         set_source(sources, "path_topology.alias_root", source.clone());
+    }
+
+    if let Some(tools) = &layer.jobs.required_tools {
+        config.jobs.required_tools = tools.clone();
+        set_source(sources, "jobs.required_tools", source.clone());
+    }
+    if let Some(mappings) = &layer.jobs.shared_workspaces {
+        config.jobs.shared_workspaces = mappings.clone();
+        set_source(sources, "jobs.shared_workspaces", source.clone());
+    }
+    if let Some(root) = &layer.jobs.local_guard_root {
+        config.jobs.local_guard_root = Some(root.clone());
+        set_source(sources, "jobs.local_guard_root", source.clone());
+    }
+    if let Some(root) = &layer.jobs.rtk_tee_root {
+        config.jobs.rtk_tee_root = Some(root.clone());
+        set_source(sources, "jobs.rtk_tee_root", source.clone());
     }
 
     // Layer 0 pack knobs (bd-bqu38). Plain bools: Some ⇒ set.
@@ -1917,6 +1992,16 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
     // an unwanted fallback to the compiled-in default.
     if overlay
         .path_topology
+        .source_root
+        .as_deref()
+        .is_some_and(|root| !root.is_empty())
+    {
+        base.path_topology
+            .source_root
+            .clone_from(&overlay.path_topology.source_root);
+    }
+    if overlay
+        .path_topology
         .canonical_root
         .as_deref()
         .is_some_and(|s| !s.is_empty())
@@ -1992,6 +2077,9 @@ fn merge_compilation(
     overlay: &rch_common::CompilationConfig,
     default: &rch_common::CompilationConfig,
 ) {
+    if overlay.native_toolchain.is_some() {
+        base.native_toolchain.clone_from(&overlay.native_toolchain);
+    }
     // Use float comparison with small epsilon for confidence_threshold
     const EPSILON: f64 = 0.0001;
     if (overlay.confidence_threshold - default.confidence_threshold).abs() > EPSILON {
@@ -2722,6 +2810,16 @@ fn apply_env_overrides_inner(
     }
 
     // Path topology overrides
+    if let Some(val) = get_env("RCH_SOURCE_PROJECT_ROOT") {
+        config.path_topology.source_root = Some(val);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "path_topology.source_root",
+                ConfigValueSource::EnvVar("RCH_SOURCE_PROJECT_ROOT".to_string()),
+            );
+        }
+    }
     let canonical_before_env = config
         .path_topology
         .to_policy()
@@ -3132,6 +3230,86 @@ mod tests {
         );
     }
     use tracing::info;
+
+    #[test]
+    fn explicit_cwd_loads_shared_jobs_without_changing_process_directory() {
+        let _guard = test_guard!();
+        let before = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".rch")).unwrap();
+        std::fs::write(
+            root.path().join(".rch/config.toml"),
+            r#"
+[jobs]
+required_tools = ["python3"]
+local_guard_root = "/bounded/local"
+rtk_tee_root = "/shared/tee"
+[[jobs.shared_workspaces]]
+controller_root = "/shared"
+worker_root = "/mnt/shared"
+worker = "worker-a"
+"#,
+        )
+        .unwrap();
+        let config = load_config_for_cwd(root.path()).unwrap();
+        assert_eq!(std::env::current_dir().unwrap(), before);
+        assert_eq!(config.jobs.required_tools, ["python3"]);
+        assert_eq!(
+            config.jobs.local_guard_root.as_deref(),
+            Some(Path::new("/bounded/local"))
+        );
+        assert_eq!(
+            config.jobs.rtk_tee_root.as_deref(),
+            Some(Path::new("/shared/tee"))
+        );
+        assert_eq!(config.jobs.shared_workspaces.len(), 1);
+        assert_eq!(config.jobs.shared_workspaces[0].worker, "worker-a");
+        assert_eq!(
+            config.jobs.shared_workspaces[0].worker_root,
+            Path::new("/mnt/shared")
+        );
+        assert!(load_config_for_cwd(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn jobs_overlay_preserves_unmentioned_values_and_attributes_explicit_empty() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user.toml");
+        let project = root.path().join("project.toml");
+        std::fs::write(
+            &user,
+            r#"
+[jobs]
+required_tools = ["node"]
+local_guard_root = "/bounded/local"
+rtk_tee_root = "/shared/tee"
+[[jobs.shared_workspaces]]
+controller_root = "/shared"
+worker_root = "/mnt/shared"
+worker = "worker-a"
+"#,
+        )
+        .unwrap();
+        std::fs::write(&project, "[jobs]\nrequired_tools = []\n").unwrap();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&HashMap::new()))
+                .unwrap();
+        assert!(loaded.config.jobs.required_tools.is_empty());
+        assert_eq!(loaded.config.jobs.shared_workspaces[0].worker, "worker-a");
+        assert_eq!(
+            loaded.config.jobs.local_guard_root.as_deref(),
+            Some(Path::new("/bounded/local"))
+        );
+        assert_eq!(
+            loaded.config.jobs.rtk_tee_root.as_deref(),
+            Some(Path::new("/shared/tee"))
+        );
+        assert!(matches!(loaded.sources.get("jobs.required_tools"),
+            Some(ConfigValueSource::ProjectConfig(path)) if path == &project));
+        assert!(matches!(loaded.sources.get("jobs.shared_workspaces"),
+            Some(ConfigValueSource::UserConfig(path)) if path == &user));
+    }
 
     /// `rch workers init` and `rch config init` rewrite the WHOLE workers.toml
     /// by deserializing into this struct and re-serializing it. A field missing
@@ -4596,12 +4774,17 @@ max_concurrent_workers = 3
 [path_topology]
 canonical_root = "/home/alex/projects"
 alias_root = "/home/alex/dp"
+source_root = "/mnt/source"
 "#,
         )
         .expect("write user config");
 
         let loaded = load_config_with_sources_from_paths(Some(&user_path), None, None)
             .expect("load_config_with_sources_from_paths");
+        assert_eq!(
+            loaded.config.path_topology.to_policy().source_root(),
+            Some(std::path::Path::new("/mnt/source"))
+        );
         assert_eq!(
             loaded.config.path_topology.canonical_root.as_deref(),
             Some("/home/alex/projects"),
@@ -4612,6 +4795,14 @@ alias_root = "/home/alex/dp"
             Some("/home/alex/dp"),
             "TOML alias_root should land in config.path_topology"
         );
+        assert_eq!(
+            loaded.config.path_topology.to_policy().source_root(),
+            Some(std::path::Path::new("/mnt/source"))
+        );
+        assert!(matches!(
+            loaded.sources.get("path_topology.source_root"),
+            Some(ConfigValueSource::UserConfig(_))
+        ));
         let canonical_source = loaded
             .sources
             .get("path_topology.canonical_root")

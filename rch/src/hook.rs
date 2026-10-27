@@ -18,6 +18,7 @@ use crate::transfer::{
 use crate::ui::console::RchConsole;
 use anyhow::Context;
 use rch_common::errors::catalog::ErrorCode;
+use rch_common::invocation::{InvocationOptions, WorkspaceMode};
 use rch_common::job_identity::{DurableJobLease, JobIdentity, default_job_lease_directory};
 use rch_common::repo_updater_contract::{
     REPO_UPDATER_ALLOW_OVERRIDE_ENV, REPO_UPDATER_ALLOWED_HOSTS_ENV, REPO_UPDATER_ALLOWLIST_ENV,
@@ -404,7 +405,7 @@ static PRE_READ_HOOK_INPUT: std::sync::OnceLock<String> = std::sync::OnceLock::n
 /// loading), against a 1ms budget (bd-1nhd).
 ///
 /// Returns true when the request is fully answered (allow: empty stdout,
-/// exit 0), exactly as [`process_hook`] would answer it. Anything else,
+/// exit 0), exactly as [`process_hook_with_cwd`] would answer it. Anything else,
 /// including a compilation hidden behind shell structure (which reports a
 /// summary), falls back to the full path with the input already read.
 pub fn try_fast_passthrough() -> bool {
@@ -434,7 +435,7 @@ pub fn try_fast_passthrough() -> bool {
     false
 }
 
-/// Whether [`process_hook`] would answer this input with a plain allow and
+/// Whether [`process_hook_with_cwd`] would answer this input with a plain allow and
 /// no other effect. Unparseable input goes to the full path, which logs it.
 fn fast_passthrough_allows(input: &str) -> bool {
     if input.is_empty() {
@@ -448,7 +449,18 @@ fn fast_passthrough_allows(input: &str) -> bool {
     }
     let command = &hook_input.tool_input.command;
     !crate::cache::classify_hook_command(command, classify_command).is_compilation
+        && !semantic::is_candidate(command)
         && declined_compilation_due_to_structure(command).is_none()
+}
+
+/// Keep per-request context separate from the shared command-only protocol
+/// type. The hook process may have been launched from a different directory.
+#[derive(Deserialize)]
+struct HookRequest {
+    #[serde(flatten)]
+    input: HookInput,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
 }
 
 /// Run the hook, reading from stdin and writing to stdout.
@@ -489,7 +501,7 @@ pub async fn run_hook() -> anyhow::Result<()> {
     }
 
     // Parse the hook input
-    let hook_input: HookInput = match serde_json::from_str(input) {
+    let hook_request: HookRequest = match serde_json::from_str(input) {
         Ok(hi) => hi,
         Err(e) => {
             warn!("Failed to parse hook input: {}", e);
@@ -499,7 +511,7 @@ pub async fn run_hook() -> anyhow::Result<()> {
     };
 
     // Process the hook request
-    let output = process_hook(hook_input).await;
+    let output = process_hook_with_cwd(hook_request.input, hook_request.cwd.as_deref()).await;
 
     // Write output:
     //   - Deny: write JSON to block the command
@@ -1378,6 +1390,7 @@ async fn try_retry_on_bigger_worker(
     worker_pin: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
+    remote_environment: &std::collections::BTreeMap<String, String>,
     durable_lease: &DurableLeaseWriter,
     release_acknowledged: bool,
     reporter: &HookReporter,
@@ -1416,6 +1429,7 @@ async fn try_retry_on_bigger_worker(
                 &preferred,
                 job_mode,
                 required_tools,
+                Some(remote_environment),
             )
             .await
         })
@@ -3419,6 +3433,94 @@ fn is_clean_overlay_cargo_fmt_check(command_parts: &[String]) -> bool {
     subcommand == "fmt" && parts.any(|part| part == "--check")
 }
 
+/// Node's automatic test contract returns streams only. Hidden runtime
+/// options can request files, so preserve their semantics by staying local (or
+/// refusing in strict mode), never by stripping the variables. The injected
+/// environment lookup keeps this policy testable without global env mutation.
+fn node_test_has_untracked_environment(
+    kind: Option<CompilationKind>,
+    environment: &rch_common::EnvironmentConfig,
+    get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    kind == Some(CompilationKind::NodeTest)
+        && ["NODE_OPTIONS", "NODE_V8_COVERAGE"].iter().any(|name| {
+            environment.remote.contains_key(*name)
+                || get_env(name).is_some_and(|value| !value.is_empty())
+        })
+}
+
+/// Only a proven no-start ordinary verification miss may use the local guard.
+/// Explicit job/remote requirements and dispatcher policy are never weakened.
+async fn guarded_verification_fallback(
+    invocation: &InvocationOptions,
+    config: &rch_common::RchConfig,
+    hard_remote_constraint: bool,
+    reason: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        invocation.verification
+            && !hard_remote_constraint
+            && !exec_requires_remote()
+            && !role_requires_remote(config.general.role)
+            && !config.general.force_remote
+            && config.compilation.allow_local_fallback,
+        "shared invocation refused before execution: {reason}; guarded local fallback is not authorized"
+    );
+    let root = config
+        .jobs
+        .local_guard_root
+        .clone()
+        .or_else(|| dirs::cache_dir().map(|path| path.join("rch/local-jobs")))
+        .context("no configured local guard root or user cache directory")?;
+    let mut options = invocation.clone();
+    // The invocation envelope is the sole owner of the requested result file.
+    options.json_result = None;
+    let mut environment = config.environment.remote.clone();
+    environment.extend(options.env);
+    options.env = environment;
+    // Nested tool invocations stay inside this owned local execution rather
+    // than recursively redispatching through the PATH shims.
+    options.env.insert("RCH_SHIM_BYPASS".into(), "1".into());
+    options
+        .env
+        .insert("RCH_CARGO_WRAPPER_BYPASS".into(), "1".into());
+    let mut guard = crate::guarded_exec::LocalGuardConfig::new(root);
+    guard.managed_rtk_tee = transfer_orchestration::uses_rtk(&options)?;
+    eprintln!("[RCH] guarded local verification ({reason})");
+    let result = crate::guarded_exec::run_guarded_local(&options, &guard).await?;
+    remote_result::record_exec_details(&result)?;
+    let outcome = match result.cause {
+        crate::guarded_exec::ExecutionCause::Exited => "completed",
+        crate::guarded_exec::ExecutionCause::Signaled => "signaled",
+        crate::guarded_exec::ExecutionCause::Timeout => "deadline_exceeded",
+        crate::guarded_exec::ExecutionCause::Interrupted => "interrupted",
+        crate::guarded_exec::ExecutionCause::JobHighWater => "job_high_water",
+        crate::guarded_exec::ExecutionCause::FreeSpaceFloor => "free_space_floor",
+        crate::guarded_exec::ExecutionCause::ControlError => "control_error",
+    };
+    emit_exec_envelope(&ExecResultEnvelope {
+        api_version: "1.0",
+        command: &invocation.shell_command(),
+        outcome,
+        location: "local",
+        fallback_reason: Some(reason),
+        worker_id: None,
+        remote_exit_code: Some(result.exit_code),
+        duration_ms: Some(result.duration_ms),
+        timing: None,
+        result_dirs: None,
+        error_code: None,
+        admission: None,
+    });
+    std::process::exit(result.exit_code);
+}
+
+/// The invocation scope already published its terminal envelope. Callers must
+/// preserve the failure status without serializing a second result on stdout.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct ExecErrorReported(#[source] pub anyhow::Error);
+
 #[allow(clippy::too_many_arguments)] // Pipeline wiring favors explicit params
 pub async fn run_exec(
     base: Option<String>,
@@ -3432,18 +3534,131 @@ pub async fn run_exec(
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
     command_parts: Vec<String>,
+    invocation: Option<InvocationOptions>,
     out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let invocation = if invocation.is_none()
+        && !job
+        && !clean_overlay
+        && base.is_none()
+        && command_parts.first().is_some_and(|command| {
+            Path::new(command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("rtk")
+        }) {
+        let options = InvocationOptions {
+            command: rch_common::invocation::CommandSpec::Argv(command_parts.clone()),
+            cwd: std::env::current_dir()?,
+            env: Default::default(),
+            timeout_seconds: None,
+            interactive: false,
+            workspace: WorkspaceMode::Shared,
+            verification: true,
+            json_result: None,
+        };
+        if semantic_plan(&options.shell_command()).await?.is_some()
+            && transfer_orchestration::uses_rtk(&options)?
+        {
+            Some(options)
+        } else {
+            invocation
+        }
+    } else {
+        invocation
+    };
+    let command = invocation
+        .as_ref()
+        .map(InvocationOptions::shell_command)
+        .unwrap_or_else(|| join_exec_command(&command_parts));
+    let sink = remote_result::ExecOutputSink::for_cli(
+        out_ctx.is_json(),
+        invocation
+            .as_ref()
+            .and_then(|value| value.json_result.clone()),
+        out_ctx.is_json(),
+    );
+    remote_result::EXEC_OUTPUT.scope(sink, async {
+        if invocation.is_some() && out_ctx.is_json() {
+            emit_exec_envelope(&ExecResultEnvelope {
+                api_version: "1.0", command: &command, outcome: "refused", location: "controller",
+                fallback_reason: Some("native invocation streams cannot share stdout with --json; use --json-result FILE"),
+                worker_id: None, remote_exit_code: None, duration_ms: Some(0),
+                timing: None, result_dirs: None, error_code: Some("RCH-E001"), admission: None,
+            });
+            eprintln!("[RCH-E001] typed invocations require --json-result FILE instead of --json/JSON --format");
+            std::process::exit(2);
+        }
+        let result = run_exec_inner(base, dependency_bases, clean_overlay, overlay_paths,
+            no_overlay, source_content_receipt, job, result_dirs, required_tools,
+            exact_worker, command_parts, invocation).await;
+        if let Err(error) = &result
+            && !remote_result::exec_envelope_emitted()
+        {
+            let reason = format!("{error:#}");
+            emit_exec_envelope(&ExecResultEnvelope {
+                api_version: "1.0", command: &command, outcome: "control_error",
+                location: "controller", fallback_reason: Some(&reason), worker_id: None,
+                remote_exit_code: None, duration_ms: Some(start.elapsed().as_millis() as u64),
+                timing: None, result_dirs: None, error_code: Some("RCH-E500"), admission: None,
+            });
+        }
+        result.map_err(|error| {
+            if remote_result::exec_envelope_emitted() {
+                ExecErrorReported(error).into()
+            } else {
+                error
+            }
+        })
+    }).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_exec_inner(
+    base: Option<String>,
+    dependency_bases: Vec<String>,
+    clean_overlay: bool,
+    overlay_paths: Vec<PathBuf>,
+    no_overlay: bool,
+    source_content_receipt: bool,
+    job: bool,
+    result_dirs: Vec<PathBuf>,
+    required_tools: Vec<String>,
+    exact_worker: Option<WorkerId>,
+    command_parts: Vec<String>,
+    invocation: Option<InvocationOptions>,
+) -> anyhow::Result<()> {
     let exec_start = std::time::Instant::now();
-    // bd-uoh4x: machine consumers (`--json` / `--format`) get a result
-    // envelope on stdout at every terminal path. Remote command output keeps
-    // streaming to stderr, so stdout stays envelope-only.
-    set_machine_output(out_ctx.is_json());
-    let command = join_exec_command(&command_parts);
+    if let Some(options) = &invocation {
+        options.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            options.workspace == WorkspaceMode::Shared,
+            "typed argv/shell, cwd, environment, timeout and native byte streams require --workspace shared; mirror transport does not support this invocation contract"
+        );
+        anyhow::ensure!(
+            !clean_overlay
+                && !source_content_receipt
+                && base.is_none()
+                && dependency_bases.is_empty()
+                && overlay_paths.is_empty()
+                && !no_overlay,
+            "shared invocations cannot use mirror overlays or source receipts"
+        );
+    }
+    let shared = invocation
+        .as_ref()
+        .is_some_and(|value| value.workspace == WorkspaceMode::Shared);
+    let explicit_job = job;
+    let job = job || shared;
+    let command = invocation
+        .as_ref()
+        .map(InvocationOptions::shell_command)
+        .unwrap_or_else(|| join_exec_command(&command_parts));
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
     }
-    if shell_wrapped_cargo_command(&command_parts) {
+    if !shared && shell_wrapped_cargo_command(&command_parts) {
         let reporter = HookReporter::new(OutputVisibility::Summary);
         reporter.summary_critical(
             "[RCH-E301] refusing shell-wrapped cargo command: RCH cannot safely synchronize its artifacts; invoke `rch exec -- cargo ...` directly",
@@ -3473,7 +3688,7 @@ pub async fn run_exec(
         std::env::var("RCH_CARGO_JSON_STDOUT").is_ok_and(|value| env_flag_enabled(&value));
     if cargo_json_stdout {
         anyhow::ensure!(
-            !out_ctx.is_json() && !job,
+            !remote_result::machine_output() && !job,
             "RCH_CARGO_JSON_STDOUT conflicts with machine envelopes and arbitrary jobs"
         );
         let classified = classify_command(&command);
@@ -3489,7 +3704,10 @@ pub async fn run_exec(
         || source_content_receipt
         || cargo_json_stdout
         || exact_worker_requested
-        || !required_tools.is_empty();
+        || !required_tools.is_empty()
+        // Legacy fallback cannot preserve typed cwd/argv/environment. Shared
+        // invocations use only the explicit guarded no-start fallback below.
+        || shared;
 
     // Classify the command. In explicit job-admission mode (`rch exec --job`,
     // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
@@ -3544,7 +3762,11 @@ pub async fn run_exec(
         );
     }
 
-    let mut config = match load_config() {
+    let loaded_config = match &invocation {
+        Some(options) => crate::config::load_config_for_cwd(&options.cwd),
+        None => load_config(),
+    };
+    let mut config = match loaded_config {
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to load config: {}, running locally", e);
@@ -3552,6 +3774,49 @@ pub async fn run_exec(
             exit_with_local_fallback(&command, &reporter, "config unavailable", require_remote);
         }
     };
+
+    if node_test_has_untracked_environment(classification.kind, &config.environment, |name| {
+        std::env::var_os(name)
+    }) {
+        let reporter = HookReporter::new(config.output.visibility);
+        exit_with_gated_local_fallback(
+            &command,
+            &reporter,
+            "Node environment options have no artifact return contract",
+            require_remote || role_requires_remote(config.general.role),
+            config.compilation.allow_local_fallback,
+            None,
+        );
+    }
+
+    let shared_workers = if let Some(options) = &invocation {
+        // Configuration may contain mappings for many projects. Resolve aliases
+        // before matching and constrain selection to the authorized worker set.
+        let cwd = options
+            .cwd
+            .canonicalize()
+            .context("resolve invocation cwd")?;
+        config
+            .jobs
+            .shared_workspaces
+            .iter()
+            .filter(|mapping| mapping.map_cwd(&cwd, &mapping.worker).is_ok())
+            .map(|mapping| WorkerId::new(mapping.worker.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if let Some(options) = &invocation
+        && shared_workers.is_empty()
+    {
+        return guarded_verification_fallback(
+            options,
+            &config,
+            explicit_job || exact_worker_requested || !required_tools.is_empty(),
+            "no configured shared workspace mapping covers the invocation cwd",
+        )
+        .await;
+    }
 
     // A project's `[jobs] required_tools` is a statement that its jobs cannot
     // run without those tools, so it ADDS to `--require-tool` rather than being
@@ -3582,6 +3847,15 @@ pub async fn run_exec(
     if let Some(policy) = config_local_policy(&config, classification.kind) {
         let reporter = HookReporter::new(config.output.visibility);
         let reason = policy.reason();
+        if let Some(options) = &invocation {
+            return guarded_verification_fallback(
+                options,
+                &config,
+                explicit_job || exact_worker_requested || required_tools_requested,
+                &reason,
+            )
+            .await;
+        }
         let refuse_local = if policy.overrides_require_remote() {
             clean_overlay
                 || source_content_receipt
@@ -3619,7 +3893,8 @@ pub async fn run_exec(
     // Decide that before a worker slot is reserved, with a reason an operator
     // can act on, and record it like every other fallback. A mode that forbids
     // local execution refuses instead.
-    if let Ok(cwd) = std::env::current_dir()
+    if !shared
+        && let Ok(cwd) = std::env::current_dir()
         && let Some(reason) = project_topology_local_reason(&topology_policy, &cwd)
     {
         let refuse_local = require_remote || clean_overlay || source_content_receipt;
@@ -3629,8 +3904,16 @@ pub async fn run_exec(
         exit_with_local_fallback(&command, &reporter, &reason, refuse_local);
     }
 
-    // Extract project name honoring configured path topology.
-    let project = extract_project_name_with_policy(&topology_policy);
+    // Shared file effects are keyed by the actual requested cwd, never by the
+    // controller process's ambient directory.
+    let project = if let Some(options) = &invocation {
+        let cwd = options.cwd.canonicalize()?;
+        let name = cwd.file_name().unwrap_or_default().to_string_lossy();
+        let hash = blake3::hash(cwd.as_os_str().as_encoded_bytes()).to_hex();
+        format!("{name}-{}", &hash[..8])
+    } else {
+        extract_project_name_with_policy(&topology_policy)
+    };
 
     // bd-2spi4: the speed gate may place a build locally only when the
     // caller and configuration permit it. Resolved strict admission (including
@@ -3692,7 +3975,10 @@ pub async fn run_exec(
     // `nightly-2026-07-11` would silently keep running on the orchestrator, which
     // is precisely the bug this feature exists to fix. Go/TS/Bun/Nix builds need no
     // rustup toolchain, so send none.
-    let project_root = std::env::current_dir().ok();
+    let project_root = invocation
+        .as_ref()
+        .map(|options| options.cwd.clone())
+        .or_else(|| std::env::current_dir().ok());
     let mut clean_overlay_spec = prepare_clean_overlay_spec(
         project_root.as_deref().unwrap_or_else(|| Path::new(".")),
         base,
@@ -3741,8 +4027,36 @@ pub async fn run_exec(
             RequiredRuntime::Rust
         )
         || job_needs_rust_toolchain;
+    let toolchain_environment = rch_common::execution_storage::toolchain_environment(
+        &config.environment,
+        &config.execution.storage,
+        |key| std::env::var(key).ok(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let toolchain = if needs_rust_toolchain {
-        if let (Some(root), Some(spec)) = (project_root.as_deref(), clean_overlay_spec.as_ref()) {
+        if let Some(version) = config
+            .compilation
+            .native_toolchain
+            .as_deref()
+            .filter(|_| !shared)
+        {
+            anyhow::ensure!(
+                clean_overlay_spec.is_none(),
+                "native toolchain selection does not override clean-overlay toolchain proofs"
+            );
+            let pin = rustup_toolchain_from_command_tokens(&command_parts)
+                .or_else(|| std::env::var("RUSTUP_TOOLCHAIN").ok())
+                .or_else(|| toolchain_environment.get("RUSTUP_TOOLCHAIN").cloned());
+            Some(crate::toolchain::configured_native_toolchain(
+                project_root
+                    .as_deref()
+                    .context("native toolchain requires project cwd")?,
+                version,
+                pin.as_deref(),
+            )?)
+        } else if let (Some(root), Some(spec)) =
+            (project_root.as_deref(), clean_overlay_spec.as_ref())
+        {
             detect_clean_overlay_toolchain(root, spec).await?
         } else if let Some(name) = rustup_toolchain_from_command_tokens(&command_parts) {
             // An explicit `RUSTUP_TOOLCHAIN=…` / `cargo +…` in the delegated
@@ -3764,12 +4078,16 @@ pub async fn run_exec(
         &reporter,
         Some(&command_parts),
     );
-    let remote_command = rewrite_cargo_target_dir_command_for_remote(
-        &command,
-        Some(&command_parts),
-        forwarded_cargo_target_dir.as_ref(),
-        &reporter,
-    );
+    let remote_command = if shared {
+        command.clone()
+    } else {
+        rewrite_cargo_target_dir_command_for_remote(
+            &command,
+            Some(&command_parts),
+            forwarded_cargo_target_dir.as_ref(),
+            &reporter,
+        )
+    };
 
     // Determine required runtime
     let required_runtime = if clean_overlay_fmt_check {
@@ -3780,9 +4098,20 @@ pub async fn run_exec(
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
     // A CLI pin is a singleton admission constraint, never the environment /
-    // project preference union. Every retry keeps this same allowed set.
-    let preferred_workers =
+    // project preference union. Shared mapping restrictions may only narrow it.
+    let mut preferred_workers =
         exec_worker_preferences(exact_worker, command_parsing::preferred_workers);
+    if shared {
+        if preferred_workers.is_empty() {
+            preferred_workers = shared_workers;
+        } else {
+            preferred_workers.retain(|worker| shared_workers.contains(worker));
+            anyhow::ensure!(
+                !preferred_workers.is_empty(),
+                "requested workers do not have a shared workspace mapping for this cwd"
+            );
+        }
+    }
     let durable_lease = DurableLeaseWriter::create(
         &command,
         require_remote,
@@ -3818,6 +4147,7 @@ pub async fn run_exec(
         &preferred_workers,
         classification.kind == Some(CompilationKind::Job),
         &required_tools,
+        Some(&toolchain_environment),
     )
     .await
     {
@@ -3883,6 +4213,7 @@ pub async fn run_exec(
                     &preferred_workers,
                     classification.kind == Some(CompilationKind::Job),
                     &required_tools,
+                    Some(&toolchain_environment),
                 )
                 .await
                 {
@@ -3993,6 +4324,7 @@ pub async fn run_exec(
             &preferred_workers,
             classification.kind == Some(CompilationKind::Job),
             &required_tools,
+            Some(&toolchain_environment),
         )
         .await
         {
@@ -4006,6 +4338,20 @@ pub async fn run_exec(
         if selection_cancelled_before_start(&response) {
             durable_lease.confirm_selection_cancelled()?;
             reporter.summary("[RCH] cancelled before remote admission");
+            emit_exec_envelope(&ExecResultEnvelope {
+                api_version: "1.0",
+                command: &command,
+                outcome: "interrupted",
+                location: "controller",
+                fallback_reason: Some("cancelled before remote admission"),
+                worker_id: None,
+                remote_exit_code: Some(130),
+                duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                timing: None,
+                result_dirs: None,
+                error_code: None,
+                admission: None,
+            });
             std::process::exit(130);
         }
         let Some(worker) = response.worker.clone() else {
@@ -4196,6 +4542,8 @@ pub async fn run_exec(
             &layer0_env,
             config.remediation.pooled_target.reaper_pooled_idle_hours,
             config.remediation.pooled_target.store_base.as_deref(),
+            invocation.as_ref(),
+            &config.jobs,
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
@@ -4280,8 +4628,7 @@ pub async fn run_exec(
                 // corpus too (off the latency path; fail-open inside).
                 {
                     let command_for_corpus = command.to_string();
-                    let cwd_for_corpus =
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let cwd_for_corpus = project_root.clone().unwrap_or_else(|| PathBuf::from("."));
                     let kind_for_corpus = classification.kind;
                     let exit_code = result.exit_code;
                     let duration_ms = result.duration_ms;
@@ -4420,6 +4767,35 @@ pub async fn run_exec(
                             &worker.id,
                         )?,
                     });
+                    std::process::exit(result.exit_code);
+                } else if shared {
+                    // An observed shared command exit (including signals) is
+                    // terminal truth. Replaying arbitrary effects is forbidden.
+                    emit_exec_envelope(&ExecResultEnvelope {
+                        api_version: "1.0",
+                        command: &command,
+                        outcome: if result.interrupted {
+                            "interrupted"
+                        } else {
+                            "completed"
+                        },
+                        location: "remote",
+                        fallback_reason: None,
+                        worker_id: Some(worker.id.as_str()),
+                        remote_exit_code: Some(result.exit_code),
+                        duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                        timing: exec_timing.as_ref(),
+                        result_dirs: exec_dir_stats.as_deref(),
+                        error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
+                        )?,
+                    });
+                    if release_acknowledged {
+                        durable_lease.acknowledge_terminal()?;
+                    }
                     std::process::exit(result.exit_code);
                 } else if !job && is_toolchain_failure(&result.stderr, result.exit_code) {
                     // Worker missing the toolchain — another worker may have it.
@@ -4605,6 +4981,35 @@ pub async fn run_exec(
                 }
             }
             Err(e) => {
+                if shared {
+                    if release_acknowledged && !retain_unconfirmed_ownership {
+                        durable_lease.record_exit(EXIT_BUILD_ERROR)?;
+                        durable_lease.acknowledge_terminal()?;
+                    }
+                    // No implicit retry, even if a generic transport error does
+                    // not prove whether the remote side started the workload.
+                    emit_exec_envelope(&ExecResultEnvelope {
+                        api_version: "1.0",
+                        command: &command,
+                        outcome: "transport_error",
+                        location: "remote",
+                        fallback_reason: Some("shared execution is never replayed"),
+                        worker_id: Some(worker.id.as_str()),
+                        remote_exit_code: None,
+                        duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                        timing: None,
+                        result_dirs: None,
+                        error_code: Some("RCH-E100"),
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
+                        )?,
+                    });
+                    return Err(
+                        e.context("shared invocation failed; not replaying remotely or locally")
+                    );
+                }
                 if classify_remote_pipeline_failure(&e)
                     == RemotePipelineFailurePolicy::AllowLocalFallback
                     && let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>()
@@ -4795,6 +5200,7 @@ pub async fn run_exec(
                 &preferred_workers,
                 classification.kind == Some(CompilationKind::Job),
                 &required_tools,
+                &toolchain_environment,
                 &durable_lease,
                 release_acknowledged,
                 &reporter,
@@ -5102,11 +5508,19 @@ mod source_fidelity;
 // `transfer_orchestration` constructs and returns `RemoteExecutionResult`
 // directly from `super::remote_result`.
 mod remote_result;
+mod semantic;
+
+/// Shared semantic planner for hook and generic shim dispatch. This only
+/// rewrites authored input; it never grants execution permission.
+pub(crate) async fn semantic_plan(command: &str) -> anyhow::Result<Option<String>> {
+    semantic::plan(command).await
+}
+
 use remote_result::{
     ExecAdmissionReference, ExecResultDirStat, ExecResultEnvelope,
     detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
     emit_exec_envelope, is_cpu_capability_signal, is_signal_killed, is_toolchain_failure,
-    remote_failure_is_disk_full, remote_failure_is_worker_fault, set_machine_output, signal_name,
+    remote_failure_is_disk_full, remote_failure_is_worker_fault, signal_name,
     wrapped_cpu_capability_signal,
 };
 
@@ -5257,8 +5671,18 @@ fn emit_first_run_message(worker: &SelectedWorker, remote_ms: u64, local_ms: Opt
     eprintln!();
 }
 
-/// Process a hook request and return the output.
+/// Legacy command-only callers use the ambient directory.
+#[cfg(test)]
 async fn process_hook(input: HookInput) -> HookOutput {
+    process_hook_with_cwd(input, None).await
+}
+
+/// Process a hook request without changing process cwd or environment.
+async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutput {
+    let load_request_config = || match cwd {
+        Some(path) => crate::config::load_config_for_cwd(path),
+        None => load_config(),
+    };
     // Tier 0: Only process Bash tool
     if input.tool_name != "Bash" {
         debug!("Non-Bash tool: {}, allowing", input.tool_name);
@@ -5279,6 +5703,23 @@ async fn process_hook(input: HookInput) -> HookOutput {
     let classification_duration_us = classification_duration.as_micros() as u64;
 
     if !classification.is_compilation {
+        if semantic::is_candidate(command) {
+            // Native compiler routing remains first. General verification uses
+            // the bounded planner only on a candidate miss, and obeys the same
+            // project enable/force-local policy without granting permission.
+            if let Ok(config) = load_request_config()
+                && config.general.enabled
+                && !config.general.force_local
+            {
+                match semantic_plan(command).await {
+                    Ok(Some(rewritten)) => {
+                        return HookOutput::rewrite_with_permission_check(rewritten);
+                    }
+                    Ok(None) => {}
+                    Err(error) => debug!("semantic planning declined: {error:#}"),
+                }
+            }
+        }
         // Log non-compilation decision latency (budget: <1ms per AGENTS.md)
         let duration_ms = classification_duration_us as f64 / 1000.0;
         if duration_ms > 1.0 {
@@ -5300,7 +5741,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
         // fallback (a silent rustc/cc storm). Only loads config on this rare
         // path to avoid touching the hot non-compilation path.
         if let Some(structure_reason) = declined_compilation_due_to_structure(command) {
-            let config = load_config().ok();
+            let config = load_request_config().ok();
             let force_remote = config
                 .as_ref()
                 .map(|cfg| cfg.general.force_remote)
@@ -5330,7 +5771,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
         return HookOutput::allow();
     }
 
-    let config = match load_config() {
+    let config = match load_request_config() {
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to load config: {}, allowing local execution", e);
@@ -5544,6 +5985,8 @@ async fn handle_selection_response(
         &[],
         config.remediation.pooled_target.reaper_pooled_idle_hours,
         config.remediation.pooled_target.store_base.as_deref(),
+        None,
+        &config.jobs,
     )
     .await;
     let remote_elapsed = remote_start.elapsed();
@@ -6189,8 +6632,8 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
                 RequiredRuntime::Go
             }
 
-            // `tsc` / `npx tsc` run under Node.
-            CompilationKind::Tsc => RequiredRuntime::Node,
+            // TypeScript and Node's built-in test runner share the Node gate.
+            CompilationKind::Tsc | CompilationKind::NodeTest => RequiredRuntime::Node,
 
             _ => RequiredRuntime::None,
         },

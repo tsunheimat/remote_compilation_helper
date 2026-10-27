@@ -462,6 +462,16 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
         if lease.terminal_acknowledged {
+            // Slot release can precede delivery of retained RTK logs. Recovery
+            // may collect them, but must never execute the workload again.
+            if recover && lease.recovery.is_some() && !process_matches(&lease) {
+                within_job_deadline(
+                    deadline,
+                    "retained output recovery",
+                    crate::hook::recover_job(&writer),
+                )
+                .await?;
+            }
             // The daemon refused before admission: no remote command ran, so
             // there is no remote exit to report or recover.
             let report = if lease.state
@@ -812,14 +822,46 @@ mod tests {
         use crate::ui::writer::OutputWriter;
         use std::os::unix::net::UnixStream;
 
+        const CHILD: &str = "RCH_JOB_OUTPUT_CLOSED_PEER_CHILD";
+        const COMPLETE: &str = "all eight real closed-peer output assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            // Create sockets only in a dedicated process. CLOEXEC does not stop
+            // parallel tests from inheriting a peer at fork, and shutdown is
+            // not final peer closure on every Unix kernel.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::jobs::tests::job_output_reports_real_closed_socket_write_and_flush_failures",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stderr).contains(COMPLETE),
+                "closed-peer child did not execute every assertion: {output:?}"
+            );
+            return;
+        }
+
         for mode in [OutputMode::Json, OutputMode::Plain] {
             for format in [OutputFormat::Json, OutputFormat::Toon] {
                 for buffered in [false, true] {
-                    let (socket, peer) = UnixStream::pair().unwrap();
+                    let (mut socket, peer) = UnixStream::pair().unwrap();
                     socket
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
+                    // Prove that closing one handle is insufficient, then close
+                    // the FINAL peer. No other test can fork this descriptor.
+                    let mut retained_peer = peer.try_clone().unwrap();
                     drop(peer);
+                    std::io::Write::write_all(&mut socket, b"x").unwrap();
+                    let mut observed = [0];
+                    std::io::Read::read_exact(&mut retained_peer, &mut observed).unwrap();
+                    assert_eq!(observed, *b"x");
+                    drop(retained_peer);
                     let stdout = if buffered {
                         // The small payload fits in the buffer; the real socket
                         // failure must be observed when the writer flushes.
@@ -847,6 +889,7 @@ mod tests {
                 }
             }
         }
+        eprintln!("{COMPLETE}");
     }
 
     #[cfg(unix)]

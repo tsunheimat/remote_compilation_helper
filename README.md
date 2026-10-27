@@ -8,10 +8,10 @@
 <h3>Quick Install</h3>
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
+curl -fsSL -A 'remote_compilation_helper-installer' "https://raw.githubusercontent.com/tsunheimat/remote_compilation_helper/main/install.sh" | bash -s -- --easy-mode
 ```
 
-<p><em>Installs `rch` + `rchd`, bootstraps config, and can install/start the background daemon. If remote execution cannot proceed, RCH fails open to local execution.</em></p>
+<p><em>Installs `rch` + `rchd`, bootstraps config, and can install/start the background daemon. Ordinary compiler offload permits local fallback where policy allows; strict-remote and shared-invocation contracts can refuse instead. This quick install is not inert staging for a remote-test migration.</em></p>
 </div>
 
 <div align="center">
@@ -36,22 +36,43 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilati
 
 **Solution**: RCH runs as a Claude Code PreToolUse hook, classifies build-like commands in milliseconds, executes them on remote workers, and returns artifacts/output as if they ran locally.
 
-**Design constraint**: RCH is fail-open. If remote execution is not safe/possible, commands run locally.
+**Design constraint**: Ordinary compiler offload is fail-open where policy permits. Strict-remote, dispatcher, and explicit workspace contracts can instead refuse execution. General verification uses a guarded local fallback only on authorized no-start paths; it does not replay an uncertain remote attempt.
 
 ---
 
 ## What RCH Intercepts
 
-RCH currently recognizes and can offload:
+RCH has two routing paths. The native compiler classifier uses typed mirror/artifact policies for:
 
 | Ecosystem | Intercepted Commands |
 |---|---|
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
-| Bun/TypeScript | `bun test`, `bun typecheck` |
+| Bun/TypeScript | `bun test`, `bun typecheck`, `tsc --noEmit`, `npx tsc --noEmit` |
+| Node | `node --test` (bounded literal options; streamed results only) |
 | Go | `go build -o <file>`, ordinary `go test`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
+
+The semantic hook and opt-in generic tool shims additionally recognize verification
+commands such as `pytest`, `python3 -m pytest`, `python3 -m unittest`, Swift
+`test`/`build`, and npm/pnpm/Bun scripts named `test`, `build`, `lint`, `typecheck`,
+`check`, `verify`, or `vet` (including `:`, `.`, and `-` suffixes). They route
+recognized commands through `rch exec --verification` with explicitly configured,
+verified **shared workspaces**, not guessed artifact retrieval. This also covers
+supported compound shell components; unsupported grammar is left unchanged.
+Arbitrary script names are not automatically classified, but an operator can
+request them explicitly with `--verification -- <argv>` or `--shell`.
+
+The native Node classifier uses the Node runtime capability gate and returns
+streams and exit status, not generated files. Watch mode, `--`, ordinary script
+launches, custom reporters, reporter destinations, profiles, coverage files,
+snapshots and unknown options are outside that native mirror contract. The
+semantic shared-workspace path is separate and may recognize forms the native
+classifier declines. See the
+[remote-test migration guide](docs/guides/migration.md#replacing-remote-test-on-linux)
+for prerequisites, staging versus activation, and outstanding deployment checks;
+source support is not a claim that a replacement release is built or accepted.
 
 Nix builds only route to workers that advertise a `nix` capability (a usable `nix`
 binary plus a populated `/nix/store`); on a fleet with no such worker they fall
@@ -82,20 +103,25 @@ local binary, and durable recovery resumes collection without rerunning Go.
 Directory outputs, symlinks or symlinked output parents, cross compilation,
 native-library modes such as `c-shared`/`c-archive`, and low-level flags that can
 create extra files are outside this output contract. Implicit forms such as
-`go build`, `go build .`, and `go build ./...` stay local because their output
-names depend on which packages they select. Go test options that write binaries,
+`go build`, `go build .`, and `go build ./...` are outside the native mirror
+contract because their output names depend on which packages they select.
+Go test options that write binaries,
 profiles, or fuzz corpora (`-c`, `-o`, `-coverprofile`, `-cpuprofile`, `-trace`,
-`-fuzz`, and related flags, including `-test.*` forms after `-args`) also stay
-local. Strict remote mode refuses
-unsupported forms instead of executing them locally.
+`-fuzz`, and related flags, including `-test.*` forms after `-args`) are also
+outside the native mirror contract. Those forms can instead route through the
+semantic shared-workspace path. Without an applicable shared path, local policy
+or strict-remote refusal applies.
 
-RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
-
-- Package management: `cargo install`, `cargo clean`, `bun install`, `bun add`, `bun remove`
-- Bun runners/dev: `bun run`, `bun build`, `bun dev`, `bun x` / `bunx`
-- Nix interactive/mutating: bare `nix develop` / `nix shell`, `nix run`, `nix repl`,
-  `nix profile`, `nix flake update`, `nix store gc`, `nix-env`, `nix-shell`
-- Watch/background/piped/redirected commands where deterministic offload is unsafe
+Automatic routing is not an arbitrary shell runner. Examples left unchanged by
+the semantic planner include package management (`cargo install`, `cargo clean`,
+`bun install`, `bun add`, `bun remove`), ordinary interpreter/script launches,
+and unsupported shell control syntax. Bun `run`/`x`/`bunx` are not blanket
+exclusions: recognized verification scripts and tool runners can route through
+shared execution. Nix interactive/mutating commands remain outside native
+compiler routing. Shell pipelines and redirects are not blanket exclusions
+either: supported components are rewritten while the invoking shell retains
+its operators and redirects. This is command routing, not a permission or
+security boundary.
 
 ---
 
@@ -162,13 +188,13 @@ RCH now includes a deterministic reliability stack for multi-repo and multi-work
 ### Recommended: Installer
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
+curl -fsSL -A 'remote_compilation_helper-installer' "https://raw.githubusercontent.com/tsunheimat/remote_compilation_helper/main/install.sh" | bash -s -- --easy-mode
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/Dicklesworthstone/remote_compilation_helper.git
+git clone https://github.com/tsunheimat/remote_compilation_helper.git
 cd remote_compilation_helper
 cargo build --release
 cp target/release/rch ~/.local/bin/
@@ -318,8 +344,13 @@ and project-topology observations are collected again for each request.
 
 ```bash
 rch hook install|uninstall|status|test
-rch shim install|status|uninstall      # cargo shim: offload builds started by scripts/Makefiles, not just hooked tool calls
+rch shim install|status|uninstall      # Cargo/clippy shims + reversible rustup wrapping
+rch shim install --tools all --dry-run # generic tools only; does not install Cargo shims
+rch env --shell bash                  # print PATH activation; does not change this shell
+rch ci -- ./scripts/test.sh            # prepend installed shims for this child process
 rch agents list|status|install-hook|uninstall-hook
+rch agents migrate --agent codex-cli --dry-run
+rch agents rollback --agent codex-cli --dry-run
 rch diagnose "cargo build --release"
 rch admit "cargo build --release"      # read-only preflight: offload / local / queue / defer verdict
 rch admit --job --require-tool clang -- ./run_shards.sh   # same, for a job-mode admission
@@ -390,12 +421,51 @@ admitted source and artifact root. No test result is implied by this description
 Wrapper-loss, pending recovery, cancellation, full installers, native Windows,
 and same-invocation live-incumbent/A/A performance acceptance remain open.
 
+### General verification (shared workspaces)
+
+```bash
+rch exec --verification --cwd /absolute/shared/project \
+  --env CI=1 --timeout 20m --json-result /absolute/results/run.json -- pytest -q
+rch exec --verification --shell 'npm test && npm run build' --timeout 30m
+```
+
+These explicit invocations preserve literal argv or explicit Bash source, cwd,
+environment overrides, and native stdout/stderr. `--json-result FILE` writes an
+independent result file; its parent must exist. `--json` / JSON output mode is
+**refused** for this contract rather than merging workload streams. PTY behavior
+is opt-in with `--interactive` and merges terminal output. Explicit invocation
+options default to `--workspace shared`; `--workspace mirror` is currently
+refused for this contract. Plain `rch exec -- cargo ...` retains its existing
+compiler transport.
+
+Configure `[jobs] shared_workspaces`, `local_guard_root`, and, for recognized RTK
+wrappers, `rtk_tee_root` as described in the
+[migration guide](docs/guides/migration.md#replacing-remote-test-on-linux).
+Python 3 is required by the embedded semantic planner; shell execution requires
+Bash. Shared mappings authorize specific workers and require live backing-tree
+verification. Remote RTK tee bytes are retrieved into an owned controller
+directory; no shared output mount is assumed. Authorized guarded-local RTK
+fallback retains a private `rtk-tee` directory in its local lease and reports
+it in `logs`. Callers must not supply
+`RTK_TEE_DIR` themselves. Local fallback is a cooperative disk and execution
+guard, not a filesystem sandbox or a hard quota. Its dedicated child subreaper
+requires `ECHILD` proof before reclaiming scratch; captured/RTK logs and unproven
+quiescence retain the lease. Deployment acceptance on the operator's workers
+remains an operator responsibility; this is not a deployment-readiness claim.
+
+Installing generic shims stages files only **if their directory is not already
+on PATH**. `rch env` prints activation; evaluating it or running `rch ci` activates
+installed shims for the selected shell/process. Agent migration is a separate
+explicit operation. Keep legacy integration recoverable until the deployment
+checks pass; these interfaces do not establish release readiness.
+
 ### Job Mode (non-compilation workloads)
 
 `rch exec --job` admits an arbitrary NON-compilation workload (sharded tests,
 fuzzing, benchmarks, mutation testing) onto the same remote rails. It bypasses
-ONLY the compilation classifier — the PreToolUse hook never sets it, so
-auto-delegation of ordinary commands is impossible.
+ONLY the compilation classifier. The PreToolUse hook does not set `--job`;
+recognized general verification instead uses the distinct shared-workspace
+`--verification` path described above.
 
 ```bash
 rch exec --job -- ./run_shards.sh
@@ -615,8 +685,11 @@ rch --help-json workers/list    # machine-readable help for nested command paths
 ```
 
 `--json` uses the standard API envelope for command output; `--format toon`
-emits the same data as TOON. The legacy `rch --capabilities` flag remains a
-raw JSON shortcut for lightweight discovery.
+emits the same data as TOON. Explicit typed execution (including
+`exec --verification`) refuses JSON output mode: use `--json-result FILE` to
+keep workload stdout/stderr separate. Plain compiler `rch --json exec -- ...`
+retains its older envelope-on-stdout, workload-on-stderr contract. The legacy
+`rch --capabilities` flag remains a raw JSON shortcut for lightweight discovery.
 
 ---
 
@@ -1201,13 +1274,13 @@ check. These checks do not sandbox arbitrary file reads by build scripts.
 The client re-fingerprints overlays after upload and refuses execution if their
 contents changed during admission or transfer.
 
-Do not batch several Cargo commands behind a shell wrapper such as
-`rch exec -- bash -lc "cargo test ... && cargo test ..."`. Shell-wrapped
-commands are classified as non-compilation for hook safety. Under
-`RCH_REQUIRE_REMOTE=1`, RCH refuses that local fallback before executing the
-shell and reports `RCH-E301`; without the env var, ordinary non-compilation
-commands may still run locally. For several focused checks, run separate direct
-`RCH_REQUIRE_REMOTE=1 rch exec -- cargo ...` invocations.
+Do not batch several Cargo commands behind an implicit mirror-path shell wrapper
+such as `rch exec -- bash -lc "cargo test ... && cargo test ..."`: that Cargo
+wrapper is refused with `RCH-E301`. For mirror/artifact execution, use separate
+direct `RCH_REQUIRE_REMOTE=1 rch exec -- cargo ...` invocations. To run explicit
+Bash source against a configured shared tree instead, use
+`rch exec --verification --shell 'cargo test ... && cargo test ...'`; this is a
+different workspace contract and cannot be combined with clean-overlay mode.
 
 ---
 
@@ -1216,14 +1289,22 @@ commands may still run locally. For several focused checks, run separate direct
 - Transport uses SSH.
 - Worker commands are constrained to classified execution paths.
 - Sensitive field masking and structured error taxonomy are built in.
-- `rch update` enforces the release's SHA-256 checksums and verifies the
-  archive's `.minisig` against a public key pinned in the binary (minisign key
-  `69B3955C8D2E62A8`, which signs every release since 2.1.0; 2.0.x and earlier
-  used `1BBD79B28BF718D0`); a bad signature
-  aborts the update. A Sigstore bundle is also verified when the release ships
-  one and `cosign` is installed. `--skip-verify` bypasses signature checks only.
-  `install.sh` still verifies checksums only.
-- Hook path remains fail-open to avoid deadlocks/stalls.
+- This fork's `rch update` uses `tsunheimat/remote_compilation_helper` releases,
+  requires SHA-256 and a Sigstore bundle verified with `cosign`, and binds the
+  GitHub Actions issuer and fork release-workflow identity to the requested tag.
+  The upstream minisign key is not a fork trust root. The explicit `--skip-verify`
+  option bypasses signature checks only, never checksum mismatches.
+- `install.sh` requires a valid checksum before extracting downloaded or offline
+  archives. `RCH_SIGNATURE_POLICY=required` additionally requires a verified
+  Sigstore bundle and refuses unsigned source fallback. The default `optional`
+  policy warns when signatures cannot be checked; it is not authenticated release
+  acceptance. Any attempted signature verification that fails aborts installation.
+  Pin an explicit `--version` for deployment or rollback; it never falls through
+  to a different latest release. Publishing and verifying a real fork release is
+  still required before rollout.
+- Ordinary hook classification can pass commands through. Strict-remote and
+  dispatcher execution refuse unauthorized local fallback; uncertain remote
+  attempts never authorize local replay.
 
 Operational recommendations:
 

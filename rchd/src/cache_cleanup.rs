@@ -1498,7 +1498,7 @@ mod tests {
             assert!(std::fs::read_link("/proc/1/cwd").is_ok());
             return false;
         }
-        let namespace = |privileged: bool| {
+        let namespace = |privileged: bool, user_namespace: bool| {
             let mut command = Command::new("timeout");
             command.args(["--kill-after=5", "90"]);
             if privileged {
@@ -1516,32 +1516,45 @@ mod tests {
                     "--kill-child=KILL",
                 ]);
             } else {
-                command.args([
-                    "unshare",
-                    "--user",
-                    "--map-root-user",
-                    "--pid",
-                    "--fork",
-                    "--mount-proc",
-                    "--kill-child=KILL",
-                ]);
+                command.arg("unshare");
+                if user_namespace {
+                    command.args(["--user", "--map-root-user"]);
+                }
+                command.args(["--pid", "--fork", "--mount-proc", "--kill-child=KILL"]);
             }
             command.stdin(Stdio::null());
             command
         };
-        let probe = namespace(false)
-            .args(["sh", "-c", "test \"$$\" -eq 1 && test \"$(readlink /proc/self)\" -gt 0 && readlink /proc/1/cwd"])
-            .output()
-            .expect("GNU timeout and util-linux unshare are required for native cleanup tests");
-        let privileged = !probe.status.success();
-        assert!(
-            !privileged || std::env::var("RCH_TEST_ALLOW_SUDO_UNSHARE").as_deref() == Ok("1"),
-            "a private PID/proc namespace is required; unprivileged setup failed: {probe:?}"
-        );
         let thread = std::thread::current();
         let name = thread.name().expect("named Rust test thread");
-        let output = namespace(privileged)
-            .arg(std::env::current_exe().unwrap())
+        let executable = std::env::current_exe().unwrap();
+        let probe = |user_namespace| {
+            // Testing only /bin/sh misses a real access failure: root mapped
+            // into a new user namespace loses host DAC override on a Cargo
+            // cache owned by a different user. Execute this exact test binary
+            // in listing mode, without creating fixtures or running the test.
+            namespace(false, user_namespace)
+                .args(["sh", "-c", "test \"$$\" -eq 1 && test \"$(readlink /proc/self)\" -gt 0 && readlink /proc/1/cwd && exec \"$1\" --exact \"$2\" --list", "namespace-probe"])
+                .arg(&executable)
+                .arg(name)
+                .output()
+                .expect("GNU timeout and util-linux unshare are required for native cleanup tests")
+        };
+        let user_probe = probe(true);
+        let user_namespace = user_probe.status.success();
+        // This fallback uses only privileges already held by the caller. It
+        // still creates the same private PID/mount/proc world; it does not
+        // change cache permissions or inspect the host process namespace.
+        let native_probe = (!user_namespace).then(|| probe(false));
+        let privileged = native_probe
+            .as_ref()
+            .is_some_and(|output| !output.status.success());
+        assert!(
+            !privileged || std::env::var("RCH_TEST_ALLOW_SUDO_UNSHARE").as_deref() == Ok("1"),
+            "a private PID/proc namespace with access to the test binary is required; user probe: {user_probe:?}; native probe: {native_probe:?}"
+        );
+        let output = namespace(privileged, user_namespace)
+            .arg(&executable)
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .output()
             .expect("re-execute the exact native cleanup test in its owned process world");

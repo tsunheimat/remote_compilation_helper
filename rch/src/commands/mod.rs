@@ -8,7 +8,7 @@
 //! - Command handlers are implemented directly in this module
 
 // Sub-modules
-mod agents;
+pub(crate) mod agents;
 mod config;
 mod config_doctor;
 mod config_init;

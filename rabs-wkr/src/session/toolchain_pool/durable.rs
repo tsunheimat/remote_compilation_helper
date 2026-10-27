@@ -1,10 +1,13 @@
 //! Optional restart-persistent compiler inputs. This is not an action cache.
 //!
 //! A private, exclusively locked directory contains atomically published trees.
-//! Names are lookup hints only: every open rehashes the complete selected dataset
-//! and rejects writable files and hardlink aliases. Incomplete captures remain
-//! charged to the configured quota but are never lookup candidates. Nothing in
-//! this store is automatically removed, repaired, or adopted after interruption.
+//! An exclusive directory reservation is charged before capture; an exclusive
+//! empty completion marker publishes only the fully verified, synced tree. This
+//! works on NFS without relying on unsupported RENAME_NOREPLACE. Names and markers
+//! are lookup hints only: every open rehashes the complete selected dataset and
+//! rejects writable files and hardlink aliases. Incomplete captures (including
+//! legacy unmarked entries) remain charged but are never lookup candidates.
+//! Nothing is automatically removed, repaired, or adopted after interruption.
 //!
 //! Set RABS_WORKER_TOOLCHAIN_CACHE_DIR to a dedicated absolute private directory
 //! and RABS_WORKER_TOOLCHAIN_CACHE_BYTES to a nonzero retention budget. Without
@@ -15,20 +18,20 @@
 //! cleanup with the worker stopped. Filesystem I/O is checkpointed but kernel
 //! calls are not claimed interruptible. No state or directories are deleted here.
 
-use super::{MAX_POOL_BYTES, MAX_POOL_ENTRIES, checkpoint, invalid};
-use rabs_cas::materialization::publish_new_directory;
+use super::{MAX_POOL_BYTES, MAX_POOL_ENTRIES, WAIT_SLICE, checkpoint, invalid};
 use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain, open_toolchain,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, TryLockError};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 pub(super) const CONFIG_DIRECTORY: &str = "RABS_WORKER_TOOLCHAIN_CACHE_DIR";
 const LOCK: &str = ".toolchain-cache-v1.lock";
 const OBJECTS: &str = "toolchains-v1";
 const PENDING: &str = ".pending-";
+const COMPLETE: &str = ".complete";
 
 struct CacheLock(File);
 
@@ -51,6 +54,9 @@ pub(super) struct DurableCache {
     max_bytes: u64,
     max_entries: usize,
     writer: Mutex<()>,
+    // A visible marker cannot grant a lease until its publication sync succeeds.
+    // An uncertain publication refuses subsequent loads until the store reopens.
+    publication_confirmed: Mutex<bool>,
 }
 
 struct Catalogue {
@@ -318,6 +324,7 @@ impl DurableCache {
             max_bytes,
             max_entries,
             writer: Mutex::new(()),
+            publication_confirmed: Mutex::new(true),
         };
         cache.catalogue(&|| false)?;
         Ok(cache)
@@ -390,16 +397,52 @@ impl DurableCache {
             Ok(_) => {}
         }
         private_directory(&path)?;
-        let mut children = fs::read_dir(&path)?;
-        let child = children
-            .next()
-            .transpose()?
-            .ok_or_else(|| invalid("persistent toolchain tree missing"))?;
+        let mut confirmed = self.publication(stopped)?;
+        let marker_path = path.join(COMPLETE);
+        let named = match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         require(
-            child.file_name() == "tree" && children.next().transpose()?.is_none(),
-            "persistent toolchain entry has unexpected files",
+            named.is_file() && named.len() == 0,
+            "invalid persistent toolchain completion marker",
         )?;
+        let marker = File::open(&marker_path)?;
+        let opened = marker.metadata()?;
+        require(
+            same_file(&named, &opened) && opened.is_file() && opened.len() == 0,
+            "persistent toolchain completion marker changed while opening",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            require(
+                opened.nlink() == 1
+                    && opened.mode() & 0o7777 == 0o600
+                    && opened.uid() == self.root_handle.metadata()?.uid(),
+                "persistent toolchain completion marker must be private, owned and unaliased",
+            )?;
+        }
+        let mut children = 0;
+        for child in fs::read_dir(&path)? {
+            let child = child?;
+            require(
+                child.file_name() == "tree" || child.file_name() == COMPLETE,
+                "persistent toolchain entry has unexpected files",
+            )?;
+            children += 1;
+        }
+        require(children == 2, "persistent toolchain tree missing")?;
         private_directory(&path.join("tree"))?;
+        // A previous process may have died between marker creation and fsync.
+        // Reconfirm its durability before granting any restart lease. The tree
+        // was synced before the marker could exist, and is still reverified below.
+        *confirmed = false;
+        marker.sync_all()?;
+        File::open(&path)?.sync_all()?;
+        *confirmed = true;
+        drop(confirmed);
         let limits = ToolchainLimits {
             max_bytes: expected.bytes.min(ToolchainLimits::default().max_bytes),
             ..ToolchainLimits::default()
@@ -476,41 +519,108 @@ impl DurableCache {
             expected.files <= limits.max_entries as u64 && expected.bytes <= limits.max_bytes,
             "persistent toolchain capture exceeds dataset bounds",
         )?;
-        let objects = self.root.join(OBJECTS);
-        // The pending name records the COMPLETE reservation before any copy.
-        // Startup charges it without trusting or adopting partial tree bytes.
-        let prefix = format!("{PENDING}{}-", name(expected));
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(&prefix);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(fs::Permissions::from_mode(0o700));
+        let entry = self.root.join(OBJECTS).join(name(expected));
+        // mkdir is an exclusive reservation, including on NFS. Never adopt or
+        // replace an existing incomplete entry; its full identity stays charged.
+        // Sync the parent before copying so the reservation survives interruption.
+        match make_directory(&entry) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                private_directory(&entry)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         }
-        let staging = builder.tempdir_in(&objects)?.keep();
         let result = (|| -> io::Result<Option<PreparedToolchain>> {
             let prepared = capture_toolchain(
                 source,
-                &staging.join("tree"),
+                &entry.join("tree"),
                 Some(expected),
                 &limits,
                 stopped,
             )?;
             prepared.sync(stopped)?;
-            File::open(&staging)?.sync_all()?;
+            File::open(&entry)?.sync_all()?;
             checkpoint(stopped)?;
-            drop(prepared); // Reopen the inventory at its new stable name.
-            publish_new_directory(&staging, &objects.join(name(expected)))?;
+            self.publish(&entry, stopped)?;
             checkpoint(stopped)?;
             let prepared = self
                 .load(expected, stopped)?
                 .ok_or_else(|| invalid("published persistent toolchain disappeared"))?;
             Ok(Some(prepared))
         })();
-        result.map_err(|error| io::Error::new(error.kind(), format!(
-            "persistent toolchain capture failed; inspect retained staging {} and final entry: {error}",
-            staging.display(),
-        )))
+        result.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "persistent toolchain capture failed; inspect retained entry {}: {error}",
+                    entry.display(),
+                ),
+            )
+        })
+    }
+
+    fn publication(&self, stopped: &impl Fn() -> bool) -> io::Result<MutexGuard<'_, bool>> {
+        loop {
+            // Check immediately before every acquisition attempt, including the
+            // one that succeeds after waiting. Never invoke caller callbacks
+            // while holding the publication guard (they may inspect the cache).
+            checkpoint(stopped)?;
+            match self.publication_confirmed.try_lock() {
+                Ok(confirmed) => {
+                    require(
+                        *confirmed,
+                        "persistent toolchain publication durability unconfirmed",
+                    )?;
+                    return Ok(confirmed);
+                }
+                Err(TryLockError::WouldBlock) => std::thread::sleep(WAIT_SLICE),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(invalid("persistent toolchain publication poisoned"));
+                }
+            }
+        }
+    }
+
+    fn publish(&self, entry: &Path, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        self.publish_with_sync(entry, stopped, |marker, directory| {
+            marker.sync_all()?;
+            directory.sync_all()
+        })
+    }
+
+    // The injected operation exercises the real publication/read exclusion and
+    // uncertain-I/O path in tests; production always syncs both real descriptors.
+    fn publish_with_sync(
+        &self,
+        entry: &Path,
+        stopped: &impl Fn() -> bool,
+        sync: impl FnOnce(&File, &File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut confirmed = self.publication(stopped)?;
+        let directory = File::open(entry)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        *confirmed = false;
+        let marker = match options.open(entry.join(COMPLETE)) {
+            Ok(marker) => marker,
+            Err(error) => {
+                // A collision did not publish anything. Other NFS I/O errors
+                // may have created the marker despite an uncertain response.
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    *confirmed = true;
+                }
+                return Err(error);
+            }
+        };
+        sync(&marker, &directory)?;
+        *confirmed = true;
+        Ok(())
     }
 }
 

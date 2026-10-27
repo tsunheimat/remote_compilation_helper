@@ -117,8 +117,8 @@ pub(crate) fn project_topology_local_reason(
         .err()
         .map(|error| {
             format!(
-                "project {} is outside canonical root {} ({error}); set [path_topology] \
-                 canonical_root or RCH_CANONICAL_PROJECT_ROOT to offload it",
+                "project {} fails source topology for worker mirror {} ({error}); set [path_topology] \
+                 source_root (RCH_SOURCE_PROJECT_ROOT) for a separate source mount, or canonical_root for a single namespace",
                 cwd.display(),
                 policy.canonical_root().display()
             )
@@ -1030,6 +1030,9 @@ pub(crate) fn estimate_cores_for_command(
 
             test_default.max(1)
         }
+        // Node concurrency is not Cargo's -j or RUST_TEST_THREADS. Reserve
+        // the test bucket without interpreting flags from another ecosystem.
+        Some(CompilationKind::NodeTest) => test_default.max(1),
         Some(CompilationKind::BunTest) => {
             if let Some(threads) = parse_test_threads(command) {
                 return threads.max(1);

@@ -715,7 +715,9 @@ deadline = time.monotonic() + 1.0
 while time.monotonic() < deadline:
     try:
         connection, _ = server.accept()
-    except TimeoutError:
+    except socket.timeout:
+        # Python 3.9 has a distinct socket timeout class; the TimeoutError
+        # alias starts in 3.10. A quiet poll is not a failed daemon handoff.
         continue
     with connection:
         connection.settimeout(0.2)
@@ -748,8 +750,19 @@ os.rename(pending, done)
             let fixture = directory.path().join("child.py");
             let done = directory.path().join("done");
             std::fs::write(&fixture, READY_CHILD).unwrap();
-            let mut command = start_command("exec python3 -I -S \"$@\"");
-            command.arg(&fixture).arg(&socket).arg(&done).arg(mode);
+            // PATH may contain a Python routing shim whose cache guard remains
+            // alive while Python runs as its grandchild. That is not a daemon
+            // handoff: readiness correctly rejects its mismatched peer PID.
+            // Launch the fixture interpreter itself, not an unrelated wrapper.
+            let python = std::fs::canonicalize("/usr/bin/python3")
+                .expect("readiness fixture requires the system Python interpreter");
+            let mut command = std::process::Command::new(python);
+            command
+                .args(["-I", "-S"])
+                .arg(&fixture)
+                .arg(&socket)
+                .arg(&done)
+                .arg(mode);
             // Even an explicitly piped caller command must not leave pipes
             // connected to a permanent daemon (or kill it when dropped).
             command

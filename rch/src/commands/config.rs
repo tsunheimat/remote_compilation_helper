@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, environment.remote.<KEY>, execution.storage.root, execution.storage.cache_root, execution.storage.tmp_root, execution.storage.home_root, execution.storage.tmp_mode, execution.storage.tmp_retention_hours, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, environment.remote.<KEY>, execution.storage.root, execution.storage.cache_root, execution.storage.tmp_root, execution.storage.home_root, execution.storage.tmp_mode, execution.storage.tmp_retention_hours, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.source_root, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -579,6 +579,17 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         .map(String::from)
         .unwrap_or_else(|| rch_common::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string());
     println!("\n{}", style.highlight("[path_topology]"));
+    if let Some(source_root) = config.path_topology.to_policy().source_root() {
+        println!(
+            "  {} = {}",
+            style.key("source_root"),
+            format_with_source(
+                "path_topology.source_root",
+                &style.value(&format!("\"{}\"", source_root.display())),
+                &value_sources
+            )
+        );
+    }
     println!(
         "  {} = {}",
         style.key("canonical_root"),
@@ -1023,6 +1034,17 @@ pub(super) fn collect_value_sources(
     // never disagrees with the runtime policy (e.g. an explicit
     // `RCH_CANONICAL_PROJECT_ROOT=""` resolves to default at runtime
     // and should display as default here too).
+    push_value_source(
+        &mut values,
+        "path_topology.source_root",
+        config
+            .path_topology
+            .to_policy()
+            .source_root()
+            .map(|root| root.display().to_string())
+            .unwrap_or_default(),
+        sources,
+    );
     let canonical_root_effective = config
         .path_topology
         .canonical_root
@@ -1540,6 +1562,9 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         }
         // GH #38: the canonical project root must be settable via the CLI, not
         // just via a hand-edited [path_topology] TOML block or env vars.
+        "path_topology.source_root" => {
+            config.path_topology.source_root = Some(parse_topology_root(value, key)?);
+        }
         "path_topology.canonical_root" => {
             config.path_topology.canonical_root = Some(parse_topology_root(value, key)?);
         }
@@ -1779,6 +1804,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "output.first_run_complete" | "first_run_complete" => {
             config.output.first_run_complete = defaults.output.first_run_complete;
             config.output.first_run_complete.to_string()
+        }
+        "path_topology.source_root" => {
+            config.path_topology.source_root = None;
+            String::new()
         }
         // GH #38: resetting returns to the compiled-in default root.
         "path_topology.canonical_root" => {
@@ -3287,6 +3316,39 @@ mod tests {
             policy.canonical_root(),
             std::path::Path::new(rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT)
         );
+    }
+
+    #[test]
+    fn source_root_config_round_trips_without_changing_worker_roots() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+        config_set_at(
+            &config_path,
+            "path_topology.source_root",
+            "/mnt/controller",
+            &ctx,
+        )
+        .expect("set source_root");
+        let config: RchConfig =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            config.path_topology.to_policy().source_root(),
+            Some(std::path::Path::new("/mnt/controller"))
+        );
+        assert!(config.path_topology.canonical_root.is_none());
+        assert!(config.path_topology.alias_root.is_none());
+        let before = std::fs::read(&config_path).unwrap();
+        for invalid in ["relative", "   "] {
+            assert!(apply_config_set(&config_path, "path_topology.source_root", invalid).is_err());
+            assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        }
+        config_reset_at(&config_path, "path_topology.source_root", &ctx)
+            .expect("reset source_root");
+        let config: RchConfig =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(config.path_topology.to_policy().source_root().is_none());
     }
 
     /// GH #38: relative and empty roots are rejected with actionable errors.

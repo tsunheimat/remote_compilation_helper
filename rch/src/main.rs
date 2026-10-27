@@ -16,8 +16,11 @@ mod doctor;
 mod doctor_webhooks;
 pub mod error;
 pub mod fleet;
+#[cfg(unix)]
+mod guarded_exec;
 #[cfg_attr(not(unix), path = "hook_windows.rs")]
 mod hook;
+mod invocation_cli;
 pub mod local_builds;
 mod process_output;
 mod self_healing_overrides;
@@ -218,6 +221,41 @@ struct Cli {
     ///   - feature flags and their status
     #[arg(long)]
     capabilities: bool,
+}
+
+/// Options for explicit invocation semantics, separate from compiler admission.
+/// Keep their storage out of the top-level command enum: ordinary hook and CLI
+/// commands should not carry the full invocation payload on their stack.
+#[derive(clap::Args)]
+#[group(multiple = true)]
+struct ExecInvocationArgs {
+    /// General verification routed by the semantic hook or tool shim.
+    #[arg(long)]
+    verification: bool,
+    /// Execute from this controller working directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Explicit environment assignment (repeatable KEY=VALUE).
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    exec_env: Vec<String>,
+    /// Forward a named shell-prefix environment variable without re-expanding it.
+    #[arg(long, value_name = "KEY")]
+    forward_env: Vec<String>,
+    /// Explicit raw shell source; never inferred from a single argv element.
+    #[arg(long, conflicts_with = "command")]
+    shell: Option<String>,
+    /// Per-invocation duration (e.g. 30s, 10m or 2h).
+    #[arg(long, value_parser = invocation_cli::parse_timeout)]
+    timeout: Option<u64>,
+    /// Request terminal/PTY behavior rather than separate byte streams.
+    #[arg(long)]
+    interactive: bool,
+    /// Atomically write the terminal result without consuming workload stdout.
+    #[arg(long)]
+    json_result: Option<PathBuf>,
+    /// Workspace backend: mirror (typed artifacts) or verified shared paths.
+    #[arg(long, value_parser = ["mirror", "shared"])]
+    workspace: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -613,6 +651,8 @@ USAGE:
     This allows the hook to return immediately (<50ms) while the actual
     compilation runs as a normal command invocation."#)]
     Exec {
+        #[command(flatten)]
+        invocation_args: Box<ExecInvocationArgs>,
         /// Git commit used as the clean source-tree baseline
         #[arg(long, short = 'b', requires = "clean_overlay")]
         base: Option<String>,
@@ -676,9 +716,20 @@ USAGE:
         /// Refuses local execution or a different worker when unavailable.
         #[arg(long, value_name = "ID", value_parser = parse_exec_worker)]
         worker: Option<rch_common::WorkerId>,
-        /// The compilation command to execute remotely
-        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        /// Literal command argv to execute (use --shell for shell syntax).
+        #[arg(required_unless_present = "shell", num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
+    },
+
+    /// Print environment activation without changing the current shell.
+    Env {
+        #[arg(long, default_value = "sh", value_parser = ["sh", "bash", "zsh", "fish"])]
+        shell: String,
+    },
+    /// Run a CI command with RCH tool interception enabled for nested children.
+    Ci {
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        command: Vec<OsString>,
     },
 
     /// Install and manage the Claude Code PreToolUse hook
@@ -1744,6 +1795,19 @@ enum ShimAction {
         /// otherwise build locally. Wrapping is reversible via `shim uninstall`.
         #[arg(long)]
         no_toolchains: bool,
+        /// Additional tool shims, comma-separated; use all for the supported set.
+        #[arg(long, value_delimiter = ',')]
+        tools: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Dispatch one intercepted tool without losing argv boundaries.
+    #[command(hide = true)]
+    Dispatch {
+        #[arg(long)]
+        tool: String,
+        #[arg(num_args = 0.., trailing_var_arg = true)]
+        args: Vec<OsString>,
     },
     /// Show shim install state, version, PATH order, and local builds
     Status,
@@ -1753,6 +1817,20 @@ enum ShimAction {
 
 #[derive(Subcommand)]
 enum AgentsAction {
+    /// Replace exactly owned legacy remote-test handlers, preserving other hooks.
+    Migrate {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restore the owned entries saved by an explicit migration.
+    Rollback {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List detected AI coding agents
     List {
         /// Show all agents, including not installed
@@ -2057,6 +2135,10 @@ fn reliability_metrics_requested(cli: &Cli) -> bool {
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
 fn main() {
+    #[cfg(unix)]
+    if let Some(code) = guarded_exec::subreaper_entrypoint() {
+        std::process::exit(code);
+    }
     // Every agent Bash command runs this binary as a hook. Answer the common
     // pass-through before building the CLI or the runtime (bd-1nhd).
     if hook::try_fast_passthrough() {
@@ -2118,6 +2200,13 @@ async fn async_main() {
     let wants_machine_output = top_level_machine_output_requested(&args);
 
     if let Err(error) = run(args).await {
+        #[cfg(unix)]
+        if error.downcast_ref::<hook::ExecErrorReported>().is_some() {
+            if !wants_machine_output {
+                eprintln!("Error: {error:#}");
+            }
+            std::process::exit(1);
+        }
         if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
             std::process::exit(exit.0);
         }
@@ -2189,8 +2278,13 @@ async fn run(args: Vec<OsString>) -> Result<()> {
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    if args.iter().any(|a| a == "--help-json") {
-        let subcommand_path: Vec<String> = args
+    // Workload arguments after `--` belong to the tool, not RCH's early flags.
+    let control_args = &args[..args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len())];
+    if control_args.iter().any(|a| a == "--help-json") {
+        let subcommand_path: Vec<String> = control_args
             .iter()
             .skip_while(|a| a.as_str() != "--help-json")
             .skip(1)
@@ -2201,7 +2295,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
     }
 
     // Early check for --capabilities (standalone flag, no subcommand context needed)
-    if args.iter().any(|a| a == "--capabilities") {
+    if control_args.iter().any(|a| a == "--capabilities") {
         return handle_capabilities();
     }
 
@@ -2443,6 +2537,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 command,
             } => handle_admit(job, require_tool, command, &ctx).await,
             Commands::Exec {
+                invocation_args,
                 base,
                 dependency_base,
                 clean_overlay,
@@ -2455,6 +2550,48 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 worker,
                 command,
             } => {
+                let ExecInvocationArgs {
+                    verification,
+                    cwd,
+                    exec_env,
+                    forward_env,
+                    shell,
+                    timeout,
+                    interactive,
+                    json_result,
+                    workspace,
+                } = *invocation_args;
+                let error_result_path = json_result.clone();
+                let invocation = invocation_cli::options(
+                    verification,
+                    cwd,
+                    exec_env,
+                    forward_env,
+                    shell,
+                    timeout,
+                    interactive,
+                    json_result,
+                    workspace,
+                    &command,
+                );
+                let invocation = match invocation {
+                    Ok(value) => value,
+                    Err(error) => {
+                        #[cfg(unix)]
+                        if let Some(path) = error_result_path {
+                            guarded_exec::write_json_result(
+                                &path,
+                                &serde_json::json!({
+                                    "api_version": "1.0", "outcome": "refused",
+                                    "location": "controller", "error_code": "RCH-E001",
+                                    "remote_exit_code": null, "worker_id": null,
+                                    "fallback_reason": format!("{error:#}")
+                                }),
+                            )?;
+                        }
+                        return Err(error);
+                    }
+                };
                 hook::run_exec(
                     base,
                     dependency_base,
@@ -2467,12 +2604,18 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     require_tool,
                     worker,
                     command,
+                    invocation,
                     &ctx,
                 )
                 .await
             }
+            Commands::Env { shell } => {
+                print!("{}", commands::shim::activation_script(&shell)?);
+                Ok(())
+            }
+            Commands::Ci { command } => invocation_cli::run_ci(command),
             Commands::Hook { action } => handle_hook(action, &ctx).await,
-            Commands::Shim { action } => handle_shim(action, &ctx),
+            Commands::Shim { action } => handle_shim(action, &ctx).await,
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),
             Commands::Doctor {
@@ -2603,7 +2746,7 @@ fn top_level_machine_output_requested(args: &[OsString]) -> bool {
         return true;
     }
 
-    for arg in args.iter().skip(1) {
+    for arg in args.iter().skip(1).take_while(|arg| *arg != "--") {
         let Some(arg) = arg.to_str() else {
             continue;
         };
@@ -5920,12 +6063,29 @@ async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
-fn handle_shim(action: ShimAction, ctx: &OutputContext) -> Result<()> {
+async fn handle_shim(action: ShimAction, ctx: &OutputContext) -> Result<()> {
     match action {
         ShimAction::Install {
             allow_local_fallback,
             no_toolchains,
-        } => commands::shim_install(!allow_local_fallback, !no_toolchains, ctx),
+            tools,
+            dry_run,
+        } => {
+            if tools.is_empty() {
+                if dry_run {
+                    println!(
+                        "Would install Cargo shims; toolchain wrapping: {}",
+                        !no_toolchains
+                    );
+                    Ok(())
+                } else {
+                    commands::shim_install(!allow_local_fallback, !no_toolchains, ctx)
+                }
+            } else {
+                commands::shim::install_tools(&tools, dry_run, ctx)
+            }
+        }
+        ShimAction::Dispatch { tool, args } => invocation_cli::dispatch_tool(tool, args).await,
         ShimAction::Status => commands::shim_status(ctx),
         ShimAction::Uninstall => commands::shim_uninstall(ctx),
     }
@@ -5933,6 +6093,12 @@ fn handle_shim(action: ShimAction, ctx: &OutputContext) -> Result<()> {
 
 async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> {
     match action {
+        AgentsAction::Migrate { agent, dry_run } => {
+            commands::agents::migrate(&agent, dry_run, ctx)?;
+        }
+        AgentsAction::Rollback { agent, dry_run } => {
+            commands::agents::rollback(&agent, dry_run, ctx)?;
+        }
         AgentsAction::List { all } => {
             commands::agents_list(all, ctx)?;
         }
@@ -7153,6 +7319,7 @@ mod tests {
                 require_tool: _,
                 worker: _,
                 command,
+                ..
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
                 assert!(clean_overlay);
@@ -7168,6 +7335,182 @@ mod tests {
             }
             _ => fail_expected("Expected clean-overlay exec command"),
         }
+    }
+
+    #[test]
+    fn workload_machine_flags_do_not_change_controller_output() {
+        let _guard = test_guard!();
+        for flag in [
+            "--json",
+            "--help-json",
+            "--capabilities",
+            "--format=json",
+            "-j",
+        ] {
+            let args = ["rch", "exec", "--verification", "--", "tool", flag].map(OsString::from);
+            assert!(!top_level_machine_output_requested(&args), "{flag}");
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(!cli.json);
+            match cli.command {
+                Some(Commands::Exec { command, .. }) => {
+                    assert_eq!(command, ["tool", flag]);
+                }
+                _ => fail_expected("Expected workload arguments"),
+            }
+        }
+        assert!(top_level_machine_output_requested(
+            &["rch", "--json", "exec", "--", "true"].map(OsString::from)
+        ));
+    }
+
+    #[test]
+    fn cli_exec_flattened_invocation_options_preserve_compiler_and_literal_argv() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--verification",
+            "--cwd",
+            "/shared/project",
+            "--env",
+            "EMPTY=",
+            "--env",
+            "LITERAL=$(not-executed)",
+            "--forward-env",
+            "PREFIX",
+            "--timeout",
+            "2m",
+            "--interactive",
+            "--json-result",
+            "result.json",
+            "--workspace",
+            "shared",
+            "--worker",
+            "test-worker",
+            "--require-tool",
+            "python3",
+            "--",
+            "python3",
+            "-m",
+            "pytest",
+            "two words",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Commands::Exec {
+            invocation_args,
+            worker,
+            require_tool,
+            command,
+            job,
+            clean_overlay,
+            ..
+        }) = cli.command
+        else {
+            fail_expected("Expected explicit invocation options");
+            return;
+        };
+        assert!(invocation_args.verification && invocation_args.interactive);
+        assert_eq!(invocation_args.cwd, Some(PathBuf::from("/shared/project")));
+        assert_eq!(
+            invocation_args.exec_env,
+            ["EMPTY=", "LITERAL=$(not-executed)"]
+        );
+        assert_eq!(invocation_args.forward_env, ["PREFIX"]);
+        assert_eq!(invocation_args.timeout, Some(120));
+        assert_eq!(
+            invocation_args.json_result,
+            Some(PathBuf::from("result.json"))
+        );
+        assert_eq!(invocation_args.workspace.as_deref(), Some("shared"));
+        assert!(invocation_args.shell.is_none());
+        assert_eq!(worker, Some(rch_common::WorkerId::new("test-worker")));
+        assert_eq!(require_tool, ["python3"]);
+        assert_eq!(command, ["python3", "-m", "pytest", "two words", "--json"]);
+        assert!(!job && !clean_overlay && !cli.json);
+
+        let plain = Cli::try_parse_from(["rch", "exec", "--", "cargo", "test"]).unwrap();
+        let Some(Commands::Exec {
+            invocation_args,
+            command,
+            ..
+        }) = plain.command
+        else {
+            fail_expected("Expected ordinary compiler invocation");
+            return;
+        };
+        assert!(!invocation_args.verification && !invocation_args.interactive);
+        assert!(invocation_args.cwd.is_none() && invocation_args.workspace.is_none());
+        assert!(invocation_args.exec_env.is_empty() && invocation_args.forward_env.is_empty());
+        assert!(invocation_args.shell.is_none() && invocation_args.timeout.is_none());
+        assert!(invocation_args.json_result.is_none());
+        assert_eq!(command, ["cargo", "test"]);
+    }
+
+    #[test]
+    fn cli_parses_explicit_invocation_contract() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--verification",
+            "--cwd",
+            "/shared/project",
+            "--env",
+            "A=a=b",
+            "--forward-env",
+            "PREFIX",
+            "--timeout",
+            "2m",
+            "--json-result",
+            "result.json",
+            "--shell",
+            "printf '%s' \"$A\"",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                invocation_args,
+                command,
+                ..
+            }) => {
+                let ExecInvocationArgs {
+                    verification,
+                    cwd,
+                    exec_env,
+                    forward_env,
+                    timeout,
+                    json_result,
+                    shell,
+                    ..
+                } = *invocation_args;
+                assert!(verification);
+                assert_eq!(cwd, Some(PathBuf::from("/shared/project")));
+                assert_eq!(exec_env, ["A=a=b"]);
+                assert_eq!(forward_env, ["PREFIX"]);
+                assert_eq!(timeout, Some(120));
+                assert_eq!(json_result, Some(PathBuf::from("result.json")));
+                assert_eq!(shell.as_deref(), Some("printf '%s' \"$A\""));
+                assert!(command.is_empty());
+            }
+            _ => fail_expected("Expected explicit invocation"),
+        }
+        assert!(Cli::try_parse_from(["rch", "exec", "--shell", "true", "--", "false"]).is_err());
+        assert!(Cli::try_parse_from(["rch", "exec", "--timeout", "0", "--", "true"]).is_err());
+        assert!(
+            Cli::try_parse_from(["rch", "shim", "install", "--tools", "all", "--dry-run"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rch",
+                "agents",
+                "migrate",
+                "--agent",
+                "codex-cli",
+                "--dry-run"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -7200,6 +7543,7 @@ mod tests {
                 require_tool: _,
                 worker: _,
                 command,
+                ..
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
                 assert_eq!(dependency_base, vec!["../dep=HEAD"]);

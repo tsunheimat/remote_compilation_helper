@@ -10,6 +10,30 @@
 
 set -euo pipefail
 
+# Package already-built candidate binaries without building, activating hooks,
+# installing anything, or deleting staging files. This is not deployment proof.
+# Usage: --package-candidate /abs/rch /abs/rchd /abs/rch-wkr /existing/output-parent
+if [[ "${1:-}" == "--package-candidate" ]]; then
+    [[ $# -eq 5 ]] || { printf 'Expected three absolute binary paths and an existing output parent\n' >&2; exit 2; }
+    for binary in "$2" "$3" "$4"; do
+        [[ "$binary" == /* && -f "$binary" && -x "$binary" ]] || {
+            printf 'Not an executable candidate binary: %s\n' "$binary" >&2; exit 2;
+        }
+    done
+    [[ "$5" == /* && -d "$5" ]] || { printf 'Output parent must be an existing absolute directory\n' >&2; exit 2; }
+    package_dir=$(mktemp -d "$5/rch-candidate.XXXXXXXX")
+    mkdir "$package_dir/bin"
+    install -m 755 "$2" "$package_dir/bin/rch"
+    install -m 755 "$3" "$package_dir/bin/rchd"
+    install -m 755 "$4" "$package_dir/bin/rch-wkr"
+    # Python hook/semantic assets use include_str!: the compiled CLI carries
+    # them, so there is no runtime checkout dependency or loose helper to omit.
+    tar -czf "$package_dir/rch-candidate.tar.gz" -C "$package_dir/bin" rch rchd rch-wkr
+    (cd "$package_dir" && sha256sum rch-candidate.tar.gz > rch-candidate.tar.gz.sha256)
+    printf 'Candidate package (unsigned, not live acceptance): %s/rch-candidate.tar.gz\n' "$package_dir"
+    exit 0
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 export PROJECT_ROOT
@@ -165,6 +189,17 @@ create_launchd_stubs "$INSTALLER_SERVICE_STUBS"
 export PATH="$INSTALLER_SERVICE_STUBS:$PATH"
 export RCH_RUNTIME_DIR="$TEST_DIR/runtime"
 
+# Actual digest of fixture bytes; this is checksum coverage, not signer proof.
+write_fixture_checksum() {
+    local tarball="$1" digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "$tarball")
+    else
+        digest=$(shasum -a 256 "$tarball")
+    fi
+    printf '%s  %s\n' "${digest%% *}" "${tarball##*/}" > "$tarball.sha256"
+}
+
 create_prompt_tarball() {
     local name="$1"
     local pkg_dir="$TEST_DIR/${name}_pkg"
@@ -221,6 +256,7 @@ EOF
     chmod +x "$pkg_dir/rch-wkr"
 
     tar -czf "$tarball" -C "$pkg_dir" rch rchd rch-wkr
+    write_fixture_checksum "$tarball"
     echo "$tarball"
 }
 
@@ -283,7 +319,7 @@ run_install_case() {
         if command -v script >/dev/null 2>&1; then
             local cmd
             cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 RCH_NO_RC=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$case_path\""
-            cmd="$cmd HOME=\"$home_dir\""
+            cmd="$cmd HOME=\"$home_dir\" VERSION=0.1.0-test RCH_SIGNATURE_POLICY=optional"
             cmd="$cmd \"$PROJECT_ROOT/install.sh\" --offline \"$tarball\" $extra_args"
             if [[ "$(uname -s)" == Darwin ]]; then
                 output=$(printf '%s' "$input_data" | script -q /dev/null /bin/bash -c "$cmd" 2>&1) || status=$?
@@ -306,6 +342,8 @@ run_install_case() {
             RCH_NO_HOOK=1 \
             RCH_NO_RC=1 \
             NO_GUM=1 \
+            VERSION=0.1.0-test \
+            RCH_SIGNATURE_POLICY=optional \
             "$PROJECT_ROOT/install.sh" --offline "$tarball" $extra_args 2>&1) || status=$?
     fi
 
@@ -436,6 +474,7 @@ EOF
     # Create tarball (all three binaries — the installer requires rch-wkr)
     cp "$pkg_dir/rch" "$pkg_dir/rch-wkr"
     tar -czf "$TEST_DIR/rch-test.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
+    write_fixture_checksum "$TEST_DIR/rch-test.tar.gz"
 
     # Run offline install (sandboxed HOME + RCH_NO_RC: never touch the
     # tester's real shell rc — see run_install_case).
@@ -449,6 +488,8 @@ EOF
              RCH_NO_HOOK=1 \
              RCH_NO_RC=1 \
              NO_GUM=1 \
+             VERSION=0.1.0-test \
+             RCH_SIGNATURE_POLICY=optional \
              "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-test.tar.gz" --yes 2>&1) || status=$?
 
     if [[ "$status" -ne 0 ]]; then
@@ -660,6 +701,7 @@ EOF
 
     cp "$pkg_dir/rchd" "$pkg_dir/rch-wkr"
     tar -czf "$TEST_DIR/rch-easymode.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
+    write_fixture_checksum "$TEST_DIR/rch-easymode.tar.gz"
 
     # Run with easy mode
     local output status=0
@@ -670,7 +712,7 @@ EOF
              RCH_NO_HOOK=1 \
              RCH_NO_RC=1 \
              NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-easymode.tar.gz" --easy-mode --yes 2>&1) || status=$?
+             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-easymode.tar.gz" --version 0.1.0-test --easy-mode --yes 2>&1) || status=$?
     if [[ "$status" -ne 0 ]]; then
         log "Installer output: $output"
         fail "Easy-mode installer exited $status"
@@ -847,6 +889,7 @@ EOF
     cp "$pkg_dir/rch" "$pkg_dir/rch-wkr"
 
     tar -czf "$TEST_DIR/rch-config.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
+    write_fixture_checksum "$TEST_DIR/rch-config.tar.gz"
 
     # Install (sandboxed HOME + RCH_NO_RC: never touch the tester's real
     # shell rc — see run_install_case).
@@ -860,7 +903,7 @@ EOF
              RCH_NO_HOOK=1 \
              RCH_NO_RC=1 \
              NO_GUM=1 \
-             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-config.tar.gz" --yes 2>&1) || status=$?
+             "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-config.tar.gz" --version 0.1.0-test --yes 2>&1) || status=$?
     if [[ "$status" != 0 ]]; then
         log "Installer output: $output"
         fail "Config-generation installer exited $status"

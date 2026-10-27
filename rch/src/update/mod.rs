@@ -153,8 +153,8 @@ pub async fn run_update(
 }
 
 /// Authorize installation from completed cryptographic verification results,
-/// never from the presence of signature metadata alone. Both supported
-/// verifiers (pinned minisign or identity-bound Sigstore) report `Some(true)`.
+/// never from the presence of signature metadata alone. The fork's exact-tag,
+/// issuer-bound Sigstore verification reports `Some(true)`.
 /// An explicit operator override may permit absent verification, but a known
 /// failed signature remains fatal. The download path already refuses invalid
 /// signatures and mismatched checksums before it can construct these results.
@@ -179,8 +179,8 @@ fn require_update_verification(
             return Err(UpdateError::SignatureVerificationFailed(format!(
                 "refusing to install {asset} without an authenticated signature; \
                  a matching checksum alone does not prove release authenticity. \
-                 Use a release with a valid pinned-key .minisig or a verified \
-                 Sigstore bundle. --skip-verify is an explicit insecure override"
+                 Use a fork release with a verified exact-tag Sigstore bundle. \
+                 --skip-verify is an explicit insecure override"
             )));
         }
     }

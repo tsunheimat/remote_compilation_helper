@@ -25,7 +25,7 @@ pub async fn verify_checksum(
 pub async fn verify_checksum_and_signature(
     file_path: &std::path::Path,
     expected: &str,
-    signature_bundle: Option<&std::path::Path>,
+    signature_bundle: Option<(&std::path::Path, &str)>,
 ) -> Result<VerificationResult, UpdateError> {
     let mut file = tokio::fs::File::open(file_path)
         .await
@@ -63,8 +63,8 @@ pub async fn verify_checksum_and_signature(
         });
     }
 
-    let signature_valid = if let Some(bundle_path) = signature_bundle {
-        Some(verify_signature(file_path, bundle_path).await?)
+    let signature_valid = if let Some((bundle_path, version)) = signature_bundle {
+        Some(verify_signature(file_path, bundle_path, version).await?)
     } else {
         None
     };
@@ -127,16 +127,29 @@ const GITHUB_ACTIONS_OIDC_ISSUER: &str = "https://token.actions.githubuserconten
 ///
 /// # Anchoring
 ///
-/// Cosign's `--certificate-identity-regexp` uses Go's `regexp.MatchString`
-/// which performs *substring* matching. Without explicit `^` and `$`
-/// anchors, a malicious certificate whose SAN merely contains our
-/// workflow URL as a substring (for example, nested inside another URL)
-/// would also satisfy the check. We anchor both ends and escape the `.`
-/// metacharacters in `github.com` / `.github` / `.yml` so the pattern
-/// matches the real identity shape only:
+/// Validate the constructed identity against the permitted fork/tag shape.
+/// Both ends are anchored and dots escaped to reject substring/lookalike URLs.
+/// Cosign receives the resulting identity with `--certificate-identity` (exact
+/// equality), not a wildcard regex, so another release tag cannot authorize
+/// the requested release:
 ///
-///     ^https://github\.com/Dicklesworthstone/remote_compilation_helper/\.github/workflows/release\.yml@refs/.*$
-const RCH_RELEASE_IDENTITY_PATTERN: &str = r"^https://github\.com/Dicklesworthstone/remote_compilation_helper/\.github/workflows/release\.yml@refs/.*$";
+///     ^https://github\.com/tsunheimat/remote_compilation_helper/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$
+const RCH_RELEASE_IDENTITY_PATTERN: &str = r"^https://github\.com/tsunheimat/remote_compilation_helper/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$";
+
+fn release_identity(version: &str) -> Result<String, UpdateError> {
+    let identity = format!(
+        "https://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v{}",
+        version.strip_prefix('v').unwrap_or(version)
+    );
+    let pattern =
+        regex::Regex::new(RCH_RELEASE_IDENTITY_PATTERN).expect("release identity pattern is valid");
+    if !pattern.is_match(&identity) {
+        return Err(UpdateError::SignatureVerificationFailed(
+            "invalid release tag for signature identity".to_string(),
+        ));
+    }
+    Ok(identity)
+}
 
 /// Verify Sigstore/cosign signature bundle for a file.
 ///
@@ -145,19 +158,28 @@ const RCH_RELEASE_IDENTITY_PATTERN: &str = r"^https://github\.com/Dicklesworthst
 /// This verifies that binaries were signed by the official RCH GitHub Actions
 /// release workflow. It checks:
 /// - OIDC issuer is GitHub Actions (`https://token.actions.githubusercontent.com`)
-/// - Certificate identity matches the release workflow URL pattern
+/// - Certificate identity equals this fork's release workflow at the requested tag
 ///
 /// Wildcard patterns (`.*`) are intentionally NOT used as they would accept
 /// any sigstore signature, defeating supply chain security.
 pub(crate) async fn verify_signature(
     file_path: &std::path::Path,
     bundle_path: &std::path::Path,
+    version: &str,
 ) -> Result<bool, UpdateError> {
-    let executable = which("cosign").map_err(|_| {
+    let cosign = which("cosign").map_err(|_| {
         UpdateError::SignatureVerificationFailed("cosign not found in PATH".to_string())
     })?;
+    verify_signature_with_cosign(&cosign, file_path, bundle_path, version).await
+}
 
-    let command = cosign_command(&executable, file_path, bundle_path);
+async fn verify_signature_with_cosign(
+    cosign: &std::path::Path,
+    file_path: &std::path::Path,
+    bundle_path: &std::path::Path,
+    version: &str,
+) -> Result<bool, UpdateError> {
+    let command = cosign_command(cosign, file_path, bundle_path, version)?;
     let output =
         capture_verifier_output(command, std::time::Duration::from_secs(120), 1024 * 1024).await?;
 
@@ -182,20 +204,22 @@ fn cosign_command(
     executable: &std::path::Path,
     file_path: &std::path::Path,
     bundle_path: &std::path::Path,
-) -> Command {
-    // Resolve PATH exactly once. Paths and policy are separate arguments,
-    // never a shell command or options obtained from the signature bundle.
+    version: &str,
+) -> Result<Command, UpdateError> {
+    // Resolve PATH exactly once. Paths and the exact fork/tag identity are
+    // separate arguments, never shell source or options from a bundle.
+    let identity = release_identity(version)?;
     let mut command = Command::new(executable);
     command
         .arg("verify-blob")
         .arg("--bundle")
         .arg(bundle_path)
-        .arg("--certificate-identity-regexp")
-        .arg(RCH_RELEASE_IDENTITY_PATTERN)
+        .arg("--certificate-identity")
+        .arg(identity)
         .arg("--certificate-oidc-issuer")
         .arg(GITHUB_ACTIONS_OIDC_ISSUER)
         .arg(file_path);
-    command
+    Ok(command)
 }
 
 async fn read_verifier_output(
@@ -232,7 +256,6 @@ async fn capture_verifier_output(
     output_limit: usize,
 ) -> Result<std::process::Output, UpdateError> {
     use std::process::Stdio;
-
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -248,7 +271,6 @@ async fn capture_verifier_output(
     let stderr = child.stderr.take().ok_or_else(|| {
         UpdateError::SignatureVerificationFailed("missing verifier stderr pipe".to_owned())
     })?;
-
     let result = tokio::time::timeout(budget, async {
         let (stdout, stderr, status) = tokio::try_join!(
             read_verifier_output(stdout, output_limit),
@@ -267,74 +289,13 @@ async fn capture_verifier_output(
         Ok(Err(error)) => format!("cosign output collection failed: {error}"),
         Err(_) => format!("cosign verification timed out after {budget:?}"),
     };
-
-    // The exchange future has dropped its pipe readers and child borrow.
-    // Reap the local child explicitly on failure, with a separate small bound;
-    // never turn failure to kill or reap into successful verification.
+    // Dropped readers and child borrow cannot leave an unbounded cleanup wait.
     match tokio::time::timeout(std::time::Duration::from_secs(2), child.kill()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => failure.push_str(&format!("; verifier teardown failed: {error}")),
         Err(_) => failure.push_str("; verifier teardown timed out"),
     }
     Err(UpdateError::SignatureVerificationFailed(failure))
-}
-
-/// Public key dsr signs every rch release archive with (minisign key id
-/// 69B3955C8D2E62A8). A checksum from the same release only detects
-/// corruption; this signature is what makes an update authentic (bd-oxxnk).
-pub(crate) const RELEASE_MINISIGN_PUBLIC_KEY: &str =
-    "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO";
-
-/// Verify `archive` against a `.minisig` document with the pinned release key.
-pub(crate) fn verify_minisign(
-    archive: &std::path::Path,
-    signature_text: &str,
-) -> Result<(), UpdateError> {
-    verify_minisign_with_key(archive, signature_text, RELEASE_MINISIGN_PUBLIC_KEY)
-}
-
-fn verify_minisign_with_key(
-    archive: &std::path::Path,
-    signature_text: &str,
-    public_key: &str,
-) -> Result<(), UpdateError> {
-    let fail = |detail: String| UpdateError::SignatureVerificationFailed(detail);
-    let key = minisign_verify::PublicKey::from_base64(public_key)
-        .map_err(|e| fail(format!("invalid pinned minisign key: {e}")))?;
-    let signature = minisign_verify::Signature::decode(signature_text)
-        .map_err(|e| fail(format!("malformed .minisig: {e}")))?;
-    let mut file = std::fs::File::open(archive)
-        .map_err(|e| fail(format!("cannot read {}: {e}", archive.display())))?;
-    verify_minisign_reader(&mut file, &key, &signature)
-}
-
-const VERIFICATION_CHUNK_BYTES: usize = 64 * 1024;
-
-/// Verify the entire archive without allocating an archive-sized buffer.
-/// Streaming retains the existing prehashed-only policy, checks the key ID,
-/// and verifies BOTH the payload signature and authenticated comment. A read
-/// error, including one after the last payload byte, is never an EOF verdict.
-fn verify_minisign_reader(
-    reader: &mut impl std::io::Read,
-    key: &minisign_verify::PublicKey,
-    signature: &minisign_verify::Signature,
-) -> Result<(), UpdateError> {
-    let fail = |detail: String| UpdateError::SignatureVerificationFailed(detail);
-    let mut verifier = key
-        .verify_stream(signature)
-        .map_err(|e| fail(format!("minisign verification failed: {e}")))?;
-    let mut buffer = vec![0u8; VERIFICATION_CHUNK_BYTES];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(length) => verifier.update(&buffer[..length]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(fail(format!("cannot read signed archive: {error}"))),
-        }
-    }
-    verifier
-        .finalize()
-        .map_err(|e| fail(format!("minisign verification failed: {e}")))
 }
 
 /// Verify a byte slice against expected checksum.
@@ -353,205 +314,6 @@ pub fn verify_sha256_bytes(content: &[u8], expected: &str) -> Result<(), UpdateE
             expected: expected.to_string(),
             actual,
         })
-    }
-}
-
-#[cfg(test)]
-mod minisign_tests {
-    use super::*;
-
-    // Fixture made once with `minisign -G -W` + `minisign -S` (throwaway key).
-    const TEST_KEY: &str = "RWTZPaZ0gaEhqMa/pPZEdaALWkxxAm/EtQzB6egPldD4Uh1cCRlw/b0w";
-    const PAYLOAD: &[u8] = b"rch minisign test payload v1\n";
-    const SIGNATURE: &str = "untrusted comment: signature from minisign secret key\n\
-RUTZPaZ0gaEhqDSXunnChY49+8G9WeMdP7wwnCG9s382LwYf7h09hfwypAG0pKwYrhcX+N1Ujyzv1r4ZpRClO4To6jTL1DR1ewo=\n\
-trusted comment: rch test fixture\n\
-xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxpswMpMCw==\n";
-
-    fn archive(bytes: &[u8]) -> tempfile::NamedTempFile {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), bytes).unwrap();
-        file
-    }
-
-    #[test]
-    fn genuine_signature_verifies() {
-        let file = archive(PAYLOAD);
-        verify_minisign_with_key(file.path(), SIGNATURE, TEST_KEY).unwrap();
-    }
-
-    #[test]
-    fn tampered_archive_is_refused_even_though_it_hashes_cleanly() {
-        // An attacker who replaces the archive can also replace the .sha256;
-        // the signature is what they cannot forge.
-        let file = archive(b"rch minisign test payload v2\n");
-        let error = verify_minisign_with_key(file.path(), SIGNATURE, TEST_KEY).unwrap_err();
-        assert!(
-            error.to_string().contains("minisign verification failed"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn signature_from_another_key_is_refused() {
-        let file = archive(PAYLOAD);
-        assert!(verify_minisign(file.path(), SIGNATURE).is_err());
-    }
-
-    #[test]
-    fn malformed_signature_is_refused() {
-        let file = archive(PAYLOAD);
-        let error = verify_minisign_with_key(file.path(), "not a minisig", TEST_KEY).unwrap_err();
-        assert!(error.to_string().contains("malformed .minisig"), "{error}");
-    }
-
-    #[test]
-    fn pinned_release_key_parses() {
-        minisign_verify::PublicKey::from_base64(RELEASE_MINISIGN_PUBLIC_KEY).unwrap();
-    }
-
-    struct Chunked<'a> {
-        remaining: &'a [u8],
-        chunk: usize,
-        interrupt: bool,
-        fail_at_eof: bool,
-        reads: usize,
-    }
-
-    impl std::io::Read for Chunked<'_> {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            assert!(buffer.len() <= VERIFICATION_CHUNK_BYTES);
-            self.reads += 1;
-            if self.interrupt {
-                self.interrupt = false;
-                return Err(std::io::ErrorKind::Interrupted.into());
-            }
-            if self.remaining.is_empty() && self.fail_at_eof {
-                return Err(std::io::Error::other("injected read failure"));
-            }
-            let length = self.remaining.len().min(self.chunk).min(buffer.len());
-            buffer[..length].copy_from_slice(&self.remaining[..length]);
-            self.remaining = &self.remaining[length..];
-            Ok(length)
-        }
-    }
-
-    #[test]
-    fn minisign_stream_accepts_short_reads_and_interrupted_io() {
-        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
-        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
-        for chunk in 1..=PAYLOAD.len() + 1 {
-            let mut reader = Chunked {
-                remaining: PAYLOAD,
-                chunk,
-                interrupt: true,
-                fail_at_eof: false,
-                reads: 0,
-            };
-            verify_minisign_reader(&mut reader, &key, &signature).unwrap();
-            assert!(reader.remaining.is_empty());
-            assert!(
-                reader.reads >= 3,
-                "interruption, payload and EOF are all required"
-            );
-        }
-    }
-
-    #[test]
-    fn minisign_stream_never_turns_read_failure_into_verified_eof() {
-        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
-        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
-        for data in [&PAYLOAD[..0], &PAYLOAD[..5], PAYLOAD] {
-            let mut reader = Chunked {
-                remaining: data,
-                chunk: 3,
-                interrupt: false,
-                fail_at_eof: true,
-                reads: 0,
-            };
-            let error = verify_minisign_reader(&mut reader, &key, &signature).unwrap_err();
-            assert!(
-                error.to_string().contains("injected read failure"),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn minisign_stream_checks_truncation_appended_bytes_and_trusted_comment() {
-        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
-        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
-        assert!(
-            verify_minisign_reader(&mut &PAYLOAD[..PAYLOAD.len() - 1], &key, &signature).is_err()
-        );
-        let mut appended = PAYLOAD.to_vec();
-        appended.push(0);
-        assert!(verify_minisign_reader(&mut appended.as_slice(), &key, &signature).is_err());
-
-        let changed = SIGNATURE.replace(
-            "trusted comment: rch test fixture",
-            "trusted comment: forged",
-        );
-        let changed = minisign_verify::Signature::decode(&changed).unwrap();
-        assert!(verify_minisign_reader(&mut &PAYLOAD[..], &key, &changed).is_err());
-    }
-
-    #[test]
-    fn minisign_stream_rejects_a_foreign_key_before_reading_payload() {
-        let key = minisign_verify::PublicKey::from_base64(RELEASE_MINISIGN_PUBLIC_KEY).unwrap();
-        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
-        let mut reader = Chunked {
-            remaining: PAYLOAD,
-            chunk: 1,
-            interrupt: false,
-            fail_at_eof: true,
-            reads: 0,
-        };
-        assert!(verify_minisign_reader(&mut reader, &key, &signature).is_err());
-        assert_eq!(reader.reads, 0);
-    }
-
-    #[test]
-    fn minisign_stream_rejects_legacy_mode_without_reading_payload() {
-        // Changing only the algorithm preserves a well-formed signature
-        // container, not its validity. Legacy mode must be refused upfront.
-        let legacy = SIGNATURE.replace("\nRUTZ", "\nRWTZ");
-        let signature = minisign_verify::Signature::decode(&legacy).unwrap();
-        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
-        let mut reader = Chunked {
-            remaining: PAYLOAD,
-            chunk: 1,
-            interrupt: false,
-            fail_at_eof: true,
-            reads: 0,
-        };
-        assert!(verify_minisign_reader(&mut reader, &key, &signature).is_err());
-        assert_eq!(reader.reads, 0);
-    }
-
-    #[test]
-    fn minisign_stream_authenticates_bytes_beyond_the_first_buffer() {
-        // Throwaway Ed25519 key, independently signed over BLAKE2b-512 of
-        // 1 MiB + 7 zero bytes. No production secret or signer is required.
-        const KEY: &str = "RWRSQ0h0ZXN0MmBwaHoVCw4YFi8NW0uVH5/PWQ4eAfqB4KheU+mLK3vO";
-        const SIG: &str = "untrusted comment: rch stream test\n\
-RURSQ0h0ZXN0Mi8mprmagbFizyF2eUefaE/5/jwR84KN9Yyf3OO1y5NwJP1Oe2voxuVRAyhv8L89lerNzNkvMbAIcENd/nq7KA0=\n\
-trusted comment: rch bounded verification fixture\n\
-Vcz52SNOvweQ+rHxeLsHlafJK6iWhND+nbrEl2yDfYyQfv/z3NEBaNwcXNt5QN5NQX3dPBymXHGFiMas/eJGCg==\n";
-        let key = minisign_verify::PublicKey::from_base64(KEY).unwrap();
-        let signature = minisign_verify::Signature::decode(SIG).unwrap();
-        let mut bytes = vec![0u8; 1024 * 1024 + 7];
-        let mut reader = Chunked {
-            remaining: &bytes,
-            chunk: usize::MAX,
-            interrupt: false,
-            fail_at_eof: false,
-            reads: 0,
-        };
-        verify_minisign_reader(&mut reader, &key, &signature).unwrap();
-        assert!(reader.reads > 16);
-        bytes[VERIFICATION_CHUNK_BYTES + 1] = 1;
-        assert!(verify_minisign_reader(&mut bytes.as_slice(), &key, &signature).is_err());
     }
 }
 
@@ -825,7 +587,7 @@ mod tests {
         // A malformed bundle: cosign cannot parse this as a valid signature.
         std::fs::write(&bundle_path, b"\x00\x01\x02 totally not a real bundle").unwrap();
 
-        let result = verify_signature(&file_path, &bundle_path).await;
+        let result = verify_signature(&file_path, &bundle_path, "1.0.0").await;
         assert!(matches!(
             result,
             Err(UpdateError::SignatureVerificationFailed(_)) | Ok(false)
@@ -870,15 +632,22 @@ mod tests {
     fn test_rch_release_identity_pattern_accepts_canonical_url() {
         // TEST START: canonical RCH release identity URL matches
         let re = regex::Regex::new(RCH_RELEASE_IDENTITY_PATTERN).unwrap();
-        let canonical = "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
+        let canonical = "https://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
         assert!(
             re.is_match(canonical),
             "canonical release URL should match: {}",
             canonical
         );
-        // Also branch refs:
-        let branch_ref = "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/heads/main";
-        assert!(re.is_match(branch_ref), "branch ref form should match");
+        assert_eq!(release_identity("1.0.0").unwrap(), canonical);
+        assert_eq!(release_identity("v1.0.0").unwrap(), canonical);
+        assert_ne!(release_identity("1.0.1").unwrap(), canonical);
+        assert_eq!(
+            release_identity("v01.2.3").unwrap(),
+            "https://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v01.2.3"
+        );
+        assert!(release_identity("1.0.0/evil").is_err());
+        let branch_ref = "https://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/heads/main";
+        assert!(!re.is_match(branch_ref), "branch refs cannot sign releases");
         // TEST PASS: canonical URL accepted
     }
 
@@ -899,7 +668,7 @@ mod tests {
         );
 
         // Subdomain trick
-        let attack2 = "https://github.com.evil.example/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
+        let attack2 = "https://github.com.evil.example/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
         assert!(
             !re.is_match(attack2),
             "subdomain-prefix attack must not match: {}",
@@ -907,7 +676,7 @@ mod tests {
         );
 
         // Wrong workflow file
-        let attack3 = "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/sneaky.yml@refs/tags/v1.0.0";
+        let attack3 = "https://github.com/tsunheimat/remote_compilation_helper/.github/workflows/sneaky.yml@refs/tags/v1.0.0";
         assert!(
             !re.is_match(attack3),
             "different-workflow URL must not match: {}",
@@ -916,7 +685,7 @@ mod tests {
 
         // Wrong protocol — must NOT match (the `^https://` anchor prefix
         // rejects http://).
-        let attack4 = "http://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
+        let attack4 = "http://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
         assert!(
             !re.is_match(attack4),
             "http (not https) must not match: {}",
@@ -925,7 +694,7 @@ mod tests {
 
         // Lookalike-URL prefix attack — the `^` anchor prevents a longer
         // hostname from being treated as a match by substring rule.
-        let attack5 = "evilhttps://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
+        let attack5 = "evilhttps://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
         assert!(
             !re.is_match(attack5),
             "lookalike-host prefix must not match: {}",
@@ -934,13 +703,74 @@ mod tests {
 
         // Path-traversal attempt — `.` is escaped in the pattern, so a
         // literal `.github` is required (no wildcard substitution).
-        let attack6 = "https://github.com/Dicklesworthstone/remote_compilation_helper/Xgithub/workflows/release.yml@refs/tags/v1.0.0";
+        let attack6 = "https://github.com/tsunheimat/remote_compilation_helper/Xgithub/workflows/release.yml@refs/tags/v1.0.0";
         assert!(
             !re.is_match(attack6),
             "missing .github literal must not match: {}",
             attack6
         );
         // TEST PASS: substring attacks rejected
+    }
+
+    /// Hermetic subprocess contract test, not a real Sigstore proof.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cosign_receives_exact_fork_tag_and_issuer_and_failure_is_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let cosign = temp.path().join("cosign-fixture");
+        std::fs::write(&cosign, r#"#!/bin/sh
+[ "$#" -eq 8 ] || exit 11
+[ "$1" = verify-blob ] || exit 12
+[ "$2" = --bundle ] || exit 13
+[ "$4" = --certificate-identity ] || exit 14
+[ "$5" = https://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.2.3 ] || exit 15
+[ "$6" = --certificate-oidc-issuer ] || exit 16
+[ "$7" = https://token.actions.githubusercontent.com ] || exit 17
+[ "$8" = artifact.bin ] || exit 18
+[ "$3" = good.bundle ] || { printf 'fixture verification rejected\n' >&2; exit 19; }
+"#).unwrap();
+        std::fs::set_permissions(&cosign, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = std::path::Path::new("artifact.bin");
+        assert!(
+            verify_signature_with_cosign(
+                &cosign,
+                file,
+                std::path::Path::new("good.bundle"),
+                "1.2.3"
+            )
+            .await
+            .unwrap()
+        );
+        for (bundle, version) in [("bad.bundle", "1.2.3"), ("good.bundle", "1.2.4")] {
+            assert!(matches!(
+                verify_signature_with_cosign(&cosign, file, std::path::Path::new(bundle), version)
+                    .await,
+                Err(UpdateError::SignatureVerificationFailed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn fork_identity_rejects_upstream_and_untrusted_refs() {
+        let re = regex::Regex::new(RCH_RELEASE_IDENTITY_PATTERN).unwrap();
+        let workflow =
+            "https://github.com/tsunheimat/remote_compilation_helper/.github/workflows/release.yml";
+        for identity in [
+            format!("{workflow}@refs/heads/main").replace("tsunheimat", "Dicklesworthstone"),
+            format!("{workflow}@refs/heads/feature"),
+            format!("{workflow}@refs/pull/1/merge"),
+            format!("{workflow}@refs/tags/v1.2.3/evil"),
+            format!("{workflow}@refs/tags/"),
+            format!("{workflow}@refs/heads/main/evil"),
+            format!("{workflow}@refs/heads/main?evil"),
+        ] {
+            assert!(
+                !re.is_match(&identity),
+                "unexpected trusted identity: {identity}"
+            );
+        }
+        assert!(re.is_match(&format!("{workflow}@refs/tags/v1.2.3-beta.1")));
     }
 
     /// Sub-criterion 1: signature verification with a real cosign bundle.
@@ -974,7 +804,9 @@ mod tests {
             return;
         }
 
-        let result = verify_signature(&bin, &sig).await;
+        let version = std::env::var("RCH_TEST_REAL_SIG_VERSION")
+            .expect("set RCH_TEST_REAL_SIG_VERSION to the fork fixture's signed release tag");
+        let result = verify_signature(&bin, &sig, &version).await;
         assert!(
             result.is_ok() && result.unwrap(),
             "real cosign-signed binary should verify"
@@ -993,14 +825,15 @@ mod bounded_verifier_tests {
         let executable = std::path::Path::new("/verifiers/cosign with spaces");
         let archive = std::path::Path::new("/download/é ' archive.tar.gz");
         let bundle = std::path::Path::new("/download/bundle;not-a-command.json");
-        let command = cosign_command(executable, archive, bundle);
+        let command = cosign_command(executable, archive, bundle, "v1.2.3").unwrap();
+        let identity = release_identity("v1.2.3").unwrap();
         assert_eq!(command.as_std().get_program(), executable.as_os_str());
         let expected = [
             std::ffi::OsStr::new("verify-blob"),
             std::ffi::OsStr::new("--bundle"),
             bundle.as_os_str(),
-            std::ffi::OsStr::new("--certificate-identity-regexp"),
-            std::ffi::OsStr::new(RCH_RELEASE_IDENTITY_PATTERN),
+            std::ffi::OsStr::new("--certificate-identity"),
+            std::ffi::OsStr::new(&identity),
             std::ffi::OsStr::new("--certificate-oidc-issuer"),
             std::ffi::OsStr::new(GITHUB_ACTIONS_OIDC_ISSUER),
             archive.as_os_str(),

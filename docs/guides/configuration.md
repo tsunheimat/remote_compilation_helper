@@ -87,12 +87,48 @@ tool discovery and credentials; explicitly set worker `RUSTUP_HOME` in
 
 Remote environment values are literal defaults. Allowlisted controller values
 override those defaults; RCH-managed cache/tmp/target paths override both.
+Managed placement also overrides the corresponding `--env`/`--forward-env`
+values on typed/shared invocations. Other explicit variables retain their values.
 Explicit assignments *inside the authored command* retain normal shell
 semantics. This is placement policy, not a security sandbox for arbitrary code.
 `CARGO_TARGET_DIR`, `RCH_CH_BASE` and the recursion-bypass variable cannot be
 set through `environment.remote`. Profile values may contain credentials, so
 `config show/get` reports their names and `(set)` rather than their values.
 Use worker-side credential provisioning instead of committing secrets.
+
+For a shared-source controller with HDD worker storage, setting only `TMPDIR`
+does not relocate language caches. Use the existing placement settings on the
+controller (paths below are worker paths):
+
+```toml
+[execution.storage]
+cache_root = "/mnt/hdd-vibe-coding-share/rch-worker/agnet-test/cache"
+tmp_root = "/mnt/hdd-vibe-coding-share/rct"
+tmp_mode = "private_mount"
+
+[jobs]
+# Controller destination for explicitly retrieved RTK output; no shared mapping.
+rtk_tee_root = "/mnt/hdd-vibe-coding-share/rch-controller/rtk-output"
+```
+
+Keep the worker tool `PATH` in `[environment.remote]`. `home_root` is optional;
+cache placement does not require changing HOME, moving sources or importing
+existing user caches. Both native mirrors and shared jobs use `cache_root` for
+Go build/module caches, Cargo package cache and Bun's install cache. Go's
+resolved `go env GOCACHE GOMODCACHE GOPATH` and actual writes establish placement;
+the absence of a particular environment variable does not. Native Cargo target
+pools and shared Cargo's authored target outputs retain their existing contracts.
+
+Controller-side native Cargo planning invokes `cargo metadata --locked`. Cargo
+may update its package index/cache there even though compilation is remote.
+Worker storage settings deliberately do not select controller paths. To keep
+that cache off the controller root disk, launch RCH/hooks/shims with the normal
+Cargo setting `CARGO_HOME=/mnt/hdd-vibe-coding-share/rch-controller/cargo-home`.
+Use a separate controller directory; no existing cache migration is necessary.
+RCH still loads Cargo configuration from that home, so operators must preserve
+any required registry configuration/credentials when choosing it. Verify actual
+controller and worker writes separately. `RCH_STATE_HOME` likewise selects the
+controller's RCH journals; it is independent of worker cache placement.
 
 Managed tmp creates a unique `rch-job-<UUID>/tmp` outside the source mirror,
 exports `TMPDIR`, `TMP` and `TEMP`, and inherits a lease into the existing RCH
@@ -225,6 +261,10 @@ half_open_max_probes = 1
 ```
 
 ### `[path_topology]`
+- `source_root` (string, optional) — Controller source tree when sources and
+  worker mirrors occupy different namespaces. Projects and relative path
+  dependencies keep their paths relative to this root under `canonical_root`.
+  Source and mirror roots must be disjoint, including resolved symlinks.
 - `canonical_root` (string, optional, default `"/data/projects"`) — Canonical
   project root directory. Override this on systems where `/data/projects` is
   unavailable (e.g., macOS with SIP).
@@ -234,6 +274,7 @@ half_open_max_probes = 1
 Environment variable overrides:
 - `RCH_CANONICAL_PROJECT_ROOT`
 - `RCH_ALIAS_PROJECT_ROOT`
+- `RCH_SOURCE_PROJECT_ROOT`
 
 Example (macOS):
 
@@ -242,6 +283,70 @@ Example (macOS):
 canonical_root = "/Users/me/Projects"
 alias_root = "/Users/me/p"
 ```
+
+For repositories on a shared source mount and a separate native worker mirror:
+
+```toml
+[path_topology]
+source_root = "/mnt/vibe-coding-share"
+canonical_root = "/mnt/hdd-vibe-coding-share/rch-worker/agnet-test/projects"
+alias_root = "/mnt/hdd-vibe-coding-share/rch-worker/agnet-test/projects-alias"
+
+[compilation]
+native_toolchain = "1.93.1"
+
+[environment.remote]
+PATH = "/opt/rch/toolchains/clippy-1.93.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+```
+
+The ordinary Cargo/clippy PATH shims and `rch exec -- cargo test` use this
+mapping. Sources remain on the source mount; rsync writes only to the separate
+mirror, builds use worker output directories, and the existing native artifact
+contract returns outputs to the originating repository. Worker preflight also
+rejects mirror destinations that resolve into source or outside the mirror.
+Use relative `--manifest-path`, workspace-member and path-dependency paths with
+this mapping. Absolute authored Cargo source paths are refused because copying
+them unchanged would select the original shared source on the worker. Optional
+repository-updater convergence is skipped for this mapping; rsync updates the
+owned mirror directly.
+
+`compilation.native_toolchain` explicitly chooses an exact native Rust version
+for unpinned projects on workers without rustup. Both admission and execution
+check `rustc --version`, Cargo and clippy availability; this option does not
+install tools. Set `environment.remote.PATH` to expose private native tools;
+the ordinary SSH login PATH need not contain them. Use a complete literal PATH
+(including system utilities), without `$PATH` expansion. Native Cargo/clippy
+and explicit shared execution both apply these remote defaults.
+
+Rust admission carries the caller's resolved remote environment, including
+project overrides, allowlisted controller values and configured cache/home
+placement. The daemon applies it to the entire toolchain probe. Probe caches
+and queued recovery are bound to that environment, so one PATH cannot reuse
+another PATH's verdict. With a configured native PATH, the exact-version probe
+is authoritative instead of the ordinary-PATH compiler inventory.
+Install matching `rch` and `rchd` builds for this
+contract. Older callers use the daemon's startup `environment.remote` defaults;
+changing those defaults for older callers requires a daemon restart.
+Admission does not allocate job scratch: managed tmp/target placement still
+occurs only after ownership is established.
+Command/project toolchain pins and `RUSTUP_TOOLCHAIN` are refused
+under this policy. Leave it unset for the existing rustup toolchain contract.
+This does not establish compatibility with projects requiring nightly Rust.
+
+Keep execution scratch separate from both source and mirror. On the existing
+shared-mount installation, retain the short worker `tmp_root` of
+`/mnt/hdd-vibe-coding-share/rct`, `tmp_mode = "private_mount"`, and the managed
+`TMPDIR` rewriting. Changing source topology does not require moving caches
+or lengthening Unix socket paths.
+
+For explicit shared jobs, a requested `--timeout` that finishes verified owned
+process cleanup, durable completion and byte-stream delivery returns exit 124
+with `outcome = "deadline_exceeded"`. SIGINT/SIGTERM uses exit 130 and
+`outcome = "interrupted"`. The daemon receives that same terminal status and
+releases this job's slots before the CLI reports completion. Ordinary workload
+exit 137 is still a completed nonzero command. Missing completion, unverified
+cleanup, output delivery failure or an unacknowledged release remains a control
+failure with retained recovery ownership and no automatic replay.
 
 ### `[api]` — daemon status API over the tailnet
 

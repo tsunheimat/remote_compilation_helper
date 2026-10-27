@@ -1494,6 +1494,9 @@ fn default_package_name(root: &Path) -> String {
 }
 
 fn allowed_dependency_roots(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
+    if let Some(source) = policy.source_root() {
+        return vec![std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf())];
+    }
     let mut roots = vec![
         policy.canonical_root().to_path_buf(),
         policy.alias_root().to_path_buf(),
@@ -1554,6 +1557,40 @@ fn normalize_path_for_policy(
     dependency_name: Option<&str>,
     context: &str,
 ) -> Result<PathBuf, CargoPathDependencyError> {
+    if policy.source_root().is_some() && path.join("Cargo.toml").is_file() {
+        // An absolute authored dependency continues to name the shared source
+        // after transfer. Refuse that contract instead of silently compiling
+        // outside the mapped mirror (metadata itself contains absolute paths,
+        // so inspect the authored manifest rather than metadata's resolution).
+        let manifest = read_manifest_document(&path.join("Cargo.toml"))?;
+        let absolute = manifest
+            .materialization_path_dependencies
+            .iter()
+            .filter_map(|dependency| dependency.dependency_path.as_deref())
+            .chain(
+                manifest
+                    .workspace_path_dependencies
+                    .values()
+                    .map(String::as_str),
+            )
+            .chain(
+                manifest
+                    .patch_path_dependencies
+                    .values()
+                    .map(String::as_str),
+            )
+            .chain(manifest.workspace_members.iter().map(String::as_str))
+            .find(|value| Path::new(value).is_absolute());
+        if let Some(absolute) = absolute {
+            return Err(CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::PathPolicyViolation,
+                format!(
+                    "separate source-root mirrors require relative Cargo source paths: {absolute}"
+                ),
+            )
+            .with_manifest_path(path.join("Cargo.toml")));
+        }
+    }
     normalize_project_path_with_policy(path, policy)
         .map(|normalized| normalized.canonical_path().to_path_buf())
         .map_err(|error| {
@@ -2932,6 +2969,40 @@ fn wildcard_match_bytes(pattern: &[u8], value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn separate_source_mapping_refuses_authored_absolute_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let project = source.join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let manifest = project.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "[package]\nname='repo'\nversion='0.1.0'\n[dependencies]\ndep={{path={:?}}}\n",
+                source.join("dep").display().to_string()
+            ),
+        )
+        .unwrap();
+        let ordinary = super::PathTopologyPolicy::new(source.clone(), source.clone());
+        assert!(super::normalize_path_for_policy(&project, &ordinary, None, None, "test").is_ok());
+        let mapped =
+            super::PathTopologyPolicy::new(dir.path().join("mirror"), dir.path().join("alias"))
+                .with_source_root(source);
+        let error =
+            super::normalize_path_for_policy(&project, &mapped, None, None, "test").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &super::CargoPathDependencyErrorKind::PathPolicyViolation
+        );
+        assert!(error.to_string().contains("relative Cargo source paths"));
+        std::fs::write(
+            &manifest,
+            "[package]\nname='repo'\nversion='0.1.0'\n[dependencies]\ndep={path='../dep'}\n",
+        )
+        .unwrap();
+        assert!(super::normalize_path_for_policy(&project, &mapped, None, None, "test").is_ok());
+    }
     use super::*;
     use crate::e2e::{MultiRepoFixtureConfig, reset_multi_repo_fixtures};
     use std::fs;

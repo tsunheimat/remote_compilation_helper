@@ -417,6 +417,7 @@ pub fn hook_status(ctx: &OutputContext) -> Result<()> {
         AgentKind::ClaudeCode,
         AgentKind::GeminiCli,
         AgentKind::CodexCli,
+        AgentKind::Hermes,
         AgentKind::ContinueDev,
     ];
 

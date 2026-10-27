@@ -30,6 +30,7 @@ pub fn detect_single_agent(kind: AgentKind) -> Result<Option<DetectedAgent>> {
         AgentKind::ClaudeCode => detect_claude_code(),
         AgentKind::GeminiCli => detect_gemini_cli(),
         AgentKind::CodexCli => detect_codex_cli(),
+        AgentKind::Hermes => detect_hermes(),
         AgentKind::Cursor => detect_cursor(),
         AgentKind::ContinueDev => detect_continue_dev(),
         AgentKind::Windsurf => detect_windsurf(),
@@ -101,6 +102,26 @@ fn detect_codex_cli() -> Result<Option<DetectedAgent>> {
         return Ok(Some(agent));
     }
 
+    Ok(None)
+}
+
+/// Detect Hermes without loading or activating any plugin.
+fn detect_hermes() -> Result<Option<DetectedAgent>> {
+    if let Some(version) = get_command_version("hermes", &["--version"]) {
+        return Ok(Some(
+            DetectedAgent::new(AgentKind::Hermes)
+                .with_version(version)
+                .with_detection_method(DetectionMethod::PathLookup),
+        ));
+    }
+    if let Some(home) = dirs::home_dir()
+        && home.join(".hermes").is_dir()
+    {
+        return Ok(Some(
+            DetectedAgent::new(AgentKind::Hermes)
+                .with_detection_method(DetectionMethod::ConfigFile),
+        ));
+    }
     Ok(None)
 }
 

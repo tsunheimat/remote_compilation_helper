@@ -499,6 +499,14 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             toolchain.as_ref(),
             required_runtime,
             &preferred_workers,
+            Some(
+                &rch_common::execution_storage::toolchain_environment(
+                    &config.environment,
+                    &config.execution.storage,
+                    |key| std::env::var(key).ok(),
+                )
+                .map_err(anyhow::Error::msg)?,
+            ),
         )
         .await
         {

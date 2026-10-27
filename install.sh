@@ -45,9 +45,25 @@ VERSION="${VERSION:-}"  # Set dynamically based on install mode
 # suppresses the no-downgrade guard so deliberate rollbacks still work.
 VERSION_EXPLICIT=false
 SKIP_INSTALL_NO_DOWNGRADE=false
-REPO_URL="https://github.com/Dicklesworthstone/remote_compilation_helper"
-GITHUB_REPO="Dicklesworthstone/remote_compilation_helper"
+# An override is an explicit choice of release publisher, not a download URL.
+GITHUB_REPO="${RCH_REPOSITORY:-tsunheimat/remote_compilation_helper}"
+REPO_URL="https://github.com/${GITHUB_REPO}"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
+SIGNATURE_POLICY="${RCH_SIGNATURE_POLICY:-optional}"
+DOWNLOAD_USER_AGENT="remote_compilation_helper-installer (+https://github.com/tsunheimat/remote_compilation_helper)"
+
+validate_release_configuration() {
+    [[ "$GITHUB_REPO" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+        die "RCH_REPOSITORY must be a GitHub owner/repository"
+    case "$SIGNATURE_POLICY" in
+        optional|required) ;;
+        *) die "RCH_SIGNATURE_POLICY must be optional or required" ;;
+    esac
+    if [[ -n "${VERSION:-}" ]]; then
+        [[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]] ||
+            die "Invalid release version: $VERSION"
+    fi
+}
 
 INSTALL_DIR="${RCH_INSTALL_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="${RCH_CONFIG_DIR:-$HOME/.config/rch}"
@@ -656,6 +672,19 @@ install_split_binary() {
     success "Installed $name ($profile)"
 }
 
+source_toolchain_channel() {
+    # Require the checkout's dated channel, including with rustup user overrides.
+    local line channel=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*channel[[:space:]]*=[[:space:]]*\"(nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})\"[[:space:]]*$ ]]; then
+            [[ -z "$channel" ]] || die "Ambiguous channel in rust-toolchain.toml"
+            channel="${BASH_REMATCH[1]}"
+        fi
+    done < rust-toolchain.toml
+    [[ -n "$channel" ]] || die "Expected a dated nightly channel in rust-toolchain.toml"
+    printf '%s\n' "$channel"
+}
+
 build_from_source() {
     info "Building from source..."
 
@@ -676,6 +705,9 @@ build_from_source() {
         requested_tag=$(installer_release_tag "$VERSION") || return 1
         verify_source_release "$project_dir" "$requested_tag" || return 1
     fi
+    [[ -f rust-toolchain.toml ]] || die "Source build requires rust-toolchain.toml"
+    local source_toolchain
+    source_toolchain=$(source_toolchain_channel)
 
     # A021 split profiles: hook CLI under wrapper-release (startup +
     # footprint first), daemon/worker under daemon-release (throughput,
@@ -687,21 +719,21 @@ build_from_source() {
     fi
 
     if $USE_GUM; then
-        spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch
-        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr
+        spin "Building rch (wrapper-release profile)..." cargo "+$source_toolchain" build --locked --profile wrapper-release -p rch
+        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo "+$source_toolchain" build --locked --profile daemon-release -p rchd -p rch-wkr
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo "+$source_toolchain" build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo "+$source_toolchain" build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     else
         info "Building rch (wrapper-release profile; this may take a while)..."
-        cargo build --locked --profile wrapper-release -p rch
+        cargo "+$source_toolchain" build --locked --profile wrapper-release -p rch
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        cargo build --locked --profile daemon-release -p rchd -p rch-wkr
+        cargo "+$source_toolchain" build --locked --profile daemon-release -p rchd -p rch-wkr
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo "+$source_toolchain" build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo "+$source_toolchain" build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     fi
@@ -761,158 +793,89 @@ verify_source_release() {
 }
 
 download_binaries() {
-    # Try to download pre-built binaries first
-    # If not available, automatically fall back to building from source
-
-    info "Checking for pre-built binaries..."
-
-    # Prefer versioned release artifacts, bound to the one resolved tag.
-    local asset_name=""
-    local checksum_url=""
+    validate_release_configuration
+    [[ -n "${VERSION:-}" ]] || die "Resolve a release version before downloading"
+    local tag_name
+    tag_name=$(installer_release_tag "$VERSION") || return 1
+    local release_url="${REPO_URL}/releases/download/${tag_name}"
+    local asset_ext="${RELEASE_ARCHIVE_EXT}" asset_name="" candidate
     local downloaded=false
-    local release_info=""
-    local tag_name=""
-    local checksum_tag=""
-    local asset_ext="${RELEASE_ARCHIVE_EXT}"
+    local candidates=()
+    for candidate in "${RELEASE_TARGETS[@]}"; do
+        candidates+=("rch-${tag_name}-${candidate}.${asset_ext}")
+    done
+    for candidate in "${RELEASE_TARGETS[@]}" "$TARGET"; do
+        candidates+=("rch-${candidate}.${asset_ext}")
+    done
 
     TEMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TEMP_DIR"; cleanup_lock' EXIT
-
-    if [[ -n "${VERSION:-}" ]]; then
-        tag_name=$(installer_release_tag "$VERSION") || return 1
-    else
-        local release_url="${GITHUB_API}/releases/latest"
-        release_info=$(curl -sL --connect-timeout 10 "${PROXY_ARGS[@]}" "$release_url" 2>/dev/null || echo "")
-        if [[ -n "$release_info" ]] && echo "$release_info" | grep -q '"tag_name"'; then
-            tag_name=$(echo "$release_info" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+    local download_dir="$TEMP_DIR/download" extract_dir="$TEMP_DIR/extracted"
+    mkdir "$download_dir" "$extract_dir"
+    # All candidates, including legacy names, belong to the SAME release.
+    for candidate in "${candidates[@]}"; do
+        info "Downloading $candidate from $tag_name..."
+        if curl -fsSL -A "$DOWNLOAD_USER_AGENT" "${PROXY_ARGS[@]}" \
+            "$release_url/$candidate" -o "$download_dir/$candidate"; then
+            asset_name="$candidate"
+            downloaded=true
+            break
         fi
-        tag_name=$(installer_release_tag "$tag_name") || return 1
-        VERSION="${tag_name#v}"
-    fi
-
-    if [[ -n "$tag_name" && ${#RELEASE_TARGETS[@]} -gt 0 ]]; then
-        # Try each candidate target triple in preference order and use the first
-        # asset that actually exists in this release (rch#23: linux-x86_64 falls
-        # back from -musl to -gnu when only -gnu was published).
-        local candidate_target
-        for candidate_target in "${RELEASE_TARGETS[@]}"; do
-            local versioned_asset="rch-${tag_name}-${candidate_target}.${asset_ext}"
-            local versioned_url
-            versioned_url=$(release_download_url "$tag_name" "$versioned_asset") || return 1
-            info "Downloading $versioned_asset from $tag_name..."
-            if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
-                downloaded=true
-                asset_name="$versioned_asset"
-                checksum_url=$(release_download_url "$tag_name" "${versioned_asset}.sha256") || return 1
-                checksum_tag="$tag_name"
-                break
-            fi
-        done
-    fi
-
+    done
     if [[ "$downloaded" != "true" ]]; then
-        local candidate_target unversioned_asset version_url
-        for candidate_target in "${RELEASE_TARGETS[@]}" "$TARGET"; do
-            unversioned_asset="rch-${candidate_target}.${asset_ext}"
-            version_url=$(release_download_url "$tag_name" "$unversioned_asset") || return 1
-            info "Downloading $unversioned_asset from $tag_name..."
-            if curl -fsSL "${PROXY_ARGS[@]}" "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
-                downloaded=true
-                asset_name="$unversioned_asset"
-                checksum_tag="$tag_name"
-                checksum_url=$(release_download_url "$tag_name" "${unversioned_asset}.sha256") || return 1
-                break
-            fi
-        done
-    fi
-
-    if [[ "$downloaded" != "true" ]]; then
-        warn "No pre-built binaries available for ${TARGET}"
-        info "Falling back to building from source..."
-        rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
+        warn "No pre-built binaries available for ${TARGET} at ${tag_name}"
         clone_and_build_from_source
         return
     fi
 
-    local checksum_file="$TEMP_DIR/SHA256SUMS"
-    local sidecar_file="$TEMP_DIR/${asset_name}.sha256"
-    if curl -fsSL "${PROXY_ARGS[@]}" "$checksum_url" -o "$sidecar_file"; then
-        local expected
-        if ! expected=$(extract_checksum_from_manifest "$(cat "$sidecar_file")" "$asset_name" true); then
-            error "Invalid or ambiguous checksum sidecar for $asset_name"
-            return 1
-        fi
-        printf '%s  %s\n' "$expected" "$asset_name" > "$checksum_file"
+    # Missing sidecar may use the same release's manifest. A present but invalid
+    # sidecar is an integrity error, never a reason to try another trust path.
+    local checksum_content expected
+    if checksum_content=$(curl -fsSL -A "$DOWNLOAD_USER_AGENT" "${PROXY_ARGS[@]}" \
+        "$release_url/$asset_name.sha256"); then
+        expected=$(extract_checksum_from_manifest "$checksum_content" "$asset_name" true) ||
+            die "Malformed checksum for $asset_name"
     else
-        local manifest_url
-        manifest_url=$(release_download_url "$checksum_tag" SHA256SUMS) || return 1
-        if ! curl -fsSL "${PROXY_ARGS[@]}" "$manifest_url" -o "$checksum_file"; then
-            error "No checksum available for $asset_name from $checksum_tag; installation refused"
-            return 1
-        fi
+        checksum_content=$(curl -fsSL -A "$DOWNLOAD_USER_AGENT" "${PROXY_ARGS[@]}" \
+            "$release_url/SHA256SUMS") || die "Missing checksum for $asset_name"
+        expected=$(extract_checksum_from_manifest "$checksum_content" "$asset_name") ||
+            die "Missing or malformed checksum for $asset_name"
     fi
-    verify_checksum "$TEMP_DIR/$asset_name" "$checksum_file" "$asset_name" || return 1
+    verify_checksum_value "$download_dir/$asset_name" "$expected" || die "Checksum verification failed"
+    verify_sigstore_bundle "$download_dir/$asset_name" "$release_url/$asset_name" "$tag_name" ||
+        die "Signature verification failed"
 
-    # Extract and install
     info "Extracting binaries..."
     if [[ "$asset_ext" == "zip" ]]; then
-        if ! command_exists unzip; then
-             warn "unzip command not found"
-             info "Falling back to building from source..."
-             rm -rf "$TEMP_DIR"
-             clone_and_build_from_source
-             return
-        fi
-        if ! unzip -q "$TEMP_DIR/$asset_name" -d "$TEMP_DIR"; then
-            warn "Failed to extract zip"
-            info "Falling back to building from source..."
-            rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-            clone_and_build_from_source
-            return
-        fi
+        command_exists unzip || die "unzip command not found"
+        unzip -q "$download_dir/$asset_name" -d "$extract_dir" || die "Failed to extract zip"
     else
-        if ! tar -xzf "$TEMP_DIR/$asset_name" -C "$TEMP_DIR"; then
-            warn "Failed to extract tarball"
-            info "Falling back to building from source..."
-            rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-            clone_and_build_from_source
-            return
-        fi
+        tar -xzf "$download_dir/$asset_name" -C "$extract_dir" || die "Failed to extract tarball"
     fi
-
-    if [[ "$MODE" == "worker" ]]; then
-        if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
-            success "Installed $WORKER_BIN"
-        else
-            warn "Worker binary not in release"
-            info "Falling back to building from source..."
-            rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-            clone_and_build_from_source
-            return
-        fi
-    else
-        for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
-            if [[ -f "$TEMP_DIR/$binary" ]]; then
-                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
-                success "Installed $binary"
-            else
-                warn "$binary not in release"
-                info "Falling back to building from source..."
-                rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-                clone_and_build_from_source
-                return
-            fi
-        done
+    local binaries=("$WORKER_BIN") binary
+    if [[ "$MODE" != "worker" ]]; then
+        binaries=("$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN")
     fi
-
+    # Preflight every required binary before replacing any installed binary.
+    for binary in "${binaries[@]}"; do
+        [[ -f "$extract_dir/$binary" && ! -L "$extract_dir/$binary" ]] ||
+            die "$binary missing or not a regular release binary"
+    done
+    for binary in "${binaries[@]}"; do
+        install_binary_file "$extract_dir/$binary" "$INSTALL_DIR/$binary"
+        success "Installed $binary"
+    done
     success "Binary installation complete"
 }
 
 clone_and_build_from_source() {
-    # Clone the repository and build from source
-    # This is the fallback when pre-built binaries aren't available
-
+    # Only an explicit release request authorizes source fallback. Never build
+    # an arbitrary default branch after discovery/download failures.
+    validate_release_configuration
+    [[ "${VERSION_EXPLICIT:-false}" == "true" && -n "${VERSION:-}" ]] ||
+        die "Source fallback requires an explicit VERSION or --version tag"
+    [[ "$SIGNATURE_POLICY" != "required" ]] ||
+        die "Required artifact signatures cannot be satisfied by a source fallback"
     local source_tag
     source_tag=$(installer_release_tag "$VERSION") || return 1
     ensure_command git
@@ -930,7 +893,7 @@ clone_and_build_from_source() {
 
     info "Cloning repository..."
     if $USE_GUM; then
-        if ! spin "Cloning RCH release $source_tag..." git clone --depth 1 --branch "$source_tag" -- "$REPO_URL" "$TEMP_DIR/rch"; then
+        if ! spin "Cloning RCH repository..." git clone --depth 1 --branch "$source_tag" -- "$REPO_URL" "$TEMP_DIR/rch"; then
             die "Failed to clone repository from $REPO_URL"
         fi
     else
@@ -939,8 +902,15 @@ clone_and_build_from_source() {
         fi
     fi
 
+    # --branch can also resolve a branch: require the requested tag and detach
+    # at that tag before any build, rejecting a branch-only look-alike.
+    git -C "$TEMP_DIR/rch" checkout --detach "refs/tags/$source_tag" ||
+        die "Requested source tag not found: $source_tag"
     cd "$TEMP_DIR/rch" || die "Failed to change to cloned repository directory"
     verify_source_release "$TEMP_DIR/rch" "$source_tag" || return 1
+    [[ -f rust-toolchain.toml ]] || die "Source build requires rust-toolchain.toml"
+    local source_toolchain
+    source_toolchain=$(source_toolchain_channel)
 
     # A021 split profiles (see build_from_source for rationale).
     if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
@@ -950,29 +920,29 @@ clone_and_build_from_source() {
     fi
 
     if $USE_GUM; then
-        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo build --locked --profile wrapper-release -p rch; then
-            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo "+$source_toolchain" build --locked --profile wrapper-release -p rch; then
+            die "Build failed. Install the pinned toolchain from rust-toolchain.toml (rustup show)."
         fi
-        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
-            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo "+$source_toolchain" build --locked --profile daemon-release -p rchd -p rch-wkr; then
+            die "Build failed. Install the pinned toolchain from rust-toolchain.toml (rustup show)."
         fi
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo "+$source_toolchain" build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo "+$source_toolchain" build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     else
         info "Building rch (wrapper-release profile; this may take a few minutes)..."
-        if ! cargo build --locked --profile wrapper-release -p rch; then
-            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        if ! cargo "+$source_toolchain" build --locked --profile wrapper-release -p rch; then
+            die "Build failed. Install the pinned toolchain from rust-toolchain.toml (rustup show)."
         fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
-            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        if ! cargo "+$source_toolchain" build --locked --profile daemon-release -p rchd -p rch-wkr; then
+            die "Build failed. Install the pinned toolchain from rust-toolchain.toml (rustup show)."
         fi
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
-            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo "+$source_toolchain" build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo "+$source_toolchain" build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     fi
@@ -1024,37 +994,12 @@ verify_checksum() {
     local checksum_file="$2"
     local filename="$3"
 
-    info "Verifying checksum..."
-
     local expected
-    if ! expected=$(extract_checksum_from_manifest "$(cat "$checksum_file")" "$filename"); then
-        error "Checksum missing, malformed or ambiguous for $filename"
-        return 1
-    fi
-
-    if [[ -z "$expected" ]]; then
-        error "Checksum not found for $filename"
-        return 1
-    fi
-
-    local computed
-    if command_exists sha256sum; then
-        computed=$(sha256sum "$file" | awk '{print $1}')
-    elif command_exists shasum; then
-        computed=$(shasum -a 256 "$file" | awk '{print $1}')
-    else
-        error "No SHA256 tool found (sha256sum or shasum required)"
-        return 1
-    fi
-
-    if [[ "$expected" != "$computed" ]]; then
-        error "Checksum verification failed!"
-        error "  Expected: $expected"
-        error "  Got:      $computed"
-        return 1
-    fi
-
-    success "Checksum verified"
+    [[ -f "$checksum_file" ]] || { error "Missing checksum file: $checksum_file"; return 1; }
+    expected=$(extract_checksum_from_manifest "$(<"$checksum_file")" "$filename") || {
+        error "Missing or malformed checksum for $filename"; return 1;
+    }
+    verify_checksum_value "$file" "$expected"
 }
 
 extract_checksum_from_manifest() {
@@ -1070,12 +1015,12 @@ extract_checksum_from_manifest() {
             path = $2
             sub(/^\*/, "", path)
             sub(/^\.\//, "", path)
+            # Release jobs hash dist/ASSET before uploading the basename.
+            sub(/^dist\//, "", path)
             if (path == file || (bare == "true" && NF == 1)) {
                 count++
                 if ((NF != 2 && !(bare == "true" && NF == 1)) ||
-                    length($1) != 64 || $1 !~ /^[[:xdigit:]]+$/) {
-                    invalid = 1
-                }
+                    length($1) != 64 || $1 !~ /^[[:xdigit:]]+$/) invalid = 1
                 checksum = tolower($1)
             }
         }
@@ -1084,6 +1029,22 @@ extract_checksum_from_manifest() {
             print checksum
         }
     '
+}
+
+verify_checksum_value() {
+    local file="$1" expected="$2" computed
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    if command_exists sha256sum; then
+        computed=$(sha256sum "$file") || return 1
+    elif command_exists shasum; then
+        computed=$(shasum -a 256 "$file") || return 1
+    else
+        error "No SHA256 tool found"
+        return 1
+    fi
+    computed="${computed%% *}"
+    [[ "$computed" == "$expected" ]] || return 1
+    success "Checksum verified"
 }
 
 # ============================================================================
@@ -1095,6 +1056,36 @@ detect_target_version() {
     if [[ -n "${VERSION:-}" ]]; then
         VERSION_EXPLICIT=true
         return 0
+    fi
+
+    # Offline identity comes from this archive, never the current checkout,
+    # latest release, or installer floor. Strip only known target suffixes so
+    # prerelease identifiers (including hyphens) remain part of the tag.
+    if [[ -n "${OFFLINE_TARBALL:-}" ]]; then
+        local archive_name="${OFFLINE_TARBALL##*/}" suffix recognized_target=false
+        case "$archive_name" in
+            *.tar.gz) archive_name="${archive_name%.tar.gz}" ;;
+            *.zip) archive_name="${archive_name%.zip}" ;;
+            *) die "Cannot infer offline release tag; supply --version or VERSION" ;;
+        esac
+        for suffix in x86_64-unknown-linux-musl x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin \
+            x86_64-pc-windows-msvc linux-x86_64 linux-aarch64 \
+            darwin-x86_64 darwin-aarch64 windows-x86_64; do
+            if [[ "$archive_name" == *"-$suffix" ]]; then
+                archive_name="${archive_name%"-$suffix"}"
+                recognized_target=true
+                break
+            fi
+        done
+        # Require a recognized target suffix: without one a suffix could be
+        # either a prerelease identifier or an unknown platform name.
+        if [[ "$recognized_target" == true &&
+              "$archive_name" =~ ^rch-v?([0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+            return 0
+        fi
+        die "Cannot infer offline release tag; supply --version or VERSION"
     fi
 
     # If building from source, read from Cargo.toml
@@ -1136,23 +1127,13 @@ detect_target_version() {
         fi
     fi
 
-    # If offline tarball, try to extract from filename
-    if [[ -n "${OFFLINE_TARBALL:-}" ]]; then
-        local tarball_version
-        tarball_version=$(echo "$OFFLINE_TARBALL" | sed -n 's/.*rch-v*\([0-9][0-9.]*\).*/\1/p')
-        if [[ -n "$tarball_version" ]]; then
-            VERSION="$tarball_version"
-            return 0
-        fi
-    fi
-
     # Try to fetch latest from GitHub (with timeout)
     local latest
     # NB: use "v*" not "v\?" - \? is a GNU sed extension that BSD sed (macOS)
     # does not understand, where it silently yields an empty match and sends us
     # down the stale-fallback path.
-    latest=$(curl -sL --connect-timeout 5 "${GITHUB_API}/releases/latest" 2>/dev/null | \
-             sed -n 's/.*"tag_name": *"v*\([^"]*\)".*/\1/p' | head -1)
+    latest=$(curl -fsSL -A "$DOWNLOAD_USER_AGENT" --connect-timeout 5 "${GITHUB_API}/releases/latest" | \
+             sed -n 's/.*"tag_name": *"v*\([^"]*\)".*/\1/p' | head -1) || latest=""
     if [[ -n "$latest" ]]; then
         VERSION="$latest"
         return 0
@@ -1166,8 +1147,8 @@ detect_target_version() {
     # releases/latest redirect, which is not part of the API rate limit: it 302s
     # to .../releases/tag/vX.Y.Z, so the resolved URL carries the version.
     local latest_url
-    latest_url=$(curl -sL -o /dev/null --connect-timeout 5 --max-time 20 \
-                 -w '%{url_effective}' "${REPO_URL}/releases/latest" 2>/dev/null)
+    latest_url=$(curl -fsSL -A "$DOWNLOAD_USER_AGENT" -o /dev/null --connect-timeout 5 --max-time 20 \
+                 -w '%{url_effective}' "${REPO_URL}/releases/latest") || latest_url=""
     latest=$(printf '%s' "$latest_url" | sed -n 's|.*/releases/tag/v*\([0-9][0-9.]*\).*|\1|p')
     if [[ -n "$latest" ]]; then
         VERSION="$latest"
@@ -1251,36 +1232,43 @@ check_existing_install() {
 # ============================================================================
 
 verify_sigstore_bundle() {
-    local file="$1"
-    local artifact_url="$2"
-
-    # Check if cosign is available
+    local file="$1" artifact_url="$2" tag="$3"
+    validate_release_configuration
     if ! command_exists cosign; then
-        warn "cosign not found; skipping Sigstore signature verification"
-        info "Install cosign for enhanced security: https://docs.sigstore.dev/cosign/installation/"
+        [[ "$SIGNATURE_POLICY" != "required" ]] || {
+            error "Required signature verification needs cosign"; return 1;
+        }
+        warn "Signature NOT verified: cosign unavailable (optional policy)"
         return 0
     fi
 
-    local bundle_url="${artifact_url}.sigstore.json"
     local bundle_file="${file}.sigstore.json"
-
-    info "Downloading Sigstore bundle..."
-    if ! curl -fsSL "${PROXY_ARGS[@]}" "$bundle_url" -o "$bundle_file" 2>/dev/null; then
-        warn "Could not download Sigstore bundle; skipping signature verification"
+    # An empty URL is the offline path: use the adjacent, supplied bundle only.
+    if [[ -n "$artifact_url" ]]; then
+        if ! curl -fsSL -A "$DOWNLOAD_USER_AGENT" "${PROXY_ARGS[@]}" \
+            "${artifact_url}.sigstore.json" -o "$bundle_file"; then
+            [[ "$SIGNATURE_POLICY" != "required" ]] || {
+                error "Required Sigstore bundle unavailable"; return 1;
+            }
+            warn "Signature NOT verified: bundle unavailable (optional policy)"
+            return 0
+        fi
+    elif [[ ! -f "$bundle_file" ]]; then
+        [[ "$SIGNATURE_POLICY" != "required" ]] || return 1
+        warn "Signature NOT verified: offline bundle unavailable (optional policy)"
         return 0
     fi
-
-    info "Verifying Sigstore signature..."
+    [[ -n "$tag" ]] || { error "Signature verification requires a release tag"; return 1; }
+    # Exact identity, not a wildcard or upstream public key. This accepts the
+    # tag-triggered release workflow only; a main-branch dispatch is not proof
+    # that the workflow identity was bound to this release tag.
+    local identity="https://github.com/${GITHUB_REPO}/.github/workflows/release.yml@refs/tags/${tag}"
     if cosign verify-blob --bundle "$bundle_file" \
-        --certificate-identity-regexp=".*" \
-        --certificate-oidc-issuer-regexp=".*" \
-        "$file" 2>/dev/null; then
+        --certificate-identity="$identity" \
+        --certificate-oidc-issuer="https://token.actions.githubusercontent.com" "$file"; then
         success "Sigstore signature verified"
-        rm -f "$bundle_file"
-        return 0
     else
         error "Sigstore signature verification failed!"
-        rm -f "$bundle_file"
         return 1
     fi
 }
@@ -1628,6 +1616,15 @@ install_from_tarball() {
         die "Tarball not found: $tarball"
     fi
 
+    validate_release_configuration
+    local checksum_file="${tarball}.sha256" expected
+    [[ -f "$checksum_file" ]] || die "Missing offline checksum: $checksum_file"
+    expected=$(extract_checksum_from_manifest "$(<"$checksum_file")" "$(basename "$tarball")") ||
+        die "Malformed offline checksum"
+    verify_checksum_value "$tarball" "$expected" || die "Offline checksum verification failed"
+    local tag=""
+    [[ -z "${VERSION:-}" ]] || tag="v${VERSION#v}"
+    verify_sigstore_bundle "$tarball" "" "$tag" || die "Offline signature verification failed"
     info "Installing from offline tarball: $tarball"
 
     TEMP_DIR=$(mktemp -d)
@@ -1681,11 +1678,18 @@ install_binaries() {
         return
     fi
 
-    if [[ "${FROM_SOURCE:-false}" == "true" ]]; then
+    if [[ "${VERSION_EXPLICIT:-false}" == "true" ]]; then
+        if [[ "${FROM_SOURCE:-false}" == "true" ]]; then
+            clone_and_build_from_source
+        else
+            download_binaries
+        fi
+    elif [[ "${FROM_SOURCE:-false}" == "true" ]]; then
+        [[ "$SIGNATURE_POLICY" != "required" ]] || die "Local source has no release artifact signature"
         build_from_source
     else
-        # Try source first (if we're in the repo), otherwise download
-        if [[ -f "Cargo.toml" ]] && grep -q "remote_compilation_helper" Cargo.toml 2>/dev/null; then
+        # Required signatures and explicit versions must not silently use a checkout.
+        if [[ "$SIGNATURE_POLICY" != "required" && -f "Cargo.toml" ]] && grep -q "remote_compilation_helper" Cargo.toml 2>/dev/null; then
             info "Found source directory, building from source..."
             FROM_SOURCE=true
             build_from_source
@@ -1792,110 +1796,19 @@ get_claude_code_settings_path() {
 }
 
 configure_claude_hook() {
+    if [[ "${ACTIVATE:-false}" != "true" && "${EASY_MODE:-false}" != "true" ]]; then
+        info "Hooks unchanged (use --activate or --easy-mode to opt in)"
+        return 0
+    fi
     if [[ -n "${RCH_NO_HOOK:-}" ]]; then
         info "Skipping Claude Code hook setup (RCH_NO_HOOK set)"
-        return
+        return 0
     fi
-
-    info "Configuring Claude Code hook..."
-
-    local settings_path
-    settings_path=$(get_claude_code_settings_path)
-    local settings_dir
-    settings_dir=$(dirname "$settings_path")
-
-    mkdir -p "$settings_dir"
-
-    local hook_path="$INSTALL_DIR/$HOOK_BIN"
-
-    if command_exists jq; then
-        configure_hook_with_jq "$settings_path" "$hook_path"
-    else
-        configure_hook_manual "$settings_path" "$hook_path"
-    fi
-}
-
-configure_hook_with_jq() {
-    local settings_path="$1"
-    local hook_path="$2"
-
-    local hook_config
-    hook_config=$(cat << EOF
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$hook_path"
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF
-)
-
-    if [[ -f "$settings_path" ]]; then
-        local existing
-        existing=$(cat "$settings_path")
-
-        # Validate existing JSON; if empty or invalid, treat as new file
-        if [[ -z "$existing" ]] || ! echo "$existing" | jq -e '.' &>/dev/null; then
-            warn "Existing settings file is empty or invalid, creating fresh config"
-            echo "$hook_config" | jq '.' > "$settings_path"
-            success "Claude Code hook configured at $settings_path"
-            return
-        fi
-
-        if echo "$existing" | jq -e '.hooks.PreToolUse' &>/dev/null; then
-            # Check if rch hook already exists (look for rch in any command field)
-            if echo "$existing" | jq -e '.hooks.PreToolUse[] | select(.hooks[]? | .command? | contains("rch"))' &>/dev/null; then
-                info "RCH hook already configured"
-                return
-            fi
-
-            local new_hook='{"matcher": "Bash", "hooks": [{"type": "command", "command": "'"$hook_path"'"}]}'
-            echo "$existing" | jq ".hooks.PreToolUse += [$new_hook]" > "$settings_path"
-        else
-            # Use * for deep merge to preserve other hooks (e.g., PostToolUse)
-            echo "$existing" | jq ". * $hook_config" > "$settings_path"
-        fi
-    else
-        echo "$hook_config" | jq '.' > "$settings_path"
-    fi
-
-    success "Claude Code hook configured at $settings_path"
-}
-
-configure_hook_manual() {
-    local settings_path="$1"
-    local hook_path="$2"
-
-    warn "jq not found - manual hook configuration required"
-
-    echo ""
-    echo -e "${BOLD}Add this to your Claude Code settings ($settings_path):${NC}"
-    echo ""
-    echo '{'
-    echo '  "hooks": {'
-    echo '    "PreToolUse": ['
-    echo '      {'
-    echo '        "matcher": "Bash",'
-    echo '        "hooks": ['
-    echo '          {'
-    echo '            "type": "command",'
-    echo "            \"command\": \"$hook_path\""
-    echo '          }'
-    echo '        ]'
-    echo '      }'
-    echo '    ]'
-    echo '  }'
-    echo '}'
-    echo ""
+    # The built binary is the single settings writer. It validates JSON, rejects
+    # unsafe files, preserves unrelated handlers and modes, and quotes its path.
+    # No jq substring ownership heuristic and no destructive malformed-JSON repair.
+    "$INSTALL_DIR/$HOOK_BIN" agents install-hook claude-code ||
+        die "Hook activation refused; settings preserved. Preview legacy migration with: rch agents migrate --agent claude-code --dry-run"
 }
 
 # ============================================================================
@@ -2895,8 +2808,10 @@ Options:
   --local              Install hook and daemon (default)
   --worker             Install worker agent only
   --from-source        Build from source (requires Rust)
-  --offline <tarball>  Install from local tarball (airgap mode)
-  --easy-mode          Configure PATH + detect agents + run doctor
+  --version <version>  Pin release; source fallback uses only its tag
+  --offline <tarball>  Install local tarball with adjacent .sha256 (airgap mode)
+  --activate           Opt in to hooks and dispatcher PATH/shims (no legacy migration)
+  --easy-mode          Activate + detect agents + run doctor
   --verify-only        Verify existing installation
   --install-service    Enable background service without prompting
   --no-service         Skip systemd/launchd service setup
@@ -2906,6 +2821,8 @@ Options:
   --help, -h           Show this help
 
 Environment:
+  RCH_REPOSITORY       GitHub owner/repo (default: tsunheimat/remote_compilation_helper)
+  RCH_SIGNATURE_POLICY optional (default) or required; invalid signatures always fail
   RCH_INSTALL_DIR      Installation directory (default: ~/.local/bin)
   RCH_CONFIG_DIR       Config directory (default: ~/.config/rch)
   RCH_NO_HOOK          Skip Claude Code hook setup if set
@@ -2950,6 +2867,7 @@ main() {
     UNINSTALL="false"
     VERIFY_ONLY="false"
     EASY_MODE="false"
+    ACTIVATE="false"
     NO_SERVICE="false"
     INSTALL_SERVICE="false"
     ENABLE_SERVICE="true"
@@ -2966,6 +2884,12 @@ main() {
                 MODE="worker"
                 shift
                 ;;
+            --version)
+                [[ -n "${2:-}" ]] || die "--version requires a release version"
+                VERSION="$2"
+                VERSION_EXPLICIT=true
+                shift 2
+                ;;
             --from-source)
                 FROM_SOURCE="true"
                 shift
@@ -2978,7 +2902,12 @@ main() {
                     die "--offline requires a tarball path"
                 fi
                 ;;
+            --activate)
+                ACTIVATE="true"
+                shift
+                ;;
             --easy-mode)
+                ACTIVATE="true"
                 EASY_MODE="true"
                 shift
                 ;;
@@ -3021,8 +2950,11 @@ main() {
     # Setup UI
     setup_ui
 
+    # Reject malformed publisher/version/policy before any network or installation.
+    validate_release_configuration
     # Detect target version (needed for header and upgrade banner)
     detect_target_version
+    validate_release_configuration
 
     show_header
 
@@ -3078,9 +3010,13 @@ main() {
         setup_launchd_service
     fi
 
-    setup_path
-    configure_dispatcher_shim
-    install_dispatcher_shim_watchdog
+    if [[ "$ACTIVATE" == "true" ]]; then
+        setup_path
+        configure_dispatcher_shim
+        install_dispatcher_shim_watchdog
+    else
+        info "PATH and shims unchanged; activate explicitly after acceptance with --activate"
+    fi
     setup_shell_completions
     verify_installation
 

@@ -26,7 +26,7 @@ use rch_common::{
     WorkerSelectionDiagnostic, WorkerSelectionDiagnosticDecision, WorkerStatus, classify_command,
 };
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -594,6 +594,8 @@ pub struct WorkerSelector {
     /// probe runs over a warm reused ControlMaster instead of a throwaway SSH
     /// session; when `None`, the legacy throwaway path is used.
     pub ssh_pool: Option<Arc<rch_common::SshPool>>,
+    /// Persistent remote defaults used by the same user's execution pipeline.
+    remote_environment: BTreeMap<String, String>,
     /// Set only on a per-call round by [`Self::preview_with_exclusions`]: a
     /// successful choice spends no half-open probe slot, fairness record,
     /// audit entry or selection metric.
@@ -644,6 +646,7 @@ impl WorkerSelector {
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
+            remote_environment: BTreeMap::new(),
             preview: false,
         }
     }
@@ -661,6 +664,7 @@ impl WorkerSelector {
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
+            remote_environment: BTreeMap::new(),
             preview: false,
         }
     }
@@ -770,6 +774,41 @@ impl WorkerSelector {
     /// Attach a shared SSH connection pool for the toolchain preflight probe.
     pub fn set_ssh_pool(&mut self, pool: Option<Arc<rch_common::SshPool>>) {
         self.ssh_pool = pool;
+    }
+
+    pub(crate) fn set_remote_environment(&mut self, environment: BTreeMap<String, String>) {
+        self.remote_environment = environment;
+    }
+
+    fn native_environment_requires_probe(&self, request: &SelectionRequest) -> bool {
+        self.remote_environment.contains_key("PATH")
+            && request
+                .toolchain
+                .as_ref()
+                .is_some_and(|toolchain| toolchain.native_version().is_some())
+    }
+
+    pub(crate) fn toolchain_preflight_key(&self, toolchain: &str) -> String {
+        if self.remote_environment.is_empty() {
+            return toolchain.to_owned();
+        }
+        use sha2::{Digest, Sha256};
+        // Length-delimited, sorted pairs: no ambiguous concatenation and no
+        // credentials in cache keys or diagnostics. A different environment
+        // must not inherit either a positive or negative probe result.
+        let mut digest = Sha256::new();
+        for (key, value) in &self.remote_environment {
+            digest.update((key.len() as u64).to_le_bytes());
+            digest.update(key.as_bytes());
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        let hash: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("{toolchain}:env:{hash}")
     }
 
     /// Get a read-only view of the audit log entries.
@@ -1605,7 +1644,9 @@ impl WorkerSelector {
 
             let runtime_available = match request.required_runtime {
                 RequiredRuntime::None => true,
-                RequiredRuntime::Rust => capabilities.has_rust(),
+                RequiredRuntime::Rust => {
+                    capabilities.has_rust() || self.native_environment_requires_probe(request)
+                }
                 RequiredRuntime::Bun => capabilities.has_bun(),
                 RequiredRuntime::Node => capabilities.has_node(),
                 RequiredRuntime::Nix => capabilities.has_nix(),
@@ -1613,12 +1654,15 @@ impl WorkerSelector {
                 RequiredRuntime::Zig => capabilities.has_zig(),
             };
 
-            let toolchain_mismatch =
-                toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities);
+            let toolchain_mismatch = if self.native_environment_requires_probe(request) {
+                None // The exact-version live probe below is authoritative for this PATH.
+            } else {
+                toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities)
+            };
             let component_mismatch = rustup_component_capability_mismatch(request, &capabilities);
             let tool_mismatch = required_tool_capability_mismatch(request, &capabilities);
             let cached_toolchain_failure = if let Some(toolchain) = request.toolchain.as_ref() {
-                let toolchain_name = toolchain.rustup_toolchain();
+                let toolchain_name = self.toolchain_preflight_key(&toolchain.rustup_toolchain());
                 worker
                     .toolchain_preflight_status(&toolchain_name)
                     .await
@@ -2217,7 +2261,9 @@ impl WorkerSelector {
             // Filter by required runtime
             let has_required_runtime = match &request.required_runtime {
                 RequiredRuntime::None => true,
-                RequiredRuntime::Rust => worker.has_rust().await,
+                RequiredRuntime::Rust => {
+                    worker.has_rust().await || self.native_environment_requires_probe(request)
+                }
                 RequiredRuntime::Bun => worker.has_bun().await,
                 RequiredRuntime::Node => worker.has_node().await,
                 RequiredRuntime::Nix => worker.has_nix().await,
@@ -2270,8 +2316,12 @@ impl WorkerSelector {
                 component_excluded.push(Arc::clone(&worker));
                 continue;
             }
-            if let Some(reason) =
-                toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities)
+            // The health inventory describes the worker's ordinary PATH. A
+            // configured native PATH still must pass the exact-version probe;
+            // its compiler cannot be judged using a different environment.
+            if !self.native_environment_requires_probe(request)
+                && let Some(reason) =
+                    toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities)
             {
                 debug!("Worker {} excluded: {}", worker_id, reason);
                 metrics::inc_reliability_error("selection", "toolchain_version_mismatch");
@@ -2994,9 +3044,15 @@ impl WorkerSelector {
     ) -> Option<String> {
         let toolchain = request.toolchain.as_ref()?;
         let toolchain_name = toolchain.rustup_toolchain();
+        let cache_key = self.toolchain_preflight_key(&toolchain_name);
 
-        toolchain_preflight_with(worker, &toolchain_name, |endpoint| {
-            probe_worker_toolchain(endpoint, &toolchain_name, self.ssh_pool.as_ref())
+        toolchain_preflight_with(worker, &cache_key, |endpoint| {
+            probe_worker_toolchain(
+                endpoint,
+                &toolchain_name,
+                &self.remote_environment,
+                self.ssh_pool.as_ref(),
+            )
         })
         .await
     }
@@ -4215,6 +4271,22 @@ fn rustup_component_capability_mismatch(
     request: &SelectionRequest,
     capabilities: &WorkerCapabilities,
 ) -> Option<String> {
+    if request
+        .toolchain
+        .as_ref()
+        .is_some_and(|t| t.native_version().is_some())
+    {
+        // The native toolchain preflight verifies Cargo and clippy together.
+        // Never reinterpret an explicit command pin as a native installation.
+        if required_rustup_component(request) == Some("rustfmt") {
+            return Some("native_toolchain_rustfmt_not_verified".into());
+        }
+        return request
+            .command
+            .as_deref()
+            .and_then(toolchain_from_command_text)
+            .map(|pin| format!("native_toolchain_conflicts_with_command_pin:{pin}"));
+    }
     let component = required_rustup_component(request)?;
     let Some(toolchain) = required_component_toolchain(request) else {
         return Some(format!(
@@ -4311,6 +4383,7 @@ where
 async fn probe_worker_toolchain(
     worker_config: rch_common::WorkerConfig,
     toolchain_name: &str,
+    remote_environment: &BTreeMap<String, String>,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> Result<(), String> {
     let ssh_options = SshOptions {
@@ -4320,10 +4393,7 @@ async fn probe_worker_toolchain(
         ..Default::default()
     };
 
-    let escaped_toolchain = shell_escape::escape(std::borrow::Cow::from(toolchain_name));
-    let command = format!(
-        "rustup run {escaped_toolchain} rustc --version >/dev/null && rustup run {escaped_toolchain} cargo --version >/dev/null"
-    );
+    let command = toolchain_preflight_command(toolchain_name, remote_environment)?;
 
     // Match the health monitor's transport choice while executing the same
     // preflight command and retaining its failure classifications.
@@ -4366,6 +4436,40 @@ async fn probe_worker_toolchain(
         )),
         Err(reason) => Err(reason),
     }
+}
+
+fn toolchain_preflight_command(
+    toolchain_name: &str,
+    remote_environment: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    rch_common::execution_storage::validate_remote_environment(remote_environment)?;
+    let escaped_toolchain = shell_escape::escape(std::borrow::Cow::from(toolchain_name));
+    let command = if let Some(version) = toolchain_name.strip_prefix("native:") {
+        if ToolchainInfo::native(version).is_none() {
+            return Err("invalid_native_toolchain_version".into());
+        }
+        if remote_environment.contains_key("RUSTUP_TOOLCHAIN") {
+            return Err("native_toolchain_refuses_rustup_pin".into());
+        }
+        ToolchainInfo::native_preflight(version)
+    } else {
+        format!(
+            "rustup run {escaped_toolchain} rustc --version >/dev/null && rustup run {escaped_toolchain} cargo --version >/dev/null"
+        )
+    };
+    if remote_environment.is_empty() {
+        return Ok(command);
+    }
+    let keys = remote_environment.keys().cloned().collect::<Vec<_>>();
+    let env =
+        rch_common::ssh_utils::build_env_prefix(&keys, |key| remote_environment.get(key).cloned());
+    // Scope defaults to the entire compound probe, including all Cargo
+    // subprocesses. A login shell here would overwrite a private tool PATH.
+    Ok(format!(
+        "{}sh -c {}",
+        env.prefix,
+        shell_escape::escape(command.into())
+    ))
 }
 
 fn short_preflight_error(stderr: &str) -> String {
@@ -6068,6 +6172,25 @@ mod tests {
             ..local
         };
         assert!(toolchain_capability_mismatch(Some(&dated), &caps).is_none());
+    }
+
+    #[test]
+    fn native_toolchain_identity_gates_version_without_claiming_rustup_components() {
+        let mut request = pinned_component_request("native-project", "cargo clippy --offline");
+        request.toolchain = Some(ToolchainInfo::native("1.93.1").unwrap());
+        let mut capabilities = WorkerCapabilities {
+            rustc_version: Some("rustc 1.93.1 (native)".into()),
+            ..Default::default()
+        };
+        assert!(toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities).is_none());
+        // Native admission has a live compiler/Cargo/clippy preflight; it does
+        // not fabricate a rustup component inventory for an unmanaged worker.
+        assert!(capabilities.rustup_components.is_empty());
+        assert!(rustup_component_capability_mismatch(&request, &capabilities).is_none());
+        capabilities.rustc_version = Some("rustc 1.92.0 (native)".into());
+        assert!(toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities).is_some());
+        request.command = Some("cargo +nightly clippy".into());
+        assert!(rustup_component_capability_mismatch(&request, &capabilities).is_some());
     }
 
     #[test]
@@ -7897,14 +8020,162 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RCH_TEST_NATIVE_RUST_BIN pointing at a native stable Rust toolchain with Clippy"]
+    async fn native_preflight_private_path_and_environment_cache() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let native = std::path::PathBuf::from(std::env::var("RCH_TEST_NATIVE_RUST_BIN").unwrap());
+        let ordinary = root.path().join("ordinary");
+        // Spaces and quotes are intentional: PATH remains literal shell data.
+        let private = root.path().join("private tools' bin");
+        std::fs::create_dir(&ordinary).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        for tool in ["rustc", "cargo"] {
+            symlink(native.join(tool), ordinary.join(tool)).unwrap();
+        }
+        symlink("/bin/sh", ordinary.join("sh")).unwrap();
+        for tool in ["cargo-clippy", "clippy-driver"] {
+            symlink(native.join(tool), private.join(tool)).unwrap();
+        }
+        let version = std::process::Command::new(native.join("rustc"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        let version = version.split_whitespace().nth(1).unwrap();
+        let toolchain = ToolchainInfo::native(version).unwrap().rustup_toolchain();
+        let run = |environment: &BTreeMap<String, String>, identity: &str| {
+            let command = toolchain_preflight_command(identity, environment).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env_clear()
+                .env("HOME", root.path())
+                .env("CARGO_HOME", root.path().join("cargo-home"))
+                .env("PATH", &ordinary)
+                .output()
+                .unwrap();
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "toolchain_preflight_command_failed:{}:{}",
+                    output.status.code().unwrap(),
+                    short_preflight_error(&String::from_utf8_lossy(&output.stderr))
+                ))
+            }
+        };
+        let mut config = rch_common::RchConfig::default();
+        config.environment.remote.insert(
+            "PATH".into(),
+            format!("{}:{}", private.display(), ordinary.display()),
+        );
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        let selector = crate::daemon_worker_selector(&config, history, None);
+        let worker = make_worker("private-native", 2, 95.0);
+        let baseline = WorkerSelector::new();
+        let baseline_key = baseline.toolchain_preflight_key(&toolchain);
+        let configured_key = selector.toolchain_preflight_key(&toolchain);
+        assert_ne!(baseline_key, configured_key);
+        let failed = toolchain_preflight_with(&worker, &baseline_key, |_| async {
+            run(&BTreeMap::new(), &toolchain)
+        })
+        .await
+        .unwrap();
+        assert!(failed.contains("no such command: `clippy`"), "{failed}");
+        assert_eq!(
+            toolchain_preflight_with(&worker, &configured_key, |_| async {
+                run(&selector.remote_environment, &toolchain)
+            })
+            .await,
+            None
+        );
+        // Reusing the same evidence does not execute a second probe.
+        assert_eq!(
+            toolchain_preflight_with(&worker, &configured_key, |_| async {
+                panic!("same environment should reuse successful preflight")
+            })
+            .await,
+            None
+        );
+        assert_eq!(
+            toolchain_preflight_with(&worker, &baseline_key, |_| async {
+                panic!("configured success must not replace the missing-tool refusal")
+            })
+            .await,
+            Some(failed)
+        );
+        assert!(
+            run(&selector.remote_environment, "native:0.0.0").is_err(),
+            "wrong exact version must refuse"
+        );
+        let invalid = BTreeMap::from([("PATH".into(), "bad\npath".into())]);
+        assert!(toolchain_preflight_command(&toolchain, &invalid).is_err());
+        let mut pinned = selector.remote_environment.clone();
+        pinned.insert("RUSTUP_TOOLCHAIN".into(), "nightly".into());
+        assert_eq!(
+            toolchain_preflight_command(&toolchain, &pinned).unwrap_err(),
+            "native_toolchain_refuses_rustup_pin"
+        );
+        let request: SelectionRequest = serde_json::from_value(serde_json::json!({
+            "project": "private-native", "command": "cargo clippy", "estimated_cores": 1,
+            "required_runtime": "rust", "toolchain": ToolchainInfo::native(version).unwrap()
+        }))
+        .unwrap();
+        let pool = WorkerPool::new();
+        pool.add_worker_state(worker).await;
+        let worker = pool.get(&WorkerId::new("private-native")).await.unwrap();
+        // Real probe results above authorize only the configured environment,
+        // even when the ordinary inventory lacks Rust or reports another version.
+        for observed in [None, Some("0.0.0".to_owned())] {
+            worker
+                .set_capabilities(WorkerCapabilities {
+                    rustc_version: observed,
+                    projects_root_ok: Some(true),
+                    ..Default::default()
+                })
+                .await;
+            let selected = selector.select(&pool, &request).await;
+            assert!(selected.worker.is_some(), "{:?}", selected.reason);
+        }
+        let wrong = "native:0.0.0";
+        let wrong_key = selector.toolchain_preflight_key(wrong);
+        assert!(
+            toolchain_preflight_with(&worker, &wrong_key, |_| async {
+                run(&selector.remote_environment, wrong)
+            })
+            .await
+            .is_some()
+        );
+        let mut wrong_request = request.clone();
+        wrong_request.toolchain = ToolchainInfo::native("0.0.0");
+        assert!(
+            selector
+                .select(&pool, &wrong_request)
+                .await
+                .worker
+                .is_none(),
+            "private PATH must not bypass the exact-version live refusal"
+        );
+        println!(
+            "private PATH preflight: native Rust {version}; ordinary PATH missing Clippy; configured PATH passed; wrong version refused; environment cache isolated"
+        );
+    }
+
+    #[tokio::test]
     async fn test_toolchain_preflight_mock_transport() {
         const CASE_ENV: &str = "RCH_PREFLIGHT_TRANSPORT_TEST_CASE";
         if let Ok(case) = std::env::var(CASE_ENV) {
             let worker = make_worker("mock-preflight", 8, 95.0);
             let endpoint = worker.endpoint_snapshot().await.config;
             let ssh_pool = Arc::new(rch_common::SshPool::default());
-            let result =
-                probe_worker_toolchain(endpoint, "nightly-2026-04-30", Some(&ssh_pool)).await;
+            let result = probe_worker_toolchain(
+                endpoint,
+                "nightly-2026-04-30",
+                &BTreeMap::new(),
+                Some(&ssh_pool),
+            )
+            .await;
             match case.as_str() {
                 "success" => assert_eq!(result, Ok(())),
                 "connect" => assert!(
