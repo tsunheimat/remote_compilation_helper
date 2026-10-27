@@ -177,6 +177,52 @@ fn leader_exit_during_capture_does_not_transfer_authority() {
     run_case(CAPTURE_RACE);
 }
 
+// The observer is an explicit fault-injection backend; the production bounded
+// capture and authorization checks run unchanged. No arbitrary PID is signalled.
+const PARTIAL_CAPTURE: &str = r#"
+rch_identified=1
+rch_boot=boot
+rch_pgid=300
+rch_start=100
+rch_snapshot='301 300 S
+302 300 S'
+rch_remote_leader_matches() { return 0; }
+rch_launch_source="$rch_launch_source"'
+rch_remote_leader_matches() { return 0; }
+rch_read_process() {
+    rch_observed_boot=boot
+    rch_observed_start=200
+    case "$1:$test_capture" in
+        302:unavailable) return 1;;
+        302:rebooted) rch_observed_boot=other-boot;;
+        302:malformed) rch_observed_start=0;;
+    esac
+    return 0
+}
+'
+export test_capture
+for test_capture in unavailable rebooted malformed complete; do
+    rch_witnesses=stale
+    rch_witness_identity=stale
+    rch_capture_group_witnesses
+    code=$?
+    if [ "$test_capture" = complete ]; then
+        [ "$code" = 0 ] || exit 1
+        [ "$rch_witnesses" = '301:200
+302:200' ] || exit 2
+        [ "$rch_witness_identity" = boot:300:100 ] || exit 3
+    else
+        [ "$code" = 46 ] || { echo "partial capture accepted: $test_capture/$code" >&2; exit 4; }
+        [ -z "$rch_witnesses" ] && [ -z "$rch_witness_identity" ] || exit 5
+    fi
+done
+"#;
+
+#[test]
+fn every_live_census_member_requires_a_complete_matching_witness() {
+    run_case(PARTIAL_CAPTURE);
+}
+
 const NO_INHERITED_AUTHORITY: &str = r#"
 # Even a parse failure must clear authority inherited from a previous call.
 rch_witnesses='301:200'

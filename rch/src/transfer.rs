@@ -1669,6 +1669,34 @@ const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
 const BUILD_OUTPUT_DIR_EXCLUDES: &[&str] = &["build/", "dist/", "coverage/"];
 /// `target/` is Cargo's own output; only a Cargo package of that name is an input.
 const CARGO_TARGET_DIR_EXCLUDE: &str = "target/";
+/// Name prefixes of custom Cargo target directories, which operator configs
+/// exclude with a trailing wildcard (`target_*/`, `.cargo-target-*/`). The
+/// fleet config's `target_*/` also matched the tracked source directory
+/// `rabs-wkr/src/target_cache/`, so remote builds failed with "file not found
+/// for module" (2026-10-23).
+const CARGO_TARGET_DIR_GLOB_PREFIXES: &[&str] = &[
+    "target_",
+    "target-",
+    ".target_",
+    ".target-",
+    ".cargo-target-",
+];
+
+/// The name prefix of a `<prefix>*/` custom target-directory exclude.
+fn cargo_target_dir_glob_prefix(pattern: &str) -> Option<&str> {
+    let prefix = pattern.strip_suffix("*/")?;
+    CARGO_TARGET_DIR_GLOB_PREFIXES
+        .contains(&prefix)
+        .then_some(prefix)
+}
+
+/// An exclude that [`tracked_input_dir_includes`] may carve tracked inputs
+/// out of. Every other exclude keeps its exact meaning.
+fn is_build_output_exclude(pattern: &str) -> bool {
+    pattern == CARGO_TARGET_DIR_EXCLUDE
+        || BUILD_OUTPUT_DIR_EXCLUDES.contains(&pattern)
+        || cargo_target_dir_glob_prefix(pattern).is_some()
+}
 
 /// Root-anchored, directory-only includes for tracked inputs that a default
 /// build-output exclude would cut off.
@@ -1676,14 +1704,17 @@ const CARGO_TARGET_DIR_EXCLUDE: &str = "target/";
 ///   and dependency preflight then failed with RCH-E410 on every worker.
 /// - bd-xmgez: `coverage/` dropped asupersync's tracked
 ///   `formal/lean/coverage/*.json`, read by `include_str!`.
+/// - 2026-10-23: a configured `target_*/` dropped rabs-wkr's tracked
+///   `src/target_cache/`.
 ///
 /// A `build/`, `dist/` or `coverage/` directory holding any tracked file is
-/// part of the source (a fresh clone has it). Generated output is untracked,
-/// so it stays excluded. A `target/` directory is readmitted only as a Cargo
-/// package (a tracked `Cargo.toml` directly inside). A directory include keeps
-/// every other rule in force for the files inside (secret patterns, nested
-/// `target/`). User-chosen excludes keep their exact meaning. Without git,
-/// nothing changes.
+/// part of the source (a fresh clone has it), and so is one matched by a
+/// custom target-directory glob such as `target_*/`. Generated output is
+/// untracked, so it stays excluded. A `target/` directory is readmitted only
+/// as a Cargo package (a tracked `Cargo.toml` directly inside). A directory
+/// include keeps every other rule in force for the files inside (secret
+/// patterns, nested `target/`). User-chosen excludes keep their exact meaning.
+/// Without git, nothing changes.
 fn tracked_input_dir_includes(project_root: &Path, effective_excludes: &[String]) -> Vec<String> {
     let names: Vec<&str> = effective_excludes
         .iter()
@@ -1694,7 +1725,12 @@ fn tracked_input_dir_includes(project_root: &Path, effective_excludes: &[String]
         .iter()
         .any(|pattern| pattern == CARGO_TARGET_DIR_EXCLUDE)
         .then_some("target");
-    if names.is_empty() && target_name.is_none() {
+    // rsync's `*` also matches nothing, so `target_*/` matches `target_` itself.
+    let target_glob_prefixes: Vec<&str> = effective_excludes
+        .iter()
+        .filter_map(|pattern| cargo_target_dir_glob_prefix(pattern.as_str()))
+        .collect();
+    if names.is_empty() && target_name.is_none() && target_glob_prefixes.is_empty() {
         return Vec::new();
     }
     let Ok(output) = std::process::Command::new("git")
@@ -1730,7 +1766,12 @@ fn tracked_input_dir_includes(project_root: &Path, effective_excludes: &[String]
             }
             prefix.push_str(component);
             let cargo_package = file == "Cargo.toml" && index + 1 == components.len();
-            if names.contains(component) || (cargo_package && target_name == Some(*component)) {
+            if names.contains(component)
+                || target_glob_prefixes
+                    .iter()
+                    .any(|glob_prefix| component.starts_with(glob_prefix))
+                || (cargo_package && target_name == Some(*component))
+            {
                 includes.insert(format!("/{prefix}/"));
             }
         }
@@ -4602,12 +4643,21 @@ impl TransferPipeline {
             }
             cmd.arg("--exclude").arg("*");
         } else {
-            // rsync is first-match-wins: carve Cargo packages out of the
-            // build-output excludes before any exclude is emitted (#113).
+            // rsync is first-match-wins. Carve tracked inputs out of the
+            // build-output excludes before those are emitted (#113), but only
+            // out of those: every other exclude, a project's `.rchignore`
+            // included, goes first, so naming a tracked `docs/build/` there
+            // still drops it.
+            let (build_output, other): (Vec<&String>, Vec<&String>) = effective_excludes
+                .iter()
+                .partition(|pattern| is_build_output_exclude(pattern));
+            for pattern in other {
+                cmd.arg("--exclude").arg(pattern);
+            }
             for pattern in tracked_input_dir_includes(&self.project_root, effective_excludes) {
                 cmd.arg("--include").arg(pattern);
             }
-            for pattern in effective_excludes {
+            for pattern in build_output {
                 cmd.arg("--exclude").arg(pattern);
             }
         }
@@ -5989,6 +6039,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 cmd.arg("-o").arg(format!("ServerAliveInterval={secs}"));
             }
         }
+        // Source retention, closure marking and freshness demand an empty stderr. With known hosts
+        // sent to /dev/null, OpenSSH re-announces the key on every call at INFO, so `rch jobs
+        // recover` could never retire a dead wrapper's build on such a worker.
+        source_content_barrier::configure_ssh_command(cmd.as_std_mut());
         cmd.arg(format!("{}@{}", worker.user, worker.host));
         if bind_activity && let Some(prefix) = &self.source_authority_prefix {
             cmd.arg(prefix);
@@ -15058,6 +15112,24 @@ Number of files transferred: 42
     }
 
     #[test]
+    fn control_plane_ssh_keeps_known_host_notices_out_of_exact_stderr_proofs() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        let args = command_args(&pipeline.worker_ssh_command(&worker, &["sh", "-s"]));
+        let level = args
+            .windows(2)
+            .position(|pair| pair[0] == "-o" && pair[1] == "LogLevel=ERROR")
+            .expect("LogLevel=ERROR");
+        let destination = args
+            .iter()
+            .position(|arg| arg == "ubuntu@worker.example")
+            .expect("destination");
+        assert!(level < destination, "{args:?}");
+        assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_owned()));
+    }
+
+    #[test]
     fn rsync_remote_paths_cover_upload_barrier_estimate_and_retrieval() {
         let _guard = test_guard!();
         let worker = flavour_test_worker();
@@ -22027,6 +22099,160 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
         );
         // A user's own exclude keeps its exact meaning.
         assert!(tracked_input_dir_includes(root.path(), &["crates/".to_string()]).is_empty());
+    }
+
+    /// #113 follow-up: readmitting tracked build-output directories must not
+    /// override a project's own exclude of one of them. The directory includes
+    /// used to precede every exclude, and rsync is first-match-wins, so
+    /// `.rchignore: docs/build/` still uploaded a tracked `docs/build/`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_exclude_still_drops_a_tracked_build_output_directory() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("source fixture");
+        let write = |path: &str, body: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        for (path, body) in [
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/build\"]\n"),
+            ("crates/build/Cargo.toml", "[package]\nname = \"helper\"\n"),
+            ("crates/build/src/lib.rs", "pub fn one() {}\n"),
+            ("docs/build/index.html", "<p>tracked site output</p>\n"),
+            ("docs/coverage/report.json", "{}\n"),
+            (".rchignore", "docs/build/\n/docs/coverage/\n"),
+        ] {
+            write(path, body);
+        }
+        for args in [&["init", "-q"][..], &["add", "-A"][..]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let pipeline = TransferPipeline::new(
+            root.path().to_path_buf(),
+            "fixture".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+        let selected: Vec<String> = pipeline
+            .enumerate_source_content_files()
+            .await
+            .expect("rsync selection")
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for kept in ["crates/build/Cargo.toml", "crates/build/src/lib.rs"] {
+            assert!(
+                selected.iter().any(|p| p == kept),
+                "{kept} missing: {selected:?}"
+            );
+        }
+        for dropped in ["docs/build/index.html", "docs/coverage/report.json"] {
+            assert!(
+                !selected.iter().any(|p| p == dropped),
+                "{dropped} selected despite .rchignore: {selected:?}"
+            );
+        }
+    }
+
+    /// A fleet config excluding custom Cargo target directories with
+    /// `target_*/` also dropped rabs-wkr's tracked `src/target_cache/` module
+    /// tree, so every remote build of the workspace failed with "file not
+    /// found for module `persistence`" (2026-10-23). Tracked directories under
+    /// such globs are source; untracked ones are build output.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn target_dir_globs_keep_tracked_source_directories() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("source fixture");
+        let write = |path: &str, body: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        for (path, body) in [
+            ("Cargo.toml", "[package]\nname = \"wkr\"\n"),
+            ("src/lib.rs", "mod target_cache;\n"),
+            ("src/target_cache.rs", "mod persistence;\n"),
+            ("src/target_cache/persistence.rs", "pub fn p() {}\n"),
+            ("src/target_cache/.env", "SECRET=1\n"),
+            ("tests/artifacts/target-class/case.json", "{}\n"),
+        ] {
+            write(path, body);
+        }
+        for args in [&["init", "-q"][..], &["add", "-A"][..]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        // Generated output stays untracked.
+        for path in [
+            "target_rch/debug/wkr",
+            "crates/x/target-nested/obj.o",
+            ".cargo-target-ci/debug/wkr",
+        ] {
+            write(path, "output\n");
+        }
+        let config = TransferConfig {
+            exclude_patterns: [
+                "target/",
+                "target_*/",
+                "target-*/",
+                ".target-*/",
+                ".target_*/",
+                ".cargo-target-*/",
+                ".env",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            ..TransferConfig::default()
+        };
+        let pipeline = TransferPipeline::new(
+            root.path().to_path_buf(),
+            "fixture".to_string(),
+            "hash".to_string(),
+            config,
+        );
+        let selected: Vec<String> = pipeline
+            .enumerate_source_content_files()
+            .await
+            .expect("rsync selection")
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for kept in [
+            "src/target_cache.rs",
+            "src/target_cache/persistence.rs",
+            "tests/artifacts/target-class/case.json",
+        ] {
+            assert!(
+                selected.iter().any(|p| p == kept),
+                "{kept} missing: {selected:?}"
+            );
+        }
+        for dropped in [
+            "src/target_cache/.env",
+            "target_rch/debug/wkr",
+            "crates/x/target-nested/obj.o",
+            ".cargo-target-ci/debug/wkr",
+        ] {
+            assert!(!selected.iter().any(|p| p == dropped), "{dropped} selected");
+        }
+        // Only the conventional target-directory prefixes are carved; any
+        // other user glob keeps its exact meaning.
+        assert!(tracked_input_dir_includes(root.path(), &["targ*/".to_string()]).is_empty());
+        assert_eq!(
+            tracked_input_dir_includes(root.path(), &["target_*/".to_string()]),
+            ["/src/target_cache/"]
+        );
     }
 
     #[cfg(unix)]
