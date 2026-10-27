@@ -180,6 +180,192 @@ impl Fixture {
     }
 }
 
+fn hook_rewrite(fixture: &Fixture, command: &str) -> String {
+    let request = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command, "timeout": 120000, "description": "mixed native/shared regression"},
+        "cwd": fixture.project,
+    });
+    let output = fixture.run(
+        &mut fixture.command(),
+        &serde_json::to_vec(&request).unwrap(),
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "hook did not rewrite {command:?}: {error}; stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let rewritten = response["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut expected = request["tool_input"].clone();
+    expected["command"] = rewritten.clone().into();
+    assert_eq!(response["hookSpecificOutput"]["updatedInput"], expected);
+    // Compounds still require the agent's permission check for the authored
+    // prefix; interception must not auto-approve unrelated shell operations.
+    assert_ne!(
+        response["hookSpecificOutput"]["permissionDecision"],
+        "allow"
+    );
+    assert!(!fixture.root.join("state/job-leases").exists());
+    rewritten
+}
+
+#[test]
+fn mixed_agent_hook_covers_both_orders_and_preserves_native_backend() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        hook_rewrite(&fixture, "pytest -q | tee log; cargo test"),
+        "rch exec --verification -- pytest -q | tee log; rch exec -- cargo test"
+    );
+    for (command, expected) in [
+        (
+            "pytest -q && cargo test",
+            "rch exec --verification -- pytest -q && rch exec -- cargo test",
+        ),
+        (
+            "cargo test && pytest -q",
+            "rch exec -- cargo test && rch exec --verification -- pytest -q",
+        ),
+        (
+            "cd 'web dir' && pytest -q && cargo check",
+            "cd 'web dir' && rch exec --verification -- pytest -q && rch exec -- cargo check",
+        ),
+        (
+            "cargo check && cargo test",
+            "rch exec -- cargo check && rch exec -- cargo test",
+        ),
+        (
+            "pytest || node --import setup.mjs --test t.cjs",
+            "rch exec --verification -- pytest || rch exec -- node --import setup.mjs --test t.cjs",
+        ),
+        (
+            "rtk run 'pytest && cargo test' && cargo check",
+            "rch exec --verification -- rtk run 'pytest && cargo test' && rch exec -- cargo check",
+        ),
+        (
+            "X='literal ; $HOME' pytest && cargo test",
+            "X='literal ; $HOME' rch exec --verification --forward-env X -- pytest && rch exec -- cargo test",
+        ),
+    ] {
+        assert_eq!(hook_rewrite(&fixture, command), expected, "{command}");
+    }
+}
+
+#[test]
+fn mixed_agent_hook_redirects_cannot_bypass_native_allowlist() {
+    let fixture = Fixture::new();
+    for (source, expected) in [
+        (
+            "cargo >log test && pytest",
+            "rch exec --verification -- cargo >log test && rch exec --verification -- pytest",
+        ),
+        (
+            "node --import setup.mjs --test t.cjs | tee log; cargo test",
+            "rch exec --verification -- node --import setup.mjs --test t.cjs | tee log; rch exec -- cargo test",
+        ),
+    ] {
+        assert_eq!(hook_rewrite(&fixture, source), expected, "{source}");
+    }
+    let config_path = fixture.root.join("config/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!("{config}\n[execution]\nallowlist = [\"go\"]\n"),
+    )
+    .unwrap();
+    for source in [
+        "cargo >log test && pytest",
+        "cargo 2>errors test && pytest",
+        "node --import setup.mjs --test t.cjs | tee log; pytest",
+    ] {
+        assert_eq!(
+            hook_rewrite(&fixture, source),
+            source.replace("pytest", "rch exec --verification -- pytest"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn mixed_agent_hook_rewrite_keeps_shell_exit_argv_cwd_and_streams() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let tools = fixture.root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    fs::create_dir(fixture.project.join("child dir")).unwrap();
+    // Explicit executables are shell-semantics witnesses, not worker mocks
+    // presented as live remote execution. The rewrite itself comes from the
+    // real compiled RCH hook; no actual Cargo/Python workload is launched.
+    let body = r#"#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if Path(sys.argv[0]).name == 'rch':
+    assert args[0] == 'exec'
+    cut = args.index('--')
+    options, args = args[1:cut], args[cut+1:]
+    with open(os.environ['CALLS'], 'a') as log:
+        log.write(json.dumps({'options': options, 'argv': args}) + '\n')
+else:
+    args = [Path(sys.argv[0]).name, *args]
+report = {'argv': args, 'cwd': os.getcwd(), 'X': os.getenv('X')}
+sys.stdout.buffer.write(json.dumps(report, sort_keys=True).encode() + b'\x00\xff')
+sys.stderr.buffer.write(b'err\x00\xff')
+sys.exit(23 if '--fail' in args else 0)
+"#;
+    for name in ["rch", "pytest", "cargo"] {
+        let path = tools.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let calls = fixture.root.join("calls.jsonl");
+    for (source, expected_calls) in [
+        ("pytest -q && cargo test", 2),
+        ("cargo test && pytest -q", 2),
+        ("pytest --fail && cargo test", 1),
+        ("cargo test --fail || pytest -q", 2),
+        (
+            "cd 'child dir' && X='literal ; $HOME' pytest '' 'two words' && cargo test",
+            2,
+        ),
+        ("pytest -q | /bin/cat; cargo test", 2),
+    ] {
+        let rewritten = hook_rewrite(&fixture, source);
+        let run_shell = |command: &str| {
+            Command::new("/bin/bash")
+                .args(["--noprofile", "--norc", "-c", command])
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+                .env("CALLS", &calls)
+                .current_dir(&fixture.project)
+                .output()
+                .unwrap()
+        };
+        let before = fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let original = run_shell(source);
+        let after = run_shell(&rewritten);
+        assert_eq!(after.status.code(), original.status.code(), "{source}");
+        assert_eq!(after.stdout, original.stdout, "{source}");
+        assert_eq!(after.stderr, original.stderr, "{source}");
+        let records: Vec<Value> = fs::read_to_string(&calls)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len() - before, expected_calls, "{source}");
+    }
+    assert!(!fixture.root.join("state/job-leases").exists());
+}
+
 #[test]
 fn rtk_hook_preserves_exact_literal_export_event_and_controls() {
     let fixture = Fixture::new();

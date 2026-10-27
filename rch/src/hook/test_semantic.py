@@ -36,6 +36,75 @@ def rewrite(command):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_hook_components_cover_both_orders_without_reconstructing_shell(self):
+        for source in ("pytest -q && cargo test", "cargo test && pytest -q",
+                       "printf '中文'; /usr/bin/clang -c 'two words.c' && pytest -q"):
+            raw = source.encode()
+            edits = semantic.plan(source, hook=True)
+            expected = 3 if source.startswith("printf") else 2
+            self.assertEqual(len(edits), expected)
+            for edit in edits:
+                self.assertEqual(raw[edit["start"]:edit["end"]].decode(), edit["word"])
+                self.assertTrue(raw[edit["start"]:edit["command_end"]].startswith(edit["word"].encode()))
+                self.assertTrue(edit["native_eligible"])
+                self.assertEqual(edit["env"], [])
+            # Generic/shim responses retain the v1 fields and behaviour.
+            for edit in semantic.plan(source):
+                self.assertEqual(set(edit), {"start", "end", "word", "env"})
+
+    def test_hook_native_eligibility_preserves_stream_and_environment_contracts(self):
+        for source in ("cargo test | tee log", "cargo test >log && pytest",
+                       "(cargo test); pytest", "cargo test & pytest"):
+            edits = semantic.plan(source, hook=True)
+            cargo = next(edit for edit in edits if edit["word"] == "cargo")
+            self.assertFalse(cargo["native_eligible"], source)
+            self.assertTrue(cargo["verification"], source)
+        for source in ("X='a b' cargo test && pytest", "export X='a b'; cargo test"):
+            cargo = next(edit for edit in semantic.plan(source, hook=True) if edit["word"] == "cargo")
+            self.assertFalse(cargo["native_eligible"])
+            self.assertEqual(cargo["env"], ["X"])
+        source = "rtk run 'pytest && cargo test' && cargo test"
+        edits = semantic.plan(source, hook=True)
+        self.assertEqual([edit["word"] for edit in edits], ["rtk", "cargo"])
+        self.assertFalse(edits[0]["native_eligible"])
+        self.assertTrue(edits[0]["verification"])
+        self.assertTrue(edits[1]["native_eligible"])
+
+    def test_hook_mode_has_no_partial_native_plan_for_unsupported_grammar(self):
+        for source in ("eval 'pytest' && cargo test", "if true; then pytest; fi && cargo test",
+                       "export X=1 && pytest; cargo test", "pytest <<EOF && cargo test",
+                       "pytest\ncargo test", "alias pytest=false; cargo test"):
+            self.assertEqual(semantic.plan(source, hook=True), [], source)
+
+    def test_hook_argv_spans_exclude_only_redirections_not_authored_arguments(self):
+        source = "cargo >'two words.log' test --features 'a b' && pytest"
+        edits = semantic.plan(source, hook=True)
+        raw = source.encode()
+        self.assertEqual([raw[arg["start"]:arg["end"]].decode()
+                          for arg in edits[0]["argv"]],
+                         ["cargo", "test", "--features", "'a b'"])
+        self.assertFalse(edits[0]["native_eligible"])
+        self.assertTrue(edits[0]["verification"])
+        self.assertEqual(edits[1]["word"], "pytest")
+        for source in ("exec -a alternate cargo test && pytest",
+                       "time -p cargo test && pytest", "! ! cargo test && pytest"):
+            self.assertNotIn("!", [edit["word"] for edit in semantic.plan(source, hook=True)])
+            self.assertNotIn("time", [edit["word"] for edit in semantic.plan(source, hook=True)])
+            self.assertNotIn("-a", [edit["word"] for edit in semantic.plan(source, hook=True)])
+
+    def test_hook_wire_mode_is_explicit_and_keeps_legacy_schema(self):
+        for request, version in (({"command": "pytest && cargo test"}, 1),
+                                 ({"command": "pytest && cargo test", "mode": "hook"}, 2)):
+            response = subprocess.run([sys.executable, "-I", str(PATH)],
+                                      input=json.dumps(request).encode(), capture_output=True,
+                                      timeout=5, check=True)
+            self.assertEqual(json.loads(response.stdout)["version"], version)
+        bad = subprocess.run([sys.executable, "-I", str(PATH)],
+                             input=b'{"command":"cargo test","mode":"unknown"}',
+                             capture_output=True, timeout=5)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertEqual(bad.stdout, b"")
+
     def test_nested_exports_and_conditionals_have_one_shell_owner(self):
         inner = (
             "export GOTOOLCHAIN=local GOSUMDB=off GOFLAGS=-mod=mod "

@@ -5696,7 +5696,36 @@ async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutp
     // Mask sensitive data in debug logs (API keys, tokens, passwords)
     debug!("Processing command: {}", mask_sensitive_command(command));
 
-    // Classify the command using the 5-tier system.
+    // A native match on the final stage must not hide an earlier general
+    // verification command (pytest && cargo test). Parse authored structure
+    // first, then select native/shared routing independently for each stage.
+    // Bare native commands keep the existing fast path below. Never fall back
+    // to a partial whole-command native rewrite after a structural miss.
+    if semantic::needs_structure(command) {
+        let config = match load_request_config() {
+            Ok(config) => config,
+            Err(error) => {
+                warn!("Failed to load compound hook policy: {error}");
+                return HookOutput::allow();
+            }
+        };
+        if !config.general.enabled || config.general.force_local {
+            return HookOutput::allow();
+        }
+        match semantic::plan_for_hook(command, &config).await {
+            Ok(Some(rewritten)) => {
+                return HookOutput::rewrite_with_permission_check(rewritten);
+            }
+            Ok(None) => debug!("No structurally safe hook components to delegate"),
+            Err(error) => debug!("Compound hook planning declined: {error:#}"),
+        }
+        if let Some(reason) = declined_compilation_due_to_structure(command) {
+            HookReporter::new(config.output.visibility).summary(&format!("[RCH] local ({reason})"));
+        }
+        return HookOutput::allow();
+    }
+
+    // Classify a bare command using the 5-tier system.
     // Per AGENTS.md: non-compilation decisions must complete in <1ms, compilation in <5ms
     // The real hook path bypasses the classification cache because hook
     // invocations are one-shot even when RCH_HOOK_MODE is not set.

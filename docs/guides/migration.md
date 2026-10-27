@@ -217,6 +217,60 @@ per-tool generic uninstall. Preserve migration journals, legacy files and active
 jobs; select the retained known-good version separately rather than deleting
 state as a shortcut.
 
+### Mixed agent commands select a backend per component
+
+The agent continues to issue ordinary shell commands. For supported compound
+syntax the hook first parses the whole authored structure, then applies native
+compilation classification and policy to each component. Both orders below
+retain the same per-tool backend; pytest no longer stays bare merely because a
+later Cargo command matched the native classifier:
+
+```text
+pytest -q && cargo test
+  -> rch exec --verification -- pytest -q && rch exec -- cargo test
+cargo test && pytest -q
+  -> rch exec -- cargo test && rch exec --verification -- pytest -q
+```
+
+A standalone native compiler command keeps the existing fast path. Compound
+planning uses the bounded embedded Python 3 helper; native configuration
+confidence/allowlist exclusions are not retried as verification bypasses.
+Ordinary local components, authored quoting, `cd`, conditional operators and
+redirections are retained. Agent permission checking remains required for the
+rewritten compound; the hook never auto-approves its unrelated prefix.
+
+Pipeline participants and redirected commands use the native-stream shared
+contract where supported. A subsequent independent Cargo stage after `;` can
+still use its native mirror path. Prefix/export environment forwarding, nested
+shell wrappers, groups and background scopes retain the conservative shared
+contract rather than silently changing stdin/stdout or environment semantics.
+A literal RTK shell remains one shared invocation, not independently scheduled
+inner commands. General shared-workspace configuration is still required.
+
+Unsupported control syntax or an unavailable/failed planner does not authorize
+a partial native rewrite of the rest of the command. The original command is
+left unchanged under the existing hook miss policy; that is not evidence of
+remote execution. Existing shim coverage and strict execution policies are not
+broadened by this structural fix. The generic-shim classifier and its wire
+schema remain separate and unchanged.
+
+### Stability backports and upgrade observations
+
+Default socket provenance is recomputed for the calling environment instead of
+reusing a systemd/agent shell's cached default. Explicit socket configuration is
+preserved. Configuration cache schema 6 also retains the fork's prior source-root
+and remote-base validation invalidation. Doctor reports a live daemon on another
+known default socket rather than starting a duplicate.
+
+Freshly admitted workers initially expose no new slots until finite filesystem
+capacity is measured, with the upstream 120-second hold bound; this is not a
+permanent refusal of unknown capacity. Existing leases remain accounted for.
+Prepared Node/Bun tool directories use their physical absolute path across `cd`.
+Explicit project rsync exclusions remain authoritative, while tracked source
+under names such as `src/target_cache` is no longer mistaken for generated Cargo
+output. Cancellation recovery requires durable records and complete process
+identity witnesses before claiming the corresponding authority.
+
 ### RTK logs and local fallback limits
 
 RTK 0.46.0 integration recognizes `rtk run -c SOURCE`, `rtk run SOURCE`,
