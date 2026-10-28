@@ -306,6 +306,18 @@ policy. This is propagation of a recognized delegation's policy, not a claim tha
 every shell command has been intercepted. Mixed compounds retain permission
 checking and exact authored command bytes.
 
+Once a candidate request and its policy have been loaded, a planner startup,
+process, protocol, output-limit or timeout failure cannot silently remove a
+remote-only requirement. Strict policy or disabled local fallback returns a
+structured hook denial with no rewritten command. Under non-strict policy the
+original command remains unchanged, with a visible diagnostic. Use
+`RCH_LOG_TARGETS=rch::hook::planner_failure=debug` to distinguish operational
+failure from a supported analysis that found nothing to delegate. Successful
+hooks remain silent on stderr. The 750ms parser budget and output bounds are
+unchanged, and the owned parser child is stopped/reaped on timeout. Ordinary
+local commands, explicit project opt-outs, and unsupported grammar keep their
+existing classification policy; this is not broader command interception.
+
 ### Worker selection inventory
 
 `rch --json diagnose --dry-run 'cargo test'` includes a `worker_selection.inventory`

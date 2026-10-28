@@ -5777,6 +5777,29 @@ async fn process_hook(input: HookInput) -> HookOutput {
     process_hook_with_cwd(input, None).await
 }
 
+/// An operational planning failure is not evidence that a candidate may run
+/// locally. Keep ordinary fail-open policy, but never erase a remote-only
+/// requirement before the executor can receive it. Grammar misses remain None
+/// and are deliberately not promoted into guessed delegation or execution.
+fn planner_failure_output(config: &rch_common::RchConfig, error: &anyhow::Error) -> HookOutput {
+    debug!(target: "rch::hook::planner_failure", "semantic planning failed: {error:#}");
+    if exec_requires_remote()
+        || role_requires_remote(config.general.role)
+        || !config.compilation.allow_local_fallback
+    {
+        HookOutput::deny(
+            "RCH could not establish required remote routing because the command planner failed. \
+             Local execution is not authorized. Retry after restoring the planner; \
+             RCH_LOG_TARGETS=rch::hook::planner_failure=debug reports the failure."
+                .to_string(),
+        )
+    } else {
+        HookReporter::new(config.output.visibility)
+            .summary("[RCH] planner failed; command unchanged under non-strict fallback policy");
+        HookOutput::allow()
+    }
+}
+
 /// Process a hook request without changing process cwd or environment.
 async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutput {
     let load_request_config = || match cwd {
@@ -5814,7 +5837,7 @@ async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutp
                 return HookOutput::rewrite_with_permission_check(rewritten);
             }
             Ok(None) => debug!("No structurally safe hook components to delegate"),
-            Err(error) => debug!("Compound hook planning declined: {error:#}"),
+            Err(error) => return planner_failure_output(&config, &error),
         }
         if let Some(reason) = declined_compilation_due_to_structure(command) {
             HookReporter::new(config.output.visibility).summary(&format!("[RCH] local ({reason})"));
@@ -5845,7 +5868,7 @@ async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutp
                         return HookOutput::rewrite_with_permission_check(rewritten);
                     }
                     Ok(None) => {}
-                    Err(error) => debug!("semantic planning declined: {error:#}"),
+                    Err(error) => return planner_failure_output(&config, &error),
                 }
             }
         }

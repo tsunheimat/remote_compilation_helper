@@ -97,6 +97,16 @@ impl Fixture {
         input: &[u8],
         mut control: impl FnMut(&std::process::Child, Duration),
     ) -> Run {
+        // A hook optimization miss legitimately exits zero with no stdout.
+        // Keep its bounded diagnostic explanation in the owned fixture instead
+        // of losing the distinction between parser startup, timeout and grammar.
+        // Workload invocations retain their exact binary stderr contract.
+        let hook_request = command.get_args().eq(["--no-self-healing"])
+            && serde_json::from_slice::<Value>(input)
+                .is_ok_and(|value| value["hook_event_name"] == "PreToolUse");
+        if hook_request {
+            command.env("RCH_LOG_TARGETS", "rch::hook::planner_failure=debug");
+        }
         let id = self.calls.fetch_add(1, Ordering::Relaxed);
         let stdout = self.root.join(format!("{id}.stdout"));
         let stderr = self.root.join(format!("{id}.stderr"));
@@ -137,12 +147,22 @@ impl Fixture {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        Run {
+        let result = Run {
             status,
             stdout: fs::read(stdout).unwrap(),
             stderr: fs::read(stderr).unwrap(),
             elapsed: start.elapsed(),
+        };
+        if hook_request && result.stdout.is_empty() {
+            eprintln!(
+                "hook returned unchanged after {:?}; fixture={}; input={}; diagnostics={}",
+                result.elapsed,
+                self.root.display(),
+                String::from_utf8_lossy(input),
+                String::from_utf8_lossy(&result.stderr),
+            );
         }
+        result
     }
 
     fn result(&self, path: &Path) -> Value {
@@ -1102,6 +1122,152 @@ fn agent_hook_carries_strict_policy_only_for_delegated_components() {
                     .is_none()
             );
         }
+    }
+}
+
+fn planner_fixture(fixture: &Fixture, name: &str, body: Option<&str>) -> PathBuf {
+    let tools = fixture.root.join(name);
+    fs::create_dir(&tools).unwrap();
+    if let Some(body) = body {
+        // The parent never holds an executable writable across parallel forks.
+        // This is a deliberately substituted parser, not remote execution proof.
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 077; set -C; printf '%s' \"$2\" > \"$1\" && /bin/chmod 700 \"$1\"",
+                "planner-fixture",
+            ])
+            .arg(tools.join("python3"))
+            .arg(format!("#!/bin/sh\n{body}\n"))
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    tools
+}
+
+fn run_planner_hook(fixture: &Fixture, tools: &Path, source: &str, strict: Option<&str>) -> Run {
+    let request = serde_json::json!({"hook_event_name":"PreToolUse", "tool_name":"Bash",
+        "tool_input":{"command":source}, "cwd":fixture.project});
+    let mut command = fixture.command();
+    command
+        .env("PATH", tools)
+        .env("PLANNER_PID", fixture.root.join("planner.pid"));
+    if let Some(strict) = strict {
+        command.env("RCH_REQUIRE_REMOTE", strict);
+    }
+    fixture.run(&mut command, &serde_json::to_vec(&request).unwrap())
+}
+
+#[test]
+fn planner_operational_failures_preserve_strict_hook_policy_and_normal_controls() {
+    let fixture = Fixture::new();
+    for (name, body, diagnostic) in [
+        ("missing", None, "start isolated semantic planner"),
+        (
+            "failed",
+            Some("/bin/cat >/dev/null; printf 'owned planner failure' >&2; exit 19"),
+            "semantic planner exited",
+        ),
+        (
+            "malformed",
+            Some("/bin/cat >/dev/null; printf '{'"),
+            "invalid structural hook response",
+        ),
+        (
+            "excess-output",
+            Some("/bin/cat >/dev/null; exec /usr/bin/python3 -I -S -c 'print(\"x\" * 524289)'"),
+            "semantic planner stdout limit",
+        ),
+    ] {
+        let tools = planner_fixture(&fixture, name, body);
+        for (role, policy, allow_fallback, strict) in [
+            ("hybrid", Some("1"), true, true),
+            ("dispatcher", None, true, true),
+            ("hybrid", None, false, true),
+            ("hybrid", None, true, false),
+            ("dispatcher", Some("0"), true, false),
+        ] {
+            fixture.configure(role, allow_fallback);
+            for source in ["pytest -q", "pytest -q && cargo test"] {
+                let output = run_planner_hook(&fixture, &tools, source, policy);
+                assert!(
+                    output.status.success(),
+                    "the hook protocol must still return a valid decision"
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains(diagnostic),
+                    "{name}/{role}/{policy:?}: {stderr}"
+                );
+                if strict {
+                    let response: Value = serde_json::from_slice(&output.stdout)
+                        .unwrap_or_else(|error| panic!("strict planner failure must deny, not allow unchanged: {name}/{source}: {error}; {stderr}"));
+                    assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+                    let reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+                        .as_str()
+                        .unwrap();
+                    assert!(
+                        reason.contains("planner") && reason.contains("remote"),
+                        "{reason}"
+                    );
+                    assert!(
+                        response
+                            .pointer("/hookSpecificOutput/updatedInput")
+                            .is_none()
+                    );
+                } else {
+                    assert!(
+                        output.stdout.is_empty(),
+                        "non-strict miss policy remains unchanged"
+                    );
+                }
+                assert!(!fixture.root.join("state/job-leases").exists());
+            }
+        }
+        // A normal local command never needs this helper, even in strict mode.
+        let ordinary = run_planner_hook(&fixture, &tools, "git status", Some("1"));
+        assert!(ordinary.status.success());
+        assert!(ordinary.stdout.is_empty());
+        assert!(ordinary.stderr.is_empty());
+    }
+    // Positive control through exactly the same PATH-mediated helper launch.
+    let real = planner_fixture(&fixture, "real", Some("exec /usr/bin/python3 \"$@\""));
+    fixture.configure("hybrid", true);
+    let output = run_planner_hook(&fixture, &real, "pytest -q && cargo test", Some("1"));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["hookSpecificOutput"]["updatedInput"]["command"],
+        "rch exec --verification --require-remote -- pytest -q && rch exec --require-remote -- cargo test"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn planner_timeout_is_bounded_reaped_and_not_strict_local_permission() {
+    let fixture = Fixture::new();
+    let tools = planner_fixture(
+        &fixture,
+        "timeout",
+        Some("/bin/cat >/dev/null; printf '%s' $$ > \"$PLANNER_PID\"; exec /bin/sleep 10"),
+    );
+    for source in ["pytest -q", "pytest -q && cargo test"] {
+        let output = run_planner_hook(&fixture, &tools, source, Some("1"));
+        assert!(output.status.success());
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("semantic planner timed out"));
+        let pid = fs::read_to_string(fixture.root.join("planner.pid")).unwrap();
+        assert!(
+            !Path::new("/proc").join(pid.trim()).exists(),
+            "owned helper must be reaped before the hook answers"
+        );
+        assert!(
+            output.elapsed < Duration::from_secs(5),
+            "not a new parser budget; hung-child cleanup sentinel"
+        );
+        assert!(!fixture.root.join("state/job-leases").exists());
     }
 }
 
