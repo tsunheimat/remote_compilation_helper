@@ -5,7 +5,7 @@
 #![cfg(unix)]
 
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,48 @@ struct Daemon {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+// The fixture's request is EOF-framed, like the actual CLI's short socket
+// messages. Reassemble fragments and transient readiness errors under ONE
+// absolute deadline. A partial request at expiry must never authorize a reply.
+fn read_scripted_request(reader: &mut impl Read, deadline: Instant) -> io::Result<String> {
+    let mut request = Vec::new();
+    let mut buffer = [0; 512];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "scripted daemon request deadline: {} bytes, no EOF",
+                    request.len()
+                ),
+            ));
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                return String::from_utf8(request)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+            }
+            Ok(count) => {
+                if request.len() + count > 8192 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "scripted daemon request exceeds 8192 bytes",
+                    ));
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Daemon {
     fn start(root: &Path, reply: Reply) -> Self {
         let socket = root.join("daemon.sock");
@@ -53,20 +95,17 @@ impl Daemon {
                     }
                     Err(error) => panic!("scripted daemon accept: {error}"),
                 };
-                // Darwin may retain the listener's nonblocking flag on the
-                // accepted stream. This fixture reads a bounded complete
-                // request, so select blocking I/O before applying its deadline.
+                // Set the accepted socket's mode explicitly on every OS;
+                // WouldBlock is readiness, not a malformed lifecycle request.
+                // Unlike read_to_string with SO_RCVTIMEO, fragments do not
+                // reset this two-second budget or discard already-read bytes.
+                stream.set_nonblocking(true).unwrap();
+                let request =
+                    read_scripted_request(&mut stream, Instant::now() + Duration::from_secs(2))
+                        .unwrap();
                 stream.set_nonblocking(false).unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
                     .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = String::new();
-                (&mut stream)
-                    .take(8192)
-                    .read_to_string(&mut request)
                     .unwrap();
                 let request = request.trim().to_owned();
                 seen.lock().unwrap().push(request.clone());
@@ -123,6 +162,71 @@ impl Daemon {
 }
 
 #[test]
+fn scripted_request_reassembles_transient_errors_without_accepting_partial_data() {
+    struct Fragments(std::collections::VecDeque<io::Result<Vec<u8>>>);
+    impl Read for Fragments {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let bytes = self.0.pop_front().expect("reader consumed past EOF")?;
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+    let mut reader = Fragments(std::collections::VecDeque::from([
+        Err(io::ErrorKind::WouldBlock.into()),
+        Ok(b"POST ".to_vec()),
+        Err(io::ErrorKind::Interrupted.into()),
+        Ok(b"/restart-".to_vec()),
+        Err(io::ErrorKind::WouldBlock.into()),
+        Ok(b"admission".to_vec()),
+        Ok(Vec::new()),
+    ]));
+    assert_eq!(
+        read_scripted_request(&mut reader, Instant::now() + Duration::from_secs(2)).unwrap(),
+        "POST /restart-admission"
+    );
+    assert!(reader.0.is_empty());
+    for bytes in [vec![b'x'; 8193], vec![0xff]] {
+        assert_eq!(
+            read_scripted_request(
+                &mut io::Cursor::new(bytes),
+                Instant::now() + Duration::from_secs(2)
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    let bytes = vec![b'x'; 8192];
+    assert_eq!(
+        read_scripted_request(
+            &mut io::Cursor::new(&bytes),
+            Instant::now() + Duration::from_secs(2)
+        )
+        .unwrap()
+        .as_bytes(),
+        bytes
+    );
+    let mut expired = Fragments(std::collections::VecDeque::new());
+    assert_eq!(
+        read_scripted_request(&mut expired, Instant::now())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn scripted_request_retains_deadline_when_peer_keeps_partial_request_open() {
+    let (mut reader, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    peer.write_all(b"POST /restart-").unwrap();
+    let error =
+        read_scripted_request(&mut reader, Instant::now() + Duration::from_millis(20)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("14 bytes, no EOF"), "{error}");
+}
+
+#[test]
 fn scripted_daemon_accepts_fragmented_requests_before_the_read_deadline() {
     use std::net::Shutdown;
 
@@ -153,7 +257,12 @@ fn scripted_daemon_accepts_fragmented_requests_before_the_read_deadline() {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.take().unwrap().join().unwrap();
+        let joined = self.thread.take().unwrap().join();
+        // A failed server still fails an otherwise passing test. Do not abort
+        // the entire test binary with a second panic during an existing unwind.
+        if !std::thread::panicking() {
+            joined.unwrap();
+        }
     }
 }
 

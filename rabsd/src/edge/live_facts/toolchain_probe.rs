@@ -139,19 +139,37 @@ mod tests {
     fn fixture(version: &str, sysroot: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = crate::test_util::private_tempdir();
         let compiler = dir.path().join("rustc");
-        std::fs::write(
-            &compiler,
-            format!(
-                "#!/bin/sh\n\
+        let script = format!(
+            "#!/bin/sh\n\
                  if [ -n \"${{PROBE_LOG:-}}\" ]; then printf '%s\\n' \"$*\" >> \"$PROBE_LOG\"; fi\n\
                  case \"$*\" in\n\
                  '-vV') {version};;\n\
                  '--print sysroot') {sysroot};;\n\
                  *) exit 64;;\n\
                  esac\n",
-            ),
-        )
-        .unwrap();
+        );
+        // A sibling test can fork while fs::write holds the executable open,
+        // inheriting that writer until its exec. Closing our own writer then
+        // does not prevent ETXTBSY. Publish in a separate, reaped process: the
+        // multithreaded test process never owns a writable executable handle.
+        // The script is literal argv data to printf, not interpolated shell.
+        let published = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 077; set -C; printf '%s' \"$2\" > \"$1\"",
+                "probe-fixture",
+            ])
+            .arg(&compiler)
+            .arg(&script)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            published.status.success(),
+            "fixture publication: {published:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&compiler).unwrap(), script);
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
         (dir, compiler)
     }
@@ -174,6 +192,90 @@ mod tests {
                 assert!(state.starts_with('Z'), "probe process remains live: {stat}");
             }
             Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
+    fn busy_executable_is_refused_without_retry_or_query_evidence() {
+        let (dir, compiler) = fixture("printf version", "printf root");
+        let env = logged_env(dir.path());
+        use std::io::{Read, Write};
+
+        // The fault writer must itself be child-owned: holding it in this
+        // multithreaded parent would reproduce the inherited-writer race even
+        // AFTER drop(writer). No sibling process can inherit this child's fd.
+        let mut writer = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "set -eu; exec 3>>\"$1\"; printf 'ready\\n'; IFS= read -r release",
+                "busy-probe",
+            ])
+            .arg(&compiler)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 6];
+        if let Err(error) = writer.stdout.as_mut().unwrap().read_exact(&mut ready) {
+            let _ = writer.kill();
+            let output = writer.wait_with_output().unwrap();
+            panic!("fault writer not ready: {error}; {output:?}");
+        }
+        let refused = identity(&compiler, &env);
+        let queried_while_busy = dir.path().join("queries").exists();
+        // Explicit data, not EOF: transient inheritance of a pipe writer by
+        // another test must not defer release of this deliberate fault.
+        let release = writer.stdin.take().unwrap().write_all(b"release\n");
+        if release.is_err() {
+            let _ = writer.kill();
+        }
+        let retired = writer.wait_with_output().unwrap();
+        assert_eq!(&ready, b"ready\n");
+        release.unwrap();
+        assert!(retired.status.success(), "fault writer: {retired:?}");
+        let error = refused.unwrap_err();
+        assert!(error.contains("os error 26"), "{error}");
+        assert!(!queried_while_busy);
+        // Reaping the deliberate writer restores the real execution path;
+        // production does not retry or reinterpret a failed spawn as evidence.
+        assert_eq!(
+            identity(&compiler, &env).unwrap(),
+            ("version".into(), "root".into())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("queries")).unwrap(),
+            "-vV\n--print sysroot\n"
+        );
+    }
+
+    #[test]
+    fn parallel_fixture_publication_and_probes_keep_exact_query_outputs() {
+        let threads: Vec<_> = (0..8)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    for round in 0..4 {
+                        let expected = format!("worker-{worker}-round-{round}");
+                        let (dir, compiler) = fixture(
+                            &format!("printf '%s' '{expected}'"),
+                            "printf '/literal root'",
+                        );
+                        let env = logged_env(dir.path());
+                        assert_eq!(
+                            identity(&compiler, &env).unwrap(),
+                            (expected, "/literal root".into())
+                        );
+                        assert_eq!(
+                            std::fs::read_to_string(dir.path().join("queries")).unwrap(),
+                            "-vV\n--print sysroot\n"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
         }
     }
 
