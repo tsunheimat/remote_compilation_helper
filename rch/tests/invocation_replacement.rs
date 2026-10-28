@@ -403,7 +403,10 @@ fn rtk_hook_preserves_exact_literal_export_event_and_controls() {
             )
         });
         let mut expected = request["tool_input"].clone();
-        expected["command"] = format!("rch exec --verification -- {command}").into();
+        // The hook was invoked under RCH_REQUIRE_REMOTE=1. Freeze that
+        // requirement into its own prefix while preserving the entire event.
+        expected["command"] =
+            format!("rch exec --verification --require-remote -- {command}").into();
         assert_eq!(response["hookSpecificOutput"]["updatedInput"], expected);
         assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     }
@@ -435,7 +438,7 @@ fn rtk_proxy_hook_preserves_exact_export_and_conditional_event() {
     });
     let mut expected = original["tool_input"].clone();
     expected["command"] = format!(
-        "rch exec --verification -- {}",
+        "rch exec --verification --require-remote -- {}",
         original["tool_input"]["command"].as_str().unwrap()
     )
     .into();
@@ -753,6 +756,189 @@ fn strict_remote_and_dispatcher_never_execute_the_local_fallback() {
         let value = fixture.result(&result);
         assert_ne!(value["outcome"], "completed");
         assert_ne!(value["location"], "remote");
+    }
+}
+
+#[test]
+fn require_remote_flag_blocks_shared_fallback_and_is_scoped_to_one_call() {
+    for role in ["hybrid", "dispatcher"] {
+        let fixture = Fixture::new();
+        fixture.configure(role, true);
+        let marker = fixture.project.join("marker");
+        for (strict, expected_runs) in [(false, 1), (true, 1), (false, 2)] {
+            let result = fixture
+                .root
+                .join(format!("result-{strict}-{expected_runs}.json"));
+            let mut command = fixture.exec();
+            // The explicit CLI requirement must win even over a falsy inherited
+            // override, without changing the following invocation's policy.
+            command
+                .env("RCH_REQUIRE_REMOTE", "0")
+                .arg("--json-result")
+                .arg(&result);
+            if strict {
+                command.arg("--require-remote");
+            }
+            let output = fixture.run(
+                command.args([
+                    "--shell",
+                    "printf run >> marker; printf 'out\\377\\000'; exit 23",
+                ]),
+                b"",
+            );
+            if strict {
+                assert!(!output.status.success());
+                assert_ne!(output.status.code(), Some(23));
+                assert!(output.stdout.is_empty());
+                let record = fixture.result(&result);
+                assert_ne!(record["outcome"], "completed");
+                assert!(record["remote_exit_code"].is_null());
+                assert!(
+                    record["fallback_reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("guarded local fallback is not authorized")
+                );
+                assert!(
+                    !String::from_utf8_lossy(&output.stderr)
+                        .contains("[RCH] guarded local verification")
+                );
+            } else {
+                assert_eq!(output.status.code(), Some(23), "{:?}", output.stderr);
+                assert_eq!(output.stdout, b"out\xff\0");
+                fixture.assert_local_result(&result, "completed", 23);
+            }
+            assert_eq!(fs::read(&marker).unwrap(), b"run".repeat(expected_runs));
+        }
+    }
+}
+
+#[test]
+fn require_remote_flag_outranks_shared_project_local_policy() {
+    for local_policy in ["force_local = true", "enabled = false"] {
+        let fixture = Fixture::new();
+        let project_config = fixture.project.join(".rch");
+        fs::create_dir(&project_config).unwrap();
+        fs::write(
+            project_config.join("config.toml"),
+            format!("[general]\n{local_policy}\n"),
+        )
+        .unwrap();
+        let config_file = fixture.root.join("config/config.toml");
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&config_file).unwrap()).unwrap();
+        // A covering mapping forces execution to reach the config-local-policy
+        // branch rather than the earlier missing-mapping refusal. No daemon or
+        // remote worker is used; the sentinel shows the authorized control ran.
+        config["jobs"]["shared_workspaces"] = toml::Value::Array(vec![
+            toml::Value::try_from(serde_json::json!({
+                "worker": "fixture", "controller_root": fixture.project,
+                "worker_root": fixture.project,
+            }))
+            .unwrap(),
+        ]);
+        fs::write(&config_file, toml::to_string(&config).unwrap()).unwrap();
+        let control = fixture.run(
+            fixture
+                .exec()
+                .args(["--shell", "printf control > marker; exit 23"]),
+            b"",
+        );
+        assert_eq!(
+            control.status.code(),
+            Some(23),
+            "{local_policy}: {:?}",
+            control.stderr
+        );
+        let result = fixture.root.join("strict-policy.json");
+        let denied = fixture.run(
+            fixture
+                .exec()
+                .arg("--require-remote")
+                .env("RCH_REQUIRE_REMOTE", "0")
+                .arg("--json-result")
+                .arg(&result)
+                .args(["--shell", "printf forbidden >> marker"]),
+            b"",
+        );
+        assert!(!denied.status.success(), "{local_policy}");
+        assert!(denied.stdout.is_empty());
+        assert_eq!(
+            fs::read(fixture.project.join("marker")).unwrap(),
+            b"control"
+        );
+        assert_ne!(fixture.result(&result)["outcome"], "completed");
+    }
+}
+
+#[test]
+fn agent_hook_carries_strict_policy_only_for_delegated_components() {
+    let fixture = Fixture::new();
+    for (role, value, strict) in [
+        ("hybrid", None, false),
+        ("hybrid", Some("1"), true),
+        ("dispatcher", None, true),
+        ("dispatcher", Some("0"), false),
+    ] {
+        fixture.configure(role, true);
+        for (source, normal, count) in [
+            ("cargo test", "rch exec -- cargo test", 1),
+            ("pytest -q", "rch exec --verification -- pytest -q", 1),
+            (
+                "pytest -q && cargo test",
+                "rch exec --verification -- pytest -q && rch exec -- cargo test",
+                2,
+            ),
+            (
+                "printf 'rch exec -- literal'; cargo test",
+                "printf 'rch exec -- literal'; rch exec -- cargo test",
+                1,
+            ),
+        ] {
+            let event = serde_json::json!({"hook_event_name":"PreToolUse", "tool_name":"Bash",
+                "tool_input":{"command":source}, "cwd":fixture.project});
+            let mut hook = fixture.command();
+            if let Some(value) = value {
+                hook.env("RCH_REQUIRE_REMOTE", value);
+            }
+            let output = fixture.run(&mut hook, &serde_json::to_vec(&event).unwrap());
+            assert!(output.status.success());
+            let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let rewritten = response["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                rewritten.matches("--require-remote").count(),
+                if strict { count } else { 0 },
+                "{role} {value:?} {source}"
+            );
+            if strict {
+                assert_eq!(rewritten.replace(" --require-remote", ""), normal);
+            } else {
+                assert_eq!(rewritten, normal);
+            }
+            if source.contains(';') {
+                assert!(
+                    rewritten.starts_with("printf 'rch exec -- literal'; "),
+                    "authored strings must not be patched"
+                );
+            }
+        }
+        let ordinary = serde_json::json!({"tool_name":"Bash", "tool_input":{"command":"git status"}, "cwd":fixture.project});
+        let mut hook = fixture.command();
+        if let Some(value) = value {
+            hook.env("RCH_REQUIRE_REMOTE", value);
+        }
+        let result = fixture.run(&mut hook, &serde_json::to_vec(&ordinary).unwrap());
+        assert!(result.status.success());
+        if !result.stdout.is_empty() {
+            let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert!(
+                response
+                    .pointer("/hookSpecificOutput/updatedInput")
+                    .is_none()
+            );
+        }
     }
 }
 

@@ -155,6 +155,7 @@ fn apply_hook_plan(
     command: &str,
     output: &[u8],
     config: &rch_common::RchConfig,
+    require_remote: bool,
 ) -> Result<Option<String>> {
     let plan: HookPlan =
         serde_json::from_slice(output).context("invalid structural hook response")?;
@@ -253,6 +254,9 @@ fn apply_hook_plan(
         } else {
             "rch exec --verification"
         });
+        if require_remote {
+            rewritten.push_str(" --require-remote");
+        }
         for name in edit.env {
             rewritten.push_str(" --forward-env ");
             rewritten.push_str(&name);
@@ -366,7 +370,12 @@ async fn request_plan(
             );
         }
         match hook_config {
-            Some(config) => apply_hook_plan(command, &output, config),
+            Some(config) => apply_hook_plan(
+                command,
+                &output,
+                config,
+                super::exec_requires_remote() || super::role_requires_remote(config.general.role),
+            ),
             None => apply_plan(command, &output),
         }
     })
@@ -500,10 +509,18 @@ mod tests {
             {"start":10,"end":15,"command_end":20,"word":"cargo","argv":[{"start":10,"end":15},{"start":16,"end":20}],"env":[],"verification":true,"native_eligible":true}
         ]});
         assert_eq!(
-            apply_hook_plan(source, &serde_json::to_vec(&valid).unwrap(), &config)
+            apply_hook_plan(source, &serde_json::to_vec(&valid).unwrap(), &config, false)
                 .unwrap()
                 .as_deref(),
             Some("rch exec --verification -- pytest && rch exec -- cargo test")
+        );
+        assert_eq!(
+            apply_hook_plan(source, &serde_json::to_vec(&valid).unwrap(), &config, true)
+                .unwrap()
+                .as_deref(),
+            Some(
+                "rch exec --verification --require-remote -- pytest && rch exec --require-remote -- cargo test"
+            )
         );
         let mut wrong_version = valid.clone();
         wrong_version["version"] = 1.into();
@@ -535,7 +552,13 @@ mod tests {
             forged_word,
         ] {
             assert!(
-                apply_hook_plan(source, &serde_json::to_vec(&invalid).unwrap(), &config).is_err(),
+                apply_hook_plan(
+                    source,
+                    &serde_json::to_vec(&invalid).unwrap(),
+                    &config,
+                    false
+                )
+                .is_err(),
                 "{invalid}"
             );
         }

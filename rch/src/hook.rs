@@ -917,6 +917,7 @@ fn build_requested_worker_refusal_incident(
     project: &str,
     command_fingerprint: &str,
     strict_remote: bool,
+    local_fallback_allowed: bool,
     now_ms: u64,
 ) -> IncidentEvent {
     let requested = requested_workers
@@ -931,7 +932,7 @@ fn build_requested_worker_refusal_incident(
         project,
         command_fingerprint,
         SelectedMode::Local,
-        !strict_remote,
+        local_fallback_allowed,
         now_ms,
     )
     .with_detail("requested_worker_set", requested)
@@ -1288,11 +1289,14 @@ fn strict_remote_for_exhausted_admission(require_remote: bool, job_admission: bo
 /// Terminal local-fallback for a remote FAILURE, gated so a failed remote build
 /// only runs on the local orchestrator when the operator permits it.
 ///
-/// Fails closed (exit `EXIT_BUILD_ERROR`) when remote execution is required
-/// (`require_remote` / proof mode / `RCH_REQUIRE_REMOTE`) OR when
-/// `compilation.allow_local_fallback = false`. Otherwise runs the command
-/// locally exactly like [`exit_with_local_fallback`]. Emits the user-facing
-/// summary itself in every branch. Never returns.
+/// Fails closed when remote execution is required (`require_remote` / proof
+/// mode / `RCH_REQUIRE_REMOTE`: the typed remote-required refusal, exit
+/// [`EXIT_REMOTE_REQUIRED_REFUSED`] when retryable) OR when
+/// `compilation.allow_local_fallback = false` (exit `EXIT_BUILD_ERROR`). Both
+/// refusals record an RCH-I012 incident and emit a `refused` envelope.
+/// Otherwise runs the command locally exactly like
+/// [`exit_with_local_fallback`]. Emits the user-facing summary itself in every
+/// branch. Never returns.
 fn exit_with_gated_local_fallback(
     command: &str,
     reporter: &HookReporter,
@@ -1301,42 +1305,90 @@ fn exit_with_gated_local_fallback(
     allow_local_fallback: bool,
     error: Option<&str>,
 ) -> ! {
-    if require_remote {
+    match remote_failure_local_policy(require_remote, allow_local_fallback) {
         // Canonical remote-required refusal (proof mode / RCH_REQUIRE_REMOTE).
-        exit_with_local_fallback_recording(command, reporter, reason, true, error);
+        RemoteFailureLocalPolicy::RefuseRemoteRequired => {
+            exit_with_local_fallback_recording(command, reporter, reason, true, error)
+        }
+        RemoteFailureLocalPolicy::RefuseFallbackDisabled => {
+            exit_with_disabled_local_fallback_refusal(command, reporter, reason, error)
+        }
+        RemoteFailureLocalPolicy::RunLocal => {
+            reporter.summary(&format!("[RCH] local ({reason})"));
+            exit_with_local_fallback_recording(command, reporter, reason, false, error)
+        }
     }
-    if !allow_local_fallback {
-        warn!(
-            "Local fallback disabled (compilation.allow_local_fallback=false); refusing to run '{}' on the orchestrator after remote failure: {reason}",
-            mask_sensitive_command(command)
-        );
-        // Fail-closed refusal: the line explaining the non-zero exit must reach the
-        // agent even at stock visibility (rch#31).
-        reporter.summary_critical(&format!(
-            "[RCH] refusing local fallback (compilation.allow_local_fallback=false; {reason})"
-        ));
-        record_hook_incident(
-            &build_local_fallback_incident(command, reason, true, now_unix_ms(), error)
-                .with_detail("policy", "compilation.allow_local_fallback=false"),
-        );
-        emit_exec_envelope(&ExecResultEnvelope {
-            api_version: "1.0",
-            command,
-            outcome: "refused",
-            location: "local",
-            fallback_reason: Some(reason),
-            worker_id: None,
-            remote_exit_code: None,
-            duration_ms: None,
-            timing: None,
-            result_dirs: None,
-            error_code: None,
-            admission: None,
-        });
-        std::process::exit(EXIT_BUILD_ERROR);
+}
+
+/// What a remote FAILURE may do on the local orchestrator (#114).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteFailureLocalPolicy {
+    /// Remote execution is required (proof mode, `RCH_REQUIRE_REMOTE`, the
+    /// dispatcher role, a strict lane): the remote-required refusal.
+    RefuseRemoteRequired,
+    /// `compilation.allow_local_fallback = false`: fail closed.
+    RefuseFallbackDisabled,
+    /// Fail-open default: run the command locally.
+    RunLocal,
+}
+
+/// The single decision every remote-failure exit in `run_exec` goes through.
+/// A required-remote refusal wins over the config gate so its stricter, typed
+/// refusal (and retryable exit code) is what callers see.
+fn remote_failure_local_policy(
+    require_remote: bool,
+    allow_local_fallback: bool,
+) -> RemoteFailureLocalPolicy {
+    if require_remote {
+        RemoteFailureLocalPolicy::RefuseRemoteRequired
+    } else if !allow_local_fallback {
+        RemoteFailureLocalPolicy::RefuseFallbackDisabled
+    } else {
+        RemoteFailureLocalPolicy::RunLocal
     }
-    reporter.summary(&format!("[RCH] local ({reason})"));
-    exit_with_local_fallback_recording(command, reporter, reason, false, error)
+}
+
+/// Refuse a remote-failure local exit because the operator set
+/// `compilation.allow_local_fallback = false`. Like the remote-required
+/// refusal, it records a durable RCH-I012 incident with
+/// `local_fallback_allowed = false` and emits the `refused` envelope, so the
+/// ledger shows the config gate held (#114). Exits `EXIT_BUILD_ERROR`.
+fn exit_with_disabled_local_fallback_refusal(
+    command: &str,
+    reporter: &HookReporter,
+    reason: &str,
+    error: Option<&str>,
+) -> ! {
+    warn!(
+        "Local fallback disabled (compilation.allow_local_fallback=false); refusing to run '{}' on the orchestrator after remote failure: {reason}",
+        mask_sensitive_command(command)
+    );
+    record_hook_incident(&build_disabled_local_fallback_incident(
+        command,
+        reason,
+        now_unix_ms(),
+        error,
+    ));
+    // Fail-closed refusal: the line explaining the non-zero exit must reach the
+    // agent even at stock visibility (rch#31).
+    reporter.summary_critical(&format!(
+        "[RCH] refusing local fallback (compilation.allow_local_fallback=false; {reason})"
+    ));
+    emit_exec_envelope(&ExecResultEnvelope {
+        api_version: "1.0",
+        command,
+        outcome: "refused",
+        location: "local",
+        fallback_reason: Some(reason),
+        worker_id: None,
+        remote_exit_code: None,
+        duration_ms: None,
+        timing: None,
+        result_dirs: None,
+        error_code: None,
+        admission: None,
+    });
+    std::process::exit(EXIT_BUILD_ERROR);
 }
 
 /// A remote build failed for a *worker-fault* reason (OOM/signal-kill, missing
@@ -2348,6 +2400,7 @@ fn build_socket_failure_incident(
     project: &str,
     command_fingerprint: &str,
     strict_remote: bool,
+    allow_local_fallback: bool,
     now_ms: u64,
 ) -> IncidentEvent {
     let mut event = IncidentEvent::new(
@@ -2357,7 +2410,9 @@ fn build_socket_failure_incident(
         project,
         command_fingerprint,
         SelectedMode::Local,
-        !strict_remote,
+        // #114: `compilation.allow_local_fallback = false` forbids the local
+        // exit as surely as proof mode does.
+        !strict_remote && allow_local_fallback,
         now_ms,
     )
     .with_detail("socket_failure", kind.as_str())
@@ -2432,6 +2487,22 @@ fn build_local_fallback_incident(
         Some(error) => event.with_detail("error", bounded_incident_error(error)),
         None => event,
     }
+}
+
+/// The incident for a remote-failure local exit refused by
+/// `compilation.allow_local_fallback = false` (#114): RCH-I012 with
+/// `local_fallback_allowed = false`. The `policy` detail names the config
+/// gate, and the strict-remote control flag stays unset because neither proof
+/// mode nor `RCH_REQUIRE_REMOTE` was in force.
+fn build_disabled_local_fallback_incident(
+    command: &str,
+    reason: &str,
+    now_ms: u64,
+    error: Option<&str>,
+) -> IncidentEvent {
+    build_local_fallback_incident(command, reason, true, now_ms, error)
+        .with_detail("policy", "compilation.allow_local_fallback=false")
+        .with_control(ControlState::default())
 }
 
 /// Secret-redacted, length-bounded error chain for an incident record.
@@ -3533,6 +3604,7 @@ pub async fn run_exec(
     result_dirs: Vec<PathBuf>,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
+    caller_requires_remote: bool,
     command_parts: Vec<String>,
     invocation: Option<InvocationOptions>,
     out_ctx: &crate::ui::context::OutputContext,
@@ -3592,7 +3664,7 @@ pub async fn run_exec(
         }
         let result = run_exec_inner(base, dependency_bases, clean_overlay, overlay_paths,
             no_overlay, source_content_receipt, job, result_dirs, required_tools,
-            exact_worker, command_parts, invocation).await;
+            exact_worker, caller_requires_remote, command_parts, invocation).await;
         if let Err(error) = &result
             && !remote_result::exec_envelope_emitted()
         {
@@ -3626,6 +3698,7 @@ async fn run_exec_inner(
     result_dirs: Vec<PathBuf>,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
+    caller_requires_remote: bool,
     command_parts: Vec<String>,
     invocation: Option<InvocationOptions>,
 ) -> anyhow::Result<()> {
@@ -3699,7 +3772,11 @@ async fn run_exec_inner(
         );
     }
     let exact_worker_requested = exact_worker.is_some();
+    // A per-call requirement never mutates inherited environment and cannot
+    // be cancelled by local-only project configuration. Unlike the general
+    // shared transport guard, it also forbids the authorized no-start fallback.
     let require_remote = exec_requires_remote()
+        || caller_requires_remote
         || clean_overlay
         || source_content_receipt
         || cargo_json_stdout
@@ -3812,7 +3889,10 @@ async fn run_exec_inner(
         return guarded_verification_fallback(
             options,
             &config,
-            explicit_job || exact_worker_requested || !required_tools.is_empty(),
+            caller_requires_remote
+                || explicit_job
+                || exact_worker_requested
+                || !required_tools.is_empty(),
             "no configured shared workspace mapping covers the invocation cwd",
         )
         .await;
@@ -3851,13 +3931,17 @@ async fn run_exec_inner(
             return guarded_verification_fallback(
                 options,
                 &config,
-                explicit_job || exact_worker_requested || required_tools_requested,
+                caller_requires_remote
+                    || explicit_job
+                    || exact_worker_requested
+                    || required_tools_requested,
                 &reason,
             )
             .await;
         }
         let refuse_local = if policy.overrides_require_remote() {
-            clean_overlay
+            caller_requires_remote
+                || clean_overlay
                 || source_content_receipt
                 || cargo_json_stdout
                 || exact_worker_requested
@@ -3930,7 +4014,8 @@ async fn run_exec_inner(
             local_slots: config.compilation.local_slots,
             kind: classification.kind,
             job,
-            strict_remote_mode: clean_overlay
+            strict_remote_mode: caller_requires_remote
+                || clean_overlay
                 || source_content_receipt
                 || cargo_json_stdout
                 || exact_worker_requested
@@ -4176,6 +4261,7 @@ async fn run_exec_inner(
                 &project,
                 &command_fingerprint,
                 strict_remote,
+                config.compilation.allow_local_fallback,
                 now_unix_ms(),
             ));
 
@@ -4254,15 +4340,18 @@ async fn run_exec_inner(
                         None,
                     );
                 }
-                // Proof lane: fail closed. exit_with_local_fallback refuses under
-                // proof mode, prints the explicit "remote required" refusal
-                // summary, and records the RCH-I012 incident (bd-qawj7).
+                // Proof lane: fail closed. The gate refuses under proof mode,
+                // prints the explicit "remote required" refusal summary, and
+                // records the RCH-I012 incident (bd-qawj7). Every exit after
+                // selection begins goes through the same gate (#114).
                 DaemonRecoveryAction::Refuse => {
-                    exit_with_local_fallback(
+                    exit_with_gated_local_fallback(
                         &command,
                         &reporter,
                         "daemon unavailable",
                         require_remote,
+                        config.compilation.allow_local_fallback,
+                        None,
                     );
                 }
             }
@@ -4366,6 +4455,11 @@ async fn run_exec_inner(
                     &project,
                     &redact_secrets(&command),
                     require_remote,
+                    // The same decision the gate below applies (#114).
+                    remote_failure_local_policy(
+                        strict_remote_for_exhausted_admission(require_remote, job),
+                        allow_local_fallback,
+                    ) == RemoteFailureLocalPolicy::RunLocal,
                     now_unix_ms(),
                 ));
             }
@@ -5020,9 +5114,12 @@ async fn run_exec_inner(
                         "Dependency preflight blocked remote execution [{}]: {}; evidence='{}'",
                         preflight_err.reason_code, preflight_err.remediation, evidence_summary
                     );
+                    // Say what blocked the remote run, not where the command
+                    // goes next: the gate below prints "[RCH] local (...)" or
+                    // the refusal, so a refused build never claims "local" (#114).
                     reporter.summary(&format!(
-                        "[RCH] local (dependency preflight {}: {}; evidence: {})",
-                        preflight_err.reason_code, preflight_err.remediation, evidence_summary
+                        "[RCH] dependency preflight blocked remote execution ({}: {})",
+                        preflight_err.reason_code, preflight_err.remediation
                     ));
                     reporter.verbose(&format!(
                         "[RCH] dependency preflight report: {}",
@@ -5743,7 +5840,7 @@ async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutp
                 && config.general.enabled
                 && !config.general.force_local
             {
-                match semantic_plan(command).await {
+                match semantic::plan_for_hook(command, &config).await {
                     Ok(Some(rewritten)) => {
                         return HookOutput::rewrite_with_permission_check(rewritten);
                     }
@@ -5907,6 +6004,14 @@ async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutp
     );
     reporter.verbose("[RCH] delegating to rch exec...");
 
+    // Freeze only an already-resolved strict policy into the delegated argv.
+    // Config local opt-outs returned above; informational commands are untouched.
+    // This survives an agent runner that does not copy the hook's environment.
+    let exec_prefix = if exec_requires_remote() || role_requires_remote(config.general.role) {
+        "rch exec --require-remote --"
+    } else {
+        "rch exec --"
+    };
     let modified_command = if let (Some(prefix), Some(extracted)) = (
         &classification.command_prefix,
         &classification.extracted_command,
@@ -5919,10 +6024,10 @@ async fn process_hook_with_cwd(input: HookInput, cwd: Option<&Path>) -> HookOutp
                 "[RCH] local (compound segment not offloadable: '{segment}')"
             ));
         }
-        format!("{}rch exec -- {}", prefix, extracted)
+        format!("{prefix}{exec_prefix} {extracted}")
     } else {
         // Simple command: wrap the entire command
-        format!("rch exec -- {}", command)
+        format!("{exec_prefix} {command}")
     };
 
     // A compound rewrite keeps the user's own prefix; auto-approving it would
