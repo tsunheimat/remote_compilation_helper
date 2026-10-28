@@ -40,10 +40,6 @@ jobs:
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             checksum_cmd: sha256sum
-          - name: macos-x86_64
-            runs-on: macos-15-intel
-            target: x86_64-apple-darwin
-            checksum_cmd: shasum -a 256
           - name: macos-aarch64
             runs-on: macos-latest
             target: aarch64-apple-darwin
@@ -53,11 +49,9 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.runs-on }}
-    # The cold Intel macOS CLI took 49m11s in run 39920156662; the
-    # independent daemon profile was still linking at the 60-minute job cutoff.
-    # Budget both shipped profiles and packaging on that runner. This is build
-    # orchestration, not the wrapper runtime SLO, whose 10ms gate is unchanged.
-    timeout-minutes: ${{ matrix.target == 'x86_64-apple-darwin' && 90 || 60 }}
+    # Intel's two independent profiles run below with their original flags.
+    # All other platforms retain their existing complete build/packaging job.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -164,12 +158,111 @@ jobs:
           path: dist/*
           retention-days: 7
 
+  intel-profile:
+    name: Build Intel macOS (${{ matrix.profile }})
+    runs-on: macos-15-intel
+    # The combined job exceeded 90m in run 40651533671. Keep each compiler
+    # profile intact and the per-job cap at 90m, but run the independent graphs
+    # on separate runners. This increases possible aggregate runner allocation;
+    # it does not relax a product SLO or turn a missing profile into success.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [wrapper-release, daemon-release]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
+          shared-key: test-release-x86_64-apple-darwin-${{ matrix.profile }}
+          cache-on-failure: true
+      - name: Build and smoke-test the unchanged shipping profile
+        shell: bash
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          if [[ "$PROFILE" == wrapper-release ]]; then
+            cargo build --profile wrapper-release --locked --target x86_64-apple-darwin -p rch
+            target/x86_64-apple-darwin/wrapper-release/rch --version
+          elif [[ "$PROFILE" == daemon-release ]]; then
+            cargo build --profile daemon-release --locked --target x86_64-apple-darwin -p rchd -p rch-wkr
+            target/x86_64-apple-darwin/daemon-release/rchd --version
+            target/x86_64-apple-darwin/daemon-release/rch-wkr --version
+          else
+            echo "Unexpected shipping profile: $PROFILE" >&2
+            exit 1
+          fi
+      - name: Bind the component to the exact tested source and bytes
+        shell: bash
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -I scripts/package_ci_components.py stage \
+            --source "$GITHUB_SHA" --target x86_64-apple-darwin \
+            --profile "$PROFILE" --output "component/$PROFILE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: intel-component-${{ matrix.profile }}
+          path: component/${{ matrix.profile }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+  intel-package:
+    name: Assemble and verify Intel macOS shipping archive
+    needs: intel-profile
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # Both named artifacts must come from this workflow run; no cross-run or
+      # latest-release download can satisfy a missing component.
+      - uses: actions/download-artifact@v4
+        with:
+          name: intel-component-wrapper-release
+          path: components/wrapper-release
+      - uses: actions/download-artifact@v4
+        with:
+          name: intel-component-daemon-release
+          path: components/daemon-release
+      - name: Assemble exact-revision flat archive and verify actual packaged binaries
+        shell: bash
+        env:
+          RUN_LABEL: ${{ github.event.pull_request.number || github.run_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          TAG="pr-${RUN_LABEL}-${GITHUB_SHA:0:7}"
+          python3 -I scripts/package_ci_components.py assemble \
+            --source "$GITHUB_SHA" --target x86_64-apple-darwin \
+            --tag "$TAG" --parts components --output dist
+          (cd dist && shasum -a 256 -c *.sha256)
+          unpack="$(mktemp -d "$RUNNER_TEMP/rch-intel-package.XXXXXX")"
+          tar -xzf "dist/rch-${TAG}-x86_64-apple-darwin.tar.gz" -C "$unpack"
+          "$unpack/rch" --version
+          "$unpack/rchd" --version
+          "$unpack/rch-wkr" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-x86_64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   verify:
     name: Verify packaged artifacts
-    needs: build
+    needs: [build, intel-package]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -180,6 +273,22 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Require every shipping target from the current revision
+        shell: bash
+        env:
+          RUN_LABEL: ${{ github.event.pull_request.number || github.run_id }}
+          RCH_REQUIRED_PLATFORMS: >-
+            linux-x86_64|tar.gz|x86_64-unknown-linux-gnu
+            linux-musl|tar.gz|x86_64-unknown-linux-musl
+            linux-aarch64|tar.gz|aarch64-unknown-linux-gnu
+            macos-x86_64|tar.gz|x86_64-apple-darwin
+            macos-aarch64|tar.gz|aarch64-apple-darwin
+            windows-x86_64|zip|x86_64-pc-windows-msvc
+          RCH_OPTIONAL_PLATFORMS: ''
+        run: |
+          set -euo pipefail
+          TAG="pr-${RUN_LABEL}-${GITHUB_SHA:0:7}"
+          bash scripts/check_release_assets.sh --dir artifacts --tag "$TAG"
       - name: Verify checksums
         run: |
           cd artifacts

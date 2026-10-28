@@ -75,6 +75,35 @@ notification for weekly drift notification; no channel is removed.
 | `update-lock.yml` | Source-filtered main/manual native cross-process ownership on Linux, Windows and macOS; duplicate full-client validation moved to the workspace owner. |
 | `wrapper-contract.yml` | Weekly/manual external Rust channel drift, all three channels in one build. |
 
+### Intel profile packaging and qualification caches
+
+The combined Intel shipping job exceeded its 90-minute limit in CI run
+40651533671. `test-release.yml` now builds the unchanged wrapper and daemon
+profiles on separate native Intel runners, each with that same per-job limit.
+This raises possible aggregate runner allocation; it is not a measured compiler
+speedup or a relaxation of the wrapper's runtime SLO. Both profile jobs, native
+binary smoke tests, and the same-revision final archive are still required.
+
+`scripts/package_ci_components.py` is consumed by that workflow to bind each
+component's source commit, target, profile, member names and byte digests before
+assembly. The final archive is checked and executed on Intel macOS, then joins
+the other five targets in the existing all-platform verifier. The component
+self-test uses synthetic bytes, not real compiler outputs. This helper can be
+removed when Intel returns to one complete build job; do not retain an unused
+manifest/certificate path. The workflow count remains twelve, not twelve jobs.
+The separate signed-release publication workflow is unchanged and is not
+qualified merely by this candidate-packaging change.
+
+For local cross-worktree qualification, do not share one Cargo output directory
+across different source roots. A native reproduction switched from source B to
+A but retained B's integration-test executable, including when checksum mode
+was enabled on the existing cache. Separate output roots passed both directions.
+Use a fresh, source-owned `CARGO_TARGET_DIR`, record the actual executable from
+Cargo's JSON output, and check its test inventory and the compiled client's
+source stamp. Source-file hashes alone cannot prove which cached binary ran.
+Keep this distinct from the earlier intermittent hook misses: this cache defect
+does not establish the cause of those historical observations.
+
 All non-release workflows have read-only repository contents permissions. Only
 the dependency audit gets check-write permission. Candidate blob injection,
 source patching, direct pushes to main and PR-comment write permissions are not
