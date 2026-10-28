@@ -1,7 +1,8 @@
 name: e2e
 
-# Called once by CI. Share the application build between the Linux mock/Cargo
-# harnesses and all native shell scenarios; keep macOS scenario coverage.
+# Called once by CI. Build the release applications separately from the native
+# scenarios: cold release + debug + test graphs exceeded the macOS job budget.
+# Both stages are required, use the same source/OS, and retain their old caps.
 on:
   workflow_call:
   workflow_dispatch:
@@ -22,7 +23,56 @@ env:
   RCH_TEST_ALLOW_SUDO_UNSHARE: "1"
 
 jobs:
+  application:
+    name: Build E2E applications (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            timeout: 120
+          - os: macos-latest
+            timeout: 90
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      RCH_GIT_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: true
+          shared-key: e2e-application-${{ matrix.os }}
+      - name: Build and stage unchanged native release applications
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
+          version="$(target/release/rch --version)"
+          printf '%s\n' "$version"
+          [[ "$version" == *"commit ${GITHUB_SHA:0:12}"* ]]
+          target/release/rchd --version
+          target/release/rch-wkr --version
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          python3 -I scripts/package_ci_components.py stage \
+            --source "$GITHUB_SHA" --target "$host" --profile release \
+            --output e2e-application
+      - uses: actions/upload-artifact@v4
+        with:
+          name: application-${{ matrix.os }}
+          path: e2e-application/*
+          if-no-files-found: error
+          retention-days: 7
+
   run:
+    needs: application
     strategy:
       fail-fast: false
       matrix:
@@ -60,11 +110,28 @@ jobs:
         with:
           prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
-          shared-key: e2e-${{ matrix.os }}
-      - name: Build E2E application binaries once
+          shared-key: e2e-tests-${{ matrix.os }}
+      - uses: actions/download-artifact@v4
+        with:
+          # Only this workflow run can supply its build-stage artifact. Do not
+          # accept a previous run/release when one platform did not build.
+          name: application-${{ matrix.os }}
+          path: e2e-application
+      - name: Verify and restore exact-source E2E applications
         id: application
+        shell: bash
         run: |
-          cargo build --release --locked -p rch -p rchd -p rch-wkr --bins
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          python3 -I scripts/package_ci_components.py restore-e2e \
+            --source "$GITHUB_SHA" --target "$host" \
+            --parts e2e-application --output target/release
+          version="$(target/release/rch --version)"
+          printf '%s\n' "$version"
+          [[ "$version" == *"commit ${GITHUB_SHA:0:12}"* ]]
+          target/release/rchd --version
+          target/release/rch-wkr --version
           echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
       - name: Verify installer and generic dispatch with the compiled client
         if: runner.os == 'Linux'
