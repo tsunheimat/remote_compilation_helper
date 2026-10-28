@@ -105,6 +105,7 @@ jobs:
         run: |
           fixture="$(mktemp -d "$RUNNER_TEMP/rch-package-contract.XXXXXX")"
           bash scripts/package_linux_candidate.sh --self-test --output-dir "$fixture/cases"
+          python3 -I scripts/package_ci_components.py self-test
       - name: Verify semantic rewrite and Hermes adapter contracts
         run: |
           python3 -I rch/src/hook/test_semantic.py
