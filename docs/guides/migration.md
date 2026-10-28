@@ -330,6 +330,29 @@ intact, and actual selections still record their normal audit entries. Inventory
 explains the existing native diagnose request; it does not replace the hook's
 per-component planner or qualify a shared mapping for execution.
 
+### Recovery uses durable owner identity, not PID existence alone
+
+Restart admission and the background recovery scan compare a stale lease's
+recorded boot and native process birth identity with the current process. A
+reused PID or a verified previous boot proves the recorded wrapper is absent;
+a fresh heartbeat, matching live owner, missing birth evidence for a live PID,
+or genuinely unavailable/foreign process view remains blocking. Previous-boot
+proof comes from the observer's own verified native identity, not an unchecked
+boot-id file. The existing fifteen-minute stale-heartbeat requirement remains.
+
+Absence authorizes the existing recovery path; it does not authorize killing the
+current occupant of a recycled PID, replaying a command, or declaring artifacts
+delivered. Journals that still own worker source remain retained. Recovery
+reloads and locks that same journal and still requires its normal completion
+and source-retirement evidence. Existing source-root/shared-workspace paths and
+worker-selection diagnostic reasons are unchanged.
+
+This identity backport does not introduce automatic recipe-less settlement,
+zero-byte journal cleanup, maintenance-owner restart fencing, or new disk
+budgets. A lease without the required recovery/delivery recipe is not newly
+made recoverable merely by aging past 24 hours. Do not delete such evidence or
+assume this change makes an active-fleet restart safe by itself.
+
 ### RTK logs and local fallback limits
 
 RTK 0.46.0 integration recognizes `rtk run -c SOURCE`, `rtk run SOURCE`,
