@@ -305,7 +305,7 @@ test_hook_json_integrity() {
     log_json "execute" "Testing hook JSON response integrity" "$test_name" "start"
     run_output_fixture "$test_name" 0 $'actual hook execution\n' "" || return 0
     if jq -se 'length == 1 and (.[0].hookSpecificOutput |
-        .hookEventName == "PreToolUse" and .updatedInput.command == "rch exec -- cargo build")' \
+        .hookEventName == "PreToolUse" and .updatedInput.command == "rch exec --require-remote -- cargo build")' \
         "$output_prefix.hook.json" >/dev/null \
         && cmp -s "$output_prefix.expected" "$output_prefix.exec.err"; then
         log_json "verify" "Single hook JSON rewrite executed and completed" "$test_name" "pass"
@@ -322,7 +322,7 @@ test_hook_no_ansi_in_json() {
     run_output_fixture "$test_name" 0 $'\033[32mremote output has color\033[0m\n' "" \
         FORCE_COLOR=1 TERM=xterm-256color || return 0
     if jq -se 'length == 1 and (.[0].hookSpecificOutput |
-        .hookEventName == "PreToolUse" and .updatedInput.command == "rch exec -- cargo build")' \
+        .hookEventName == "PreToolUse" and .updatedInput.command == "rch exec --require-remote -- cargo build")' \
         "$output_prefix.hook.json" >/dev/null \
         && ! grep -Fq $'\033' "$output_prefix.hook.json" \
         && ! grep -Fq $'\033' "$output_prefix.exec.json" \

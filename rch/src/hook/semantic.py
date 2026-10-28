@@ -17,7 +17,7 @@ import os
 import re
 import shlex
 import sys
-from dataclasses import dataclass
+from collections import namedtuple
 
 MAX_INPUT = 65536
 MAX_TOKENS = 4096
@@ -34,13 +34,10 @@ class ParseMiss(ValueError):
     """Shell syntax cannot be preserved by this bounded structure parser."""
 
 
-@dataclass(frozen=True)
-class Word:
-    value: str
-    raw: str
-    start: int
-    end: int
-    operator: bool = False
+# Only immutable field storage is needed. Avoid importing dataclasses and its
+# inspection machinery for every short-lived hook invocation. The field names,
+# positional constructor and default operator value remain unchanged.
+Word = namedtuple("Word", "value raw start end operator", defaults=(False,))
 
 
 def expansion_end(source: str, start: int, depth: int = 0) -> int:

@@ -24,20 +24,25 @@ e2e_timestamp() {
 }
 
 e2e_now_ms() {
-    local milliseconds
-    milliseconds="$(date +%s%3N 2>/dev/null)" || milliseconds=""
-    # BSD date can succeed while leaving an unsupported %N in the output.
-    if [[ "$milliseconds" =~ ^[0-9]+$ ]]; then
-        printf '%s\n' "$milliseconds"
+    local sample seconds fraction
+    sample="$(date '+%s.%N' 2>/dev/null)" || sample=""
+    # Some date implementations ignore the precision in %3N and emit all
+    # nanoseconds. Concatenated digits then look valid but are not milliseconds.
+    # Read the two fields from one clock sample, validate their widths, and
+    # convert explicitly. BSD's literal %N takes the Python fallback below.
+    if [[ "$sample" =~ ^([0-9]{1,12})\.([0-9]{9})$ ]]; then
+        seconds="${BASH_REMATCH[1]}"
+        fraction="${BASH_REMATCH[2]}"
+        printf '%s\n' "$((10#$seconds * 1000 + 10#${fraction:0:3}))"
         return
     fi
     if command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+        python3 -I -S -c 'import time; print(time.time_ns() // 1_000_000)'
         return
     fi
-    local seconds
-    seconds="$(date +%s)"
-    printf '%s000' "$seconds"
+    seconds="$(date +%s)" || return 1
+    [[ "$seconds" =~ ^[0-9]{1,12}$ ]] || return 1
+    printf '%s\n' "$((10#$seconds * 1000))"
 }
 
 e2e_log() {
@@ -70,14 +75,37 @@ e2e_xml_escape() {
     printf '%s' "$value"
 }
 
+# These native fixtures specify strictness explicitly; do not accept an arbitrary
+# rch prefix or strip controller flags before checking it. A missing strict flag,
+# changed workload, added shell stage or shared-backend switch is a failure.
+e2e_assert_native_rewrite() {
+    local command="$1" delegated="$2" strict="$3" expected
+    expected="rch exec -- $command"
+    case "$strict" in
+        1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
+            expected="rch exec --require-remote -- $command" ;;
+    esac
+    if [[ "$delegated" != "$expected" ]]; then
+        printf 'Hook rewrite mismatch: expected <%s>, got <%s>\n' "$expected" "$delegated" >&2
+        return 1
+    fi
+}
+
 # Exercise the same two phases as the hook consumer: obtain updatedInput, then
 # execute its command. The child exit is data, not this helper's return status;
 # callers must assert E2E_EXEC_EXIT and the execution envelope separately.
 e2e_run_delegated() {
     local rch_bin="$1" project_dir="$2" command="$3" log_prefix="$4"
     shift 4
-    local hook_input delegated variable
+    local hook_input delegated variable strict=0
     local -a fixture_env=(env)
+    # Match env's last assignment wins rule. Ambient RCH policy is removed
+    # below; scenarios that test dispatcher policy use their own contract.
+    for variable in "$@"; do
+        case "$variable" in
+            RCH_REQUIRE_REMOTE=*) strict="${variable#*=}" ;;
+        esac
+    done
     # Operator overrides (requested workers, queue policy, output format, etc.)
     # are not inputs to these fixtures. Only explicit per-scenario RCH values
     # below may affect admission or formatting.
@@ -95,7 +123,7 @@ e2e_run_delegated() {
     ) || return 1
     delegated="$(jq -er '.hookSpecificOutput.updatedInput.command | strings' \
         "$log_prefix.hook.json")" || return 1
-    [[ "$delegated" == "rch exec -- "* ]] || return 1
+    e2e_assert_native_rewrite "$command" "$delegated" "$strict" || return 1
     E2E_EXEC_EXIT=0
     (
         cd "$project_dir" || exit 1

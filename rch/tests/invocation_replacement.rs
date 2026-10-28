@@ -216,6 +216,169 @@ fn hook_rewrite(fixture: &Fixture, command: &str) -> String {
 }
 
 #[test]
+fn shell_e2e_validator_requires_exact_native_policy_and_authored_command() {
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/lib/e2e_common.sh");
+    let command = "cargo test -- 'literal ; $HOME'";
+    let ordinary = format!("rch exec -- {command}");
+    let strict = format!("rch exec --require-remote -- {command}");
+    let shared = format!("rch exec --verification --require-remote -- {command}");
+    let extra_stage = format!("{strict}; printf injected");
+    for (delegated, policy, accepted) in [
+        (ordinary.as_str(), "0", true),
+        (ordinary.as_str(), "", true),
+        (strict.as_str(), "1", true),
+        (strict.as_str(), "TrUe", true),
+        (strict.as_str(), "yes", true),
+        (strict.as_str(), "ON", true),
+        (ordinary.as_str(), "1", false),
+        (strict.as_str(), "0", false),
+        (shared.as_str(), "1", false),
+        (extra_stage.as_str(), "1", false),
+        ("rch exec --require-remote -- cargo check", "1", false),
+    ] {
+        // Only invoke the assertion helper, never the supplied workload.
+        let output = Command::new("/bin/bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "source \"$1\"; e2e_assert_native_rewrite \"$2\" \"$3\" \"$4\"",
+                "validator",
+            ])
+            .arg(&helper)
+            .args([command, delegated, policy])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "{policy}: {delegated}: {:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "validator must never execute shell input"
+        );
+        if !accepted {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Hook rewrite mismatch"));
+        }
+    }
+}
+
+#[test]
+fn shell_e2e_clock_converts_fraction_width_instead_of_guessing_digit_units() {
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/lib/e2e_common.sh");
+    // Deliberate clock-provider fixtures, not elapsed-time/performance claims.
+    // The valid fractional cases must not silently use the Python fallback.
+    let harness = r#"
+source "$1"
+date() {
+    if [[ "$1" == '+%s' ]]; then
+        printf '%s\n' "$CLOCK_SECONDS"
+    else
+        printf '%s\n' "$CLOCK_SAMPLE"
+        return "$CLOCK_STATUS"
+    fi
+}
+python3() { printf '%s\n' '1700000000789'; }
+if [[ "$NO_PYTHON" == 1 ]]; then
+    unset -f python3
+    PATH=/no-executables
+fi
+e2e_now_ms
+"#;
+    for (sample, no_python, date_status, seconds, expected) in [
+        (
+            "1700000000.123456789",
+            false,
+            "0",
+            "1700000000",
+            Some("1700000000123\n"),
+        ),
+        (
+            "1700000000.000000001",
+            false,
+            "0",
+            "1700000000",
+            Some("1700000000000\n"),
+        ),
+        (
+            "1700000000.999999999",
+            false,
+            "0",
+            "1700000000",
+            Some("1700000000999\n"),
+        ),
+        ("0000000008.009000000", false, "0", "8", Some("8009\n")),
+        (
+            "1700000000123456789",
+            false,
+            "0",
+            "1700000000",
+            Some("1700000000789\n"),
+        ),
+        (
+            "1700000000.%N",
+            false,
+            "0",
+            "1700000000",
+            Some("1700000000789\n"),
+        ),
+        (
+            "1700000000.123456",
+            false,
+            "0",
+            "1700000000",
+            Some("1700000000789\n"),
+        ),
+        (
+            "9223372036854775808.123456789",
+            false,
+            "0",
+            "1700000000",
+            Some("1700000000789\n"),
+        ),
+        (
+            "1700000000.123456789",
+            false,
+            "1",
+            "1700000000",
+            Some("1700000000789\n"),
+        ),
+        (
+            "1700000000.%N",
+            true,
+            "0",
+            "1700000000",
+            Some("1700000000000\n"),
+        ),
+        ("1700000000.%N", true, "0", "not-a-clock", None),
+    ] {
+        let output = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", harness, "clock"])
+            .arg(&helper)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CLOCK_SAMPLE", sample)
+            .env("CLOCK_STATUS", date_status)
+            .env("CLOCK_SECONDS", seconds)
+            .env("NO_PYTHON", if no_python { "1" } else { "0" })
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            expected.is_some(),
+            "{sample}: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, expected.unwrap_or("").as_bytes(), "{sample}");
+        assert!(output.stderr.is_empty(), "{sample}: {:?}", output.stderr);
+    }
+}
+
+#[test]
 fn mixed_agent_hook_covers_both_orders_and_preserves_native_backend() {
     let fixture = Fixture::new();
     assert_eq!(

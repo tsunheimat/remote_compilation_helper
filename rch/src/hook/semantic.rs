@@ -275,7 +275,9 @@ fn apply_hook_plan(
 fn helper_process() -> Command {
     let mut process = Command::new("python3");
     process
-        .args(["-I", "-c", HELPER])
+        // The embedded helper is stdlib-only. System sitecustomize/.pth hooks
+        // are not needed and must not consume its bounded startup budget.
+        .args(["-I", "-S", "-c", HELPER])
         // PATH may resolve python3 to RCH's generic tool shim. Only this
         // parser subprocess bypasses interception; workload children retain
         // normal shim behavior and the parent environment is never mutated.
@@ -637,7 +639,8 @@ mod tests {
                  test \"$RCH_SHIM_BYPASS\" = 1 || exit 81\n\
                  test \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 || exit 82\n\
                  test \"$1\" = -I || exit 83\n\
-                 test \"$2\" = -c || exit 84\n\
+                 test \"$2\" = -S || exit 84\n\
+                 test \"$3\" = -c || exit 85\n\
                  exec {interpreter} \"$@\"\n"
             ),
         )

@@ -281,7 +281,7 @@ invoke_hook() {
     case_rch_for "${1:-30}" < "$prefix.input.json" > "$prefix.output.json" 2> "$prefix.stderr"
     DELEGATED_COMMAND=$(jq -ers '
         select(length == 1) | .[0].hookSpecificOutput.updatedInput.command
-        | select(. == "rch exec -- cargo check")
+        | select(. == "rch exec --require-remote -- cargo check")
     ' "$prefix.output.json")
 }
 
