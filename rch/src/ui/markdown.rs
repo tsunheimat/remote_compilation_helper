@@ -391,6 +391,35 @@ mod tests {
     }
 
     #[test]
+    fn wikilink_events_are_bounded_and_following_content_is_not_duplicated() {
+        // RUSTSEC-2026-0414: exercise the patched dependency with the affected
+        // option explicitly. Production keeps Parser::new's default options.
+        // take() bounds the regression itself even with a vulnerable resolver.
+        for links in [1, 16, 256, 4096] {
+            let input = format!("{}unique-tail", "[[a|]] ".repeat(links));
+            let bound = 8 * links + 8;
+            let events: Vec<_> = Parser::new_ext(&input, pulldown_cmark::Options::ENABLE_WIKILINKS)
+                .take(bound + 1)
+                .collect();
+            assert!(
+                events.len() <= bound,
+                "wikilink event growth for {links} links"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |event| matches!(event, Event::Text(text) if text.contains("unique-tail"))
+                    )
+                    .count(),
+                1
+            );
+            let rendered = render_markdown(&input, false, true);
+            assert_eq!(rendered.matches("unique-tail").count(), 1);
+        }
+    }
+
+    #[test]
     fn test_render_heading() {
         log_test_start("test_render_heading");
         let md = "# Title";
