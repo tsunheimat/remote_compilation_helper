@@ -408,14 +408,21 @@ def javascript(words: list[Word], depth: int, direct: bool = False) -> bool:
     return bool(args and ((exe == "playwright" and args[0] == "test") or (exe == "vite" and args[0] == "build")))
 
 
-def plan(source: str, depth: int = 0, *, whole_shell: bool = False) -> list[dict]:
+def plan(source: str, depth: int = 0, *, whole_shell: bool = False, hook: bool = False) -> list[dict]:
     if depth > MAX_DEPTH or not isinstance(source, str) or "\0" in source:
         return []
     try:
         if len(source.encode("utf-8")) > MAX_INPUT:
             return []
         tokens = lex(source)
-        commands = [arguments(parts) for parts in invocations(tokens)]
+        parts = invocations(tokens)
+        commands = [arguments(component) for component in parts]
+        # Native compiler output and stdin are not a transparent shell stream.
+        # A pipeline changes only its participating stages, not a later Cargo
+        # command after `;`. Group/background scope remains conservative.
+        scoped_structure = any(token.operator and token.value in {"&", "(", ")"}
+                               for token in tokens)
+        token_indices = {token.start: index for index, token in enumerate(tokens)}
         # Export state belongs to a shell scope, not the flattened invocation
         # stream. Track only unconditional top-level sequences here. For a
         # literal nested shell, family() uses only the existence of a workload:
@@ -455,7 +462,7 @@ def plan(source: str, depth: int = 0, *, whole_shell: bool = False) -> list[dict
                 return []
         edits = []
         exported = []
-        for words in commands:
+        for component, words in zip(parts, commands):
             if words and words[0].value == "export":
                 if len(words) == 1:
                     continue  # `export` alone only prints current state.
@@ -490,9 +497,33 @@ def plan(source: str, depth: int = 0, *, whole_shell: bool = False) -> list[dict
                     break
                 if builtin == "exec" and i == len(words):
                     break
-            if family(words[i:], depth):
+            verification = family(words[i:], depth)
+            if verification or (hook and i < len(words) and literal(words[i])
+                                and not ASSIGNMENT.fullmatch(words[i].raw)
+                                and not words[i].value.startswith("-")
+                                and words[i].value not in {"!", "time"}):
                 word = words[i]
-                edits.append({"start": len(source[:word.start].encode("utf-8")), "end": len(source[:word.end].encode("utf-8")), "word": word.raw, "env": env})
+                edit = {"start": len(source[:word.start].encode("utf-8")),
+                        "end": len(source[:word.end].encode("utf-8")),
+                        "word": word.raw, "env": env}
+                if hook:
+                    first = token_indices[component[0].start]
+                    last = token_indices[component[-1].start]
+                    piped = ((first > 0 and tokens[first - 1].value in {"|", "|&"}) or
+                             (last + 1 < len(tokens) and tokens[last + 1].value in {"|", "|&"}))
+                    # Return authored spans, never a reconstructed command. Rust
+                    # applies the native classifier and policy to EACH component;
+                    # a final Cargo command cannot hide an earlier pytest stage.
+                    edit.update(command_end=len(source[:words[-1].end].encode("utf-8")),
+                                argv=[{"start": len(source[:arg.start].encode("utf-8")),
+                                       "end": len(source[:arg.end].encode("utf-8"))}
+                                      for arg in words[i:]],
+                                verification=verification,
+                                native_eligible=not (env or scoped_structure or piped or
+                                    any(token.operator for token in component) or
+                                    os.path.basename(word.value) in
+                                    {"rtk", "bash", "sh", "env", "nice", "timeout"}))
+                edits.append(edit)
         return edits
     except (ParseMiss, RecursionError, ValueError):
         return []
@@ -501,9 +532,14 @@ def plan(source: str, depth: int = 0, *, whole_shell: bool = False) -> list[dict
 def main() -> None:
     raw = sys.stdin.buffer.read(MAX_INPUT * 6 + 1024)
     request = json.loads(raw)
-    if not isinstance(request, dict) or set(request) != {"command"} or not isinstance(request["command"], str):
+    if (not isinstance(request, dict) or set(request) not in ({"command"}, {"command", "mode"})
+            or not isinstance(request["command"], str)
+            or ("mode" in request and request["mode"] != "hook")):
         raise ValueError("invalid planner input")
-    print(json.dumps({"version": 1, "insertions": plan(request["command"])}, ensure_ascii=True, separators=(",", ":")))
+    hook = request.get("mode") == "hook"
+    print(json.dumps({"version": 2 if hook else 1,
+                      "insertions": plan(request["command"], hook=hook)},
+                     ensure_ascii=True, separators=(",", ":")))
 
 
 if __name__ == "__main__":
