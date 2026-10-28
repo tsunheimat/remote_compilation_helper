@@ -24,7 +24,7 @@ use rabs_key::typed_digest::compute;
 use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
 use rabs_protocol::redaction::redact_argv;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 /// What the edge observes about one consult (parsed from the frame).
@@ -226,9 +226,47 @@ impl ShadowPlane {
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     let mut file = std::fs::File::options()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{line}")
+    // A prior interrupted/short append is evidence, not a prefix for the next
+    // receipt. Never concatenate, silently truncate, or advance the index over
+    // it. The plane's existing single-writer ownership serializes these checks.
+    if file.metadata()?.len() != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail)?;
+        if tail != *b"\n" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shadow journal has an unterminated record; retained without append",
+            ));
+        }
+    }
+    write_record(&mut file, line)
+}
+
+fn write_record(writer: &mut impl Write, line: &str) -> std::io::Result<()> {
+    // Formatting into File via writeln! issued separate writes for JSON and
+    // newline. SIGKILL in between left a full JSON value that the next boot
+    // joined to another value. Submit the complete frame in one write instead.
+    // This is process-interruption framing, not a power-loss/fsync guarantee.
+    let mut frame = Vec::with_capacity(line.len() + 1);
+    frame.extend_from_slice(line.as_bytes());
+    frame.push(b'\n');
+    loop {
+        match writer.write(&frame) {
+            Ok(written) if written == frame.len() => return Ok(()),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "short shadow record append; completion not recorded",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// The shadow report: per-class consults and hit-upper-bound counts,
@@ -282,6 +320,102 @@ mod tests {
             argv: argv.iter().map(|s| (*s).to_string()).collect(),
             cwd: "/work".to_string(),
             env_names: vec!["CARGO_HOME".to_string()],
+        }
+    }
+
+    #[test]
+    fn receipt_frame_includes_newline_in_one_write() {
+        #[derive(Default)]
+        struct Calls(Vec<Vec<u8>>);
+        impl Write for Calls {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut calls = Calls::default();
+        write_record(&mut calls, "{\"value\":1}").unwrap();
+        assert_eq!(
+            calls.0,
+            vec![b"{\"value\":1}\n".to_vec()],
+            "a kill between record and newline must not expose an unframed receipt"
+        );
+    }
+
+    #[test]
+    fn interrupted_writes_retry_whole_frames_but_short_writes_do_not_continue() {
+        struct Fault {
+            calls: usize,
+            mode: &'static str,
+            bytes: Vec<u8>,
+        }
+        impl Write for Fault {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.mode == "interrupt" && self.calls == 1 {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                if self.mode == "error" {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                let count = match self.mode {
+                    "short" => bytes.len() - 1,
+                    "zero" => 0,
+                    _ => bytes.len(),
+                };
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for mode in ["interrupt", "short", "zero", "error"] {
+            let mut writer = Fault {
+                calls: 0,
+                mode,
+                bytes: Vec::new(),
+            };
+            let result = write_record(&mut writer, "{\"ok\":true}");
+            if mode == "interrupt" {
+                result.unwrap();
+                assert_eq!(writer.calls, 2);
+                assert_eq!(writer.bytes, b"{\"ok\":true}\n");
+            } else {
+                let kind = result.unwrap_err().kind();
+                assert_eq!(
+                    kind,
+                    if mode == "error" {
+                        std::io::ErrorKind::PermissionDenied
+                    } else {
+                        std::io::ErrorKind::WriteZero
+                    }
+                );
+                assert_eq!(
+                    writer.calls, 1,
+                    "partial frames must not become resumed success"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unterminated_receipt_cannot_be_concatenated_or_advance_the_index() {
+        for retained in [b"{\"v\":1}".as_slice(), b"{\"v\":", b"\xff"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("shadow-receipts.ndjson");
+            std::fs::write(&path, retained).unwrap();
+            let mut plane = ShadowPlane::open(directory.path()).unwrap();
+            let error = plane
+                .on_consult("new", &observation(&["/tc/rustc"]), |_| "leader")
+                .expect_err("unframed prior evidence must be retained, never appended to");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read(&path).unwrap(), retained);
+            assert!(!directory.path().join("shadow-index.ndjson").exists());
+            assert!(plane.index.is_empty());
         }
     }
 
