@@ -16,6 +16,22 @@ on:
       - 'scripts/test_daemon_force_stop.py'
       - 'rch-common/src/process_identity.rs'
       - '.github/workflows/update-lock.yml'
+  # The copied stable manifest is a separate build graph from workspace CI.
+  # Exercise relevant changes before merge, not only after main is updated.
+  pull_request:
+    paths:
+      - 'rch/src/update/lock.rs'
+      - 'rch/src/update/mod.rs'
+      - 'rch/src/update/types.rs'
+      - 'rch/src/update/install.rs'
+      - 'rch/src/update/install/daemon_shutdown.rs'
+      - 'rch/src/commands/daemon.rs'
+      - 'rch/src/commands/daemon/**'
+      - 'rch/tests/daemon_stop_safety.rs'
+      - 'rch/tests/daemon_force_stop.rs'
+      - 'scripts/test_daemon_force_stop.py'
+      - 'rch-common/src/process_identity.rs'
+      - '.github/workflows/update-lock.yml'
   workflow_dispatch:
 
 permissions:
@@ -85,9 +101,12 @@ jobs:
           tempfile = "3.25"
           uuid = { version = "1", features = ["v4"] }
           tokio = { version = "1.49.0", features = ["full"] }
+          # Linux process-identity observation also calls rustix. A transitive
+          # copy of rustix in another dependency cannot satisfy this import.
+          [target.'cfg(unix)'.dependencies]
+          rustix = { version = "1.1.5", features = ["process"] }
           [target.'cfg(target_os = "macos")'.dependencies]
           libproc = "=0.14.11"
-          rustix = { version = "1.1.5", features = ["process"] }
           TOML
           # Cargo discovers configuration from the working directory even
           # with --manifest-path. The copied stable crate must not inherit the

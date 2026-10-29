@@ -72,8 +72,17 @@ notification for weekly drift notification; no channel is removed.
 | `remote-process-platform.yml` | Source-filtered main/manual native Linux/macOS identity, timeout and owned-process lifecycle; duplicate workspace lint/check removed. |
 | `rsync-paths.yml` | Source-filtered main/manual real modern Linux and stock legacy macOS rsync argument behavior. |
 | `managed-pool.yml` | Source-filtered main/manual real policy under checked and optimized arithmetic, including Windows. |
-| `update-lock.yml` | Source-filtered main/manual native cross-process ownership on Linux, Windows and macOS; duplicate full-client validation moved to the workspace owner. |
+| `update-lock.yml` | Source-filtered PR/main or manual native cross-process ownership on Linux, Windows and macOS; the independently generated stable manifest is checked before merge, while full-client validation remains with the workspace owner. |
 | `wrapper-contract.yml` | Weekly/manual external Rust channel drift, all three channels in one build. |
+
+The updater ownership lane copies exact production modules into a separate
+stable-toolchain crate. Its generated manifest must declare `rustix` for Unix,
+not just macOS: the Linux process observer also uses it, and a transitive copy
+cannot satisfy a direct import. Main-push run 40802227637 exposed that omission
+before Linux tests could run; macOS and Windows passed. The same existing lane
+now checks only relevant PR paths as well, so generated-manifest drift is not
+first discovered after merge. Platform coverage, assertions and the 15-minute
+job limit are unchanged; this adds no workflow file or full-client rebuild.
 
 ### Intel profile packaging and qualification caches
 
