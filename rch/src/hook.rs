@@ -5781,12 +5781,15 @@ async fn process_hook(input: HookInput) -> HookOutput {
 /// locally. Keep ordinary fail-open policy, but never erase a remote-only
 /// requirement before the executor can receive it. Grammar misses remain None
 /// and are deliberately not promoted into guessed delegation or execution.
-fn planner_failure_output(config: &rch_common::RchConfig, error: &anyhow::Error) -> HookOutput {
-    debug!(target: "rch::hook::planner_failure", "semantic planning failed: {error:#}");
-    if exec_requires_remote()
+pub(crate) fn planner_failure_requires_refusal(config: &rch_common::RchConfig) -> bool {
+    exec_requires_remote()
         || role_requires_remote(config.general.role)
         || !config.compilation.allow_local_fallback
-    {
+}
+
+fn planner_failure_output(config: &rch_common::RchConfig, error: &anyhow::Error) -> HookOutput {
+    debug!(target: "rch::hook::planner_failure", "semantic planning failed: {error:#}");
+    if planner_failure_requires_refusal(config) {
         HookOutput::deny(
             "RCH could not establish required remote routing because the command planner failed. \
              Local execution is not authorized. Retry after restoring the planner; \

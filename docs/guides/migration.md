@@ -159,6 +159,27 @@ that replace PATH. Ordinary interpreter launches remain local while their nested
 verification commands can still resolve through shims. Missing `rch` makes a
 generic shim refuse rather than run an unclassified, unguarded workload.
 
+A generic dispatch whose planner fails now resolves the same refusal policy as
+the agent hook. Explicit remote-only policy, dispatcher default strictness, or
+disabled local fallback refuses before the real tool starts; an unreadable
+policy also refuses. A successful classification that finds an ordinary
+interpreter command is different and still allows it locally. Non-strict
+planner failure retains the existing literal local launch with a diagnostic.
+This change does not broaden unsupported grammar or change non-UTF-8 argv
+handling, so it is not a universal remote-only shell sandbox.
+
+The Node frontend recognizes bounded literal options before `--test`, including
+`--import`, `--require`/`-r`, loader and test-selection options. Thus
+`node --import setup.mjs --test` reaches the same shared-verification path as
+`node --test`, through direct generic dispatch, installed PATH shims and `rch ci`.
+Option values are consumed before identifying test mode: `node --require --test
+app.js`, ordinary scripts with a later `--test`, `--`, eval/print and unknown or
+dynamic prefixes are not newly classified. Arguments and preloads are forwarded
+unchanged; they are not evaluated by the planner. Nested literal RTK/shell
+wrappers share that recognition without double dispatch. Native compiler
+allowlist/confidence checks and the distinction between native stream-only and
+shared-workspace contracts remain in effect.
+
 `--tools all` installs only these generic frontends: `go`, `swift`, `npm`, `pnpm`,
 `bun`, `pytest`, `python`, `python3`, `node`, `make`, `npx`, `bunx`, `vitest`, `jest`,
 `tsc`, `eslint`, `prettier`, `playwright`, `vite`, and `rtk`. It does **not** include Cargo

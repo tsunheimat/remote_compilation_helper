@@ -1547,6 +1547,254 @@ fn interactive_duplex_output_does_not_deadlock_pending_input() {
     fixture.assert_guard_reclaimed();
 }
 
+fn generic_tool_witness(fixture: &Fixture) -> PathBuf {
+    let tools = fixture.root.join("generic-tools");
+    fs::create_dir(&tools).unwrap();
+    let executable = tools.join("node");
+    // A shell sentinel verifies actual dispatch/guard/argv behavior; this is
+    // explicitly not a claim that Node or an SSH worker was executed.
+    let body = "#!/bin/sh\nprintf x >> \"$RUN_RECORD\"\nprintf '%s' \"${RCH_GUARDED_LOCAL:-0}\" > \"$GUARD_RECORD\"\nprintf '%s\\0' \"$@\"\nprintf owned-tool-error >&2\nexit 17\n";
+    let published = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "umask 077; set -C; printf '%s' \"$2\" > \"$1\" && /bin/chmod 700 \"$1\"",
+            "generic-tool-witness",
+        ])
+        .arg(&executable)
+        .arg(body)
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(published.status.success(), "{published:?}");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_rch"), tools.join("rch")).unwrap();
+    executable
+}
+
+#[test]
+fn generic_shim_planner_failures_preserve_remote_policy() {
+    let fixture = Fixture::new();
+    let executable = generic_tool_witness(&fixture);
+    let calls = fixture.root.join("generic-calls");
+    let guard = fixture.root.join("generic-guard");
+    for (name, body, diagnostic) in [
+        ("shim-missing", None, "start isolated semantic planner"),
+        (
+            "shim-failed",
+            Some("/bin/cat >/dev/null; exit 19"),
+            "semantic planner exited",
+        ),
+        (
+            "shim-malformed",
+            Some("/bin/cat >/dev/null; printf '{'"),
+            "invalid semantic planner response",
+        ),
+        (
+            "shim-oversized",
+            Some("/bin/cat >/dev/null; exec /usr/bin/python3 -I -S -c 'print(\"x\" * 524289)'"),
+            "semantic planner stdout limit",
+        ),
+        (
+            "shim-timeout",
+            Some("/bin/cat >/dev/null; printf '%s' $$ > \"$PLANNER_PID\"; exec /bin/sleep 10"),
+            "semantic planner timed out",
+        ),
+    ] {
+        let tools = planner_fixture(&fixture, name, body);
+        for (role, policy, allow_fallback, refuse) in [
+            ("hybrid", Some("1"), true, true),
+            ("dispatcher", None, true, true),
+            ("hybrid", None, false, true),
+            ("hybrid", None, true, false),
+            ("dispatcher", Some("0"), true, false),
+        ] {
+            fixture.configure(role, allow_fallback);
+            let before = fs::read(&calls).unwrap_or_default();
+            let mut command = fixture.command();
+            command
+                .args([
+                    "shim",
+                    "dispatch",
+                    "--tool",
+                    "node",
+                    "--",
+                    "--test",
+                    "two words; $HOME",
+                    "",
+                ])
+                .env("RCH_SHIM_REAL_TOOL", &executable)
+                .env("PATH", &tools)
+                .env("RUN_RECORD", &calls)
+                .env("GUARD_RECORD", &guard)
+                .env("PLANNER_PID", fixture.root.join("shim-planner.pid"));
+            if let Some(policy) = policy {
+                command.env("RCH_REQUIRE_REMOTE", policy);
+            }
+            let result = fixture.run(&mut command, b"");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains(diagnostic),
+                "{name}/{role}/{policy:?}: {stderr}"
+            );
+            if refuse {
+                assert_ne!(
+                    result.status.code(),
+                    Some(17),
+                    "strict shim planner failure must not launch the local tool: {name}/{role}/{policy:?}"
+                );
+                assert!(!result.status.success());
+                assert!(result.stdout.is_empty());
+                assert!(stderr.contains("refusing local execution"), "{stderr}");
+                assert_eq!(fs::read(&calls).unwrap_or_default(), before);
+            } else {
+                assert_eq!(result.status.code(), Some(17));
+                assert_eq!(result.stdout, b"--test\0two words; $HOME\0\0");
+                assert!(result.stderr.ends_with(b"owned-tool-error"));
+                assert_eq!(fs::read(&calls).unwrap().len(), before.len() + 1);
+            }
+            if name == "shim-timeout" {
+                let pid = fs::read_to_string(fixture.root.join("shim-planner.pid")).unwrap();
+                assert!(
+                    !Path::new("/proc").join(pid.trim()).exists(),
+                    "owned helper must be reaped before dispatch returns"
+                );
+            }
+            assert!(!fixture.root.join("state/job-leases").exists());
+        }
+    }
+    // Unknown policy is not permission to execute either. Keep the same
+    // real-tool witness and require its invocation counter to stay unchanged.
+    fs::write(fixture.root.join("config/config.toml"), "[general\ninvalid").unwrap();
+    let before = fs::read(&calls).unwrap();
+    let invalid = fixture.run(
+        fixture
+            .command()
+            .args(["shim", "dispatch", "--tool", "node", "--", "--test"])
+            .env("PATH", fixture.root.join("shim-missing"))
+            .env("RCH_SHIM_REAL_TOOL", &executable)
+            .env("RUN_RECORD", &calls)
+            .env("GUARD_RECORD", &guard),
+        b"",
+    );
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("refusing local execution"));
+    assert_eq!(fs::read(&calls).unwrap(), before);
+
+    // A successful negative classification remains an ordinary interpreter,
+    // even under strict policy; absence of a test workload is not a failure.
+    let real = planner_fixture(&fixture, "shim-real", Some("exec /usr/bin/python3 \"$@\""));
+    fixture.configure("hybrid", true);
+    let result = fixture.run(
+        fixture
+            .command()
+            .args([
+                "shim", "dispatch", "--tool", "node", "--", "app.js", "--test",
+            ])
+            .env("PATH", real)
+            .env("RCH_SHIM_REAL_TOOL", &executable)
+            .env("RCH_REQUIRE_REMOTE", "1")
+            .env("RUN_RECORD", &calls)
+            .env("GUARD_RECORD", &guard),
+        b"",
+    );
+    assert_eq!(result.status.code(), Some(17));
+    assert_eq!(result.stdout, b"app.js\0--test\0");
+    assert_eq!(fs::read(&guard).unwrap(), b"0");
+}
+
+#[test]
+fn generic_node_leading_options_are_guarded_without_changing_argv() {
+    let fixture = Fixture::new();
+    let executable = generic_tool_witness(&fixture);
+    let tools = executable.parent().unwrap();
+    let calls = fixture.project.join("node-calls");
+    let guard = fixture.project.join("node-guard");
+    let installed = fixture.run(
+        fixture
+            .command()
+            .args(["shim", "install", "--tools", "node"]),
+        b"",
+    );
+    assert!(installed.status.success(), "{:?}", installed.stderr);
+    let path = std::env::join_paths([tools, Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let variants: &[&[&str]] = &[
+        &[
+            "--import",
+            "setup with spaces.mjs",
+            "--test",
+            "literal ; $HOME",
+            "",
+        ],
+        &["-r", "setup.cjs", "--test"],
+        &["-rsetup.cjs", "--test"],
+        &["--require=setup.cjs", "--import=setup.mjs", "--test"],
+        &[
+            "--no-warnings",
+            "--test-name-pattern",
+            "literal ; $HOME",
+            "--test",
+        ],
+    ];
+    for args in variants {
+        for entry in ["dispatch", "ci"] {
+            let before = fs::read(&calls).unwrap_or_default().len();
+            let mut command = fixture.command();
+            if entry == "dispatch" {
+                command.args(["shim", "dispatch", "--tool", "node", "--"]);
+            } else {
+                command.args(["ci", "--", "node"]);
+            }
+            command
+                .args(*args)
+                .env("PATH", &path)
+                .env("RCH_SHIM_REAL_TOOL", &executable)
+                .env("RUN_RECORD", &calls)
+                .env("GUARD_RECORD", &guard);
+            let output = fixture.run(&mut command, b"");
+            assert_eq!(
+                output.status.code(),
+                Some(17),
+                "{entry}/{args:?}: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read(&guard).unwrap(),
+                b"1",
+                "Node test options must enter guarded verification: {entry}/{args:?}"
+            );
+            let expected: Vec<u8> = args
+                .iter()
+                .flat_map(|arg| arg.as_bytes().iter().copied().chain([0]))
+                .collect();
+            assert_eq!(output.stdout, expected);
+            assert!(output.stderr.ends_with(b"owned-tool-error"));
+            assert_eq!(fs::read(&calls).unwrap().len(), before + 1);
+            fixture.assert_guard_reclaimed();
+            // This fixture has no shared-workspace mapping, so strict mode
+            // must return the existing permanent pre-admission refusal (1),
+            // not the retryable worker-unavailable code (103) or a local launch.
+            let refused = fixture.run(command.env("RCH_REQUIRE_REMOTE", "1"), b"");
+            assert_eq!(
+                refused.status.code(),
+                Some(1),
+                "{entry}/{args:?}: {:?}",
+                String::from_utf8_lossy(&refused.stderr)
+            );
+            let reason = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                reason.contains("shared invocation refused before execution"),
+                "{reason}"
+            );
+            assert!(
+                reason.contains("guarded local fallback is not authorized"),
+                "{reason}"
+            );
+            assert!(refused.stdout.is_empty());
+            assert_eq!(fs::read(&calls).unwrap().len(), before + 1);
+        }
+    }
+}
+
 #[test]
 fn real_generic_shim_and_ci_execute_tool_once_with_literal_args() {
     use std::os::unix::fs::{PermissionsExt, symlink};
