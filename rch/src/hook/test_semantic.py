@@ -36,6 +36,32 @@ def rewrite(command):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_token_storage_remains_immutable_and_preserves_default_operator(self):
+        word = semantic.Word("value", "'value'", 0, 7)
+        self.assertEqual((word.value, word.raw, word.start, word.end, word.operator),
+                         ("value", "'value'", 0, 7, False))
+        with self.assertRaises(AttributeError):
+            word.value = "mutated"
+        self.assertTrue(semantic.Word("&&", "&&", 8, 10, True).operator)
+        self.assertEqual(semantic.lex("'value' && pytest")[0], word)
+
+    def test_embedded_helper_needs_no_site_initialization(self):
+        source = "pytest -q && cargo test"
+        # Exercise the production -I -S -c form, including stdin EOF, rather
+        # than merely importing the module in the already-running test process.
+        helper = PATH.read_text()
+        for mode in (None, "hook"):
+            request = {"command": source}
+            if mode:
+                request["mode"] = mode
+            result = subprocess.run([sys.executable, "-I", "-S", "-c", helper],
+                                    input=json.dumps(request).encode(),
+                                    capture_output=True, timeout=5, check=True)
+            response = json.loads(result.stdout)
+            self.assertEqual(response["version"], 2 if mode else 1)
+            self.assertEqual(response["insertions"], semantic.plan(source, hook=bool(mode)))
+            self.assertEqual(result.stderr, b"")
+
     def test_hook_components_cover_both_orders_without_reconstructing_shell(self):
         for source in ("pytest -q && cargo test", "cargo test && pytest -q",
                        "printf '中文'; /usr/bin/clang -c 'two words.c' && pytest -q"):

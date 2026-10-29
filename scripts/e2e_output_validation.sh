@@ -436,7 +436,9 @@ test_hook_json_pristine() {
     stdout_file=$(mktemp)
     stderr_file=$(mktemp)
 
-    echo "$hook_input" | RCH_SOCKET_PATH="$socket_path" RCH_TEST_MODE=1 \
+    # This is the ordinary-policy control. The executed remote cases above
+    # explicitly require and check the strict prefix through e2e_run_delegated.
+    echo "$hook_input" | RCH_SOCKET_PATH="$socket_path" RCH_TEST_MODE=1 RCH_REQUIRE_REMOTE=0 \
         "$rch_bin" >"$stdout_file" 2>"$stderr_file" || true
 
     local stdout_content

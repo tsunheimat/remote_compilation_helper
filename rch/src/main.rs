@@ -716,6 +716,14 @@ USAGE:
         /// Refuses local execution or a different worker when unavailable.
         #[arg(long, value_name = "ID", value_parser = parse_exec_worker)]
         worker: Option<rch_common::WorkerId>,
+        /// Run this invocation remotely or refuse; never execute it locally.
+        /// Unlike an inherited RCH_REQUIRE_REMOTE, this explicit requirement
+        /// also refuses under force_local/disabled configuration. It applies
+        /// equally to native compilation, --job and shared --verification.
+        /// The flag alone does not change the workspace backend or classify
+        /// an ordinary command as an offloadable job.
+        #[arg(long)]
+        require_remote: bool,
         /// Literal command argv to execute (use --shell for shell syntax).
         #[arg(required_unless_present = "shell", num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2548,6 +2556,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 result_dir,
                 require_tool,
                 worker,
+                require_remote,
                 command,
             } => {
                 let ExecInvocationArgs {
@@ -2603,6 +2612,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     result_dir,
                     require_tool,
                     worker,
+                    require_remote,
                     command,
                     invocation,
                     &ctx,
@@ -3793,8 +3803,9 @@ fn policies() -> Vec<PolicyCapability> {
                     .to_string(),
             reason_code: Some("RCH-I012".to_string()),
             next_action:
-                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>`; a refusal surfaces \
-                 RCH-I012 instead of silently running locally."
+                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>` or, for one call, \
+                 `rch exec --require-remote -- <build cmd>`; a refusal surfaces RCH-I012 instead \
+                 of silently running locally."
                     .to_string(),
         },
         PolicyCapability {
@@ -7748,6 +7759,74 @@ mod tests {
             "check",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_exec_require_remote_without_changing_invocation_backend() {
+        let _guard = test_guard!();
+        for (args, required, job, verification) in [
+            (vec!["rch", "exec", "--", "true"], false, false, false),
+            (
+                vec!["rch", "exec", "--require-remote", "--", "true"],
+                true,
+                false,
+                false,
+            ),
+            (
+                vec!["rch", "exec", "--job", "--require-remote", "--", "true"],
+                true,
+                true,
+                false,
+            ),
+            (
+                vec![
+                    "rch",
+                    "exec",
+                    "--verification",
+                    "--require-remote",
+                    "--",
+                    "true",
+                ],
+                true,
+                false,
+                true,
+            ),
+        ] {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Exec {
+                    require_remote,
+                    job: parsed_job,
+                    invocation_args,
+                    command,
+                    ..
+                }) => {
+                    assert_eq!(require_remote, required);
+                    assert_eq!(parsed_job, job);
+                    assert_eq!(invocation_args.verification, verification);
+                    assert!(invocation_args.workspace.is_none());
+                    assert!(invocation_args.cwd.is_none());
+                    assert_eq!(command, vec!["true"]);
+                }
+                _ => fail_expected("Expected exec command"),
+            }
+        }
+        match Cli::try_parse_from(["rch", "exec", "--", "pytest", "--require-remote"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Exec {
+                require_remote,
+                command,
+                ..
+            }) => {
+                assert!(
+                    !require_remote,
+                    "workload arguments are not controller options"
+                );
+                assert_eq!(command, vec!["pytest", "--require-remote"]);
+            }
+            _ => fail_expected("Expected literal exec command"),
+        }
     }
 
     #[test]

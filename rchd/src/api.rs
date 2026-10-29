@@ -2610,11 +2610,17 @@ async fn handle_select_worker_dry_run(
 ) -> SelectionResponse {
     // Same exclusions as a real request: a worker already building this
     // project would not be handed a second build of it.
-    let excluded_worker_ids = project_excluded_workers(ctx, &request.project);
-    let result = ctx
+    let exclusions = project_exclusions(ctx, &request.project);
+    let excluded_worker_ids = exclusions.keys().cloned().collect();
+    // Keep selection and explanations in the same preview round. Inventory
+    // reports configured workers without reserving slots or creating a job.
+    let mut result = ctx
         .worker_selector
-        .preview_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
+        .preview_with_inventory(&ctx.pool, request, &excluded_worker_ids)
         .await;
+    if let Some(diagnostics) = result.diagnostics.as_mut() {
+        describe_project_exclusions(diagnostics, &exclusions);
+    }
     let worker = match result.worker {
         Some(worker) => {
             // Read slot/score state before taking the config lock: tokio's
@@ -3557,14 +3563,94 @@ fn project_excluded_workers(
     ctx: &DaemonContext,
     project: &str,
 ) -> std::collections::HashSet<String> {
-    let mut excluded = ctx.history.active_workers_for_project(project);
-    excluded.extend(
-        ctx.history
-            .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
-    );
-    excluded.extend(ctx.history.live_checkout_fenced_workers(project));
-    excluded.extend(ctx.history.source_busy_fenced_workers(project));
+    project_exclusions(ctx, project).into_keys().collect()
+}
+
+/// The fork still permits one active project per worker. Do not invent lane
+/// configuration or import the newer lane scheduler merely to explain this
+/// existing exclusion. Other fences keep the same priority and lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectExclusion {
+    ActiveBuild,
+    SourceFenced,
+    LiveCheckout,
+    SourceBusy,
+}
+
+impl ProjectExclusion {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::ActiveBuild => "project.active_build",
+            Self::SourceFenced => "project.source_fenced",
+            Self::LiveCheckout => "project.live_checkout_fenced",
+            Self::SourceBusy => "project.source_busy_fenced",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ActiveBuild => "this worker already has an active build for this project",
+            Self::SourceFenced => {
+                "a failed build's client lease still owns this project's source on this worker"
+            }
+            Self::LiveCheckout => {
+                "this worker's live checkout of the project refused a source sync"
+            }
+            Self::SourceBusy => "another owner holds this project's source on this worker",
+        }
+    }
+}
+
+fn project_exclusions(
+    ctx: &DaemonContext,
+    project: &str,
+) -> std::collections::HashMap<String, ProjectExclusion> {
+    let mut excluded: std::collections::HashMap<_, _> = ctx
+        .history
+        .active_workers_for_project(project)
+        .into_iter()
+        .map(|worker| (worker, ProjectExclusion::ActiveBuild))
+        .collect();
+    let fences = [
+        (
+            ctx.history
+                .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
+            ProjectExclusion::SourceFenced,
+        ),
+        (
+            ctx.history.live_checkout_fenced_workers(project),
+            ProjectExclusion::LiveCheckout,
+        ),
+        (
+            ctx.history.source_busy_fenced_workers(project),
+            ProjectExclusion::SourceBusy,
+        ),
+    ];
+    for (workers, cause) in fences {
+        for worker in workers {
+            excluded.entry(worker).or_insert(cause);
+        }
+    }
     excluded
+}
+
+fn describe_project_exclusions(
+    diagnostics: &mut rch_common::SelectionDiagnostics,
+    exclusions: &std::collections::HashMap<String, ProjectExclusion>,
+) {
+    for worker in &mut diagnostics.workers {
+        if let Some(cause) = exclusions.get(worker.worker_id.as_str())
+            && worker
+                .reason_codes
+                .iter()
+                .any(|code| code == "active_project_exclusion")
+        {
+            // Retain the existing broad code for consumers, then add the
+            // precise cause. A not-requested worker keeps its earlier denial.
+            worker.final_reason = cause.reason().to_string();
+            worker.reason_codes.push(cause.reason_code().to_string());
+        }
+    }
 }
 
 pub(crate) fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
@@ -5860,6 +5946,165 @@ mod tests {
                 .active_workers_for_project("dry-run-project")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn dry_run_selection_inventories_every_worker_without_reservation() {
+        use rch_common::WorkerSelectionDiagnosticDecision as Decision;
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        for id in ["chosen", "busy", "live-fenced", "source-busy", "active"] {
+            pool.add_worker(make_test_worker(id, 8)).await;
+        }
+        let busy = pool.get(&WorkerId::new("busy")).await.unwrap();
+        assert!(busy.reserve_slots(6).await);
+        let active_worker = pool.get(&WorkerId::new("active")).await.unwrap();
+        assert!(active_worker.reserve_slots(1).await);
+        let chosen_worker = pool.get(&WorkerId::new("chosen")).await.unwrap();
+        let ctx = make_test_context(pool);
+        ctx.history
+            .fence_live_checkout("inventory-project", "live-fenced");
+        ctx.history
+            .fence_source_busy("inventory-project", "source-busy");
+        let active = ctx.history.start_active_build(
+            "inventory-project".into(),
+            "active".into(),
+            "cargo test".into(),
+            std::process::id(),
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        // A second fence must not change the existing active-build precedence.
+        ctx.history
+            .fence_live_checkout("inventory-project", "active");
+        let mut request = SelectionRequest {
+            job_mode: false,
+            project: "inventory-project".into(),
+            command: Some("cargo build".into()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            disk_headroom_gib: 0,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            required_tools: vec![],
+            hook_pid: None,
+        };
+        let entry = |response: &SelectionResponse, id: &str| {
+            response
+                .diagnostics
+                .as_ref()
+                .expect("inventory present")
+                .workers
+                .iter()
+                .find(|worker| worker.worker_id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing worker {id}"))
+                .clone()
+        };
+        let response = handle_select_worker_dry_run(&ctx, &request).await;
+        assert_eq!(response.worker.as_ref().unwrap().id.as_str(), "chosen");
+        assert!(response.build_id.is_none());
+        assert_eq!(response.diagnostics.as_ref().unwrap().workers.len(), 5);
+        assert_eq!(entry(&response, "chosen").final_decision, Decision::Allow);
+        assert_eq!(
+            entry(&response, "busy").reason_codes,
+            vec!["slots.insufficient"]
+        );
+        for (id, cause) in [
+            ("live-fenced", ProjectExclusion::LiveCheckout),
+            ("source-busy", ProjectExclusion::SourceBusy),
+            ("active", ProjectExclusion::ActiveBuild),
+        ] {
+            let observed = entry(&response, id);
+            assert_eq!(observed.final_decision, Decision::Deny);
+            assert!(observed.active_project_excluded);
+            assert_eq!(
+                observed.reason_codes,
+                vec!["active_project_exclusion", cause.reason_code()]
+            );
+            assert_eq!(observed.final_reason, cause.reason());
+        }
+        assert_eq!(chosen_worker.used_slots(), 0);
+        assert_eq!(busy.used_slots(), 6);
+        assert_eq!(active_worker.used_slots(), 1);
+        assert_eq!(ctx.history.active_builds().len(), 1);
+        assert_eq!(ctx.history.active_builds()[0].id, active.id);
+        assert!(ctx.history.queued_builds().is_empty());
+        assert!(ctx.worker_selector.get_audit_log(None).await.is_empty());
+        let plain = ctx
+            .worker_selector
+            .preview_with_exclusions(
+                &ctx.pool,
+                &request,
+                &project_excluded_workers(&ctx, &request.project),
+            )
+            .await;
+        assert!(plain.worker.is_some() && plain.diagnostics.is_none());
+
+        request.preferred_workers = vec![WorkerId::new("chosen")];
+        let requested = handle_select_worker_dry_run(&ctx, &request).await;
+        for id in ["busy", "live-fenced", "source-busy", "active"] {
+            let observed = entry(&requested, id);
+            assert_eq!(observed.final_decision, Decision::Deny);
+            assert_eq!(observed.reason_codes, vec!["selection.not_requested"]);
+            assert_eq!(observed.final_reason, "not in the requested worker set");
+        }
+        request.preferred_workers = vec![WorkerId::new("not-configured")];
+        let absent = handle_select_worker_dry_run(&ctx, &request).await;
+        assert!(absent.worker.is_none());
+        assert!(
+            absent
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .workers
+                .iter()
+                .all(|worker| worker.final_decision == Decision::Deny
+                    && worker.reason_codes == ["selection.not_requested"])
+        );
+        assert!(absent.build_id.is_none());
+        assert_eq!(chosen_worker.used_slots(), 0);
+        assert_eq!(busy.used_slots(), 6);
+        assert_eq!(active_worker.used_slots(), 1);
+        assert_eq!(ctx.history.active_builds().len(), 1);
+        assert!(ctx.history.queued_builds().is_empty());
+        assert!(ctx.worker_selector.get_audit_log(None).await.is_empty());
+
+        // Countermetric: an actual selection still records its audit, and a
+        // later preview neither replaces it nor consumes the next audit ID.
+        request.preferred_workers = vec![WorkerId::new("chosen")];
+        let selected = ctx
+            .worker_selector
+            .select_with_exclusions(
+                &ctx.pool,
+                &request,
+                &project_excluded_workers(&ctx, &request.project),
+            )
+            .await;
+        assert!(selected.worker.is_some());
+        let actual_log = ctx.worker_selector.get_audit_log(None).await;
+        assert_eq!(actual_log.len(), 1);
+        assert_eq!(actual_log[0].id, 1);
+        assert_eq!(actual_log[0].selected_worker_id.as_deref(), Some("chosen"));
+        let _ = handle_select_worker_dry_run(&ctx, &request).await;
+        let preserved = ctx.worker_selector.get_audit_log(None).await;
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].id, actual_log[0].id);
+        assert_eq!(preserved[0].timestamp_ms, actual_log[0].timestamp_ms);
+        let _ = ctx
+            .worker_selector
+            .select_with_exclusions(
+                &ctx.pool,
+                &request,
+                &project_excluded_workers(&ctx, &request.project),
+            )
+            .await;
+        let actual_log = ctx.worker_selector.get_audit_log(None).await;
+        assert_eq!(actual_log.len(), 2);
+        let mut ids = actual_log.iter().map(|entry| entry.id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]

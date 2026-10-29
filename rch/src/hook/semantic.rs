@@ -155,6 +155,7 @@ fn apply_hook_plan(
     command: &str,
     output: &[u8],
     config: &rch_common::RchConfig,
+    require_remote: bool,
 ) -> Result<Option<String>> {
     let plan: HookPlan =
         serde_json::from_slice(output).context("invalid structural hook response")?;
@@ -253,6 +254,9 @@ fn apply_hook_plan(
         } else {
             "rch exec --verification"
         });
+        if require_remote {
+            rewritten.push_str(" --require-remote");
+        }
         for name in edit.env {
             rewritten.push_str(" --forward-env ");
             rewritten.push_str(&name);
@@ -271,7 +275,9 @@ fn apply_hook_plan(
 fn helper_process() -> Command {
     let mut process = Command::new("python3");
     process
-        .args(["-I", "-c", HELPER])
+        // The embedded helper is stdlib-only. System sitecustomize/.pth hooks
+        // are not needed and must not consume its bounded startup budget.
+        .args(["-I", "-S", "-c", HELPER])
         // PATH may resolve python3 to RCH's generic tool shim. Only this
         // parser subprocess bypasses interception; workload children retain
         // normal shim behavior and the parent environment is never mutated.
@@ -366,7 +372,12 @@ async fn request_plan(
             );
         }
         match hook_config {
-            Some(config) => apply_hook_plan(command, &output, config),
+            Some(config) => apply_hook_plan(
+                command,
+                &output,
+                config,
+                super::exec_requires_remote() || super::role_requires_remote(config.general.role),
+            ),
             None => apply_plan(command, &output),
         }
     })
@@ -500,10 +511,18 @@ mod tests {
             {"start":10,"end":15,"command_end":20,"word":"cargo","argv":[{"start":10,"end":15},{"start":16,"end":20}],"env":[],"verification":true,"native_eligible":true}
         ]});
         assert_eq!(
-            apply_hook_plan(source, &serde_json::to_vec(&valid).unwrap(), &config)
+            apply_hook_plan(source, &serde_json::to_vec(&valid).unwrap(), &config, false)
                 .unwrap()
                 .as_deref(),
             Some("rch exec --verification -- pytest && rch exec -- cargo test")
+        );
+        assert_eq!(
+            apply_hook_plan(source, &serde_json::to_vec(&valid).unwrap(), &config, true)
+                .unwrap()
+                .as_deref(),
+            Some(
+                "rch exec --verification --require-remote -- pytest && rch exec --require-remote -- cargo test"
+            )
         );
         let mut wrong_version = valid.clone();
         wrong_version["version"] = 1.into();
@@ -535,7 +554,13 @@ mod tests {
             forged_word,
         ] {
             assert!(
-                apply_hook_plan(source, &serde_json::to_vec(&invalid).unwrap(), &config).is_err(),
+                apply_hook_plan(
+                    source,
+                    &serde_json::to_vec(&invalid).unwrap(),
+                    &config,
+                    false
+                )
+                .is_err(),
                 "{invalid}"
             );
         }
@@ -614,7 +639,8 @@ mod tests {
                  test \"$RCH_SHIM_BYPASS\" = 1 || exit 81\n\
                  test \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 || exit 82\n\
                  test \"$1\" = -I || exit 83\n\
-                 test \"$2\" = -c || exit 84\n\
+                 test \"$2\" = -S || exit 84\n\
+                 test \"$3\" = -c || exit 85\n\
                  exec {interpreter} \"$@\"\n"
             ),
         )

@@ -137,7 +137,10 @@ def stat_process(pid: int) -> tuple[str, int, int] | None:
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
         return fields[0], int(fields[2]), int(fields[19])
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # Exit before open yields ENOENT; exit after open can yield ESRCH on
+        # read. Both prove this observation absent. Permission, I/O and malformed
+        # records still raise: they are not proof of successful cleanup.
         return None
 
 
@@ -306,6 +309,38 @@ def check_admitted_receipt_change(test, mutation: str, index: int) -> None:
     test.wait_for(lambda: (other_job / "beats").stat().st_size > before)
     (other_job / "release").touch()
     test.finish(other, other_job)
+
+
+class ProcessObservationTests(unittest.TestCase):
+    def test_disappearance_during_proc_read_is_absent_but_other_errors_are_not(self):
+        from unittest.mock import patch
+        import errno
+
+        for failure in (FileNotFoundError(errno.ENOENT, "gone"),
+                        ProcessLookupError(errno.ESRCH, "exited after open")):
+            with patch.object(Path, "read_text", side_effect=failure):
+                self.assertIsNone(stat_process(123))
+                self.assertFalse(alive(123, 456))
+        for failure in (PermissionError(errno.EACCES, "denied"),
+                        OSError(errno.EIO, "read failed")):
+            with patch.object(Path, "read_text", side_effect=failure):
+                with self.assertRaises(type(failure)):
+                    stat_process(123)
+        with patch.object(Path, "read_text", return_value="invalid stat record"):
+            with self.assertRaises(IndexError):
+                stat_process(123)
+
+    def test_real_owned_child_is_live_then_absent_after_reap(self):
+        child = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            observed = stat_process(child.pid)
+            self.assertIsNotNone(observed)
+            self.assertTrue(alive(child.pid, observed[2]))
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+        self.assertIsNone(stat_process(child.pid))
+        self.assertFalse(alive(child.pid, observed[2]))
 
 
 class ScriptTransport(unittest.TestCase):

@@ -271,6 +271,65 @@ under names such as `src/target_cache` is no longer mistaken for generated Cargo
 output. Cancellation recovery requires durable records and complete process
 identity witnesses before claiming the corresponding authority.
 
+### Per-invocation remote requirement
+
+`rch exec --require-remote -- COMMAND...` requires this particular invocation to
+run remotely or refuse before local execution. It applies to native compilation,
+explicit `--job`, and shared `--verification`; it also forbids guarded-local
+verification fallback. The flag alone does not select the shared backend, so
+`rch exec --require-remote -- cargo test` retains the native mirror/artifact path.
+It does not make an ordinary command offloadable: use the existing verification
+or job interface when that execution contract is intended.
+
+An explicit per-call requirement wins over `force_local`, disabled configuration,
+and a falsy inherited `RCH_REQUIRE_REMOTE`; those conflicts refuse rather than
+starting locally or overriding policy to start remotely. The native path's
+historical environment-only local-config opt-out is preserved; existing shared
+fallback guards remain in force. No process-global environment is modified, and a subsequent invocation
+without the flag retains its own policy. Options after the workload's `--` remain
+literal workload arguments, not controller flags. Windows refuses this flag
+before starting a local command because its client lacks Unix daemon transport.
+
+Remote-failure incident records reflect the same effective fallback policy as
+execution. A refusal caused only by `compilation.allow_local_fallback=false`
+records that configuration cause, not a fabricated strict-remote flag, and emits
+an explicit refused result. Socket and requested-worker diagnostics cannot claim
+local fallback is allowed when the corresponding execution gate forbids it.
+
+Agents still issue ordinary tool commands. Once the hook resolves an existing
+strict policy (`RCH_REQUIRE_REMOTE=1` or the dispatcher default without an explicit
+opt-out), it includes `--require-remote` in each delegated native/shared prefix.
+Thus the execution step need not inherit the hook's entire environment to keep
+that requirement. The hook does not inject it into authored strings, ordinary
+local commands, unrecognized grammar, or commands explicitly excluded by project
+policy. This is propagation of a recognized delegation's policy, not a claim that
+every shell command has been intercepted. Mixed compounds retain permission
+checking and exact authored command bytes.
+
+### Worker selection inventory
+
+`rch --json diagnose --dry-run 'cargo test'` includes a `worker_selection.inventory`
+when a supporting daemon supplies selection diagnostics. Each configured worker
+is reported as `selected`, `eligible`, `fallback_candidate`, or `excluded`, with
+human-readable reasons and stable reason codes. The selected/fallback verdict is
+from that same preview round, not reconstructed from a later fleet snapshot.
+Older daemons lacking inventory evidence leave the field absent; the client does
+not invent an empty successful inventory.
+
+The fork's existing one-active-project-per-worker rule is reported as
+`project.active_build`, not a fictitious configurable lane limit. Source ownership,
+live checkout and source-busy fences have distinct codes. An explicit requested
+worker set takes precedence in diagnostics: other configured workers report
+`selection.not_requested`, even if another exclusion also applies. This does not
+relax actual selection or import the upstream multi-lane scheduler.
+
+Dry-run queries may contact the daemon and perform its existing capability
+checks, but they do not create builds, reserve execution slots, spend half-open
+probe slots or append dispatch-audit entries. Real selection audit records remain
+intact, and actual selections still record their normal audit entries. Inventory
+explains the existing native diagnose request; it does not replace the hook's
+per-component planner or qualify a shared mapping for execution.
+
 ### RTK logs and local fallback limits
 
 RTK 0.46.0 integration recognizes `rtk run -c SOURCE`, `rtk run SOURCE`,

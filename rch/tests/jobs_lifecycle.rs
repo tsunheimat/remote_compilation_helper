@@ -59,7 +59,10 @@ if os.environ.get('MISSING_RECEIPT') and 'cat -- ' in command and '.done' in com
     sys.exit(0)
 parsed=shlex.split(command)
 if parsed[:2] in [['sh','-c'],['sh','-lc'],['bash','-c'],['bash','-lc']]:
-    parsed=shlex.split(parsed[2])
+    # Only inspect tokens for this adapter's fault injection. Shell comments
+    # can contain unmatched quotes; they are not arguments to tokenize. The
+    # command actually executed below is still the unchanged authored string.
+    parsed=shlex.split(parsed[2],comments=True)
 if parsed[-2:-1]==['sh'] and parsed[-1].endswith('.done.launch'):
     import json
     with open(os.environ['RCH_FIXTURE_LAUNCH_LOG'],'a') as log:
@@ -112,7 +115,14 @@ def serve():
             request=data.decode().splitlines()[0]; requests.append(request)
             route=request.split(' ',1)[1]; query=urllib.parse.parse_qs(urllib.parse.urlsplit(route).query)
             reply={'status':'ok'}
-            if route.startswith('/select-worker'):
+            endpoint=urllib.parse.urlsplit(route).path
+            if endpoint in ('/select-worker','/select-toolchain-environment'):
+                # Mirror both current selection protocols in this explicitly
+                # simulated peer. Native requests carry admission-bound tool
+                # environment; do not answer them with a generic success object.
+                if endpoint=='/select-toolchain-environment':
+                    assert 'toolchain_environment' in query
+                    assert isinstance(json.loads(query['toolchain_environment'][0]),dict)
                 selections.append(query)
                 reply={'worker':{'id':'fixture','host':'rch-fixture','user':'root','identity_file':'/unused','slots_available':2,'speed_score':1.0},'reason':'success','build_id':8000+len(selections)}
             if route.startswith('/release-worker'): releases.append(query)
@@ -155,6 +165,24 @@ try:
                 stat=pathlib.Path('/proc')/pid/'stat'
                 assert not stat.exists() or stat.read_text().rsplit(') ',1)[1][0] in 'ZX',pid
         print(name, 'PASS', round(elapsed,3), record)
+    # Positive per-call contract through the actual execution/receipt path.
+    # SSH and admission are the same explicitly simulated adapters above;
+    # the real workload asserts it reached that adapter, not local fallback.
+    strict_work=root/'source/project/strict-call'; strict_work.mkdir()
+    strict_result=root/'strict-call.json'; strict_payload=b'literal\x00\xffstdin'
+    strict_code='import os,sys; assert os.environ["RCH_FIXTURE_TRANSPORT"]=="worker"; data=sys.stdin.buffer.read(); open("runs","ab").write(b"x"); sys.stdout.buffer.write(data); sys.stderr.buffer.write(b"err\\x00\\xfe"); sys.exit(23)'
+    before=len(selections); before_release=len(releases)
+    strict_run=subprocess.run([str(root/'rch'),'--no-self-healing','exec','--verification','--require-remote','--cwd',str(strict_work),'--json-result',str(strict_result),'--','/usr/bin/python3','-c',strict_code],env=dict(env,RCH_REQUIRE_REMOTE='0'),cwd=strict_work,input=strict_payload,capture_output=True,timeout=20)
+    assert strict_run.returncode==23,(strict_run.returncode,strict_run.stderr)
+    assert strict_run.stdout==strict_payload,strict_run.stdout
+    assert b'err\x00\xfe' in strict_run.stderr,strict_run.stderr
+    strict_record=json.loads(strict_result.read_text())
+    assert strict_record['outcome']=='completed' and strict_record['remote_exit_code']==23 and strict_record['worker_id']=='fixture',strict_record
+    assert (strict_work/'runs').read_bytes()==b'x'
+    assert len(selections)==before+1 and len(releases)==before_release+1
+    assert releases[-1]['exit_code']==['23']
+    assert releases[-1]['local_wrapper_id']==selections[-1]['local_wrapper_id']
+    print('per-call-strict-positive PASS: exact binary streams, worker contract, one execution and one release')
     for name,variable,workload in [('unverified','FAIL_CLEANUP',code),('missing','MISSING_RECEIPT','open("runs","a").write("x")')]:
         cwd=root/'source/project'/name; cwd.mkdir()
         result=root/(name+'.json'); before=len(releases)
@@ -217,9 +245,10 @@ TMPDIR = "/tmp"
     install=subprocess.run([str(root/'rch'),'--no-self-healing','shim','install','--no-toolchains'],env=env,cwd=cwd,capture_output=True)
     assert install.returncode==0,install.stderr
     shim=root/'home/.rch/shims'
-    for name,argv in [('default-cargo',[str(root/'rch'),'--no-self-healing','--json','exec','--','cargo','test','--offline','--locked']),('cargo-shim',[str(shim/'cargo'),'test','--no-run','--offline','--locked']),('clippy-shim',[str(shim/'cargo-clippy'),'--offline','--locked','--','-D','warnings'])]:
+    for name,argv in [('default-cargo',[str(root/'rch'),'--no-self-healing','--json','exec','--','cargo','test','--offline','--locked']),('strict-cargo',[str(root/'rch'),'--no-self-healing','--json','exec','--require-remote','--','cargo','test','--offline','--locked']),('cargo-shim',[str(shim/'cargo'),'test','--no-run','--offline','--locked']),('clippy-shim',[str(shim/'cargo-clippy'),'--offline','--locked','--','-D','warnings'])]:
         before=len(releases); started=time.monotonic()
-        run=subprocess.run(argv,env=env,cwd=cwd,capture_output=True,timeout=60)
+        call_env=dict(env,RCH_REQUIRE_REMOTE='0') if name=='strict-cargo' else env
+        run=subprocess.run(argv,env=call_env,cwd=cwd,capture_output=True,timeout=60)
         (root/(name+'.stdout')).write_bytes(run.stdout); (root/(name+'.stderr')).write_bytes(run.stderr)
         assert run.returncode==0,(name,run.returncode,run.stdout,run.stderr)
         assert len(releases)==before+1 and releases[-1]['exit_code']==['0'],(name,releases)
@@ -321,7 +350,7 @@ func mustJSON(v any)[]byte{b,_:=json.Marshal(v);return b}
             event={'hook_event_name':'PreToolUse','tool_name':'Bash','tool_input':{'command':source},'cwd':str(cwd)}
             hook=subprocess.run([str(root/'rch'),'--no-self-healing'],input=json.dumps(event).encode(),env=env,cwd=cwd,capture_output=True,timeout=10)
             planned=json.loads(hook.stdout)['hookSpecificOutput']['updatedInput']['command']
-            assert planned=='rch exec --verification -- '+source,(source,planned)
+            assert planned=='rch exec --verification --require-remote -- '+source,(source,planned)
             result=root/(name+'.json')
             argv=[str(root/'rch'),'--no-self-healing','exec','--verification','--cwd',str(cwd),'--json-result',str(result),'--env',f'FAIL_FIXTURE={fail}','--env','EXPLICIT=literal value','--env','EXPECT_SHARED=1','--env',f'GOCACHE={root}/forbidden-cache','--env',f'TMPDIR={root}/forbidden-tmp','--',*shlex.split(source)]
             before=len(releases)
@@ -361,7 +390,7 @@ func mustJSON(v any)[]byte{b,_:=json.Marshal(v);return b}
             hook=subprocess.run([str(root/'rch'),'--no-self-healing'],input=json.dumps(event).encode(),env=env,cwd=cwd,capture_output=True,timeout=10)
             assert hook.returncode==0,(hook.returncode,hook.stderr)
             updated=json.loads(hook.stdout)['hookSpecificOutput']['updatedInput']
-            planned='rch exec --verification -- '+source
+            planned='rch exec --verification --require-remote -- '+source
             assert updated==dict(event['tool_input'],command=planned),updated
             assert len(selections)==before and len(releases)==before_release
             run=subprocess.run(['/bin/sh','-c',updated['command']],env=env,cwd=cwd,capture_output=True,timeout=120)
@@ -458,7 +487,7 @@ test('compound worker',()=>{
             hook=subprocess.run([str(root/'rch'),'--no-self-healing'],input=json.dumps(event).encode(),env=shim_env,cwd=cwd,capture_output=True,timeout=10)
             assert hook.returncode==0 and not hook.stderr,(hook.returncode,hook.stderr)
             updated=json.loads(hook.stdout)['hookSpecificOutput']['updatedInput']['command']
-            assert updated=='rch exec --verification -- '+source,updated
+            assert updated=='rch exec --verification --require-remote -- '+source,updated
             assert len(selections)==before and len(releases)==before_release
             run=subprocess.run(['/bin/sh','-c',updated if route=='hook' else source],env=dict(shim_env,**({'MISSING_RECEIPT':'1'} if uncertain else {})),cwd=cwd,capture_output=True,timeout=120)
             (root/(name+'.stdout')).write_bytes(run.stdout);(root/(name+'.stderr')).write_bytes(run.stderr)
