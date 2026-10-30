@@ -291,7 +291,7 @@ fn helper_process() -> Command {
 }
 
 /// Return an authored-shell rewrite, or `None` on a semantic/grammar miss.
-/// Operational failures are errors for the caller to log and fail open.
+/// Operational failures are errors for the caller to apply its strict/fallback policy.
 pub(super) async fn plan(command: &str) -> Result<Option<String>> {
     request_plan(command, None).await
 }
@@ -321,49 +321,63 @@ async fn request_plan(
         serde_json::json!({ "command": command })
     };
     let request = serde_json::to_vec(&request)?;
+    let started = std::time::Instant::now();
     let mut child = helper_process()
         .spawn()
         .context("start isolated semantic planner")?;
     let mut stdin = child.stdin.take().context("planner stdin unavailable")?;
     let stdout = child.stdout.take().context("planner stdout unavailable")?;
     let stderr = child.stderr.take().context("planner stderr unavailable")?;
+    let spawn_elapsed = started.elapsed();
+    // Keep bounded progress outside the cancelled future. A plain timeout used
+    // to discard the distinction between helper startup, pipe EOF and child
+    // exit. These counters are diagnostic only: no late output is accepted,
+    // budget renewed, helper retried, or command/stream contents disclosed.
+    let mut request_sent = false;
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    let mut waiting_for_exit = false;
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
     let result = tokio::time::timeout(PLAN_TIMEOUT, async {
         let write = async {
             stdin.write_all(&request).await?;
             // EOF terminates the helper's bounded read. Explicitly close the
             // pipe rather than relying on AsyncWrite shutdown semantics.
             drop(stdin);
+            request_sent = true;
             Ok::<_, std::io::Error>(())
         };
         let read_stdout = async {
-            let mut bytes = Vec::new();
             stdout
                 .take((MAX_OUTPUT_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
+                .read_to_end(&mut output)
                 .await?;
             ensure!(
-                bytes.len() <= MAX_OUTPUT_BYTES,
+                output.len() <= MAX_OUTPUT_BYTES,
                 "semantic planner stdout limit"
             );
-            Ok::<_, anyhow::Error>(bytes)
+            stdout_eof = true;
+            Ok::<_, anyhow::Error>(())
         };
         let read_stderr = async {
-            let mut bytes = Vec::new();
             stderr
                 .take((MAX_STDERR_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
+                .read_to_end(&mut diagnostics)
                 .await?;
             ensure!(
-                bytes.len() <= MAX_STDERR_BYTES,
+                diagnostics.len() <= MAX_STDERR_BYTES,
                 "semantic planner stderr limit"
             );
-            Ok::<_, anyhow::Error>(bytes)
+            stderr_eof = true;
+            Ok::<_, anyhow::Error>(())
         };
-        let ((), output, diagnostics) = tokio::try_join!(
+        tokio::try_join!(
             async { write.await.map_err(anyhow::Error::from) },
             read_stdout,
             read_stderr
         )?;
+        waiting_for_exit = true;
         let status = child.wait().await?;
         if !status.success() {
             bail!(
@@ -389,8 +403,27 @@ async fn request_plan(
             Err(error)
         }
         Err(error) => {
+            let phase = if waiting_for_exit {
+                "exit"
+            } else if request_sent {
+                "pipes"
+            } else {
+                "stdin"
+            };
+            // This status is observed AFTER the deadline, never evidence of
+            // timely completion. try_wait reaps only our exact owned child.
+            let child_after_deadline = child.try_wait();
+            let detail = format!(
+                "semantic planner timed out (phase={phase}; elapsed_ms={}; spawn_ms={}; \
+                 request_sent={request_sent}; stdout_bytes={}; stdout_eof={stdout_eof}; \
+                 stderr_bytes={}; stderr_eof={stderr_eof}; child_after_deadline={child_after_deadline:?})",
+                started.elapsed().as_millis(),
+                spawn_elapsed.as_millis(),
+                output.len(),
+                diagnostics.len(),
+            );
             let _ = child.kill().await;
-            Err(error).context("semantic planner timed out")
+            Err(error).context(detail)
         }
     }
 }

@@ -1272,6 +1272,72 @@ fn planner_timeout_is_bounded_reaped_and_not_strict_local_permission() {
 }
 
 #[test]
+fn planner_timeout_reports_io_or_exit_progress_without_exposing_stream_contents() {
+    let fixture = Fixture::new();
+    for (name, body, phase, stdout_bytes, stderr_bytes, eof) in [
+        (
+            "no-output",
+            "/bin/cat >/dev/null; exec /bin/sleep 10",
+            "pipes",
+            0,
+            0,
+            false,
+        ),
+        (
+            "partial-output",
+            "/bin/cat >/dev/null; printf 'private-out'; printf 'private-err' >&2; exec /bin/sleep 10",
+            "pipes",
+            11,
+            11,
+            false,
+        ),
+        // A complete, valid plan still cannot authorize a rewrite until the
+        // owned helper exits in time. Closed pipes are not process completion.
+        (
+            "closed-output",
+            "/bin/cat >/dev/null; printf '{\"version\":1,\"insertions\":[]}'; exec 1>&- 2>&-; exec /bin/sleep 10",
+            "exit",
+            29,
+            0,
+            true,
+        ),
+    ] {
+        let tools = planner_fixture(&fixture, name, Some(body));
+        let output = run_planner_hook(&fixture, &tools, "pytest -q", Some("1"));
+        assert!(output.status.success());
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            response
+                .pointer("/hookSpecificOutput/updatedInput")
+                .is_none()
+        );
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        for expected in [
+            "semantic planner timed out".to_owned(),
+            format!("phase={phase}"),
+            "request_sent=true".to_owned(),
+            format!("stdout_bytes={stdout_bytes}"),
+            format!("stderr_bytes={stderr_bytes}"),
+            format!("stdout_eof={eof}"),
+            format!("stderr_eof={eof}"),
+            "child_after_deadline=Ok(None)".to_owned(),
+        ] {
+            assert!(
+                diagnostic.contains(&expected),
+                "{name}: missing {expected}: {diagnostic}"
+            );
+        }
+        assert!(!diagnostic.contains("private-out") && !diagnostic.contains("private-err"));
+        assert!(!fixture.root.join("state/job-leases").exists());
+        assert!(
+            output.elapsed < Duration::from_secs(5),
+            "hung fixture must be stopped, not awaited for ten seconds"
+        );
+    }
+}
+
+#[test]
 fn explicit_remote_opt_out_keeps_existing_dispatcher_override_semantics() {
     let fixture = Fixture::new();
     fixture.configure("dispatcher", true);
