@@ -1202,6 +1202,47 @@ fi
     )
 }
 
+/// Sync only these records, including directories. Explicit fsync avoids both
+/// syncfs and uutils versions that silently implement `sync FILE` as sync().
+/// Python is also used by the existing namespace and artifact custody paths.
+/// Missing Python or any failed barrier is an error, never a broad-sync fallback.
+pub(crate) fn file_fsync_command(paths: &[&str]) -> String {
+    let script = "import os, stat, sys\nfor path in sys.argv[1:]:\n fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n try:\n  mode = os.fstat(fd).st_mode\n  if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)): raise OSError('not a record or directory')\n  os.fsync(fd)\n finally: os.close(fd)";
+    format!(
+        "python3 -I -S -c {} {}",
+        escape(Cow::Borrowed(script)),
+        paths
+            .iter()
+            .map(|path| escape(Cow::Borrowed(*path)).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+// mkdir -p can create several names. Confirm the leaf directory and all
+// containing entries; ancestor aliases such as Darwin's /tmp are legitimate.
+fn directory_fsync_command(directory: &str) -> String {
+    let paths: Vec<_> = Path::new(directory)
+        .ancestors()
+        .map(|path| path.join(".").display().to_string())
+        .collect();
+    file_fsync_command(&paths.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn completion_records_fsync_command(path: &str, pending: bool, streamed: bool) -> String {
+    let mut records = vec![if pending {
+        format!("{path}.pending")
+    } else {
+        path.to_owned()
+    }];
+    if streamed {
+        // The old filesystem flush also persisted the output logs. A durable
+        // completion must not certify logs whose bytes have not reached disk.
+        records.extend([format!("{path}.stdout"), format!("{path}.stderr")]);
+    }
+    file_fsync_command(&records.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
 /// Removes every file the durable supervisor writes beside `path`; the claim
 /// is an empty `mkdir` directory. Succeeds when nothing is left.
 fn recovery_completion_cleanup_script(path: &str) -> String {
@@ -3371,18 +3412,23 @@ impl TransferPipeline {
         // The receipts stay private, but the workload runs under the caller's
         // umask: a leaked 077 made every remote output 0600/0700, and rsync -a
         // carried those modes home.
+        // sync -f uses syncfs, and uutils 0.10 even implements sync FILE as
+        // global sync(). Both can hold a completed job behind unrelated writes.
+        // Call fsync explicitly, including the directory after publication.
+        let interactive = self
+            .invocation_options
+            .as_ref()
+            .is_some_and(|options| options.interactive);
         let supervisor = format!(
-            "trap '' HUP; ( {command}\n); s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
+            "trap '' HUP; ( {command}\n); s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && {sync_pending} && mv -f -- {pending} {done} && {sync_directory} || exit 255; exit \"$s\"",
             identity = quote(identity),
             pending = quote(&format!("{path}.pending")),
             done = quote(path),
-            directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
+            sync_pending = completion_records_fsync_command(path, true, !interactive),
+            sync_directory =
+                directory_fsync_command(Path::new(path).parent().unwrap().to_str().unwrap()),
         );
-        if self
-            .invocation_options
-            .as_ref()
-            .is_some_and(|options| options.interactive)
-        {
+        if interactive {
             // A PTY is one bidirectional terminal stream, not two byte channels.
             // Keep the same exclusive claim and durable receipt, but do not put
             // files between the workload and its terminal descriptors.
@@ -3466,6 +3512,7 @@ impl TransferPipeline {
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
              [ -f {done} ] && [ ! -L {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt; execution outcome remains unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
+             {sync_completion} || {{ printf '%s\\n' 'RCH: completion durability unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -3484,6 +3531,11 @@ impl TransferPipeline {
             identity = quote(identity),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
             stall_ticks = stall_secs * 5,
+            sync_completion = format_args!(
+                "{} && {}",
+                completion_records_fsync_command(path, false, true),
+                directory_fsync_command(Path::new(path).parent().unwrap().to_str().unwrap())
+            ),
         )
     }
 
@@ -3494,9 +3546,23 @@ impl TransferPipeline {
         let Some((path, identity)) = &self.recovery_completion else {
             return Ok(None);
         };
+        // A rename can be visible before its directory barrier succeeds. A
+        // reconnect must re-establish both barriers before trusting that name.
         let script = format!(
-            "if [ -f {p} ] && [ ! -L {p} ]; then cat -- {p}; fi",
-            p = escape(Cow::from(path.as_str()))
+            "if [ -f {p} ] && [ ! -L {p} ]; then {sync_completion} && cat -- {p}; fi",
+            p = escape(Cow::from(path.as_str())),
+            sync_completion = format_args!(
+                "{} && {}",
+                completion_records_fsync_command(
+                    path,
+                    false,
+                    !self
+                        .invocation_options
+                        .as_ref()
+                        .is_some_and(|options| options.interactive)
+                ),
+                directory_fsync_command(Path::new(path).parent().unwrap().to_str().unwrap())
+            ),
         );
         let output = tokio::time::timeout(
             Duration::from_secs(10),
@@ -11377,6 +11443,196 @@ mod tests {
         assert!(stdout.ends_with("line-19999\n"), "tail was cut");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "last\n");
         assert!(std::path::Path::new(&receipt).is_file());
+    }
+
+    /// A busy filesystem must not become the completion barrier for an
+    /// unrelated job. Exercise the generated supervisor and actual file fsync;
+    /// injected barrier failures must leave even a visible receipt untrusted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_uses_file_sync_and_requires_both_barriers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (case, workload_status, expected) in [
+            ("ok", 0, 0),
+            ("workload_failure", 3, 3),
+            ("pending", 0, 255),
+            ("stdout", 0, 255),
+            ("stderr", 0, 255),
+            ("directory", 0, 255),
+            ("ancestor", 0, 255),
+            ("receipt", 0, 255),
+        ] {
+            let root = retained.join(case);
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let global_sync = bin.join("sync");
+            std::fs::write(&global_sync, "#!/bin/sh\nexit 91\n").unwrap();
+            std::fs::set_permissions(&global_sync, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let receipt = root.join("completion");
+            let calls = root.join("sync.calls");
+            let invocations = root.join("invocations");
+            let sync = bin.join("python3");
+            std::fs::write(
+                &sync,
+                "#!/bin/sh\n\
+                 for path do\n\
+                  case \"$path\" in /*) printf '%s\\n' \"$path\" >> \"$RCH_TEST_SYNC_LOG\";; *) continue;; esac\n\
+                  case \"$RCH_TEST_SYNC_FAILURE:$path\" in pending:*.pending|stdout:*.stdout|stderr:*.stderr|ancestor:/.) exit 74;; esac\n\
+                  if [ \"$RCH_TEST_SYNC_FAILURE\" = directory ] && [ -d \"$path\" ]; then exit 74; fi\n\
+                  if [ \"$RCH_TEST_SYNC_FAILURE\" = receipt ] && [ \"$path\" = \"$RCH_TEST_RECEIPT\" ]; then exit 74; fi\n\
+                 done\n\
+                 exec /usr/bin/python3 \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let pipeline = TransferPipeline::new(
+                root.clone(),
+                "sync-barrier".into(),
+                "abc123".into(),
+                TransferConfig::default(),
+            )
+            .with_recovery_completion(receipt.to_str().unwrap().into(), "barrier".into());
+            let command = pipeline.durable_execution_command(format!(
+                "printf 'once\\n' >> {}; printf 'rendered\\n'; exit {workload_status}",
+                escape(Cow::from(invocations.to_str().unwrap()))
+            ));
+            let script = root.join("command.sh");
+            std::fs::write(&script, command).unwrap();
+            let output = std::process::Command::new("timeout")
+                .args(["--kill-after=2s", "10s", "sh"])
+                .arg(script)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("RCH_TEST_SYNC_FAILURE", case)
+                .env("RCH_TEST_SYNC_LOG", &calls)
+                .env("RCH_TEST_RECEIPT", &receipt)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{case}: {output:?}");
+            assert_eq!(std::fs::read_to_string(invocations).unwrap(), "once\n");
+            let calls = std::fs::read_to_string(calls).unwrap();
+            assert!(calls.contains("completion.pending"), "{calls}");
+            if expected != 255 {
+                assert_eq!(output.stdout, b"rendered\n");
+                assert_eq!(
+                    std::fs::read_to_string(&receipt).unwrap(),
+                    format!("barrier {workload_status}\n")
+                );
+                assert!(
+                    calls.contains("completion.stdout") && calls.contains("completion.stderr"),
+                    "{calls}"
+                );
+                assert!(
+                    calls.lines().any(|path| path == "/."),
+                    "created ancestor barriers missing: {calls}"
+                );
+            } else if matches!(case, "pending" | "stdout" | "stderr") {
+                assert!(!receipt.exists());
+            } else {
+                // A failed post-rename barrier must not turn a visible record
+                // into permission to release the job's ownership.
+                assert!(receipt.is_file());
+                assert!(
+                    std::fs::read_to_string(root.join("completion.stderr"))
+                        .unwrap()
+                        .contains("completion durability unconfirmed")
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_file_fsync_rejects_symlinks_missing_and_special_objects() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap().keep();
+        let record = root.join("record with ' quotes");
+        std::fs::write(&record, b"owned record bytes").unwrap();
+        let alias = root.join("link");
+        symlink(&record, &alias).unwrap();
+        let fifo = root.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (path, expected) in [
+            (&record, true),
+            (&root, true),
+            (&alias, false),
+            (&fifo, false),
+            (&root.join("missing"), false),
+        ] {
+            let script = file_fsync_command(&[path.to_str().unwrap()]);
+            let result = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert_eq!(result.status.success(), expected, "{path:?}: {result:?}");
+        }
+        assert_eq!(std::fs::read(&record).unwrap(), b"owned record bytes");
+        assert!(alias.is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_completion_preserves_stdin_and_refuses_failed_persistence() {
+        use std::os::unix::fs::PermissionsExt;
+        for fail_sync in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let input = root.join("input");
+            std::fs::write(&input, b"\0\xffstdin").unwrap();
+            let mut options = raw_test_options();
+            options.interactive = true;
+            let pipeline = TransferPipeline::new(
+                root.clone(),
+                "interactive".into(),
+                "abcdef".into(),
+                TransferConfig::default(),
+            )
+            .with_invocation_options(options)
+            .unwrap()
+            .with_recovery_completion(
+                root.join("receipt").to_str().unwrap().into(),
+                "interactive-job".into(),
+            );
+            let script =
+                pipeline.durable_execution_command("cat; printf 'err' >&2; exit 23".into());
+            let tools = root.join("tools");
+            std::fs::create_dir(&tools).unwrap();
+            let sync = tools.join("python3");
+            std::fs::write(
+                &sync,
+                if fail_sync {
+                    "#!/bin/sh\nexit 74\n"
+                } else {
+                    "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n"
+                },
+            )
+            .unwrap();
+            std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+                .stdin(std::fs::File::open(&input).unwrap())
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(if fail_sync { 255 } else { 23 }),
+                "{result:?}"
+            );
+            assert_eq!(result.stdout, b"\0\xffstdin");
+            assert_eq!(result.stderr, b"err");
+            assert_eq!(root.join("receipt").exists(), !fail_sync);
+            assert!(
+                !root.join("receipt.stdout").exists(),
+                "PTY must not invent log files"
+            );
+        }
     }
 
     /// The build must create its outputs under the caller's umask; only the

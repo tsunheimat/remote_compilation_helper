@@ -585,6 +585,26 @@ weaken cancellation deadlines to make a test pass. Direct group signaling avoids
 spawning `kill(1)` during cancellation, but cannot force blocked filesystem I/O
 to finish or make a D-state process immediately reapable.
 
+Source admission, namespace setup, reusable source-pair ownership and durable
+execution completion now flush the named records/directories with isolated
+Python `os.fsync`, not utility-dependent filesystem-wide `sync`. Python must be
+available on the worker. Missing Python, unsupported objects or any failed
+barrier refuses confirmation; there is no broader-flush fallback. Private record
+bytes, quarantine evidence, rename source/destination directories and newly
+created ancestors remain explicitly covered. No-follow opens reject record
+symlinks, while validated topology aliases and ordinary ancestor aliases retain
+their existing meaning.
+
+A streamed completion also confirms its retained stdout/stderr bytes before
+publishing and before trusting a receipt after reconnect. Interactive execution
+keeps real stdin/PTY semantics and creates no invented log files; a failed
+receipt barrier returns an unconfirmed outcome rather than the workload's
+apparently successful status. Existing workload exit codes, output bytes,
+source custody, no-replay rules and timeouts remain unchanged. These barriers
+reduce the scope of requested writes, not the amount of required evidence.
+They do not claim power-loss testing, guaranteed bounded filesystem latency or
+that every historical contention/termination failure has the same cause.
+
 The optional RABS worker toolchain pool publishes a synced tree with an
 exclusive `.complete` marker, rather than relying on `RENAME_NOREPLACE`, which
 this NFS mount rejects. Lookup still verifies the complete tree and its identity;
