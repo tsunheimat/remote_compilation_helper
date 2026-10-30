@@ -83,8 +83,15 @@ impl AsyncWrite for PreviewingWire {
             _ => None,
         };
         if let Some(replies) = replies {
-            self.wire.steps =
-                VecDeque::from([Step::Bytes(replies.into_bytes().into()), Step::Pending]);
+            // Appending a new server reply must not discard an unread reply or
+            // its remaining bytes. A delayed client can send its next renewal
+            // before draining the preceding preview, just like on a real pipe.
+            if matches!(self.wire.steps.back(), Some(Step::Pending)) {
+                self.wire.steps.pop_back();
+            }
+            self.wire.steps.push_back(Step::Bytes(replies.into_bytes().into()));
+            self.wire.steps.push_back(Step::Pending);
+            cx.waker().wake_by_ref();
         }
         Pin::new(&mut self.wire).poll_write(cx, bytes)
     }
@@ -95,6 +102,57 @@ impl AsyncWrite for PreviewingWire {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.wire).poll_shutdown(cx)
+    }
+}
+
+#[test]
+fn preview_transport_preserves_unread_and_partial_replies_between_writes() {
+    // Force the ordering that a descheduled reader can encounter: the next
+    // timer writes before the preceding reply has been fully consumed. This
+    // fixture must model a byte stream, not a one-response replacement slot.
+    for consumed in [0, 1, 19] {
+        let trigger = Trigger::default();
+        let mut wire = PreviewingWire { wire: Wire::new(&trigger, &[]), queries: 0 };
+        wire.wire.steps = VecDeque::from([Step::Pending]);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let query = json!({"kind":"output-preview", "request_id":7});
+        let first_renewal = json!({"kind":"execution-lease-renew", "request_id":7, "renewal_seq":1});
+        let second_renewal = json!({"kind":"execution-lease-renew", "request_id":7, "renewal_seq":2});
+        let mut received = Vec::new();
+        for (index, message) in [&query, &first_renewal, &query, &second_renewal].into_iter().enumerate() {
+            let bytes = format!("{message}\n").into_bytes();
+            assert!(matches!(Pin::new(&mut wire).poll_write(&mut cx, &bytes), Poll::Ready(Ok(n)) if n == bytes.len()));
+            if index == 0 && consumed > 0 {
+                let mut bytes = vec![0; consumed];
+                let mut output = ReadBuf::new(&mut bytes);
+                assert!(matches!(Pin::new(&mut wire).poll_read(&mut cx, &mut output), Poll::Ready(Ok(()))));
+                assert_eq!(output.filled().len(), consumed);
+                received.extend_from_slice(output.filled());
+            }
+        }
+        // Small reads also exercise record fragmentation rather than assuming
+        // a read returns exactly one whole response.
+        for _ in 0..4096 {
+            let mut bytes = [0; 7];
+            let mut output = ReadBuf::new(&mut bytes);
+            match Pin::new(&mut wire).poll_read(&mut cx, &mut output) {
+                Poll::Ready(Ok(())) => {
+                    assert!(!output.filled().is_empty(), "open fixture must not invent EOF");
+                    received.extend_from_slice(output.filled());
+                }
+                Poll::Pending => break,
+                Poll::Ready(Err(error)) => panic!("fixture read failed: {error}"),
+            }
+        }
+        let frames: Vec<Value> = received.split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("complete retained frame"))
+            .collect();
+        assert_eq!(frames, vec![preview_reply(false), heartbeat(), renewal_ack(&first_renewal),
+            preview_reply(true), heartbeat(), renewal_ack(&second_renewal), result()],
+            "unread replies were lost after consuming {consumed} bytes");
+        assert_eq!(wire.wire.sent(), [query.clone(), first_renewal, query, second_renewal]);
     }
 }
 

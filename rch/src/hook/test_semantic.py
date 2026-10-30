@@ -36,6 +36,39 @@ def rewrite(command):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_node_leading_options_reach_shared_verification_without_rewriting_arguments(self):
+        for command in (
+            "node --import 'setup with spaces.mjs' --test 'literal ; $HOME' ''",
+            "node --require setup.cjs --test tests/unit.cjs",
+            "node -r setup.cjs --test", "node -rsetup.cjs --test",
+            "node --loader custom-loader --test",
+            "node --experimental-loader custom-loader --test",
+            "node --require=setup.cjs --import=setup.mjs --loader=loader --test",
+            "node --no-warnings --trace-warnings --enable-source-maps --test",
+            "node --test-name-pattern='some test' --test-skip-pattern slow --test",
+            "node --test-concurrency 2 --test-timeout=5000 --test-shard 1/2 --test",
+            "node --test-only --test-force-exit --test-reporter tap --test=tests/unit.cjs",
+            "/usr/bin/node --import setup.mjs --test",
+        ):
+            for prefix in ("", "rtk proxy ", "env CI=1 "):
+                source = prefix + command
+                self.assertEqual(rewrite(source), "rch exec --verification -- " + source, source)
+            nested = "rtk run -c " + shlex.quote(command)
+            self.assertEqual(rewrite(nested), "rch exec --verification -- " + nested)
+
+    def test_node_prefix_values_and_script_boundaries_cannot_fake_test_mode(self):
+        for command in (
+            "node app.js --test", "node --require setup.cjs app.js --test",
+            "node --require --test app.js", "node --import --test", "node -r --test",
+            "node --test-name-pattern --test", "node --import= --test",
+            "node --loader --test", "node --test-reporter custom.mjs --test",
+            "node --test-reporter --test", "node --test=", "node -- --test",
+            "node --watch --test", "node --unknown-option --test",
+            "node --no-warnings=yes --test", "node --import $MODULE --test",
+            "node --eval 'console.log(1)' --test", "node --print '1' --test",
+        ):
+            self.assertEqual(rewrite(command), command, command)
+
     def test_token_storage_remains_immutable_and_preserves_default_operator(self):
         word = semantic.Word("value", "'value'", 0, 7)
         self.assertEqual((word.value, word.raw, word.start, word.end, word.operator),

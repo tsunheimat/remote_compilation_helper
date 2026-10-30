@@ -21,6 +21,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::job_identity::{
     DurableJobLease, LOCAL_WRAPPER_ID_PREFIX, default_job_lease_directory,
 };
+use rch_common::process_identity::{OwnerPresence, owner_presence};
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
     CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
@@ -3505,7 +3506,9 @@ fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
             .map_err(|error| anyhow!("cannot read {}: {error}", entry.path().display()))?;
         let lease: DurableJobLease = serde_json::from_slice(&bytes)
             .map_err(|error| anyhow!("cannot parse {}: {error}", entry.path().display()))?;
-        if lease_blocks_restart(&lease, now_unix_ms, || is_process_alive(lease.wrapper_pid)) {
+        if lease_blocks_restart(&lease, now_unix_ms, || {
+            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+        }) {
             blocked.push(lease.identity.local_wrapper_id);
         } else if now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS
             && !lease_owns_unretired_source(&lease)
@@ -3528,25 +3531,26 @@ fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
 /// finished job; short enough that the directory stays bounded.
 const LEASE_REAP_RETENTION_MS: u64 = 60 * 60 * 1000;
 
-/// Heartbeat age past which a lease whose wrapper PID is provably dead is
+/// Heartbeat age past which a lease whose wrapper owner is provably absent is
 /// treated as abandoned for restart-admission purposes. Wrappers heartbeat
 /// every few seconds while alive, so fifteen minutes of silence combined with
-/// a dead PID is affirmative evidence the client is gone — not a pause.
+/// an absent owner is affirmative evidence the client is gone — not a pause.
 const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 
 /// Whether one durable client lease blocks the restart-admission barrier.
 ///
 /// A lease only stops blocking on affirmative evidence: either the wrapper
-/// acknowledged a terminal state, or the wrapper is provably dead (its PID no
-/// longer exists AND its heartbeat is stale past
-/// [`DEAD_WRAPPER_HEARTBEAT_STALE_MS`]). Everything else — fresh heartbeat, a
-/// PID that still exists (possibly recycled — conservative direction), a
-/// zero/unknown PID — stays blocking. Without the dead-wrapper arm, leases
+/// acknowledged a terminal state, or the wrapper owner is provably absent
+/// AND its heartbeat is stale past [`DEAD_WRAPPER_HEARTBEAT_STALE_MS`]. A
+/// recycled PID or a previous boot proves that the recorded owner is absent;
+/// the existence of an unrelated process does not keep its lease alive.
+/// Fresh heartbeats, live owners, and uncertain ownership stay blocking.
+/// Without the absent-wrapper arm, leases
 /// orphaned by killed wrappers accumulate forever and permanently wedge
 /// `rch daemon restart` (observed live 2026-08-09: ~450 dead `running` leases,
 /// heartbeats days old, no restart possible).
 ///
-/// `wrapper_alive` is a thunk so the (subprocess-spawning) liveness probe only
+/// `wrapper_presence` is a thunk so the durable identity probe only
 /// runs for leases that already passed the cheap heartbeat-staleness filter.
 /// A lease whose recovery recipe is not retired is the only authority that
 /// can release its worker-side source claim (`rch jobs recover`). Reaping it
@@ -3670,7 +3674,7 @@ pub(crate) fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
 pub(crate) fn lease_blocks_restart(
     lease: &DurableJobLease,
     now_unix_ms: u64,
-    wrapper_alive: impl FnOnce() -> bool,
+    wrapper_presence: impl FnOnce() -> OwnerPresence,
 ) -> bool {
     if lease.state.is_terminal() && lease.terminal_acknowledged {
         return false;
@@ -3680,11 +3684,7 @@ pub(crate) fn lease_blocks_restart(
     if !heartbeat_stale {
         return true;
     }
-    if lease.wrapper_pid == 0 {
-        // No PID to check — death cannot be proven, so fail closed.
-        return true;
-    }
-    wrapper_alive()
+    wrapper_presence() != OwnerPresence::Absent
 }
 
 /// Handle a release-worker request.
@@ -7215,6 +7215,68 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lease_scan_uses_native_birth_identity_and_preserves_source_authority() {
+        use rch_common::process_identity::{ProcessStart, current_process_identity};
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let stale = now - 2 * LEASE_REAP_RETENTION_MS;
+        let current = current_process_identity().expect("native process birth identity");
+        let new_lease = || {
+            let mut lease = make_test_lease(stale, std::process::id());
+            lease.recovery = Some(serde_json::json!({
+                "source_roots":["/owned-project"], "pair":null,
+                "retire_root":null, "retired":false
+            }));
+            lease
+        };
+        let mut live = new_lease();
+        live.process_birth = Some(current.clone());
+        let unknown = new_lease();
+        let mut reused = new_lease();
+        let mut other_birth = current.clone();
+        match &mut other_birth.start {
+            ProcessStart::Linux { ticks } => *ticks = ticks.checked_add(1).unwrap(),
+            ProcessStart::Darwin { seconds, .. } => *seconds = seconds.checked_add(1).unwrap(),
+        }
+        reused.process_birth = Some(other_birth.clone());
+        let mut previous_boot = current;
+        previous_boot.boot_id = if previous_boot.boot_id == "00000000-0000-0000-0000-000000000001" {
+            "00000000-0000-0000-0000-000000000002".into()
+        } else {
+            "00000000-0000-0000-0000-000000000001".into()
+        };
+        let mut rebooted = new_lease();
+        rebooted.process_birth = Some(previous_boot.clone());
+        let mut reserved = new_lease();
+        reserved.wrapper_pid = 1;
+        reserved.process_birth = Some(previous_boot);
+        let mut fresh = new_lease();
+        fresh.heartbeat_unix_ms = now;
+        fresh.process_birth = Some(other_birth);
+        let mut expected = vec![
+            live.identity.local_wrapper_id.clone(),
+            unknown.identity.local_wrapper_id.clone(),
+            fresh.identity.local_wrapper_id.clone(),
+        ];
+        expected.sort();
+        let mut records = Vec::new();
+        for lease in [live, unknown, reused, rebooted, reserved, fresh] {
+            let path = directory.join(format!("{}.json", lease.identity.local_wrapper_id));
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            records.push((path, bytes));
+        }
+        assert_eq!(scan_client_leases(&directory).unwrap(), expected);
+        // Absence permits recovery, not destruction of the only worker-side
+        // source authority. Even the stale reused/old-boot files stay intact.
+        for (path, bytes) in records {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+    }
+
     #[test]
     fn is_process_alive_uses_the_syscall_truthfully() {
         // Our own PID is alive; PID 0 is defined dead; a PID from the far end
@@ -7270,23 +7332,81 @@ mod tests {
     fn test_lease_blocks_restart_stale_heartbeat_alive_pid_blocks() {
         let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
         let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS, 1);
-        assert!(lease_blocks_restart(&lease, now, || true));
+        assert!(lease_blocks_restart(&lease, now, || OwnerPresence::Live));
     }
 
     #[test]
     fn test_lease_blocks_restart_stale_heartbeat_dead_pid_unblocks() {
         let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
         let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS, 1);
-        assert!(!lease_blocks_restart(&lease, now, || false));
+        assert!(!lease_blocks_restart(&lease, now, || OwnerPresence::Absent));
     }
 
     #[test]
     fn test_lease_blocks_restart_zero_pid_stays_blocking_even_when_stale() {
         let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
         let lease = make_test_lease(1, 0);
-        assert!(lease_blocks_restart(&lease, now, || unreachable!(
-            "a zero pid must not probe liveness"
-        )));
+        assert!(lease_blocks_restart(&lease, now, || {
+            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+        }));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_stale_unknown_ownership_stays_blocking() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let lease = make_test_lease(1, 4242);
+        assert!(lease_blocks_restart(&lease, now, || OwnerPresence::Unknown));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_recycled_pid_and_old_boot_do_not_block() {
+        use rch_common::process_identity::{ProcessIdentity, ProcessObservation, ProcessStart};
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let mut lease = make_test_lease(1, 4242);
+        let original = ProcessIdentity {
+            boot_id: "6a5a0649-d23a-4d74-b542-85f5e69de721".into(),
+            start: ProcessStart::Linux { ticks: 10 },
+        };
+        lease.process_birth = Some(original.clone());
+        for replacement in [
+            ProcessIdentity {
+                start: ProcessStart::Linux { ticks: 11 },
+                ..original.clone()
+            },
+            ProcessIdentity {
+                boot_id: "0e9306b2-57d4-42c2-85b7-ec00aa52fe86".into(),
+                ..original.clone()
+            },
+        ] {
+            assert!(!lease_blocks_restart(&lease, now, || {
+                lease
+                    .owner_identity()
+                    .unwrap()
+                    .presence(&ProcessObservation::Present(replacement))
+            }));
+        }
+        assert!(lease_blocks_restart(&lease, now, || {
+            original.presence(&ProcessObservation::Unknown)
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_lease_blocks_restart_linux_live_identity_and_recycled_start() {
+        use rch_common::process_identity::{ProcessStart, current_process_identity};
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let mut lease = make_test_lease(1, std::process::id());
+        lease.process_birth = Some(current_process_identity().expect("Linux process identity"));
+        assert!(lease_blocks_restart(&lease, now, || {
+            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+        }));
+        let ProcessStart::Linux { ticks } = &mut lease.process_birth.as_mut().unwrap().start else {
+            panic!("Linux birth marker expected");
+        };
+        *ticks = ticks.saturating_add(1);
+        assert!(!lease_blocks_restart(&lease, now, || {
+            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+        }));
     }
 
     #[test]
@@ -7297,8 +7417,8 @@ mod tests {
         let mut lease = make_test_lease(1, 1);
         lease.state = rch_common::job_identity::JobLifecycleState::Finished;
         assert!(!lease.terminal_acknowledged);
-        assert!(!lease_blocks_restart(&lease, now, || false));
-        assert!(lease_blocks_restart(&lease, now, || true));
+        assert!(!lease_blocks_restart(&lease, now, || OwnerPresence::Absent));
+        assert!(lease_blocks_restart(&lease, now, || OwnerPresence::Live));
     }
 
     #[tokio::test]

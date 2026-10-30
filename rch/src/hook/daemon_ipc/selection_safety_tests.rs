@@ -125,8 +125,15 @@ async fn failures_before_connect_do_not_invent_unconfirmed_ownership() {
     let root = tempfile::tempdir().unwrap();
     let missing = root.path().join("missing.sock");
     let refused = root.path().join("refused.sock");
-    // Dropping the listener leaves a socket path with nobody accepting it.
-    drop(std::os::unix::net::UnixListener::bind(&refused).unwrap());
+    // The parallel test process must never hold this listening descriptor:
+    // another test can fork between creation and drop, retaining a connectable
+    // socket until exec despite CLOEXEC. Publish the closed socket from a
+    // dedicated child, and wait for that sole owner to exit before querying it.
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-S", "-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); s.close()"])
+        .arg(&refused).output().unwrap();
+    assert!(output.status.success(), "closed-socket fixture: {output:?}");
+    assert!(refused.exists());
     for path in [&missing, &refused] {
         for wait in [false, true] {
             let error = query_daemon(
@@ -152,10 +159,61 @@ async fn failures_before_connect_do_not_invent_unconfirmed_ownership() {
             assert!(
                 error
                     .downcast_ref::<SelectionOutcomeUnconfirmed>()
-                    .is_none()
+                    .is_none(),
+                "path={path:?}, wait={wait}: {error:#}"
             );
+            if path == &refused {
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                );
+            } else {
+                assert!(error.downcast_ref::<DaemonError>().is_some());
+            }
         }
     }
+}
+
+#[tokio::test]
+async fn retained_listener_reference_is_not_proof_of_preconnect_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("retained.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let retained = listener.try_clone().unwrap();
+    drop(listener);
+    retained.set_nonblocking(true).unwrap();
+    let retained = tokio::net::UnixListener::from_std(retained).unwrap();
+    let client = UnixStream::connect(&path).await.unwrap();
+    let (peer, _) = retained.accept().await.unwrap();
+    let (reader, mut writer) = client.into_split();
+    let peer_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(peer);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line.as_bytes(), REQUEST);
+        // Actual peer EOF after accepting a request cannot authorize replay.
+    });
+    let result = exchange_selection_request(
+        reader,
+        &mut writer,
+        REQUEST,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        false,
+    )
+    .await;
+    peer_task.await.unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .downcast_ref::<SelectionOutcomeUnconfirmed>()
+            .is_some()
+    );
+    // This control proves the opposite of pre-connect refusal: the request
+    // reached a retained listener. Do not reuse a parent-owned descriptor to
+    // assert its later global disappearance; the isolated-child test above
+    // separately proves genuine ECONNREFUSED without the fork inheritance race.
+    drop(retained);
 }
 
 /// Models a transport accepting the complete request, then failing its flush.

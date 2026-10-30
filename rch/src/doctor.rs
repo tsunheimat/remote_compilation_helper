@@ -9837,45 +9837,106 @@ exit 0\n"
         }
     }
 
+    async fn all_probe_entries(
+        arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+        budget: Duration,
+    ) -> bool {
+        tokio::time::timeout(budget, async {
+            let mut entered = BTreeSet::new();
+            for _ in 0..3 {
+                let Some(name) = arrivals.recv().await else {
+                    return false;
+                };
+                if !entered.insert(name) {
+                    return false;
+                }
+            }
+            entered == BTreeSet::from(["a", "b", "c"])
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     #[tokio::test]
     async fn probes_actually_run_in_parallel_not_serial() {
-        // TEST START: integration-style proof that the join is concurrent.
-        // Three tasks each sleep 100ms; with serial execution wallclock
-        // would be ~300ms+ ; with parallel execution it's ~100ms +
-        // join overhead. We assert wallclock < 250ms to leave wide
-        // headroom for CI variability while still rejecting any
-        // accidental return to sequential await.
-        let start = std::time::Instant::now();
-        let h1 = tokio::spawn(async {
-            tokio::time::timeout(PROBE_TIMEOUT, async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                Ok::<_, std::io::Error>("a".to_string())
-            })
-            .await
+        // Observe overlapping execution, not a wall-clock guess about it.
+        // A 300ms caller stall made the old 250ms test reject concurrent work.
+        // The actual probe timeout remains unchanged; this is NOT a speed test.
+        for caller_pause in [Duration::ZERO, Duration::from_millis(300)] {
+            let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+            let (release_a, wait_a) = tokio::sync::oneshot::channel::<()>();
+            let (release_b, wait_b) = tokio::sync::oneshot::channel::<()>();
+            let (release_c, wait_c) = std::sync::mpsc::channel::<()>();
+            let a = entered.clone();
+            let h1 = tokio::spawn(async move {
+                tokio::time::timeout(PROBE_TIMEOUT, async move {
+                    a.send("a").map_err(std::io::Error::other)?;
+                    wait_a.await.map_err(std::io::Error::other)?;
+                    Ok::<_, std::io::Error>("a".to_string())
+                })
+                .await
+            });
+            let b = entered.clone();
+            let h2 = tokio::spawn(async move {
+                tokio::time::timeout(PROBE_TIMEOUT, async move {
+                    b.send("b").map_err(std::io::Error::other)?;
+                    wait_b.await.map_err(std::io::Error::other)?;
+                    Ok::<_, std::io::Error>("b".to_string())
+                })
+                .await
+            });
+            let h3 = tokio::task::spawn_blocking(move || {
+                entered.send("c").unwrap();
+                wait_c.recv_timeout(PROBE_TIMEOUT).unwrap();
+                vec!["c".to_string()]
+            });
+            std::thread::sleep(caller_pause);
+            let overlapped = all_probe_entries(&mut arrivals, PROBE_TIMEOUT).await;
+            let unfinished = !h1.is_finished() && !h2.is_finished() && !h3.is_finished();
+            // Always release and join the owned tasks, including a failed
+            // observation. No blocked test thread is abandoned on assertion.
+            let _ = release_a.send(());
+            let _ = release_b.send(());
+            let _ = release_c.send(());
+            let (r1, _) = join_isolated_async_probe("p1", Some(h1)).await;
+            let (r2, _) = join_isolated_async_probe("p2", Some(h2)).await;
+            let (r3, _) = join_isolated_blocking_probe("p3", Some(h3)).await;
+            assert!(
+                overlapped && unfinished,
+                "all three must enter before any is released"
+            );
+            assert_eq!(r1.as_deref(), Some("a"));
+            assert_eq!(r2.as_deref(), Some("b"));
+            assert_eq!(r3.as_deref(), Some(&["c".to_string()][..]));
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_entry_observer_rejects_a_serial_executor() {
+        let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let (release, mut releases) = tokio::sync::mpsc::unbounded_channel();
+        // Explicit serial mutation control: the next probe cannot enter until
+        // its predecessor finishes. The same observer must not call this overlap.
+        let task = tokio::spawn(async move {
+            let mut finished = Vec::new();
+            for name in ["a", "b", "c"] {
+                entered.send(name).unwrap();
+                releases.recv().await.unwrap();
+                finished.push(name);
+            }
+            finished
         });
-        let h2 = tokio::spawn(async {
-            tokio::time::timeout(PROBE_TIMEOUT, async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                Ok::<_, std::io::Error>("b".to_string())
-            })
-            .await
-        });
-        let h3 = tokio::task::spawn_blocking(|| {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            vec!["c".to_string()]
-        });
-        let (r1, _) = join_isolated_async_probe("p1", Some(h1)).await;
-        let (r2, _) = join_isolated_async_probe("p2", Some(h2)).await;
-        let (r3, _) = join_isolated_blocking_probe("p3", Some(h3)).await;
-        let elapsed = start.elapsed();
-        assert_eq!(r1.as_deref(), Some("a"));
-        assert_eq!(r2.as_deref(), Some("b"));
-        assert_eq!(r3.as_deref(), Some(&["c".to_string()][..]));
+        let overlapped = all_probe_entries(&mut arrivals, Duration::from_millis(250)).await;
+        let unfinished = !task.is_finished();
+        for _ in 0..3 {
+            release.send(()).unwrap();
+        }
+        let finished = task.await.unwrap();
         assert!(
-            elapsed < std::time::Duration::from_millis(250),
-            "probes must run in parallel: elapsed={elapsed:?} (serial would be ~300ms+)"
+            !overlapped && unfinished,
+            "serial execution cannot pass the overlap gate"
         );
-        // TEST PASS: actual parallelism (not just structural)
+        assert_eq!(finished, ["a", "b", "c"]);
     }
 
     #[test]
