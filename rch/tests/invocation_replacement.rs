@@ -288,6 +288,104 @@ fn shell_e2e_validator_requires_exact_native_policy_and_authored_command() {
 }
 
 #[test]
+fn saved_time_e2e_requires_exact_test_execution_not_interleaved_console_text() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/e2e_bd-zked.sh");
+    // These are explicit Cargo-result fixtures, not daemon/unit-test passes.
+    // The complete shell scenario separately runs the actual Rust assertion.
+    let harness = r#"
+source "$1"
+tmp_root="$2"
+PROJECT_ROOT="$tmp_root"
+LOG_FILE="$tmp_root/scenario.jsonl"
+log_json() { :; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+cargo() {
+    printf '%s\n' "$*" > "$tmp_root/cargo-argv"
+    [[ "$*" == 'test --locked -p rchd --bin rchd -- history::tests::test_saved_time_stats_no_negative_savings --exact' ]] || return 88
+    printf '%s\n' "$FIXTURE_OUTPUT"
+    printf '%s\n' 'retained Cargo diagnostic' >&2
+    return "$FIXTURE_EXIT"
+}
+test_no_negative_savings
+"#;
+    for (name, stdout, code, accepted) in [
+        (
+            "pass",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "0",
+            true,
+        ),
+        (
+            "empty",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 639 filtered out; finished in 0.00s",
+            "0",
+            false,
+        ),
+        (
+            "ignored",
+            "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "0",
+            false,
+        ),
+        (
+            "wrong-count",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 637 filtered out; finished in 0.00s",
+            "0",
+            false,
+        ),
+        (
+            "failed",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "101",
+            false,
+        ),
+        (
+            "false-success",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "101",
+            false,
+        ),
+        ("missing", "unrelated test passed", "0", false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        // A parallel --nocapture run may split this cosmetic harness line.
+        // The old grep rejects it despite a successful suite; it is no longer
+        // used as permission to skip executing the exact named assertion.
+        fs::write(directory.path().join("saved-time-tests.log"),
+            "test history::tests::test_saved_time_stats_no_negative_savings ... tracing output\n\
+             more tracing\nok\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 632 filtered out; finished in 0.00s\n").unwrap();
+        let output = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", harness, "saved-time-fixture"])
+            .arg(&script)
+            .arg(directory.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("FIXTURE_OUTPUT", stdout)
+            .env("FIXTURE_EXIT", code)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            directory.path().join("cargo-argv").exists(),
+            "{name}: exact test was never invoked"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("no-negative-savings.log")).unwrap(),
+            format!("{stdout}\n")
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("no-negative-savings.stderr")).unwrap(),
+            "retained Cargo diagnostic\n"
+        );
+    }
+}
+
+#[test]
 fn shell_e2e_clock_converts_fraction_width_instead_of_guessing_digit_units() {
     let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/lib/e2e_common.sh");
     // Deliberate clock-provider fixtures, not elapsed-time/performance claims.
