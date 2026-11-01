@@ -1,89 +1,100 @@
-name: PR8 native startup diagnosis (not qualification)
+name: PR8 native link comparison (not qualification)
 on:
   push:
     branches: [diagnose/pr8-native-startup-20261101]
   workflow_dispatch:
 permissions:
   contents: read
-  actions: read
 jobs:
-  diagnose:
+  compare:
     runs-on: macos-latest
-    timeout-minutes: 10
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_BUILD_JOBS: 2
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      RCH_GIT_COMMIT: 0c8025f69848682228346f3068e57aa35446465a
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Obtain and verify the exact previously tested native release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
+          shared-key: pr8-native-link-comparison
+          cache-on-failure: true
+      - name: Build both real CLI variants without changing source or TLS
         shell: bash
         run: |
           set -euo pipefail
           mkdir evidence
-          gh api repos/tsunheimat/remote_compilation_helper/actions/artifacts/12974625219/zip > evidence/application.zip
-          python3 - <<'PY'
-          import hashlib, json, pathlib, zipfile
-          p = pathlib.Path('evidence')
-          assert hashlib.sha256((p/'application.zip').read_bytes()).hexdigest() == '7168983b1e552aa49809d97e4b7948bca0df101e715bc6e8f884a69776d2f476'
-          with zipfile.ZipFile(p/'application.zip') as archive:
-              assert set(archive.namelist()) == {'component.json', 'rch', 'rchd', 'rch-wkr'}
-              parts = p/'parts'
-              parts.mkdir()
-              for name in archive.namelist():
-                  (parts/name).write_bytes(archive.read(name))
-          receipt = json.loads((parts/'component.json').read_text())
-          assert receipt['source'] == 'b30995825be82fd53ab5170d1d44b149a0965637'
-          assert receipt['target'] == 'aarch64-apple-darwin'
-          print(json.dumps(receipt, indent=2))
-          PY
-          python3 -I scripts/package_ci_components.py restore-e2e --parts evidence/parts --output evidence/bin --source b30995825be82fd53ab5170d1d44b149a0965637 --target aarch64-apple-darwin
-          evidence/bin/rch --version
-          otool -L evidence/bin/rch > evidence/linked-libraries.txt
-          size -m evidence/bin/rch > evidence/segments.txt
-          codesign -dvv evidence/bin/rch > evidence/signature.txt 2>&1
-      - name: Measure unchanged hook inputs and process-launch controls
+          # Exact same deployment target, source and release profile in both
+          # arms. This experimental macOS12 floor is NOT yet adopted by PR8.
+          git diff 0c8025f69848682228346f3068e57aa35446465a --exit-code -- Cargo.toml Cargo.lock rch rch-common rch-telemetry
+          cargo rustc --locked --release -p rch --bin rch -- -C link-arg=-Wl,-no_fixup_chains
+          cp target/release/rch evidence/rch-legacy
+          cargo rustc --locked --release -p rch --bin rch -- -C link-arg=-Wl,-fixup_chains
+          cp target/release/rch evidence/rch-chains
+          for name in legacy chains; do
+            evidence/rch-$name --version
+            otool -l evidence/rch-$name > evidence/$name-load-commands.txt
+            otool -L evidence/rch-$name > evidence/$name-libraries.txt
+            size -m evidence/rch-$name > evidence/$name-segments.txt
+            codesign -dvv evidence/rch-$name > evidence/$name-signature.txt 2>&1
+          done
+          grep -q LC_DYLD_CHAINED_FIXUPS evidence/chains-load-commands.txt
+          if grep -q LC_DYLD_CHAINED_FIXUPS evidence/legacy-load-commands.txt; then exit 1; fi
+      - name: Paired startup and observable-behavior comparison
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, pathlib, platform, resource, statistics, subprocess, sys, time
+          import hashlib, json, os, pathlib, resource, statistics, subprocess, time
           p = pathlib.Path('evidence')
-          binary = str((p/'bin/rch').resolve())
-          variants = [('empty', [binary], b''), ('read', [binary], b'{"tool_name":"Read","tool_input":{"command":"ignored"}}\n'), ('echo', [binary], b'{"tool_name":"Bash","tool_input":{"command":"echo test"}}\n'), ('git', [binary], b'{"tool_name":"Bash","tool_input":{"command":"git status"}}\n'), ('system-true', ['/usr/bin/true'], b'{"tool_name":"Bash","tool_input":{"command":"echo test"}}\n')]
-          report = {'python': sys.version, 'platform': platform.platform(), 'cpus': os.cpu_count(), 'load': os.getloadavg(), 'rounds': []}
-          # Three predeclared rounds, 50 processes each, alternating ordering.
-          # No best-round selection, warmup exclusion, timing waiver or source change.
+          binaries = {name: str((p/('rch-'+name)).resolve()) for name in ('legacy','chains')}
+          report = {'source': '0c8025f69848682228346f3068e57aa35446465a', 'deployment_target': '12.0', 'cpu_count': os.cpu_count(), 'load': os.getloadavg(), 'sha256': {name:hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() for name,path in binaries.items()}, 'rounds': []}
+          inputs = [('empty', b''), ('read', b'{"tool_name":"Read","tool_input":{"command":"x"}}\n'), ('echo', b'{"tool_name":"Bash","tool_input":{"command":"echo test"}}\n'), ('git', b'{"tool_name":"Bash","tool_input":{"command":"git status"}}\n')]
+          # Three predetermined rounds, fifty interleaved processes per arm and
+          # input, all samples retained. No warmup exclusion or best-run choice.
           for turn in range(3):
-              for name, command, data in variants[::1 if turn % 2 == 0 else -1]:
-                  samples = []
-                  before = resource.getrusage(resource.RUSAGE_CHILDREN)
-                  for _ in range(50):
-                      start = time.perf_counter_ns()
-                      result = subprocess.run(command, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
-                      samples.append(time.perf_counter_ns() - start)
-                      assert not result.stderr, (name, result.stderr)
-                  after = resource.getrusage(resource.RUSAGE_CHILDREN)
-                  row = {'round': turn, 'input': name, 'mean_ms': statistics.mean(samples)/1e6, 'median_ms': statistics.median(samples)/1e6, 'samples_ns': samples, 'child_user': after.ru_utime-before.ru_utime, 'child_system': after.ru_stime-before.ru_stime}
-                  report['rounds'].append(row)
-                  print({k:v for k,v in row.items() if k != 'samples_ns'}, flush=True)
-          (p/'timing.json').write_text(json.dumps(report, indent=2))
-          data = variants[2][2]
-          for label, flags in [('dyld-statistics', {'DYLD_PRINT_STATISTICS':'1', 'DYLD_PRINT_STATISTICS_DETAILS':'1'}), ('dyld-libraries', {'DYLD_PRINT_LIBRARIES':'1'})]:
-              result = subprocess.run([binary], input=data, capture_output=True, env=dict(os.environ, **flags))
-              (p/(label+'.stdout')).write_bytes(result.stdout)
-              (p/(label+'.stderr')).write_bytes(result.stderr)
-              print(label, result.returncode, result.stderr.decode(errors='replace'), flush=True)
-              assert result.returncode == 0 and not result.stdout
+              for label,data in inputs:
+                  samples = {name:[] for name in binaries}
+                  cpu = {name:0.0 for name in binaries}
+                  for number in range(50):
+                      order = ('legacy','chains') if (number+turn)%2==0 else ('chains','legacy')
+                      observed = []
+                      for name in order:
+                          before = resource.getrusage(resource.RUSAGE_CHILDREN)
+                          started = time.perf_counter_ns()
+                          result = subprocess.run([binaries[name]],input=data,capture_output=True,check=True)
+                          samples[name].append(time.perf_counter_ns()-started)
+                          after = resource.getrusage(resource.RUSAGE_CHILDREN)
+                          cpu[name] += after.ru_utime+after.ru_stime-before.ru_utime-before.ru_stime
+                          observed.append((result.returncode,result.stdout,result.stderr))
+                      assert observed[0] == observed[1] == (0,b'',b''), (label,observed)
+                  for name in binaries:
+                      row={'round':turn,'input':label,'variant':name,'mean_ms':statistics.mean(samples[name])/1e6,'median_ms':statistics.median(samples[name])/1e6,'samples_ns':samples[name],'child_cpu':cpu[name]}
+                      report['rounds'].append(row)
+                      print({k:v for k,v in row.items() if k!='samples_ns'},flush=True)
+          for arguments in (['--version'],['--capabilities'],['--help-json'],['--help'],['not-a-valid-subcommand']):
+              values=[subprocess.run([binary,*arguments],capture_output=True) for binary in binaries.values()]
+              assert values[0].returncode==values[1].returncode
+              # Executable names in help/errors naturally differ; preserve the
+              # machine-readable contracts exactly and check failures stay so.
+              if arguments[0] in ('--version','--capabilities','--help-json'):
+                  assert (values[0].stdout,values[0].stderr)==(values[1].stdout,values[1].stderr)
+          (p/'comparison.json').write_text(json.dumps(report,indent=2))
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pr8-native-startup-diagnosis
+          name: pr8-native-link-comparison
           path: |
             evidence/*.json
             evidence/*.txt
-            evidence/*.stdout
-            evidence/*.stderr
           if-no-files-found: error
           retention-days: 7
