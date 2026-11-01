@@ -32,6 +32,23 @@ mod native {
             "{libraries}"
         );
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            let output = Command::new("/usr/bin/otool")
+                .args(["-l", binary])
+                .output()
+                .expect("inspect native ARM link-edit representation");
+            assert!(output.status.success(), "otool -l failed: {output:?}");
+            let commands = String::from_utf8(output.stdout).unwrap();
+            assert!(commands.contains("LC_DYLD_CHAINED_FIXUPS"), "{commands}");
+            assert!(
+                !commands.contains("LC_DYLD_INFO_ONLY"),
+                "classic rebasing remained: {commands}"
+            );
+            // The runtime check below and the unchanged complete-process E2E
+            // timing gate are still required; a load command is not a speedup.
+        }
+
         let root = tempfile::tempdir().unwrap().keep();
         let mut child = Command::new(binary)
             .env_clear()
