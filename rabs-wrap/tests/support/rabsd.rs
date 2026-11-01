@@ -6,6 +6,9 @@
 //! directory rather than the test's ambient cwd/CARGO_TARGET_DIR. A failed or
 //! ambiguous build never falls back to a stale installed daemon.
 
+#[path = "workspace_selection.rs"]
+mod workspace_selection;
+
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
@@ -228,17 +231,27 @@ fn cargo_artifact(value: &serde_json::Value, workspace: &Path) -> Result<Option<
     Ok(Some(executable))
 }
 
-fn build(workspace: &Path, wrapper: &Path) -> Result<Binaries, String> {
+fn build_command(
+    workspace: &Path,
+    wrapper: &Path,
+    selection: Option<&str>,
+) -> Result<Command, String> {
     let (target_dir, profile) = build_layout(wrapper)?;
-    let mut child = Command::new(env!("CARGO"))
+    let mut command = Command::new(env!("CARGO"));
+    if let Some(selection) = selection {
+        let args = workspace_selection::workspace_args(selection)?;
+        // Keep the enclosing test graph's feature unification. A single-package
+        // build here recompiles a different graph and can consume the native
+        // job budget before its remaining tests run. This still asks Cargo to
+        // verify freshness; it neither runs tests recursively nor trusts a file.
+        command.args(["test", "--no-run"]).args(args);
+    } else {
+        command.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
+    }
+    command
         .current_dir(workspace)
         .args([
-            "build",
             "--locked",
-            "-p",
-            "rabsd",
-            "--bin",
-            "rabsd",
             "--message-format=json-render-diagnostics",
             "--profile",
             profile,
@@ -249,7 +262,28 @@ fn build(workspace: &Path, wrapper: &Path) -> Result<Binaries, String> {
         .arg(target_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // The parent test crate's metadata must not invalidate dependency build
+    // scripts. Compiler flags/instrumentation and explicit target/profile stay.
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("CARGO_PKG_")
+                || name.starts_with("CARGO_BIN_EXE_")
+                || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH")
+        }) {
+            command.env_remove(name);
+        }
+    }
+    Ok(command)
+}
+
+fn build(workspace: &Path, wrapper: &Path) -> Result<Binaries, String> {
+    let selection = match std::env::var("RABS_TEST_WORKSPACE_ARGS") {
+        Ok(selection) => Some(selection),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("invalid RABS_TEST_WORKSPACE_ARGS: {error}")),
+    };
+    let mut child = build_command(workspace, wrapper, selection.as_deref())?
         .spawn()
         .map_err(|error| format!("build rabsd: {error}"))?;
     let mut stdout = BufReader::new(child.stdout.take().ok_or("missing Cargo output")?);
@@ -367,6 +401,75 @@ mod tests {
         }
         assert!(build_layout(Path::new("target/debug/rabs-wrap")).is_err());
         assert!(build_layout(Path::new("/target/debug/deps/test")).is_err());
+    }
+
+    #[test]
+    fn companion_preparation_preserves_test_graph_and_fixed_artifact_boundaries() {
+        let workspace = Path::new("/source/this-worktree");
+        let wrapper = Path::new("/owned-output/debug/rabs-wrap");
+        for (selection, prefix) in [
+            (None, vec!["build", "-p", "rabsd", "--bin", "rabsd"]),
+            (Some("--workspace"), vec!["test", "--no-run", "--workspace"]),
+            (
+                Some("--workspace --exclude rchd --features rich-ui"),
+                vec![
+                    "test",
+                    "--no-run",
+                    "--workspace",
+                    "--exclude",
+                    "rchd",
+                    "--features",
+                    "rich-ui",
+                ],
+            ),
+        ] {
+            let command = build_command(workspace, wrapper, selection).unwrap();
+            let actual: Vec<_> = command
+                .get_args()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            let mut expected = prefix;
+            expected.extend([
+                "--locked",
+                "--message-format=json-render-diagnostics",
+                "--profile",
+                "dev",
+                "--manifest-path",
+                "/source/this-worktree/Cargo.toml",
+                "--target-dir",
+                "/owned-output",
+            ]);
+            assert_eq!(actual, expected);
+            assert_eq!(command.get_current_dir(), Some(workspace));
+            // This test does not alter global env to make its control pass.
+            let removed: Vec<_> = command.get_envs().collect();
+            for (name, _) in std::env::vars_os().filter(|(name, _)| {
+                name.to_str().is_some_and(|name| {
+                    name.starts_with("CARGO_PKG_")
+                        || name.starts_with("CARGO_BIN_EXE_")
+                        || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH")
+                })
+            }) {
+                assert!(
+                    removed
+                        .iter()
+                        .any(|(key, value)| *key == name && value.is_none())
+                );
+            }
+        }
+        for invalid in [
+            "",
+            "--workspace --exclude rabsd",
+            "--workspace --manifest-path /other/Cargo.toml",
+            "--workspace --target-dir /other",
+            "--workspace --profile release",
+            "--workspace -- --ignored",
+        ] {
+            assert!(
+                build_command(workspace, wrapper, Some(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
