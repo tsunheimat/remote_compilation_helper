@@ -1,494 +1,89 @@
-name: CI
-
+name: PR8 native startup diagnosis (not qualification)
 on:
   push:
-    branches: [main]
-  pull_request:
-  schedule:
-    - cron: '0 6 * * 1'  # Weekly security scan on Monday 6 AM UTC
+    branches: [diagnose/pr8-native-startup-20261101]
   workflow_dispatch:
-    inputs:
-      extended:
-        description: 'Also run documentation, benchmarks and coverage (existing budgets enforced)'
-        type: boolean
-        default: false
-
-# Cancel in-progress runs for the same branch/PR to save resources
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-# Minimal permissions - only what's needed
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  # Reduce network retries for faster failure
-  CARGO_NET_RETRY: 2
-  CARGO_HTTP_TIMEOUT: 30
-  # The pinned asupersync Git dependency stalls with Cargo's built-in fetcher
-  # on cold runners; use the runner's Git transport for dependency downloads.
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Bound compiler concurrency on hosted runners, as in the E2E workflow.
-  CARGO_BUILD_JOBS: 2
-  # Match the repository pin and the toolchain used by the worker fleet.
-  RUSTUP_TOOLCHAIN: nightly-2026-08-31
-  # Positive native cleanup fixtures re-exec inside a fresh PID/proc namespace.
-  # Hosted Ubuntu may restrict unprivileged user namespaces; permit only this
-  # test's scoped sudo-unshare route, never a host-wide AppArmor/sysctl change.
-  RCH_TEST_ALLOW_SUDO_UNSHARE: "1"
-
+  actions: read
 jobs:
-  # One checkout/cache for formatting and the compiler-backed Clippy check.
-  # Clippy type-checks the same complete target/feature graph as cargo check.
-  check:
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  diagnose:
+    runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-          components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          cache-on-failure: true
-      # Collect diagnostics from independent targets in one run. Failed
-      # dependencies still block their consumers; every warning remains fatal.
-      - run: cargo clippy --locked --workspace --all-targets --all-features --keep-going -- -D warnings
-
-  # Bundle integrity, installer syntax and workflow wiring share one cheap job.
-  manifest_sync:
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run manifest sync tests
-        run: |
-          chmod +x tests/manifest_sync_test.sh
-          ./tests/manifest_sync_test.sh
-      - name: Guard canonical rch skill against stale/destructive guidance
-        run: |
-          chmod +x scripts/check_rch_skill.sh
-          ./scripts/check_rch_skill.sh
-      - name: Guard operational runbooks against stale/destructive guidance
-        run: |
-          chmod +x scripts/check_runbooks_safe.sh
-          ./scripts/check_runbooks_safe.sh
-      - name: Guard manifests against absolute-path (/dp) deps (rch#23)
-        run: |
-          chmod +x scripts/check_no_dp_path_deps.sh
-          ./scripts/check_no_dp_path_deps.sh
-      - name: Self-test release-asset-completeness gate (rch#23/#25 prevention)
-        run: |
-          chmod +x scripts/check_release_assets.sh
-          ./scripts/check_release_assets.sh --self-test
-
-      - name: Verify fork installer integrity and explicit rollback
-        run: bash scripts/install_no_downgrade_unit_test.sh
-      - name: Verify updater and release-workflow trust policy
-        # Source contract only; native updater tests retain their separate owner.
-        run: bash scripts/test_update_signature_verification.sh --source-only
-      - name: Reject local/refused results in the remote acceptance validator
-        run: python3 -I scripts/validate_remote_execution.py --self-test
-      - name: Verify candidate packaging identity and no-clobber contracts
-        # Real Git/archive/digest checks, synthetic Rust tools; no build or install.
-        shell: bash
-        run: |
-          fixture="$(mktemp -d "$RUNNER_TEMP/rch-package-contract.XXXXXX")"
-          bash scripts/package_linux_candidate.sh --self-test --output-dir "$fixture/cases"
-          python3 -I scripts/package_ci_components.py self-test
-      - name: Verify semantic rewrite and Hermes adapter contracts
-        run: |
-          python3 -I rch/src/hook/test_semantic.py
-          python3 -I rch/src/agent/hermes_plugin.py
-      - name: Check installer scripts (retained from notify-acfs)
+      - name: Obtain and verify the exact previously tested native release
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          command -v shellcheck
-          for script in install.sh scripts/install.sh; do
-            if [ -f "$script" ]; then
-              shellcheck "$script"
-            fi
-          done
-      - name: Validate all workflow syntax, expressions and reusable calls
-        uses: docker://rhysd/actionlint:1.7.12
-        with:
-          # Embedded script lint is separate from workflow-graph validation.
-          args: -color -shellcheck= -pyflakes=
-
-  # Dependency vulnerability scanning - runs on PRs too for immediate feedback
-  security:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      checks: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  # Verify documentation builds without warnings
-  docs:
-    if: github.event_name == 'workflow_dispatch' && inputs.extended
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-      - name: Build documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features --workspace
-
-  # Cross-platform test matrix
-  # Note: Uses default features only (excludes true-e2e feature which runs in dedicated e2e job)
-  test:
-    if: github.event_name != 'schedule'
-    name: test (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            os: ubuntu-latest
-            cargo_args: --workspace
-          - name: linux-arm64
-            os: ubuntu-24.04-arm
-            cargo_args: --workspace
-          - name: macos-x64
-            os: macos-15-intel
-            # macOS: exclude rchd (daemon) tests due to CI environment issues with Unix sockets
-            cargo_args: --workspace --exclude rchd
-          - name: macos-arm64
-            os: macos-14
-            # macOS: exclude rchd (daemon) tests due to CI environment issues with Unix sockets
-            cargo_args: --workspace --exclude rchd
-          # Note: Windows tests disabled - rch-wkr tests use Unix shell commands (echo, /tmp paths)
-          # and other workspace crates have Unix-only dependencies (openssh, rich_rust)
-          # The Windows build-release job still validates that binaries can be built for Windows
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-          # The real-Cargo build-dir fixture also executes cargo clippy.
-          components: clippy
-      - name: Install Go for native recovery fixtures
-        if: runner.os == 'macOS'
-        uses: actions/setup-go@v7
-        with:
-          go-version: '1.25.12'
-          cache: false
-      - name: Install native worker-command fixture prerequisites
-        if: runner.os == 'macOS'
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_NO_INSTALL_UPGRADE: '1'
-          HOMEBREW_NO_INSTALL_CLEANUP: '1'
-        run: |
-          brew install coreutils findutils flock
-          # Expose the real timeout/flock prerequisites, not replacements for
-          # host BSD utilities; the Cygwin inventory fixture selects gfind.
-          rch_test_tools="$(mktemp -d "$RUNNER_TEMP/rch-test-tools.XXXXXX")"
-          ln -s "$(brew --prefix coreutils)/bin/gtimeout" "$rch_test_tools/timeout"
-          ln -s "$(brew --prefix flock)/bin/flock" "$rch_test_tools/flock"
-          "$rch_test_tools/flock" --version
-          printf '%s\n' "$rch_test_tools" >> "$GITHUB_PATH"
-          "$rch_test_tools/timeout" --version
-          gfind --version
-          go version
-          openssl version -a
-      - name: Install wrapper contract toolchain prerequisites
-        run: |
-          set -euo pipefail
-          for channel in stable beta nightly; do
-            rustup toolchain install "$channel" --profile minimal --no-self-update
-            rustup run "$channel" rustc --version --verbose
-            rustup run "$channel" cargo --version --verbose
-          done
-          rustup toolchain list
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          shared-key: test-${{ matrix.name }}
-          cache-on-failure: true
-      - name: Run tests
-        env:
-          RCH_MOCK_SSH: '1'
-          # Nested fixture preparation must use this same unified test graph.
-          RABS_TEST_WORKSPACE_ARGS: ${{ matrix.cargo_args }}
-        run: |
-          set -o pipefail
-          mkdir -p target/test-logs
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            # Two concurrent rustc processes consumed over 14 GiB before a
-            # runner shutdown. Bound compilation, including nested Cargo builds.
-            # Native test parallelism and all gates retain their existing values.
-            export CARGO_BUILD_JOBS=1
-            # A runner shutdown can prevent the artifact-upload step itself.
-            # Record bounded resource observations in the live job log.
-            python3 -u - <<'PY' &
-          import datetime
-          import json
-          import pathlib
-          import time
-
-          def read(path):
-              try:
-                  return pathlib.Path(path).read_text()
-              except OSError:
-                  return None
-
-          while True:
-              meminfo = read('/proc/meminfo') or ''
-              memory = {line.split(':', 1)[0]: line.split(':', 1)[1].strip()
-                        for line in meminfo.splitlines()
-                        if line.startswith(('MemTotal:', 'MemAvailable:', 'SwapTotal:', 'SwapFree:'))}
-              processes = []
-              for entry in pathlib.Path('/proc').iterdir():
-                  if not entry.name.isdecimal():
-                      continue
-                  fields = dict(line.split(':', 1) for line in (read(entry / 'status') or '').splitlines()
-                                if ':' in line)
-                  rss = int(fields.get('VmRSS', '0 kB').split()[0])
-                  if rss:
-                      processes.append({'pid': int(entry.name), 'name': fields.get('Name', '').strip(),
-                                        'rss_kib': rss, 'threads': fields.get('Threads', '').strip()})
-              cgroup = read('/proc/self/cgroup') or ''
-              relative = next((line.split('::', 1)[1] for line in cgroup.splitlines()
-                               if line.startswith('0::')), '/')
-              cgroup_root = pathlib.Path('/sys/fs/cgroup') / relative.lstrip('/')
-              print('RCH test runner resources ' + json.dumps({
-                  'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                  'memory': memory, 'self_cgroup': cgroup,
-                  'cgroup': {name: read(cgroup_root / name) for name in
-                             ('memory.current', 'memory.max', 'memory.peak', 'memory.events', 'cpu.max')},
-                  'host_oom_kill': next((line for line in (read('/proc/vmstat') or '').splitlines()
-                                         if line.startswith('oom_kill ')), None),
-                  'largest_processes': sorted(processes, key=lambda row: row['rss_kib'], reverse=True)[:8]
-              }), flush=True)
-              time.sleep(30)
-          PY
-            rch_test_sampler_pid=$!
-            trap 'rch_test_status=$?; trap - EXIT; kill "$rch_test_sampler_pid" 2>/dev/null || true; wait "$rch_test_sampler_pid" 2>/dev/null || true; exit "$rch_test_status"' EXIT
-          fi
-          # Exercise focused regressions before the full workspace command.
-          # Preserve each verdict and still attempt the complete workspace
-          # after a fixture failure.
-          rch_fixture_status=0
-          cargo test --locked -p rabs-sandbox --test snapshot_capture_realfs -- --nocapture 2>&1 | tee target/test-logs/snapshot-capture-realfs.log || rch_fixture_status=$?
-          # Keep the full workspace's package selection for the native socket
-          # checks, including the Darwin peer-close assertion.
-          rch_command_status=0
-          cargo test --no-fail-fast ${{ matrix.cargo_args }} commands::helpers::daemon_command_tests -- --nocapture 2>&1 | tee target/test-logs/daemon-command.log || rch_command_status=$?
-          rch_workspace_status=0
-          cargo test --no-fail-fast ${{ matrix.cargo_args }} 2>&1 | tee target/test-logs/workspace-tests.log || rch_workspace_status=$?
-          if (( rch_workspace_status != 0 )); then
-            exit "$rch_workspace_status"
-          fi
-          if (( rch_command_status != 0 )); then
-            exit "$rch_command_status"
-          fi
-          exit "$rch_fixture_status"
-      - name: Upload test logs on failure or cancellation
-        if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs-${{ matrix.name }}
-          path: |
-            target/test-logs/snapshot-capture-realfs.log
-            target/test-logs/daemon-command.log
-            target/test-logs/workspace-tests.log
-            target/debug/deps/*.log
-            **/test-output.log
-          retention-days: 7
-
-  # One owner for all shell scenarios and the feature-gated Cargo E2E suite.
-  e2e:
-    if: github.event_name != 'schedule'
-    needs: check
-    uses: ./.github/workflows/e2e.yml
-
-  # Performance benchmark - verify latency budgets from AGENTS.md
-  benchmark:
-    if: github.event_name == 'workflow_dispatch' && inputs.extended
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          shared-key: benchmark
-          cache-on-failure: true
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Run benchmarks
-        run: |
-          cargo bench -p rch-common --bench classifier -- --save-baseline ci
-          cargo bench -p rch-common --bench remediation_hotpath -- --save-baseline ci
-      - name: Verify performance budgets
-        run: python3 scripts/check_benchmark_budgets.py
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
-          path: target/criterion/
-          retention-days: 30
-
-  # Validate the actual shipping profiles, versions and packages on all six
-  # platforms once, instead of also compiling a second generic release matrix.
-  build-release:
-    if: github.event_name != 'schedule'
-    needs: [check, test]
-    uses: ./.github/workflows/test-release.yml
-
-  # Coverage reporting (Linux only)
-  coverage:
-    if: github.event_name == 'workflow_dispatch' && inputs.extended
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
-          components: llvm-tools-preview, clippy
-      - name: Install wrapper contract toolchain prerequisites
-        run: |
-          set -euo pipefail
-          for channel in stable beta nightly; do
-            rustup toolchain install "$channel" --profile minimal --no-self-update
-            rustup run "$channel" rustc --version --verbose
-            rustup run "$channel" cargo --version --verbose
-          done
-          rustup toolchain list
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          # Keep the ordinary target cache out of this job: coverage owns one
-          # fresh instrumented tree after the previous runner exhausted disk.
-          shared-key: coverage-registry
-          cache-targets: false
-          cache-on-failure: true
-      - name: Build instrumented binaries for E2E tests
-        run: |
-          rch_coverage_target="$(mktemp -d "$RUNNER_TEMP/rch-coverage-target.XXXXXX")"
-          rch_coverage_env="$(mktemp "$RUNNER_TEMP/rch-coverage-env.XXXXXX")"
-          export CARGO_TARGET_DIR="$rch_coverage_target"
-          export CARGO_LLVM_COV_TARGET_DIR="$rch_coverage_target"
-          cargo llvm-cov show-env --sh > "$rch_coverage_env"
-          source "$rch_coverage_env"
-          printf 'CARGO_TARGET_DIR=%s\nCARGO_LLVM_COV_TARGET_DIR=%s\nRCH_COVERAGE_ENV=%s\n' \
-            "$CARGO_TARGET_DIR" "$CARGO_LLVM_COV_TARGET_DIR" "$rch_coverage_env" >> "$GITHUB_ENV"
-          # Prepare the same test graph plus the standalone worker binary.
-          # This avoids separate production/test dependency feature variants.
-          cargo build --workspace --features rich-ui --bins --tests --profile test
-      - name: Generate LCOV coverage
-        env:
-          RCH_MOCK_SSH: '1'
-          RABS_TEST_WORKSPACE_ARGS: --workspace --features rich-ui
-        # Match cargo-llvm-cov's default --tests selection. The fresh target
-        # contains no previous profiles, so no cleanup or second build tree is
-        # needed. All report formats and the threshold consume this execution.
-        run: |
-          source "$RCH_COVERAGE_ENV"
-          cargo test --features rich-ui --workspace --tests
-          cargo llvm-cov report --workspace --lcov --output-path lcov.info
-      - name: Generate HTML coverage report
-        env:
-          RCH_MOCK_SSH: '1'
-        # Reuse the preceding test execution for each report format.
-        run: cargo llvm-cov report --workspace --html --output-dir coverage-html
-      - name: Generate per-crate coverage summary
-        env:
-          RCH_MOCK_SSH: '1'
-        run: |
-          set -o pipefail
-          echo "## Coverage Summary" > coverage-summary.md
-          echo "" >> coverage-summary.md
-          cargo llvm-cov report --workspace --text 2>&1 | tee -a coverage-summary.md
-      - name: Check coverage threshold
-        env:
-          RCH_MOCK_SSH: '1'
-        # Fail if line coverage drops below 65% (goal: 75%)
-        # See bead remote_compilation_helper-pacy for progress tracking
-        run: cargo llvm-cov report --workspace --fail-under-lines 65
-      - uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-      - name: Upload HTML coverage report
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-html
-          path: coverage-html/
-          retention-days: 30
-      - name: Upload coverage summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-summary
-          path: coverage-summary.md
-          retention-days: 30
-
-  # The stable aggregate also fails on skipped/cancelled REQUIRED jobs.
-  # Only intentionally unrequested extended jobs may be skipped on PRs.
-  ci-success:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [check, manifest_sync, security, test, e2e, build-release, docs, benchmark, coverage]
-    if: always()
-    steps:
-      - name: Check required results for this invocation
-        env:
-          JOB_RESULTS: ${{ toJSON(needs) }}
-          EVENT_NAME: ${{ github.event_name }}
-          EXTENDED: ${{ inputs.extended || false }}
-        run: |
+          mkdir evidence
+          gh api repos/tsunheimat/remote_compilation_helper/actions/artifacts/12974625219/zip > evidence/application.zip
           python3 - <<'PY'
-          import json
-          import os
-          import sys
-
-          results = json.loads(os.environ['JOB_RESULTS'])
-          required = {'security'}
-          if os.environ['EVENT_NAME'] != 'schedule':
-              required.update({'check', 'manifest_sync', 'test', 'e2e', 'build-release'})
-          if os.environ['EVENT_NAME'] == 'workflow_dispatch' and os.environ['EXTENDED'] == 'true':
-              required.update({'docs', 'benchmark', 'coverage'})
-          failed = {job: results.get(job, {}).get('result', 'missing')
-                    for job in sorted(required)
-                    if results.get(job, {}).get('result') != 'success'}
-          print(json.dumps({'required': sorted(required), 'failed': failed}, indent=2))
-          sys.exit(1 if failed else 0)
+          import hashlib, json, pathlib, zipfile
+          p = pathlib.Path('evidence')
+          assert hashlib.sha256((p/'application.zip').read_bytes()).hexdigest() == '7168983b1e552aa49809d97e4b7948bca0df101e715bc6e8f884a69776d2f476'
+          with zipfile.ZipFile(p/'application.zip') as archive:
+              assert set(archive.namelist()) == {'component.json', 'rch', 'rchd', 'rch-wkr'}
+              parts = p/'parts'
+              parts.mkdir()
+              for name in archive.namelist():
+                  (parts/name).write_bytes(archive.read(name))
+          receipt = json.loads((parts/'component.json').read_text())
+          assert receipt['source'] == 'b30995825be82fd53ab5170d1d44b149a0965637'
+          assert receipt['target'] == 'aarch64-apple-darwin'
+          print(json.dumps(receipt, indent=2))
           PY
+          python3 -I scripts/package_ci_components.py restore-e2e --parts evidence/parts --output evidence/bin --source b30995825be82fd53ab5170d1d44b149a0965637 --target aarch64-apple-darwin
+          evidence/bin/rch --version
+          otool -L evidence/bin/rch > evidence/linked-libraries.txt
+          size -m evidence/bin/rch > evidence/segments.txt
+          codesign -dvv evidence/bin/rch > evidence/signature.txt 2>&1
+      - name: Measure unchanged hook inputs and process-launch controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, platform, resource, statistics, subprocess, sys, time
+          p = pathlib.Path('evidence')
+          binary = str((p/'bin/rch').resolve())
+          variants = [('empty', [binary], b''), ('read', [binary], b'{"tool_name":"Read","tool_input":{"command":"ignored"}}\n'), ('echo', [binary], b'{"tool_name":"Bash","tool_input":{"command":"echo test"}}\n'), ('git', [binary], b'{"tool_name":"Bash","tool_input":{"command":"git status"}}\n'), ('system-true', ['/usr/bin/true'], b'{"tool_name":"Bash","tool_input":{"command":"echo test"}}\n')]
+          report = {'python': sys.version, 'platform': platform.platform(), 'cpus': os.cpu_count(), 'load': os.getloadavg(), 'rounds': []}
+          # Three predeclared rounds, 50 processes each, alternating ordering.
+          # No best-round selection, warmup exclusion, timing waiver or source change.
+          for turn in range(3):
+              for name, command, data in variants[::1 if turn % 2 == 0 else -1]:
+                  samples = []
+                  before = resource.getrusage(resource.RUSAGE_CHILDREN)
+                  for _ in range(50):
+                      start = time.perf_counter_ns()
+                      result = subprocess.run(command, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+                      samples.append(time.perf_counter_ns() - start)
+                      assert not result.stderr, (name, result.stderr)
+                  after = resource.getrusage(resource.RUSAGE_CHILDREN)
+                  row = {'round': turn, 'input': name, 'mean_ms': statistics.mean(samples)/1e6, 'median_ms': statistics.median(samples)/1e6, 'samples_ns': samples, 'child_user': after.ru_utime-before.ru_utime, 'child_system': after.ru_stime-before.ru_stime}
+                  report['rounds'].append(row)
+                  print({k:v for k,v in row.items() if k != 'samples_ns'}, flush=True)
+          (p/'timing.json').write_text(json.dumps(report, indent=2))
+          data = variants[2][2]
+          for label, flags in [('dyld-statistics', {'DYLD_PRINT_STATISTICS':'1', 'DYLD_PRINT_STATISTICS_DETAILS':'1'}), ('dyld-libraries', {'DYLD_PRINT_LIBRARIES':'1'})]:
+              result = subprocess.run([binary], input=data, capture_output=True, env=dict(os.environ, **flags))
+              (p/(label+'.stdout')).write_bytes(result.stdout)
+              (p/(label+'.stderr')).write_bytes(result.stderr)
+              print(label, result.returncode, result.stderr.decode(errors='replace'), flush=True)
+              assert result.returncode == 0 and not result.stdout
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr8-native-startup-diagnosis
+          path: |
+            evidence/*.json
+            evidence/*.txt
+            evidence/*.stdout
+            evidence/*.stderr
+          if-no-files-found: error
+          retention-days: 7
