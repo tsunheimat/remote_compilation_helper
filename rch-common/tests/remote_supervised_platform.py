@@ -47,12 +47,22 @@ class SupervisedPlatform(unittest.TestCase):
     def setUp(self):
         # Retain failure receipts for diagnosis. Only our direct supervisor
         # children are signalled during cleanup; their own watchdog owns work.
-        self.root = Path(tempfile.mkdtemp(prefix="rch-supervised-platform-"))
+        evidence = os.environ.get("RCH_TEST_EVIDENCE_ROOT")
+        if evidence:
+            self.assertTrue(Path(evidence).is_absolute(), "evidence root must be absolute")
+            Path(evidence).mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="rch-supervised-platform-", dir=evidence))
         self.receipt = self.root / "receipt"
         self.ready = self.root / "ready"
         self.release = self.root / "release"
         self.children = []
         self.env = dict(os.environ, HOME=str(self.root), TMPDIR=str(self.root))
+        if evidence:
+            self.env['RCH_TEST_OBSERVATION_TRACE'] = str(self.root / 'observations.log')
+            (self.root / 'case.json').write_text(json.dumps({
+                'case': self.id(), 'shell': SHELL,
+                'no_gnu_timeout': os.environ.get('RCH_TEST_NO_TIMEOUT') == '1',
+            }))
         if os.environ.get("RCH_TEST_NO_TIMEOUT") == "1":
             binaries = self.root / "bin"
             binaries.mkdir()
@@ -76,8 +86,47 @@ class SupervisedPlatform(unittest.TestCase):
             # An exact fresh-channel recovery, never a blind killpg(record).
             self.cancel("kill")
 
+    def diagnostic_protocol(self, protocol):
+        # Test-only observation, not replacement evidence: call the unchanged
+        # native functions once and preserve their exit/stdout/stderr. Capture
+        # failed exchanges and unavailable census snapshots out-of-band, so a
+        # hosted failure is diagnosable instead of discarding its /tmp tree.
+        if not self.env.get('RCH_TEST_OBSERVATION_TRACE'):
+            return protocol
+        for name in ('rch_group_state', 'rch_control_capture'):
+            declaration = name + '() {'
+            self.assertEqual(protocol.count(declaration), 1)
+            protocol = protocol.replace(declaration, name + '_diagnostic_original() {', 1)
+        boundary = '\nRCH_SCOPED_LAUNCH_SOURCE_104\n'
+        self.assertEqual(protocol.count(boundary), 1)
+        wrappers = r'''
+rch_group_state() {
+    rch_group_state_diagnostic_original
+    rch_fixture_diagnostic_state=$?
+    if [ "$rch_fixture_diagnostic_state" = 2 ]; then
+        {
+            printf 'CENSUS_UNAVAILABLE observer=%s group=%s identified=%s\n' "$$" "${rch_pgid-}" "${rch_identified-}"
+            printf 'LAST_SNAPSHOT_MAY_BE_STALE\n%s\nEND_SNAPSHOT\n' "${rch_snapshot-}"
+        } >> "$RCH_TEST_OBSERVATION_TRACE" 2>/dev/null || :
+    fi
+    return "$rch_fixture_diagnostic_state"
+}
+rch_control_capture() {
+    rch_control_capture_diagnostic_original "$@"
+    rch_fixture_diagnostic_capture=$?
+    if [ "$rch_fixture_diagnostic_capture" != 0 ]; then
+        printf 'CAPTURE_FAILED observer=%s status=%s budget=%s executable=%s\n' \
+            "$$" "$rch_fixture_diagnostic_capture" "${1-}" "${2-}" \
+            >> "$RCH_TEST_OBSERVATION_TRACE" 2>/dev/null || :
+    fi
+    return "$rch_fixture_diagnostic_capture"
+}
+'''
+        return protocol.replace(boundary, '\n' + wrappers + boundary, 1)
+
     def start(self, payload, seconds=0, prefix="", stdin=subprocess.DEVNULL,
               protocol=PROTOCOL, diagnostic=None):
+        protocol = self.diagnostic_protocol(protocol)
         out = open(self.root / f"out-{len(self.children)}", "w+b")
         err = open(self.root / f"err-{len(self.children)}", "w+b")
         self.addCleanup(out.close)
@@ -124,6 +173,7 @@ class SupervisedPlatform(unittest.TestCase):
                 f"while [ ! -f {shlex.quote(str(self.release))} ]; do sleep .1; done")
 
     def observe(self, body, protocol=PROTOCOL, timeout=30):
+        protocol = self.diagnostic_protocol(protocol)
         return subprocess.run([SHELL, "-c", protocol + "\n" + body], env=self.env,
                               capture_output=True, timeout=timeout)
 
@@ -142,7 +192,7 @@ class SupervisedPlatform(unittest.TestCase):
         payload = ("import pathlib, signal, sys; "
                    "pathlib.Path(sys.argv[1]).write_text('ready'); signal.pause()")
         child = subprocess.Popen(
-            [SHELL, "-c", PROTOCOL + '\nrch_remote_record "$1" 115 || exit $?; '
+            [SHELL, "-c", self.diagnostic_protocol(PROTOCOL) + '\nrch_remote_record "$1" 115 || exit $?; '
              'exec "$2" -I -S -c "$3" "$4"',
              "rch-stable-witness", str(self.receipt), sys.executable, payload, str(self.ready)],
             env=self.env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
@@ -286,6 +336,25 @@ esac
             with self.assertRaises(AssertionError):
                 self.assert_crash_cleanup(time.monotonic() + .1)
 
+    def test_observer_diagnostics_preserve_status_and_streams_without_authority(self):
+        trace = self.root / 'diagnostic-control.log'
+        for body in (
+            "rch_control_capture 1s /bin/sh -c 'printf native-success'",
+            "rch_control_capture 1s /bin/sh -c 'printf native-refusal; exit 7'",
+            "rch_check_procfs_namespace() { return 1; }; rch_group_state",
+        ):
+            self.env.pop('RCH_TEST_OBSERVATION_TRACE', None)
+            baseline = self.observe(body)
+            self.env['RCH_TEST_OBSERVATION_TRACE'] = str(trace)
+            diagnosed = self.observe(body)
+            self.assertEqual((diagnosed.returncode, diagnosed.stdout, diagnosed.stderr),
+                             (baseline.returncode, baseline.stdout, baseline.stderr))
+        text = trace.read_text()
+        self.assertIn('status=7 budget=1s executable=/bin/sh', text)
+        self.assertIn('CENSUS_UNAVAILABLE', text)
+        self.assertNotIn('native-refusal', text, "diagnostics do not copy captured command content")
+        self.assertFalse(self.receipt.exists(), "observability must not fabricate an execution record")
+
     def test_status_and_binary_stdin_survive_supervision(self):
         data = b"original\x00input\nlast\xff"
         with tempfile.TemporaryFile() as source:
@@ -389,7 +458,7 @@ rch_group_state() {
     rch_fixture_group_state
 }
 '''
-        script = PROTOCOL.replace(CORE, core) + (
+        script = self.diagnostic_protocol(PROTOCOL.replace(CORE, core)) + (
             f"\nrch_remote_cancel {shlex.quote(str(self.receipt))} 115 term")
         started = time.monotonic()
         self.cancel_started = started
