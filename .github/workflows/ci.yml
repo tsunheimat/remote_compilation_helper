@@ -187,6 +187,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     needs: check
+    env:
+      # The Linux full-workspace graph exhausted the hosted disk while linking
+      # rabs-wkr tests (job125136170741). Retain line/module backtraces, but do
+      # not duplicate full type/variable DWARF in every native test executable.
+      # This changes only test-job debug metadata: optimization, assertions,
+      # overflow checks, test selection and all shipped profiles are unchanged.
+      # Apply equally to nested fixture builds so their graph stays consistent.
+      CARGO_PROFILE_DEV_DEBUG: ${{ startsWith(matrix.name, 'linux-') && '1' || '2' }}
+      CARGO_PROFILE_TEST_DEBUG: ${{ startsWith(matrix.name, 'linux-') && '1' || '2' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -231,7 +240,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ hashFiles('Cargo.toml') }}
-          shared-key: test-${{ matrix.name }}
+          # Do not restore the old full-debug Linux target beside this graph.
+          shared-key: test-${{ matrix.name }}${{ startsWith(matrix.name, 'linux-') && '-limited-debug-v1' || '' }}
           cache-on-failure: true
       - name: Run tests
         env:
@@ -252,6 +262,7 @@ jobs:
           import datetime
           import json
           import pathlib
+          import shutil
           import time
 
           def read(path):
@@ -282,6 +293,7 @@ jobs:
               print('RCH test runner resources ' + json.dumps({
                   'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                   'memory': memory, 'self_cgroup': cgroup,
+                  'filesystems': {path: shutil.disk_usage(path)._asdict() for path in ('.', '/tmp')},
                   'cgroup': {name: read(cgroup_root / name) for name in
                              ('memory.current', 'memory.max', 'memory.peak', 'memory.events', 'cpu.max')},
                   'host_oom_kill': next((line for line in (read('/proc/vmstat') or '').splitlines()

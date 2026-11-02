@@ -58,6 +58,32 @@ notification for weekly drift notification; no channel is removed.
 | `remote-only-policy.yml` | Repeats the full-workspace formatter/compiler/linter and fallback test coverage. | `hook::fallback_policy_tests` remains registered and runs in the workspace suite. |
 | `rsync-transport.yml` | Repeats full-workspace checks; produces a source archive with no in-repository consumer. | Workspace transfer tests plus the separate real native/legacy rsync lane remain. |
 
+## Linux native test storage boundary
+
+PR10 CI run 41401099191 / Linux x64 job 125136170741 exhausted its hosted
+filesystem while linking `rabs-wkr` integration tests. The log contains linker
+SIGBUS and the runner's explicit `No space left on device`; memory sampling
+showed no OOM kill. This is a failed build, not passing tests or evidence that
+the Cargo remote-only policy failed. Incremental compilation was already off.
+
+Only the existing Linux native-test jobs now set `CARGO_PROFILE_DEV_DEBUG=1`
+and `CARGO_PROFILE_TEST_DEBUG=1`. Limited debug information retains line/module
+backtraces but omits full type/variable information. Optimization, debug
+assertions, overflow checking, package/test selection and the 90-minute job
+budget are unchanged. Nested development builds inherit the same setting.
+macOS keeps full debug information; E2E, compiler gates and every release
+profile/packaging job keep their original settings. No test is removed, and
+this is not a runtime speedup claim.
+
+Linux test caches have a separate key so old full-debug artifacts are not
+restored alongside the limited-debug graph. No operator or shared worker cache
+is deleted. Existing resource sampling also records workspace and temporary
+filesystem free space, making another capacity failure directly observable.
+These settings belong to test-runner storage provisioning, not the controller
+or worker deployment configuration. Exact-head hosted compilation remains the
+proof that the complete graph fits; a local focused comparison alone is not
+full Linux CI qualification.
+
 ## Retained workflow owners
 
 | File | Distinct purpose / trigger |
