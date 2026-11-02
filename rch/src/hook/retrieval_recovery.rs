@@ -3471,11 +3471,95 @@ mod tests {
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null");
-        command.stdin(Stdio::null()).kill_on_drop(true);
-        tokio::time::timeout(Duration::from_secs(120), command.output())
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let execution = async {
+            // A concurrently forked fixture can briefly retain a write handle
+            // to a freshly published executable. ETXTBSY means exec did NOT
+            // start that program. Retry only this spawn error, for at most
+            // 50 short waits, inside the original total workload deadline.
+            // After a child exists, its exit/output is observed exactly once.
+            let mut attempts = 0;
+            let child = loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempts < 50 =>
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            child.wait_with_output().await
+        };
+        tokio::time::timeout(Duration::from_secs(120), execution)
             .await
             .expect("Go output fixture exceeded its bound")
-            .expect("Go and rsync are required for the Go delivery regression")
+            .expect("Go delivery fixture execution failed")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn go_fixture_busy_spawn_is_bounded_and_does_not_replay_a_started_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("owned executable");
+        let started = directory.path().join("starts");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf 'started\\n' >> \"$1\"\nprintf '%s\\000' \"$2\"\nprintf 'fixture-error\\n' >&2\nexit 26\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        let mut command = tokio::process::Command::new(&executable);
+        command.arg(&started).arg("two words $(literal)");
+        // A real held write descriptor forces Linux's pre-exec ETXTBSY. No
+        // synthetic successful output or process exit is substituted here.
+        assert_eq!(
+            command.spawn().unwrap_err().kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+        assert!(!started.exists());
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(writer);
+        };
+        let (output, ()) = tokio::join!(biased; run_go_fixture(&mut command), release);
+        // Exit26 is a STARTED child's failure, not spawn errno26. Preserve its
+        // literal argv, both streams and exactly one execution; never retry it.
+        assert_eq!(output.status.code(), Some(26));
+        assert_eq!(output.stdout, b"two words $(literal)\0");
+        assert_eq!(output.stderr, b"fixture-error\n");
+        assert_eq!(std::fs::read(&started).unwrap(), b"started\n");
+
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        let mut blocked = tokio::process::Command::new(&executable);
+        blocked.arg(&started).arg("must not start");
+        let task = tokio::spawn(async move {
+            let output = run_go_fixture(&mut blocked).await;
+            drop(writer);
+            output
+        });
+        let rejected = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a persistent writer must not consume the 120-second workload budget")
+            .expect_err("persistent executable contention must remain a failed fixture");
+        assert!(rejected.is_panic());
+        assert_eq!(std::fs::read(&started).unwrap(), b"started\n");
     }
 
     #[cfg(unix)]
