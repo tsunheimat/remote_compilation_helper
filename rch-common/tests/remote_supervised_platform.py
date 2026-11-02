@@ -358,7 +358,7 @@ esac
         self.assertNotEqual(run[0].wait(timeout=15), 0)
         self.assert_empty()
 
-    def cancel_with_probe(self, probe):
+    def cancel_with_probe(self, probe, unavailable_after_kill=False):
         # Fault injection is confined to the cancelling channel. Launch,
         # leader identity, actual signals and the final census remain native.
         # Put it in the literal shared source so a bounded collector sees the
@@ -366,16 +366,57 @@ esac
         core = CORE.replace("rch_read_process() {", "rch_real_read_process() {")
         core += "\n" + probe
         trace = self.root / "signals"
+        outcomes = shlex.quote(str(self.root / "signal-outcomes"))
         core = core.replace("rch_signal_group() {", "rch_real_signal_group() {")
-        core += ("\nrch_signal_group() { printf '%s\\n' \"$1\" >> "
-                 + shlex.quote(str(trace)) + '; rch_real_signal_group "$@"; }\n')
+        core += ("\nrch_fixture_killed=0\nrch_signal_group() { printf '%s\\n' \"$1\" >> "
+                 + shlex.quote(str(trace)) + '; rch_real_signal_group "$@"; '
+                 'rch_fixture_signal_status=$?; printf "%s:%s\\n" "$1" "$rch_fixture_signal_status" >> '
+                 + outcomes + '; [ "$1:$rch_fixture_signal_status" != KILL:0 ] || rch_fixture_killed=1; '
+                 'return "$rch_fixture_signal_status"; }\n')
+        if unavailable_after_kill:
+            # Only the cancelling channel's first post-KILL census is replaced.
+            # The real authorized signal and independent recovery observation
+            # below remain native. This must produce refusal44, never success.
+            core = core.replace("rch_group_state() {", "rch_fixture_group_state() {", 1)
+            core += '''
+rch_fixture_unknown=0
+rch_group_state() {
+    if [ "$rch_fixture_killed" = 1 ] && [ "$rch_fixture_unknown" = 0 ]; then
+        rch_fixture_unknown=1
+        printf 'RCH_FIXTURE_POST_KILL_UNKNOWN\\n' >&2
+        return 2
+    fi
+    rch_fixture_group_state
+}
+'''
         script = PROTOCOL.replace(CORE, core) + (
             f"\nrch_remote_cancel {shlex.quote(str(self.receipt))} 115 term")
         started = time.monotonic()
+        self.cancel_started = started
         result = subprocess.run([SHELL, "-c", script], env=self.env,
                                 capture_output=True, timeout=25)
         elapsed = time.monotonic() - started
         return result, elapsed, trace.read_text() if trace.exists() else ""
+
+    def assert_bounded_kill(self, run, result, elapsed, signals):
+        # The cancellation API must never claim success on unavailable census.
+        # A valid44 AFTER an authenticated KILL is unconfirmed, not a retry of
+        # the workload or permission to ignore liveness. Confirm actual native
+        # absence on a fresh observation within the ORIGINAL10s total budget.
+        self.assertIn(result.returncode, (0, 44), result.stderr)
+        self.assertLess(elapsed, 10, "member observation consumed the recovery budget")
+        self.assertEqual(signals, "KILL\n", "partial collection must not authorize TERM")
+        self.assertEqual((self.root / "signal-outcomes").read_text().splitlines(), ["KILL:0"],
+                         "an attempted or refused signal is not delivered cancellation")
+        until = self.cancel_started + 10
+        if result.returncode == 0:
+            self.assert_empty()
+        else:
+            self.assert_crash_cleanup(until)
+        remaining = until - time.monotonic()
+        self.assertGreater(remaining, 0, "cleanup exceeded original cancellation budget")
+        self.assertNotEqual(run[0].wait(timeout=remaining), 0)
+        self.assertLess(time.monotonic(), until)
 
     def test_stalled_member_probe_cannot_starve_cancellation(self):
         run = self.start(
@@ -389,11 +430,35 @@ rch_read_process() {{
     rch_real_read_process "$1"
 }}
 ''')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(elapsed, 10, "member observation consumed the recovery budget")
-        self.assertEqual(signals, "KILL\n", "partial collection must not authorize TERM")
+        self.assert_bounded_kill(run, result, elapsed, signals)
+
+    def test_post_kill_unknown_stays_refused_until_separate_native_confirmation(self):
+        from unittest.mock import patch
+
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        # Deliberately unavailable witnesses require the independently verified
+        # leader's immediate KILL. No fabricated process identities or signals.
+        result, elapsed, signals = self.cancel_with_probe('''
+rch_read_process() {
+    [ "$1" = "$rch_pgid" ] || return 1
+    rch_real_read_process "$1"
+}
+''', unavailable_after_kill=True)
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assertIn(b'RCH_FIXTURE_POST_KILL_UNKNOWN', result.stderr)
+        self.assert_bounded_kill(run, result, elapsed, signals)
+        # Refusal remains refusal even after separate cleanup confirmation.
+        self.assertEqual(result.returncode, 44)
+        with self.assertRaises(AssertionError):
+            self.assert_bounded_kill(run, result, elapsed, '')
+        with patch.object(self, 'assert_crash_cleanup', side_effect=AssertionError('still live/unknown')):
+            with self.assertRaises(AssertionError):
+                self.assert_bounded_kill(run, result, elapsed, signals)
+        with patch.object(self, 'cancel_started', time.monotonic() - 11):
+            with self.assertRaises(AssertionError):
+                self.assert_bounded_kill(run, result, elapsed, signals)
         self.assert_empty()
-        self.assertNotEqual(run[0].wait(timeout=10), 0)
 
     def test_large_group_has_one_collection_budget_not_one_per_member(self):
         run = self.start(
