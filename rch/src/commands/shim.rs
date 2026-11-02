@@ -12,7 +12,9 @@
 //!
 //! The shim is deliberately conservative:
 //! - loop-safe: honors `RCH_CARGO_WRAPPER_BYPASS=1` (rch's own re-exec) → real cargo;
-//! - fail-open: if `rch` is not on `PATH`, run the real cargo unchanged;
+//! - strict install: missing `rch` refuses known build/test requests;
+//! - explicit `RCH_REQUIRE_REMOTE`: local IDE/wrapper hints cannot run a build;
+//! - ordinary queries and the trusted worker loop-break remain local;
 //! - IDE-safe: rust-analyzer's `--message-format=json-diagnostic-{rendered-ansi,short}`
 //!   → real cargo, local. A plain `--message-format=json` (scripts, CI, lint
 //!   gates) still offloads; treating every `--message-format` as an IDE was the bug
@@ -76,7 +78,9 @@ use crate::ui::theme::StatusIndicator;
 ///
 /// `7` preserves caller RCH_REQUIRE_REMOTE values and marks only the shim's
 /// default injection, bound to the exec process, for safe speed-gate admission.
-const SHIM_VERSION: &str = "7";
+/// `8` refuses known build/test fallback when the router is missing under
+/// strict install policy; explicit remote-only also overrides local IDE hints.
+const SHIM_VERSION: &str = "8";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -123,6 +127,56 @@ export RCH_QUEUE_WHEN_BUSY
     format!("{policy}exec rch exec -- {command} \"$@\"")
 }
 
+/// Shell policy stays usable when RCH itself is missing. Match hook.rs's
+/// case-insensitive truthy values without launching an external interpreter.
+/// The install default governs a missing router; an explicit caller request
+/// additionally forbids local IDE/compiler-wrapper placement. The worker's
+/// established bypass remains a trust boundary, not a sandbox escape defence.
+fn shim_refusal_policy(default_strict: bool) -> String {
+    format!(
+        r#"rch_shim_requested=0
+case "${{RCH_REQUIRE_REMOTE-}}" in
+  1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) rch_shim_requested=1 ;;
+esac
+rch_shim_required=$rch_shim_requested
+if [ "${{RCH_REQUIRE_REMOTE+x}}" != x ]; then rch_shim_required={default}; fi
+rch_shim_refuse() {{
+  printf 'rch shim: remote required; refusing local build (%s)\n' "$1" >&2
+  exit 103
+}}
+"#,
+        default = u8::from(default_strict)
+    )
+}
+
+/// One bounded argv classifier for PATH and absolute-toolchain frontends.
+/// It inspects a function-local copy; it never mutates the executed argv.
+fn cargo_shim_classifier() -> &'static str {
+    r#"find_subcommand() {
+  rch_subcommand=
+  case "${1:-}" in +?*) shift ;; esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -v|-vv|-vvv|--verbose|-q|--quiet|--locked|--offline|--frozen) shift ;;
+      --color|--config|-Z|-C)
+        [ "$#" -ge 2 ] || return 0
+        shift 2 ;;
+      --color=?*|--config=?*|-Z?*|-C?*) shift ;;
+      --) shift; break ;;
+      -*) return 0 ;;
+      *) break ;;
+    esac
+  done
+  rch_subcommand="${1:-}"
+}
+find_subcommand "$@"
+rch_shim_build=0
+case "$rch_subcommand" in
+  build|b|test|t|check|c|clippy|bench|doc|nextest|run|r|zigbuild|xwin) rch_shim_build=1 ;;
+esac
+"#
+}
+
 /// Render the `cargo-clippy` shim.
 ///
 /// The `cargo` shim alone does not catch `cargo clippy`: build scripts, CI and
@@ -138,6 +192,7 @@ export RCH_QUEUE_WHEN_BUSY
 ///     it is normalized to `cargo clippy ...` and offloaded.
 fn cargo_clippy_shim_body(require_remote: bool) -> String {
     let offload = shim_offload(require_remote, "cargo clippy");
+    let policy = shim_refusal_policy(require_remote);
     format!(
         r##"#!/bin/sh
 # rch cargo-clippy shim — MANAGED FILE, edit via `rch shim install`.
@@ -146,6 +201,7 @@ fn cargo_clippy_shim_body(require_remote: bool) -> String {
 # Catches DIRECT `cargo-clippy` invocations (scripts, Makefiles, lint gates)
 # that bypass the `cargo` shim entirely by never going through cargo.
 REAL="${{RCH_SHIM_REAL_CARGO_CLIPPY:-$HOME/.cargo/bin/cargo-clippy}}"
+{policy}
 # Cap parallelism on every LOCAL fallback. Local builds never reach rch's slot
 # accounting, so nothing else bounds them — and a repo's own .cargo/config.toml
 # outranks ~/.cargo/config.toml, so a committed `jobs = -1` (= nproc-1) wins over
@@ -153,15 +209,20 @@ REAL="${{RCH_SHIM_REAL_CARGO_CLIPPY:-$HOME/.cargo/bin/cargo-clippy}}"
 # here is the only reliable cap. An explicitly-set CARGO_BUILD_JOBS always wins;
 # tune the default with RCH_LOCAL_MAX_JOBS.
 exec_local() {{
+  if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" != 1 ] && [ "$rch_shim_requested" = 1 ]; then
+    rch_shim_refuse 'local clippy placement conflicts with RCH_REQUIRE_REMOTE'
+  fi
   if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
     CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
     export CARGO_BUILD_JOBS
   fi
   exec "$REAL" "$@"
 }}
-# Loop-break + fail-open, identical contract to the cargo shim.
-if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ] \
-   || ! command -v rch >/dev/null 2>&1 || [ ! -x "$REAL" ]; then
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ]; then
+  exec_local "$@"
+fi
+if ! command -v rch >/dev/null 2>&1; then
+  [ "$rch_shim_required" != 1 ] || rch_shim_refuse 'rch executable unavailable'
   exec_local "$@"
 fi
 # Invoked BY cargo as a subcommand (`cargo-clippy clippy ...`): the outer cargo
@@ -186,6 +247,8 @@ fi
 /// A dispatcher box wants fail-closed; that is the default on install.
 fn cargo_shim_body(require_remote: bool) -> String {
     let offload = shim_offload(require_remote, "cargo");
+    let policy = shim_refusal_policy(require_remote);
+    let classifier = cargo_shim_classifier();
     format!(
         r##"#!/bin/sh
 # rch cargo shim — MANAGED FILE, edit via `rch shim install`.
@@ -211,6 +274,8 @@ fn cargo_shim_body(require_remote: bool) -> String {
 #                            build would actually use);
 #   4. $HOME/.cargo/bin/cargo — the stock rustup proxy, correct wherever rch
 #                            never renamed anything.
+{policy}
+{classifier}
 resolve_real() {{
   if [ -n "${{RCH_REAL_CARGO:-}}" ] && [ -x "$RCH_REAL_CARGO" ]; then
     REAL="$RCH_REAL_CARGO"
@@ -244,6 +309,9 @@ resolve_real() {{
 # here is the only reliable cap. An explicitly-set CARGO_BUILD_JOBS always wins;
 # tune the default with RCH_LOCAL_MAX_JOBS.
 exec_local() {{
+  if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" != 1 ] && [ "$rch_shim_build" = 1 ] && [ "$rch_shim_requested" = 1 ]; then
+    rch_shim_refuse 'local Cargo placement conflicts with RCH_REQUIRE_REMOTE'
+  fi
   if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
     CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
     export CARGO_BUILD_JOBS
@@ -281,13 +349,19 @@ exec_local() {{
   esac
   exec "$REAL" "$@"
 }}
-# Loop-break: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local-fallback exec.
-# Also fail open if rch is unavailable — never block a build.
-if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || ! command -v rch >/dev/null 2>&1; then
+# Trusted worker/re-exec loop-break; explicit remote policy is enforced before
+# any other local build path. Ordinary non-build queries remain available.
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ]; then
   exec_local "$@"
 fi
-# Explicit operator escape hatch: force this one build local.
+# This operator hint may override the install default, not an explicit request.
 if [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ]; then
+  exec_local "$@"
+fi
+if ! command -v rch >/dev/null 2>&1; then
+  if [ "$rch_shim_build" = 1 ] && [ "$rch_shim_required" = 1 ]; then
+    rch_shim_refuse 'rch executable unavailable'
+  fi
   exec_local "$@"
 fi
 # `cargo clippy` runs as: set RUSTC_WORKSPACE_WRAPPER=clippy-driver, then exec an
@@ -319,32 +393,9 @@ for a in "$@"; do
       exec_local "$@" ;;
   esac
 done
-# Inspect a function-local copy of argv. Never shift the caller's arguments or
-# reconstruct a shell command: option values can contain spaces, quotes, and
-# names such as "build". RCH still owns eligibility, topology and placement.
-# Only the first argument can be rustup's +toolchain selector. Unknown options
-# stay local rather than guessing. Recognizing -C does not change cwd here:
-# RCH's source-closure preflight must still approve or refuse that request.
-find_subcommand() {{
-  rch_subcommand=
-  case "${{1:-}}" in +?*) shift ;; esac
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -v|-vv|-vvv|--verbose|-q|--quiet|--locked|--offline|--frozen) shift ;;
-      --color|--config|-Z|-C)
-        [ "$#" -ge 2 ] || return 0
-        shift 2 ;;
-      --color=?*|--config=?*|-Z?*|-C?*) shift ;;
-      --) shift; break ;;
-      -*) return 0 ;;
-      *) break ;;
-    esac
-  done
-  rch_subcommand="${{1:-}}"
-}}
-find_subcommand "$@"
-case "$rch_subcommand" in
-  build|b|test|t|check|c|clippy|bench|doc|nextest|run|r|zigbuild|xwin)
+# Eligibility/topology still belong to RCH; classification changed no argv.
+case "$rch_shim_build" in
+  1)
     {offload} ;;
   *)
     exec_local "$@" ;;
@@ -667,7 +718,9 @@ fn cargo_interception_in(path: &std::ffi::OsStr, shim: &Path, cwd: &Path) -> Int
 /// fallback, so a bypassed build resolves rustc/clippy-driver from THAT
 /// toolchain instead of the rustup proxy's default — mirroring the tiered
 /// resolution of shim v4 (same 2026-08-30 nightly-renamed-cargo incident).
-const TOOLCHAIN_WRAP_VERSION: &str = "3";
+/// `4` refuses known builds when the canonical frontend is missing, unless
+/// explicitly opted out, and lets an intact frontend own its install policy.
+const TOOLCHAIN_WRAP_VERSION: &str = "4";
 
 /// Marker identifying an rch-managed toolchain wrapper (vs. the real binary).
 const TOOLCHAIN_MARKER: &str = "# rch-toolchain-wrap-version:";
@@ -708,6 +761,8 @@ fn toolchain_cargos() -> Vec<PathBuf> {
 /// fallback — otherwise rch's fallback would silently build with the rustup
 /// default toolchain instead of the one the caller explicitly asked for.
 fn toolchain_wrap_body() -> String {
+    let policy = shim_refusal_policy(true);
+    let classifier = cargo_shim_classifier();
     format!(
         r##"#!/bin/sh
 # rch toolchain cargo wrapper — MANAGED FILE, edit via `rch shim install`.
@@ -719,9 +774,14 @@ fn toolchain_wrap_body() -> String {
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REAL="$SELF_DIR/{real}"
 SHIM="$HOME/.rch/shims/cargo"
+{policy}
+{classifier}
 # Same local-parallelism cap as the cargo shim: this path runs the real toolchain
 # cargo directly, so it must not inherit an unbounded `-j` from a repo config.
 exec_local() {{
+  if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" != 1 ] && [ "$rch_shim_build" = 1 ] && [ "$rch_shim_requested" = 1 ]; then
+    rch_shim_refuse 'local toolchain placement conflicts with RCH_REQUIRE_REMOTE'
+  fi
   if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
     CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
     export CARGO_BUILD_JOBS
@@ -733,9 +793,15 @@ exec_local() {{
   export PATH
   exec "$REAL" "$@"
 }}
-# Loop-break + fail-open: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local
-# fallback exec. Never block a build if the shim or rch is missing.
-if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ ! -x "$SHIM" ] || ! command -v rch >/dev/null 2>&1; then
+# The intact canonical shim owns the install policy even if rch is unavailable.
+# Without that frontend, default to refusal for known builds, not local load.
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ]; then
+  exec_local "$@"
+fi
+if [ ! -x "$SHIM" ]; then
+  if [ "$rch_shim_build" = 1 ] && [ "$rch_shim_required" = 1 ]; then
+    rch_shim_refuse 'canonical Cargo shim unavailable'
+  fi
   exec_local "$@"
 fi
 # Preserve toolchain identity through any local fallback.
@@ -1657,7 +1723,7 @@ mod tests {
     }
 
     #[test]
-    fn shim_body_is_loop_safe_and_fail_open() {
+    fn shim_body_preserves_loop_break_and_remote_refusal() {
         let body = cargo_shim_body(true);
         // Honors rch's own bypass and the missing-rch case up front.
         assert!(body.contains("RCH_CARGO_WRAPPER_BYPASS"));
@@ -1798,6 +1864,8 @@ mod tests {
             .env_remove("RCH_CARGO_WRAPPER_BYPASS")
             .env_remove("RCH_SHIM_LOCAL_IDE")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("RCH_REQUIRE_REMOTE")
+            .env_remove("RCH_SPEED_GATE_SHIM_PID")
             .env_remove("RCH_REAL_CARGO")
             .env_remove("RCH_SHIM_REAL_CARGO")
             .env_remove("RCH_SHIM_REAL_CARGO_CLIPPY")
@@ -1836,6 +1904,228 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Missing-router controls have a private PATH with no installed RCH,
+    /// Cargo or compiler. The local sentinel records literal argv; it is not
+    /// represented as a live remote compiler. No user shim is installed.
+    #[cfg(unix)]
+    fn missing_router_output(
+        body: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        canonical: Option<&str>,
+    ) -> std::process::Output {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_exe(&root.join("cargo"), body);
+        let real = root.join(REAL_CARGO_NAME);
+        write_exe(&real, "#!/bin/sh\nprintf '%s\\0' LOCAL \"$@\"\n");
+        // The toolchain wrapper legitimately needs dirname to find its sibling.
+        std::os::unix::fs::symlink("/usr/bin/dirname", root.join("dirname")).unwrap();
+        if let Some(canonical) = canonical {
+            std::fs::create_dir_all(root.join(".rch/shims")).unwrap();
+            write_exe(&root.join(".rch/shims/cargo"), canonical);
+        }
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg(root.join("cargo"))
+            .args(args)
+            .env_clear()
+            .env("HOME", root)
+            .env("PATH", root)
+            .env("RCH_REAL_CARGO", &real)
+            .env("RCH_SHIM_REAL_CARGO_CLIPPY", &real);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        output_retrying_text_busy(&mut command)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_router_respects_remote_only_instead_of_starting_local_builds() {
+        for installed_strict in [false, true] {
+            for (body, args) in [
+                (
+                    cargo_shim_body(installed_strict),
+                    vec!["--locked", "test", "--", "two words", "$(literal)"],
+                ),
+                (
+                    cargo_clippy_shim_body(installed_strict),
+                    vec!["--all-targets"],
+                ),
+            ] {
+                for policy in [
+                    None,
+                    Some("1"),
+                    Some("TrUe"),
+                    Some("YES"),
+                    Some("on"),
+                    Some("0"),
+                ] {
+                    let env = policy
+                        .map(|v| vec![("RCH_REQUIRE_REMOTE", v)])
+                        .unwrap_or_default();
+                    let output = missing_router_output(&body, &args, &env, None);
+                    let strict = policy.map_or(installed_strict, |value| value != "0");
+                    if strict {
+                        assert_eq!(
+                            output.status.code(),
+                            Some(103),
+                            "strict missing-router leak: {installed_strict}/{policy:?}: {output:?}"
+                        );
+                        assert!(output.stdout.is_empty(), "local tool must never start");
+                        assert!(
+                            String::from_utf8_lossy(&output.stderr).contains("remote required")
+                        );
+                    } else {
+                        assert!(output.status.success(), "{output:?}");
+                        let fields = recorded_fields(&output);
+                        assert_eq!(fields[0], b"LOCAL");
+                        assert_eq!(
+                            &fields[1..],
+                            args.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+        for args in [
+            &["metadata"][..],
+            &["--version"][..],
+            &["--config", "test", "metadata"][..],
+        ] {
+            let output = missing_router_output(
+                &cargo_shim_body(true),
+                args,
+                &[("RCH_REQUIRE_REMOTE", "1")],
+                None,
+            );
+            assert!(
+                output.status.success(),
+                "non-build query must remain usable: {output:?}"
+            );
+            assert_eq!(recorded_fields(&output)[0], b"LOCAL");
+        }
+        for args in [
+            &["+nightly", "--offline", "test"][..],
+            &["--config=build.jobs=2", "check"][..],
+        ] {
+            let output = missing_router_output(
+                &cargo_shim_body(true),
+                args,
+                &[("RCH_REQUIRE_REMOTE", "1")],
+                None,
+            );
+            assert_eq!(output.status.code(), Some(103));
+            assert!(output.stdout.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_remote_policy_blocks_local_build_hints_but_retains_worker_bypass() {
+        for installed_strict in [false, true] {
+            for hint in [
+                vec![("RCH_SHIM_LOCAL_IDE", "1")],
+                vec![("RUSTC_WORKSPACE_WRAPPER", "/test/clippy-driver")],
+                vec![],
+            ] {
+                let mut env = vec![("RCH_REQUIRE_REMOTE", "1")];
+                env.extend(hint);
+                let output = record_shim(
+                    &cargo_shim_body(installed_strict),
+                    &argv_bytes(&["test", "--message-format=json-diagnostic-short"]),
+                    &env,
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(103),
+                    "explicit remote-only must not run IDE/wrapper work locally: {output:?}"
+                );
+                assert!(output.stdout.is_empty());
+            }
+            for args in [vec!["clippy", "--all-targets"], vec!["--all-targets"]] {
+                let output = record_shim(
+                    &cargo_clippy_shim_body(installed_strict),
+                    &argv_bytes(&args),
+                    &[("RCH_REQUIRE_REMOTE", "true"), ("RCH_SHIM_LOCAL_IDE", "1")],
+                );
+                assert_eq!(output.status.code(), Some(103));
+                assert!(output.stdout.is_empty());
+            }
+        }
+        for body in [
+            cargo_shim_body(true),
+            cargo_clippy_shim_body(true),
+            toolchain_wrap_body(),
+        ] {
+            let output = missing_router_output(
+                &body,
+                &["test", "--", "a b"],
+                &[
+                    ("RCH_REQUIRE_REMOTE", "1"),
+                    ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ],
+                None,
+            );
+            assert!(
+                output.status.success(),
+                "owned worker bypass must not recurse: {output:?}"
+            );
+            assert_eq!(
+                recorded_fields(&output),
+                vec![b"LOCAL".as_slice(), b"test", b"--", b"a b"]
+            );
+        }
+        let output = record_shim(
+            &cargo_shim_body(true),
+            &argv_bytes(&["--locked", "test"]),
+            &[("RCH_REQUIRE_REMOTE", "1")],
+        );
+        assert!(output.status.success());
+        assert_eq!(recorded_fields(&output)[0], b"RCH");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_toolchain_frontend_refuses_builds_and_preserves_canonical_policy() {
+        let body = toolchain_wrap_body();
+        assert!(
+            body.len() < 8 * 1024,
+            "installed wrapper version detection has a size bound"
+        );
+        for policy in [None, Some("1"), Some("0")] {
+            let env = policy
+                .map(|v| vec![("RCH_REQUIRE_REMOTE", v)])
+                .unwrap_or_default();
+            let output = missing_router_output(&body, &["test"], &env, None);
+            if policy == Some("0") {
+                assert!(output.status.success());
+                assert_eq!(recorded_fields(&output)[0], b"LOCAL");
+            } else {
+                assert_eq!(
+                    output.status.code(),
+                    Some(103),
+                    "missing canonical shim must not silently compile: {output:?}"
+                );
+                assert!(output.stdout.is_empty());
+            }
+        }
+        for strict in [false, true] {
+            let canonical = cargo_shim_body(strict);
+            let output = missing_router_output(&body, &["--locked", "test"], &[], Some(&canonical));
+            assert_eq!(
+                output.status.code(),
+                Some(if strict { 103 } else { 0 }),
+                "canonical install policy must own missing-router fallback: {output:?}"
+            );
+        }
+        let output =
+            missing_router_output(&body, &["metadata"], &[("RCH_REQUIRE_REMOTE", "1")], None);
+        assert!(output.status.success());
+        assert_eq!(recorded_fields(&output)[0], b"LOCAL");
     }
 
     /// The regression this whole change exists for: a plain
@@ -2983,13 +3273,12 @@ esac
     // --- toolchain wrapping -------------------------------------------------
 
     #[test]
-    fn toolchain_wrapper_is_loop_safe_and_fail_open() {
+    fn toolchain_wrapper_preserves_loop_break_and_checks_missing_frontend() {
         let body = toolchain_wrap_body();
-        // Same loop-break contract rch honors on its own local-fallback exec.
+        // Same worker loop-break, with explicit refusal if the router vanished.
         assert!(body.contains("RCH_CARGO_WRAPPER_BYPASS"));
-        // Fail open when the shim is absent or rch is not installed.
         assert!(body.contains(r#"[ ! -x "$SHIM" ]"#));
-        assert!(body.contains("command -v rch"));
+        assert!(body.contains("canonical Cargo shim unavailable"));
         // Toolchain identity must survive a local fallback, else rch would
         // rebuild with the rustup default rather than the requested toolchain.
         assert!(body.contains("RCH_SHIM_REAL_CARGO=\"$REAL\""));

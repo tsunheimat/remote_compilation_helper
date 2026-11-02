@@ -96,6 +96,131 @@ rch exec --verification --cwd /mnt/vibe-coding-share/project \
 rch exec --verification --shell 'npm test && npm run build' --timeout 30m
 ```
 
+### Bounded Linux dispatcher replacement: the first usable deployment
+
+The initial remote-test replacement is deliberately limited to the existing
+Linux controller/worker pair, its existing shared storage, and the project's
+actual Cargo, Go, Python, Node/package-manager and RTK test commands. Do not
+wait for arbitrary-shell interception, a new general-purpose mirror backend,
+more RABS features or a new cache scheduler. An unrecognized project test
+script can use `rch exec --require-remote --verification -- ./scripts/test.sh`;
+put dependency preparation inside that remote script rather than installing
+large dependencies on the controller first.
+
+A usable deployment must satisfy all four outcomes: the covered workloads run
+on the worker, inability to offload does not launch them locally, large writes
+land on the intended data filesystem, and cancellation/results are correct.
+Normal agent/editing/SSH/RCH coordination overhead and small result records
+still use controller resources; this is not a zero-RAM or zero-write promise.
+
+#### Controller policy and installed shim refresh
+
+Launch the controller's agent/CI process with explicit policy, not only the
+shim's install default. Never apply this controller environment to the worker:
+
+```bash
+export RCH_ENABLED=1
+export RCH_REQUIRE_REMOTE=1
+export RCH_QUEUE_WHEN_BUSY=1
+export RCH_VISIBILITY=summary
+unset RCH_FORCE_LOCAL RCH_SHIM_LOCAL_IDE RCH_CARGO_WRAPPER_BYPASS RCH_SHIM_BYPASS
+```
+
+Merge these values into the existing controller configuration (do not append
+duplicate TOML tables or replace the worker/SSH configuration):
+
+```toml
+[general]
+role = "dispatcher"
+
+[compilation]
+allow_local_fallback = false
+```
+
+Cargo shim version 8 and toolchain-wrapper version 4 are needed for the missing
+router correction. Updating `rch` alone does NOT rewrite old installed shims.
+Preview and then explicitly refresh the generic frontends and Cargo frontends
+separately, using the staged/approved binary and the installation steps below.
+Toolchain wrapping and writing an already-active shim directory are activation,
+not a read-only preflight; take the existing migration/rollback snapshot first.
+
+A missing router now refuses recognized Cargo/clippy build requests under a
+strict install policy. Explicit `RCH_REQUIRE_REMOTE=1` (also true/yes/on,
+case-insensitive) additionally refuses conflicting IDE/workspace-wrapper local
+build hints. The trusted `RCH_CARGO_WRAPPER_BYPASS=1` remains for actual remote
+execution and owned re-execution, so it must not leak into the controller agent's
+launch environment. Normal metadata/version queries remain local. Explicit
+remote-only policy also avoids the shim-default speed-gate placement exception.
+An intact toolchain frontend delegates missing-router policy to the canonical
+shim; a missing canonical frontend refuses known builds unless explicitly opted
+out. These are execution-policy rules, not protection against an agent that
+intentionally removes its policy or invokes an unwrapped binary.
+
+#### Worker storage: reuse the existing data disk
+
+Keep the shared mappings described above. Verify the actual backing mount on
+both endpoints, including nested mounts; identical path strings are not proof.
+The following is an example worker execution placement, NOT an instruction to
+create it on the controller or assume that `/srv` is your data disk:
+
+```toml
+[execution.storage]
+root = "/srv/remote-test/cache/rch"
+tmp_mode = "env"
+tmp_retention_hours = 24
+```
+
+Replace that root with an existing approved worker data-disk path. It derives
+package caches and per-job scratch; leave HOME unchanged unless the worker's
+runtimes and registry credentials have been checked under a different HOME.
+For actual workloads that write directly to `/tmp`, use the existing
+`private_mount` mode only after validating worker mount privileges. Do not put
+job scratch in tmpfs merely to avoid disk writes. Cargo target pools remain
+separately owned; do not set a global shared `CARGO_TARGET_DIR` across unrelated
+worktrees. Retain the existing native source-root/mirror mapping for Cargo.
+
+Project-local `.venv`, `node_modules`, reports and coverage files are not all
+package caches. Their shared backing filesystem must also be acceptable. Use
+`findmnt -T`/`df` on both hosts and inspect these actual paths during the first
+run; configuring `execution.storage.root` alone does not move them. If the
+existing shared volume is already the intended data disk, retain it rather
+than building a new storage architecture. Keep controller result/RTK logs in
+its approved bounded storage; ordinary unclassified local tools are not covered
+by the remote cache policy.
+
+#### Finite acceptance and cutover
+
+Use the existing clean-source packaging script below; stage by absolute path
+first. Check the packaged source/binary hashes, worker tool versions, config,
+SSH and mapping before activation. After the operator enables one test agent
+with RCH alone, run the following acceptance against **code1 and the actual
+separate worker**, not two processes on a single test host:
+
+| Check | Required observation |
+| --- | --- |
+| Actual project tests | One representative command for every enabled family (Cargo, Go, Python, Node/npm/pnpm/Bun and RTK as used) runs on the intended worker with correct cwd/environment. Record unused families as not enabled, not as passed. |
+| Entry coverage | The real agent hook output and installed PATH shims both work. Generic `--tools all` does not install Cargo. Check `type -a` and absolute/script entrypoints; known exceptions use explicit verification. |
+| Remote-only failure | A per-invocation nonexistent requested worker with `--require-remote` refuses without executing a harmless workload marker on code1. Also check missing-RCH shim refusal in an isolated test PATH; do not stop a live worker to manufacture this test. |
+| Output and status | A passing and an intentionally failing test return the correct stdout/stderr and exit code. Keep required coverage/artifacts visible through the intended workspace contract. |
+| Cancellation | Cancel one started disposable test; confirm the owned worker process stops and the job/slot settles without replay. |
+| Placement and reuse | Inspect cache/target/tmp/project-output paths after a cold and repeated run. They must remain on the approved filesystems and not create large controller caches or targets. Do not clear global caches to force a cold run. |
+| Replacement independence | Stop remote-test interception for that agent's test environment; RCH must still work without an old shim/hook masking a miss. Preserve the old binaries/configuration as rollback material. |
+
+Use the existing `rch shim status`, `rch agents status`, `rch config validate`
+and `.claude/skills/rch/scripts/validate-setup.sh` as preflight aids, not as a
+substitute for the workload observations above. Explicit verification has its
+own terminal result record (`--json-result FILE`) without consuming workload
+stdout. For a read-only worker identity/cache probe, run a real interpreter
+through that same path and inspect hostname, cwd and the named cache/tmp
+environment variables; do not print credentials or the entire environment.
+
+Once this finite matrix passes, switch the normal agent launch to the approved
+RCH version and retire remote-test interception. Keep only one active hook/shim
+owner. On an acceptance failure, restore the captured launch/configuration
+rather than deleting source/cache or automatically replaying an uncertain job.
+The consumer of this section is the operator's code1 cutover; it is not a claim
+that activation or distinct-host acceptance has already occurred.
+
 ### Package the committed candidate
 
 On a compatible Linux build host with the pinned toolchain installed, use
