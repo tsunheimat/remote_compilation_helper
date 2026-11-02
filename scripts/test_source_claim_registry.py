@@ -474,19 +474,78 @@ class SourceAdmission105Tests(unittest.TestCase):
         self.assertEqual(self.fixture.run("aa", self.roots, "cancel").returncode, 73)
 
     def test_pending_sync_error_cannot_be_mistaken_for_retryable_contention(self):
-        sync = shutil.which("sync")
-        self.assertIsNotNone(sync)
-        shim = self.root / "tools/sync"
-        shim.write_text(
-            '#!/bin/sh\ncase "${2-}" in *.pending) exit 75;; esac\n'
-            f'exec {shlex.quote(sync)} "$@"\n', encoding="utf-8",
-        )
+        # The transaction now uses direct Python fsync, not a utility subprocess.
+        # Observe its actual descriptor after the production open/type checks.
+        # Exit 75 at exactly the pending-record barrier must still mean an
+        # unconfirmed transaction (73), never retryable source contention (75).
+        tools = self.root / "tools"
+        real_python = str(Path(sys.executable).resolve())
+        probe = tools / "pending_fsync_probe.py"
+        probe.write_text(r'''
+import json, os, sys
+args = sys.argv[1:]
+real_python = os.environ['RCH_TEST_REAL_PYTHON']
+if len(args) < 4 or args[:3] != ['-I', '-S', '-c'] or 'os.fsync(' not in args[3]:
+    os.execv(real_python, [real_python] + args)
+real_open, real_fsync = os.open, os.fsync
+opened = {}
+def observe_open(path, flags, *rest, **keywords):
+    fd = real_open(path, flags, *rest, **keywords)
+    opened[fd] = os.fsdecode(path)
+    return fd
+def record(path, phase):
+    with open(os.environ['RCH_TEST_FSYNC_TRACE'], 'a') as stream:
+        stream.write(json.dumps({'path': path, 'phase': phase}) + '\n')
+def observe_fsync(fd):
+    path = opened[fd]
+    if path == os.environ['RCH_TEST_PENDING_PATH']:
+        record(path, 'entered')
+        if os.environ['RCH_TEST_FAIL_PENDING'] == '1':
+            os._exit(75)
+        real_fsync(fd)
+        record(path, 'confirmed')
+        return
+    return real_fsync(fd)
+os.open, os.fsync = observe_open, observe_fsync
+sys.argv = ['-c'] + args[4:]
+exec(compile(args[3], '<production-pending-fsync>', 'exec'))
+''', encoding="utf-8")
+        shim = tools / "python3"
+        shim.write_text("#!/bin/sh\nexec " + shlex.quote(real_python) + " -I -S "
+                        + shlex.quote(str(probe)) + ' "$@"\n', encoding="utf-8")
         shim.chmod(0o700)
+        broad = tools / "sync"
+        broad.write_text('#!/bin/sh\necho unexpected-global-sync >&2\nexit 97\n', encoding="utf-8")
+        broad.chmod(0o700)
+        pending = self.fixture.path("bb", self.roots, "pending")
+        trace = self.root / "pending-fsync.jsonl"
+        self.fixture.env.update({
+            "RCH_TEST_REAL_PYTHON": real_python,
+            "RCH_TEST_FSYNC_TRACE": str(trace),
+            "RCH_TEST_PENDING_PATH": str(pending),
+            "RCH_TEST_FAIL_PENDING": "1",
+        })
         result = self.fixture.run("bb", self.roots, "try-acquire")
         self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"unexpected-global-sync", result.stderr)
         self.assertFalse(self.fixture.path("bb", self.roots).exists())
-        self.assertEqual(self.fixture.path("bb", self.roots, "pending").read_bytes(),
-                         root_bytes(self.roots))
+        self.assertEqual(pending.read_bytes(), root_bytes(self.roots))
+        self.assertEqual([json.loads(line) for line in trace.read_text().splitlines()],
+                         [{"path": str(pending), "phase": "entered"}])
+
+        # Positive control uses the same interceptor and a disjoint source;
+        # it performs a real fsync rather than making every transaction refuse.
+        roots = [str(self.root / "independent-source")]
+        successful_pending = self.fixture.path("cc", roots, "pending")
+        self.fixture.env.update({"RCH_TEST_PENDING_PATH": str(successful_pending),
+                                 "RCH_TEST_FAIL_PENDING": "0"})
+        self.accepted(self.fixture.run("cc", roots, "try-acquire"))
+        self.assertEqual(self.fixture.path("cc", roots).read_bytes(), root_bytes(roots))
+        self.assertEqual(pending.read_bytes(), root_bytes(self.roots))
+        self.assertEqual([json.loads(line) for line in trace.read_text().splitlines()][1:],
+                         [{"path": str(successful_pending), "phase": "entered"},
+                          {"path": str(successful_pending), "phase": "confirmed"}])
 
     def test_sequential_commands_on_one_worker_wait_for_exact_release(self):
         # The first command is complete, but its ownership release is delayed.

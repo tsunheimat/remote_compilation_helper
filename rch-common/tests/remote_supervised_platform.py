@@ -2,6 +2,8 @@
 """Run the exact embedded rch-build supervisor, not the legacy watchdog tail.
 
 SupervisedPlatform uses native Linux/macOS identities without platform mocks.
+Complete-witness helper controls use a stable, owned native group; the other
+cases retain the real supervisor/watchdog, including incomplete-census refusal.
 DarwinPrimitives selects Darwin's portable syscall adapters explicitly, also
 on Linux; those tests are not native libproc or macOS qualification. Darwin
 needs the candidate rch-wkr and Python 3.7+ (the harness needs Python 3.9+).
@@ -104,7 +106,14 @@ class SupervisedPlatform(unittest.TestCase):
     def wait_ready(self, child):
         until = time.monotonic() + 15
         while not self.ready.exists():
-            self.assertIsNone(child.poll(), f"setup failed; fixtures: {self.root}")
+            status = child.poll()
+            if status is not None:
+                error = self.root / f"err-{self.children.index(child)}"
+                with error.open('rb') as stream:
+                    stream.seek(0, os.SEEK_END)
+                    stream.seek(max(0, stream.tell() - 4096))
+                    diagnostic = stream.read().decode(errors='replace')
+                self.fail(f"setup failed ({status}); fixtures: {self.root}; stderr: {diagnostic}")
             self.assertLess(time.monotonic(), until, f"setup stalled: {self.root}")
             time.sleep(.02)
         self.assertTrue(self.receipt.exists())
@@ -114,9 +123,60 @@ class SupervisedPlatform(unittest.TestCase):
         return (f"printf ready > {shlex.quote(str(self.ready))}; "
                 f"while [ ! -f {shlex.quote(str(self.release))} ]; do sleep .1; done")
 
-    def observe(self, body):
-        return subprocess.run([SHELL, "-c", PROTOCOL + "\n" + body], env=self.env,
+    def observe(self, body, protocol=PROTOCOL):
+        return subprocess.run([SHELL, "-c", protocol + "\n" + body], env=self.env,
                               capture_output=True, timeout=30)
+
+    def start_stable_witness(self):
+        # Complete collection needs a stable census. The real supervisor's
+        # watchdog repeatedly starts short-lived helpers; their disappearance
+        # correctly refuses partial witnesses and selects immediate KILL. That
+        # is not a valid positive fixture for an assertion requiring TERM.
+        # This one-process native group has a genuine production identity
+        # record and no changing descendants. Other tests still exercise the
+        # entire supervisor/watchdog, deadlines and incomplete-census behavior.
+        out = open(self.root / f"out-{len(self.children)}", "w+b")
+        err = open(self.root / f"err-{len(self.children)}", "w+b")
+        self.addCleanup(out.close)
+        self.addCleanup(err.close)
+        payload = ("import pathlib, signal, sys; "
+                   "pathlib.Path(sys.argv[1]).write_text('ready'); signal.pause()")
+        child = subprocess.Popen(
+            [SHELL, "-c", PROTOCOL + '\nrch_remote_record "$1" 115 || exit $?; '
+             'exec "$2" -I -S -c "$3" "$4"',
+             "rch-stable-witness", str(self.receipt), sys.executable, payload, str(self.ready)],
+            env=self.env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+            start_new_session=True,
+        )
+        self.children.append(child)
+        until = time.monotonic() + 15
+        while not self.ready.exists():
+            self.assertIsNone(child.poll(), self.contents(err).decode(errors="replace"))
+            self.assertLess(time.monotonic(), until, f"native group setup stalled: {self.root}")
+            time.sleep(.02)
+        self.assertTrue(self.receipt.exists())
+        return child, out, err
+
+    def observe_capture_fault(self, body):
+        # Restrict exchange faults to the bounded witness helper. Darwin also
+        # uses rch_control_capture for native leader identity; corrupting that
+        # unrelated 1s call tests missing authority (43), not invalid witnesses.
+        marker = "rch_control_capture() {"
+        self.assertEqual(CORE.count(marker), 1)
+        core = CORE.replace(marker, "rch_fixture_real_capture() {", 1)
+        trace = shlex.quote(str(self.root / "capture-exchanges"))
+        core += '''
+rch_control_capture() {
+    if [ "${rch_fixture_capture_status+x}" = x ] &&
+        [ "${1-}:${2-}:${3-}:${5-}" = '5s:/bin/sh:-c:rch-witnesses' ]; then
+        printf '%s\\n' "$rch_fixture_capture_status" >> ''' + trace + '''
+        printf '%s\\n' "$rch_fixture_capture_output"
+        return "$rch_fixture_capture_status"
+    fi
+    rch_fixture_real_capture "$@"
+}
+'''
+        return self.observe(body, protocol=PROTOCOL.replace(CORE, core, 1))
 
     def cancel(self, mode="term"):
         return self.observe(f"rch_remote_cancel {shlex.quote(str(self.receipt))} 115 {mode}")
@@ -253,8 +313,7 @@ rch_read_process() {
         self.assertNotEqual(run[0].wait(timeout=10), 0)
 
     def test_complete_collection_retains_graceful_term(self):
-        run = self.start(self.blocking_payload())
-        self.wait_ready(run[0])
+        run = self.start_stable_witness()
         result, _, signals = self.cancel_with_probe('''
 rch_read_process() { rch_real_read_process "$1"; }
 ''')
@@ -291,21 +350,23 @@ rch_remote_witness_matches
         self.assertEqual(self.cancel("kill").returncode, 0)
 
     def test_partial_and_malformed_collection_never_leaks_witnesses(self):
-        run = self.start(self.blocking_payload())
-        self.wait_ready(run[0])
+        run = self.start_stable_witness()
         for output, code in (("123:456", 7), ("", 0), ("123", 0),
                              ("123:0", 0), ("1:456", 0), ("123:456:789", 0)):
             with self.subTest(output=output, status=code):
-                result = self.observe(f'''
+                result = self.observe_capture_fault(f'''
 rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
 rch_group_state; [ "$?" = 1 ] || exit 81
-rch_control_capture() {{ printf '%s\\n' {shlex.quote(output)}; return {code}; }}
+rch_fixture_capture_output={shlex.quote(output)}
+rch_fixture_capture_status={code}
 rch_witnesses=stale; rch_witness_identity=stale
 rch_capture_group_witnesses
 [ "$?" = 46 ] && [ -z "$rch_witnesses$rch_witness_identity" ] || exit 82
 ''')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIsNone(run[0].poll())
+        self.assertEqual((self.root / "capture-exchanges").read_text().splitlines(),
+                         ['7', '0', '0', '0', '0', '0'])
         self.assertEqual(self.cancel("kill").returncode, 0)
 
     def test_collection_failure_does_not_bypass_live_birth_check(self):
@@ -322,24 +383,26 @@ rch_remote_cancel {shlex.quote(str(self.receipt))} 115 term
         self.assertEqual(self.cancel("kill").returncode, 0)
 
     def test_bounded_witness_match_preserves_birth_and_exchange_fences(self):
-        run = self.start(self.blocking_payload())
-        self.wait_ready(run[0])
-        result = self.observe(f'''
+        run = self.start_stable_witness()
+        result = self.observe_capture_fault(f'''
 rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
 rch_group_state; [ "$?" = 1 ] || exit 81
 rch_capture_group_witnesses || exit 82
 rch_remote_witness_matches || exit 83
 rch_witnesses="$rch_pgid:$((rch_start + 1))"
 if rch_remote_witness_matches; then exit 84; fi
-rch_control_capture() {{ printf 'RCH_WITNESS_MATCH_V1\\n'; return 7; }}
+rch_fixture_capture_output=RCH_WITNESS_MATCH_V1
+rch_fixture_capture_status=7
 if rch_remote_witness_matches; then exit 85; fi
-rch_control_capture() {{ printf 'RCH_WITNESS_MATCH_V1 contaminated\\n'; }}
+rch_fixture_capture_output='RCH_WITNESS_MATCH_V1 contaminated'
+rch_fixture_capture_status=0
 if rch_remote_witness_matches; then exit 86; fi
 rch_witness_identity=stale
-rch_control_capture() {{ exit 87; }}
+rch_fixture_capture_status=87
 if rch_remote_witness_matches; then exit 88; fi
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "capture-exchanges").read_text().splitlines(), ['7', '0'])
         self.assertIsNone(run[0].poll())
         self.assertEqual(self.cancel("kill").returncode, 0)
 

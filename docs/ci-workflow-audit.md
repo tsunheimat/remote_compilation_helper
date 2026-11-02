@@ -67,9 +67,9 @@ notification for weekly drift notification; no channel is removed.
 | `test-release.yml` | Reusable/manual six-platform shipping build, smoke test and archive verification. No independent PR trigger. |
 | `rabs-binaries.yml` | Source-filtered PR/main or manual native installer and release-only RABS gates. |
 | `release.yml` | Explicit tag/manual release, artifact integrity/provenance and publication. Intel runner aligned to `macos-15-intel`; upstream crate publication is skipped for the fork. |
-| `durable-execution.yml` | Source-filtered main/manual exact formatter, supervisor-loss and real source-registry tests; read-only, no patch-to-main job. |
+| `durable-execution.yml` | Source-filtered PR/main or manual exact formatter, supervisor-loss and real source-registry tests; read-only, no patch-to-main job. |
 | `source-content-ssh.yml` | Source-filtered main/manual real SSH/rsync integrity tests; historical publication job removed. |
-| `remote-process-platform.yml` | Source-filtered main/manual native Linux/macOS identity, timeout and owned-process lifecycle; duplicate workspace lint/check removed. |
+| `remote-process-platform.yml` | Source-filtered PR/main or manual native Linux/macOS identity, timeout and owned-process lifecycle; duplicate workspace lint/check removed. |
 | `rsync-paths.yml` | Source-filtered main/manual real modern Linux and stock legacy macOS rsync argument behavior. |
 | `managed-pool.yml` | Source-filtered main/manual real policy under checked and optimized arithmetic, including Windows. |
 | `update-lock.yml` | Source-filtered PR/main or manual native cross-process ownership on Linux, Windows and macOS; the independently generated stable manifest is checked before merge, while full-client validation remains with the workspace owner. |
@@ -83,6 +83,36 @@ before Linux tests could run; macOS and Windows passed. The same existing lane
 now checks only relevant PR paths as well, so generated-manifest drift is not
 first discovered after merge. Platform coverage, assertions and the 15-minute
 job limit are unchanged; this adds no workflow file or full-client rebuild.
+
+### Standalone protocol checks must run before merge
+
+Main-push runs 41380337883 and 41380337862 exposed standalone fixture drift
+not covered by the already-passing PR workspace jobs. The same two workflows
+now include matching source-filtered PR triggers; they retain their existing
+Linux/macOS matrices, assertions, read-only permissions and job budgets. No new
+workflow file or duplicate full-workspace compiler job is added.
+
+The durable renderer fixture compiles the unchanged production method together
+with all three fsync-rendering helpers using the selected toolchain. Both its
+default invocation and `--native` run that compiled formatter; the independent
+Python template fallback is removed. The registry fault test intercepts the
+actual pending-file descriptor flush, requires failure 73 rather than treating
+an injected 75 as retryable contention, preserves the pending evidence, and
+checks a successful real-fsync control with the same interceptor.
+
+Complete-witness controls use a stable, test-owned native process group. A
+supervisor watchdog starts transient helpers whose disappearance legitimately
+prevents complete witness collection; that cannot be used as a positive fixture
+requiring TERM. The remaining cases still exercise the real supervisor and its
+conservative fallback. Malformed-exchange injection targets only the witness
+exchange, never Darwin's separate native leader-identity probe. Failed setup
+retains a bounded stderr excerpt rather than only a temporary-directory name.
+
+Local native descriptor tests must resolve the native interpreter, not an outer
+development-transport tool shim. A recorded control showed the latter reopening
+closed stdin/stderr as `/dev/null`; the direct interpreter preserved their
+absence. This is a test-environment boundary, not permission to relax closed-FD
+assertions or bypass remote admission. Hosted platform checks remain required.
 
 ### Intel profile packaging and qualification caches
 

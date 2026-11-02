@@ -1,6 +1,18 @@
 name: Remote process platform identity
 
 on:
+  pull_request:
+    paths:
+      - 'rch-common/src/process_identity.rs'
+      - 'rch-common/src/remote_process.sh'
+      - 'rch-common/src/remote_scoped_launch.rs'
+      - 'rch-common/src/remote_scoped_launch.sh'
+      - 'rch-common/tests/remote_supervised_platform.py'
+      - 'rch-common/tests/remote_process_platform.py'
+      - 'rch-common/tests/remote_control_timeout.py'
+      - 'rch-wkr/src/main.rs'
+      - 'rch/src/transfer.rs'
+      - '.github/workflows/remote-process-platform.yml'
   push:
     branches: [main]
     paths:
