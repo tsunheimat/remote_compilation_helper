@@ -123,9 +123,9 @@ class SupervisedPlatform(unittest.TestCase):
         return (f"printf ready > {shlex.quote(str(self.ready))}; "
                 f"while [ ! -f {shlex.quote(str(self.release))} ]; do sleep .1; done")
 
-    def observe(self, body, protocol=PROTOCOL):
+    def observe(self, body, protocol=PROTOCOL, timeout=30):
         return subprocess.run([SHELL, "-c", protocol + "\n" + body], env=self.env,
-                              capture_output=True, timeout=30)
+                              capture_output=True, timeout=timeout)
 
     def start_stable_witness(self):
         # Complete collection needs a stable census. The real supervisor's
@@ -186,6 +186,71 @@ rch_control_capture() {
             f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; rch_group_state")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def assert_crash_cleanup(self, until):
+        # A killed leader does not produce a terminal-success acknowledgement.
+        # Its surviving watchdog cleans asynchronously. Within the caller's
+        # ORIGINAL crash budget, require a fresh affirmative empty census;
+        # neither a live group nor unavailable evidence is success. Normal
+        # successful-completion tests still use immediate assert_empty().
+        states = []
+        diagnostic = b''
+        while True:
+            remaining = until - time.monotonic()
+            self.assertGreater(remaining, 0,
+                               f"crash cleanup not confirmed; states={states}; "
+                               f"stderr={diagnostic!r}; fixture={self.root}")
+            try:
+                result = self.observe(
+                    f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; rch_group_state",
+                    timeout=remaining,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail(f"crash cleanup observer exceeded its total deadline; states={states}; "
+                          f"fixture={self.root}")
+            states.append(result.returncode)
+            diagnostic = result.stderr[-4096:]
+            self.assertLess(time.monotonic(), until, f"late cleanup evidence: {states}")
+            self.assertIn(result.returncode, (0, 1, 2), diagnostic)
+            if result.returncode == 0:
+                return states
+            time.sleep(min(.05, max(0, until - time.monotonic())))
+
+    def test_crash_cleanup_requires_positive_census_and_preserves_total_deadline(self):
+        from unittest.mock import patch
+
+        run = self.start_stable_witness()
+        # A real live group cannot pass merely by exhausting the wait budget.
+        with self.assertRaises(AssertionError):
+            self.assert_crash_cleanup(time.monotonic() + .2)
+        self.assertIsNone(run[0].poll())
+        self.assertEqual(self.cancel("kill").returncode, 0)
+        run[0].wait(timeout=5)
+        native_observe = self.observe
+        calls = []
+
+        def transient(body, **kwargs):
+            calls.append(body)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess([], 2, b'', b'explicit unavailable-census fault')
+            return native_observe(body, **kwargs)
+
+        # Exactly one injected unavailable observation followed by real native
+        # absence is a valid asynchronous cleanup, not an unknown-as-success.
+        with patch.object(self, 'observe', side_effect=transient):
+            states = self.assert_crash_cleanup(time.monotonic() + 8)
+        self.assertEqual(states[0], 2)
+        self.assertEqual(states[-1], 0)
+        self.assertGreaterEqual(len(calls), 2)
+        with patch.object(self, 'observe', return_value=subprocess.CompletedProcess([], 2, b'', b'unknown')):
+            with self.assertRaises(AssertionError):
+                self.assert_crash_cleanup(time.monotonic() + .1)
+        with patch.object(self, 'observe', return_value=subprocess.CompletedProcess([], 43, b'', b'wrong identity')):
+            with self.assertRaises(AssertionError):
+                self.assert_crash_cleanup(time.monotonic() + 8)
+        with patch.object(self, 'observe', side_effect=subprocess.TimeoutExpired('owned census', .1)):
+            with self.assertRaises(AssertionError):
+                self.assert_crash_cleanup(time.monotonic() + .1)
+
     def test_status_and_binary_stdin_survive_supervision(self):
         data = b"original\x00input\nlast\xff"
         with tempfile.TemporaryFile() as source:
@@ -232,7 +297,7 @@ rch_control_capture() {
         self.assertEqual(result.returncode, 0, result.stderr)
         started = time.monotonic()
         self.assertNotEqual(run[0].wait(timeout=8), 0)
-        self.assert_empty()
+        self.assert_crash_cleanup(started + 8)
         self.assertLess(time.monotonic() - started, 8)
 
     def test_deadline_stops_group_and_emits_marker(self):
