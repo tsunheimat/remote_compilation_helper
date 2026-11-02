@@ -157,7 +157,7 @@ class SupervisedPlatform(unittest.TestCase):
         self.assertTrue(self.receipt.exists())
         return child, out, err
 
-    def observe_capture_fault(self, body):
+    def observe_capture_fault(self, body, timeout=30):
         # Restrict exchange faults to the bounded witness helper. Darwin also
         # uses rch_control_capture for native leader identity; corrupting that
         # unrelated 1s call tests missing authority (43), not invalid witnesses.
@@ -176,7 +176,42 @@ rch_control_capture() {
     rch_fixture_real_capture "$@"
 }
 '''
-        return self.observe(body, protocol=PROTOCOL.replace(CORE, core, 1))
+        return self.observe(body, protocol=PROTOCOL.replace(CORE, core, 1), timeout=timeout)
+
+    def observe_live_capture_fault(self, body, budget=5):
+        # Malformed-reply tests need an authenticated LIVE census as setup.
+        # Darwin can legitimately report unknown for a global ps snapshot; do
+        # not confuse an unavailable prerequisite with the injected reply's
+        # verdict. Only that pre-fault unknown is retried, within a SINGLE
+        # five-second bound (stricter than observe's former 30-second limit).
+        # A disappeared/invalid owner or any result AFTER injection is returned
+        # once, never retried into a green test. All six fault deliveries are
+        # still counted independently by capture-exchanges.
+        prefix = f'''
+rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
+rch_group_state
+case "$?" in
+    1) ;;
+    2) printf 'RCH_FIXTURE_CENSUS_UNAVAILABLE\\n' >&2; exit 79 ;;
+    *) exit 81 ;;
+esac
+'''
+        until = time.monotonic() + budget
+        unavailable = 0
+        while True:
+            remaining = until - time.monotonic()
+            self.assertGreater(remaining, 0,
+                               f"live witness setup not confirmed; unknown={unavailable}; fixture={self.root}")
+            try:
+                result = self.observe_capture_fault(prefix + body, timeout=remaining)
+            except subprocess.TimeoutExpired:
+                self.fail(f"live witness setup/exchange exceeded its total bound; fixture={self.root}")
+            self.assertLess(time.monotonic(), until, "late witness fixture evidence")
+            if (result.returncode != 79 or result.stdout or
+                    result.stderr != b'RCH_FIXTURE_CENSUS_UNAVAILABLE\n'):
+                return result
+            unavailable += 1
+            time.sleep(min(.05, max(0, until - time.monotonic())))
 
     def cancel(self, mode="term"):
         return self.observe(f"rch_remote_cancel {shlex.quote(str(self.receipt))} 115 {mode}")
@@ -414,14 +449,51 @@ rch_remote_witness_matches
         self.assertIsNone(run[0].poll(), "failed witness probe signalled the workload")
         self.assertEqual(self.cancel("kill").returncode, 0)
 
+    def test_witness_fixture_requires_live_setup_and_never_retries_fault_results(self):
+        from unittest.mock import patch
+
+        run = self.start_stable_witness()
+        native = self.observe_capture_fault
+        calls = []
+
+        def unavailable_once(body, **kwargs):
+            calls.append(body)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess([], 79, b'', b'RCH_FIXTURE_CENSUS_UNAVAILABLE\n')
+            return native(body, **kwargs)
+
+        fault = '''
+rch_fixture_capture_output=123
+rch_fixture_capture_status=0
+rch_capture_group_witnesses
+[ "$?" = 46 ] && [ -z "$rch_witnesses$rch_witness_identity" ] || exit 82
+'''
+        with patch.object(self, 'observe_capture_fault', side_effect=unavailable_once):
+            self.assertEqual(self.observe_live_capture_fault(fault).returncode, 0)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual((self.root / 'capture-exchanges').read_text().splitlines(), ['0'])
+        for code in (80, 81, 82):
+            with self.subTest(code=code):
+                result = subprocess.CompletedProcess([], code, b'', b'identity/absence/fault failure')
+                with patch.object(self, 'observe_capture_fault', return_value=result) as observer:
+                    self.assertEqual(self.observe_live_capture_fault(fault).returncode, code)
+                    self.assertEqual(observer.call_count, 1)
+        unavailable = subprocess.CompletedProcess([], 79, b'', b'RCH_FIXTURE_CENSUS_UNAVAILABLE\n')
+        with patch.object(self, 'observe_capture_fault', return_value=unavailable):
+            with self.assertRaises(AssertionError):
+                self.observe_live_capture_fault(fault, budget=.1)
+        with patch.object(self, 'observe_capture_fault', side_effect=subprocess.TimeoutExpired('census', .1)):
+            with self.assertRaises(AssertionError):
+                self.observe_live_capture_fault(fault, budget=.1)
+        self.assertIsNone(run[0].poll())
+        self.assertEqual(self.cancel('kill').returncode, 0)
+
     def test_partial_and_malformed_collection_never_leaks_witnesses(self):
         run = self.start_stable_witness()
         for output, code in (("123:456", 7), ("", 0), ("123", 0),
                              ("123:0", 0), ("1:456", 0), ("123:456:789", 0)):
             with self.subTest(output=output, status=code):
-                result = self.observe_capture_fault(f'''
-rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
-rch_group_state; [ "$?" = 1 ] || exit 81
+                result = self.observe_live_capture_fault(f'''
 rch_fixture_capture_output={shlex.quote(output)}
 rch_fixture_capture_status={code}
 rch_witnesses=stale; rch_witness_identity=stale
