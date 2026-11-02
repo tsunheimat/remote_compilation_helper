@@ -816,6 +816,48 @@ class DarwinPrimitives(unittest.TestCase):
         return subprocess.run([SHELL, "-c", source], input=data, env=env,
                               capture_output=True, start_new_session=True, timeout=10)
 
+    def test_native_darwin_unknown_state_is_scoped_to_the_target_group(self):
+        # macOS artifact13127873747 contained a valid unrelated `?<` row:
+        # pid28119/group965 invalidated live group27856 and aborted admission.
+        # Apple ps/tasks.c defines H and ? in mach_state_table. These are not
+        # malformed records. An unknown TARGET state must remain unknown;
+        # no parser result here grants signal authority or replays a workload.
+        cases = (
+            ('unrelated unknown, live target', '42 42 S<\n51 965 ?<', 1, True),
+            ('unrelated unknown, empty target', '51 965 ?<', 0, True),
+            ('unrelated unknown, zombie target', '42 42 Z\n51 965 ?<', 0, True),
+            ('halted target is not terminal', '42 42 H', 1, True),
+            ('unknown target cannot prove absence', '42 42 ?<', 2, True),
+            ('live member cannot hide unknown target', '42 42 S\n43 42 ?', 2, True),
+            ('zombie cannot hide unknown target', '42 42 Z\n43 42 ?', 2, True),
+            ('ordinary live target', '42 42 R+', 1, True),
+            ('ordinary empty target', '51 965 S', 0, True),
+            ('malformed unrelated state', '51 965 !', 2, True),
+            ('future unsupported state', '51 965 Q', 2, True),
+            ('unknown state with invalid suffix', '51 965 ?!', 2, True),
+            ('malformed pid', 'invalid 965 ?', 2, True),
+            ('malformed group', '51 invalid ?', 2, True),
+            ('missing field', '51 965', 2, True),
+            ('extra field', '51 965 ? extra', 2, True),
+            ('duplicate pid', '51 965 S\n51 965 ?', 2, True),
+            ('missing observer', '51 965 ?', 2, False),
+        )
+        for name, rows, expected, observer in cases:
+            with self.subTest(name=name):
+                observed = 'printf "%s 4241 S\\n" "$$"' if observer else ':'
+                result = self.run_adapter(f'''
+rch_pgid=42
+rch_scope_bound=0
+rch_control_capture() {{
+    [ "$#" = 4 ] && [ "$1:$2:$3:$4" = '1s:ps:-axo:pid=,pgid=,stat=' ] || return 125
+    {observed}
+    printf '%s\\n' {shlex.quote(rows)}
+}}
+rch_group_state
+''')
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stdout, b'')
+
     def site_environment(self):
         # A real isolated venv, not a fake python executable. -I still loads
         # its .pth hooks; every RCH-owned helper must also request -S.
