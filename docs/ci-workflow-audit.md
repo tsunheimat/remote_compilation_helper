@@ -72,8 +72,17 @@ notification for weekly drift notification; no channel is removed.
 | `remote-process-platform.yml` | Source-filtered main/manual native Linux/macOS identity, timeout and owned-process lifecycle; duplicate workspace lint/check removed. |
 | `rsync-paths.yml` | Source-filtered main/manual real modern Linux and stock legacy macOS rsync argument behavior. |
 | `managed-pool.yml` | Source-filtered main/manual real policy under checked and optimized arithmetic, including Windows. |
-| `update-lock.yml` | Source-filtered main/manual native cross-process ownership on Linux, Windows and macOS; duplicate full-client validation moved to the workspace owner. |
+| `update-lock.yml` | Source-filtered PR/main or manual native cross-process ownership on Linux, Windows and macOS; the independently generated stable manifest is checked before merge, while full-client validation remains with the workspace owner. |
 | `wrapper-contract.yml` | Weekly/manual external Rust channel drift, all three channels in one build. |
+
+The updater ownership lane copies exact production modules into a separate
+stable-toolchain crate. Its generated manifest must declare `rustix` for Unix,
+not just macOS: the Linux process observer also uses it, and a transitive copy
+cannot satisfy a direct import. Main-push run 40802227637 exposed that omission
+before Linux tests could run; macOS and Windows passed. The same existing lane
+now checks only relevant PR paths as well, so generated-manifest drift is not
+first discovered after merge. Platform coverage, assertions and the 15-minute
+job limit are unchanged; this adds no workflow file or full-client rebuild.
 
 ### Intel profile packaging and qualification caches
 
@@ -89,10 +98,37 @@ component's source commit, target, profile, member names and byte digests before
 assembly. The final archive is checked and executed on Intel macOS, then joins
 the other five targets in the existing all-platform verifier. The component
 self-test uses synthetic bytes, not real compiler outputs. This helper can be
-removed when Intel returns to one complete build job; do not retain an unused
-manifest/certificate path. The workflow count remains twelve, not twelve jobs.
+removed when neither shipping nor E2E needs a split-build handoff; do not
+retain an unused manifest/certificate path. The workflow count remains twelve, not twelve jobs.
 The separate signed-release publication workflow is unchanged and is not
 qualified merely by this candidate-packaging change.
+
+### E2E application preparation is separate from test execution
+
+CI run 40681529196's macOS E2E job exceeded its unchanged 90-minute cap:
+release preparation took 47m42s, then the first debug application build took
+17m55s and the cancellation scenario's test graph took 14m17s. Only 31 of the
+41 scripts had completed when the job was cancelled; that is a failed run,
+not an E2E pass. Its retained artifact and job annotation establish the split
+between build and test time, not a product workload timeout.
+
+`e2e.yml` now runs native release preparation in a separate required job per OS.
+Each preparation and test job retains the prior OS-specific 120/90-minute cap;
+possible aggregate runner allocation increases. The compiler profile/flags,
+all 41 discovered scripts, Linux Cargo/mock-SSH paths, and all product budgets
+are unchanged. Build/test cache keys are separate. The same-run artifact must
+match commit, native target, release profile, exact three applications and
+hashes before any tests can consume it. The existing component helper restores
+executable permissions and replaces only those named cached applications;
+missing/mismatched/tampered inputs fail rather than silently invoking stale
+cached binaries. Native source-stamped version checks run on both sides.
+
+The helper's added nine cases use synthetic payloads and reject mismatched
+source/target/profile, missing/extra members, changed bytes and unsafe links.
+They do not establish that native hosted E2E has completed. Application
+artifacts have a separate name prefix and are not ingested as scenario results.
+The reusable E2E workflow must succeed as a whole; an informational aggregate
+cannot override a failed build or cancelled test job.
 
 For local cross-worktree qualification, do not share one Cargo output directory
 across different source roots. A native reproduction switched from source B to

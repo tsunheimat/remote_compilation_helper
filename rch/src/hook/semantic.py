@@ -340,7 +340,43 @@ def family(words: list[Word], depth: int = 0) -> bool:
             i += 2 if values[i] in {"--project", "--directory", "--package", "--python", "--with", "--group"} else 1
         return family(args[i:], depth + 1)
     if exe == "node":
-        return bool(values and (values[0] == "--test" or values[0].startswith("--test=")))
+        # Node allows literal options before --test. Consume each option's
+        # value first: `--require --test app.js` is NOT test-runner evidence.
+        # Stop on a script, --, eval/print, unknown flag or dynamic prefix;
+        # never scan arbitrary script arguments for a later --test string.
+        # These prefixes mirror the native classifier's bounded option set.
+        # Once test mode is established, preserve the existing shared-workspace
+        # trailing-argument contract; native stream-only restrictions differ.
+        taking_value = {"--require", "-r", "--import", "--loader", "--experimental-loader",
+                        "--test-name-pattern", "--test-skip-pattern", "--test-concurrency",
+                        "--test-timeout", "--test-shard", "--test-reporter"}
+        standalone = {"--test-only", "--test-force-exit", "--no-warnings",
+                      "--trace-warnings", "--enable-source-maps"}
+        i = 0
+        while i < len(args):
+            if not literal(args[i]):
+                return False
+            option = args[i].value
+            flag, separator, value = option.partition("=")
+            if flag == "--test":
+                return not separator or bool(value)
+            if flag in taking_value:
+                if not separator:
+                    i += 1
+                    if i >= len(args) or not literal(args[i]):
+                        return False
+                    value = args[i].value
+                if not value or (flag == "--test-reporter" and
+                                 value not in {"spec", "tap", "dot", "junit", "lcov"}):
+                    return False
+            elif option in standalone:
+                pass
+            elif option.startswith("-r") and not option.startswith("--") and len(option) > 2:
+                pass
+            else:
+                return False
+            i += 1
+        return False
     if exe in {"npm", "pnpm", "bun"}:
         i = 0
         while i < len(values):

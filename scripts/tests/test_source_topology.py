@@ -8,12 +8,14 @@ inputs, not a claim of Cargo, SSH-fleet or native-Darwin qualification.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import select
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -111,6 +113,109 @@ class SourceTopologyTests(unittest.TestCase):
             tool.chmod(0o700)
         return {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
 
+    def fsync_tools(self, *, fail=False, fail_index=None, trace=None, entered=None, gate=None):
+        """Observe the production Python barrier, not the obsolete sync utility.
+
+        Only os.fsync is intercepted. The production code still opens and checks
+        its actual objects, and successful observations execute the real fsync.
+        Faults/waits are explicit test inputs, never evidence of power loss.
+        """
+        real_python = str(Path(sys.executable).resolve())
+        env = self.fault_tools({"sync": "echo unexpected-global-sync >&2; exit 97"})
+        directory = Path(env["PATH"].split(os.pathsep)[0])
+        probe = directory / "fsync_probe.py"
+        probe.write_text(r'''
+import json, os, stat, sys, time
+args = sys.argv[1:]
+real_python = os.environ['TOPOLOGY_REAL_PYTHON']
+if len(args) < 4 or args[:3] != ['-I', '-S', '-c'] or 'os.fsync(' not in args[3]:
+    os.execv(real_python, [real_python] + args)
+real_open, real_fsync = os.open, os.fsync
+opened = {}
+def observe_open(path, flags, *rest, **keywords):
+    fd = real_open(path, flags, *rest, **keywords)
+    opened[fd] = os.fsdecode(path)
+    return fd
+def observe_fsync(fd):
+    trace = os.environ['TOPOLOGY_FSYNC_TRACE']
+    try:
+        with open(trace) as stream:
+            index = sum(json.loads(line)['phase'] == 'entered' for line in stream)
+    except FileNotFoundError:
+        index = 0
+    path = opened[fd]
+    info = os.fstat(fd)
+    record = {'index': index, 'path': path, 'directory': stat.S_ISDIR(info.st_mode),
+              'inode': info.st_ino, 'phase': 'entered'}
+    with open(trace, 'a') as stream:
+        stream.write(json.dumps(record) + '\n')
+    entered, gate = os.environ.get('TOPOLOGY_ENTERED'), os.environ.get('TOPOLOGY_GATE')
+    if entered:
+        with open(entered, 'a'):
+            pass
+    if gate:
+        while not os.path.exists(gate):
+            time.sleep(0.01)
+    if (os.environ.get('TOPOLOGY_FAIL') == '1' or
+            os.environ.get('TOPOLOGY_FAIL_INDEX') == str(index)):
+        raise OSError('injected exact topology fsync failure')
+    real_fsync(fd)
+    record['phase'] = 'confirmed'
+    with open(trace, 'a') as stream:
+        stream.write(json.dumps(record) + '\n')
+os.open, os.fsync = observe_open, observe_fsync
+sys.argv = ['-c'] + args[4:]
+exec(compile(args[3], '<production-topology-fsync>', 'exec'))
+''')
+        tool = directory / "python3"
+        tool.write_text("#!/bin/sh\nexec " + shlex.quote(real_python)
+                        + " -I -S " + shlex.quote(str(probe)) + ' "$@"\n')
+        tool.chmod(0o700)
+        env["TOPOLOGY_REAL_PYTHON"] = real_python
+        env["TOPOLOGY_FSYNC_TRACE"] = str(trace or directory / "fsync.jsonl")
+        for name, value in (("TOPOLOGY_FAIL", "1" if fail else None),
+                            ("TOPOLOGY_FAIL_INDEX", fail_index),
+                            ("TOPOLOGY_ENTERED", entered), ("TOPOLOGY_GATE", gate)):
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = str(value)
+        return env
+
+    def test_topology_confirms_every_resolved_directory_barrier_without_global_sync(self):
+        trace = self.base / "topology-barriers.jsonl"
+        env = self.fsync_tools(trace=trace)
+        before = self.inventory()
+        for attempt in range(2):
+            self.accepted(self.topology(env=env), b"RCH_TOPOLOGY_OK\n")
+            records = [json.loads(line) for line in trace.read_text().splitlines()]
+            confirmed = [row for row in records if row["phase"] == "confirmed"]
+            # Both canonical and alias roots resolve to the same directory,
+            # but each root and its containing-directory confirmation remains.
+            expected = [self.canonical.resolve(), self.base.resolve()] * (2 * (attempt + 1))
+            self.assertEqual([Path(row["path"]) for row in confirmed], expected)
+            self.assertEqual(len(records), 2 * len(expected))
+            self.assertTrue(all(row["directory"] for row in records))
+            self.assertEqual(before, self.inventory(), "topology must not grant source ownership")
+
+    def test_each_topology_barrier_failure_refuses_without_publishing_or_losing_setup(self):
+        before = self.inventory()
+        for index in range(4):
+            trace = self.base / ("failed-barrier-" + str(index) + ".jsonl")
+            result = self.topology(env=self.fsync_tools(fail_index=index, trace=trace))
+            self.assertEqual(result.returncode, 73, result.stderr)
+            self.assertEqual(result.stdout, b"")
+            self.assertIn(b"injected exact topology fsync failure", result.stderr)
+            self.assertNotIn(b"unexpected-global-sync", result.stderr)
+            records = [json.loads(line) for line in trace.read_text().splitlines()]
+            self.assertEqual([row["index"] for row in records if row["phase"] == "entered"],
+                             list(range(index + 1)))
+            self.assertEqual([row["index"] for row in records if row["phase"] == "confirmed"],
+                             list(range(index)))
+            self.assertEqual(self.alias.resolve(), self.canonical.resolve())
+            self.assertEqual(before, self.inventory())
+            self.initialize()
+
     def test_namespace_never_becomes_a_durable_build_claim(self):
         before = self.inventory()
         self.initialize()
@@ -195,7 +300,7 @@ class SourceTopologyTests(unittest.TestCase):
         self.assertEqual(set(self.inventory()), {"metadata.lock"})
 
     def test_durability_failure_refuses_then_additive_setup_can_resume(self):
-        result = self.topology(env=self.fault_tools({"sync": "exit 1"}))
+        result = self.topology(env=self.fsync_tools(fail=True))
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(result.stdout, b"")
         self.assertTrue(self.alias.is_symlink(), "failed barriers must preserve additive setup")
@@ -204,7 +309,7 @@ class SourceTopologyTests(unittest.TestCase):
 
     def test_already_present_fast_path_reestablishes_durability(self):
         self.initialize()
-        result = self.topology(env=self.fault_tools({"sync": "exit 1"}))
+        result = self.topology(env=self.fsync_tools(fail=True))
         self.assertEqual(result.returncode, 73, result.stderr)
         self.assertEqual(result.stdout, b"")
         self.assertEqual(self.alias.resolve(), self.canonical.resolve())
@@ -233,12 +338,8 @@ class SourceTopologyTests(unittest.TestCase):
 
     def test_ready_and_new_claim_wait_for_complete_namespace_confirmation(self):
         entered, gate = self.base / "entered", self.base / "continue"
-        real_sync = shlex.quote(shutil.which("sync"))
-        env = self.fault_tools({"sync": (
-            "touch " + shlex.quote(str(entered)) + "\n"
-            + "while [ ! -e " + shlex.quote(str(gate)) + " ]; do sleep 0.01; done\n"
-            + "exec " + real_sync + ' "$@"'
-        )})
+        trace = self.base / "blocked-barriers.jsonl"
+        env = self.fsync_tools(entered=entered, gate=gate, trace=trace)
         command, data = self.command("topology", "a1", self.scope, *self.topology_commands())
         initializer = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, env=env)
@@ -268,6 +369,8 @@ class SourceTopologyTests(unittest.TestCase):
             stdout, stderr = contender.communicate(timeout=5)
             self.assertEqual((contender.returncode, stdout, stderr), (0, b"", b""))
             self.assertEqual(len(list(self.registry.glob("*.claim"))), 1)
+            records = [json.loads(line) for line in trace.read_text().splitlines()]
+            self.assertEqual([row["phase"] for row in records], ["entered", "confirmed"] * 4)
         finally:
             gate.touch()
             for child in (initializer, contender):

@@ -97,6 +97,16 @@ impl Fixture {
         input: &[u8],
         mut control: impl FnMut(&std::process::Child, Duration),
     ) -> Run {
+        // A hook optimization miss legitimately exits zero with no stdout.
+        // Keep its bounded diagnostic explanation in the owned fixture instead
+        // of losing the distinction between parser startup, timeout and grammar.
+        // Workload invocations retain their exact binary stderr contract.
+        let hook_request = command.get_args().eq(["--no-self-healing"])
+            && serde_json::from_slice::<Value>(input)
+                .is_ok_and(|value| value["hook_event_name"] == "PreToolUse");
+        if hook_request {
+            command.env("RCH_LOG_TARGETS", "rch::hook::planner_failure=debug");
+        }
         let id = self.calls.fetch_add(1, Ordering::Relaxed);
         let stdout = self.root.join(format!("{id}.stdout"));
         let stderr = self.root.join(format!("{id}.stderr"));
@@ -137,12 +147,22 @@ impl Fixture {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        Run {
+        let result = Run {
             status,
             stdout: fs::read(stdout).unwrap(),
             stderr: fs::read(stderr).unwrap(),
             elapsed: start.elapsed(),
+        };
+        if hook_request && result.stdout.is_empty() {
+            eprintln!(
+                "hook returned unchanged after {:?}; fixture={}; input={}; diagnostics={}",
+                result.elapsed,
+                self.root.display(),
+                String::from_utf8_lossy(input),
+                String::from_utf8_lossy(&result.stderr),
+            );
         }
+        result
     }
 
     fn result(&self, path: &Path) -> Value {
@@ -264,6 +284,104 @@ fn shell_e2e_validator_requires_exact_native_policy_and_authored_command() {
         if !accepted {
             assert!(String::from_utf8_lossy(&output.stderr).contains("Hook rewrite mismatch"));
         }
+    }
+}
+
+#[test]
+fn saved_time_e2e_requires_exact_test_execution_not_interleaved_console_text() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/e2e_bd-zked.sh");
+    // These are explicit Cargo-result fixtures, not daemon/unit-test passes.
+    // The complete shell scenario separately runs the actual Rust assertion.
+    let harness = r#"
+source "$1"
+tmp_root="$2"
+PROJECT_ROOT="$tmp_root"
+LOG_FILE="$tmp_root/scenario.jsonl"
+log_json() { :; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+cargo() {
+    printf '%s\n' "$*" > "$tmp_root/cargo-argv"
+    [[ "$*" == 'test --locked -p rchd --bin rchd -- history::tests::test_saved_time_stats_no_negative_savings --exact' ]] || return 88
+    printf '%s\n' "$FIXTURE_OUTPUT"
+    printf '%s\n' 'retained Cargo diagnostic' >&2
+    return "$FIXTURE_EXIT"
+}
+test_no_negative_savings
+"#;
+    for (name, stdout, code, accepted) in [
+        (
+            "pass",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "0",
+            true,
+        ),
+        (
+            "empty",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 639 filtered out; finished in 0.00s",
+            "0",
+            false,
+        ),
+        (
+            "ignored",
+            "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "0",
+            false,
+        ),
+        (
+            "wrong-count",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 637 filtered out; finished in 0.00s",
+            "0",
+            false,
+        ),
+        (
+            "failed",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "101",
+            false,
+        ),
+        (
+            "false-success",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 638 filtered out; finished in 0.00s",
+            "101",
+            false,
+        ),
+        ("missing", "unrelated test passed", "0", false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        // A parallel --nocapture run may split this cosmetic harness line.
+        // The old grep rejects it despite a successful suite; it is no longer
+        // used as permission to skip executing the exact named assertion.
+        fs::write(directory.path().join("saved-time-tests.log"),
+            "test history::tests::test_saved_time_stats_no_negative_savings ... tracing output\n\
+             more tracing\nok\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 632 filtered out; finished in 0.00s\n").unwrap();
+        let output = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", harness, "saved-time-fixture"])
+            .arg(&script)
+            .arg(directory.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("FIXTURE_OUTPUT", stdout)
+            .env("FIXTURE_EXIT", code)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            directory.path().join("cargo-argv").exists(),
+            "{name}: exact test was never invoked"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("no-negative-savings.log")).unwrap(),
+            format!("{stdout}\n")
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("no-negative-savings.stderr")).unwrap(),
+            "retained Cargo diagnostic\n"
+        );
     }
 }
 
@@ -1105,6 +1223,218 @@ fn agent_hook_carries_strict_policy_only_for_delegated_components() {
     }
 }
 
+fn planner_fixture(fixture: &Fixture, name: &str, body: Option<&str>) -> PathBuf {
+    let tools = fixture.root.join(name);
+    fs::create_dir(&tools).unwrap();
+    if let Some(body) = body {
+        // The parent never holds an executable writable across parallel forks.
+        // This is a deliberately substituted parser, not remote execution proof.
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 077; set -C; printf '%s' \"$2\" > \"$1\" && /bin/chmod 700 \"$1\"",
+                "planner-fixture",
+            ])
+            .arg(tools.join("python3"))
+            .arg(format!("#!/bin/sh\n{body}\n"))
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    tools
+}
+
+fn run_planner_hook(fixture: &Fixture, tools: &Path, source: &str, strict: Option<&str>) -> Run {
+    let request = serde_json::json!({"hook_event_name":"PreToolUse", "tool_name":"Bash",
+        "tool_input":{"command":source}, "cwd":fixture.project});
+    let mut command = fixture.command();
+    command
+        .env("PATH", tools)
+        .env("PLANNER_PID", fixture.root.join("planner.pid"));
+    if let Some(strict) = strict {
+        command.env("RCH_REQUIRE_REMOTE", strict);
+    }
+    fixture.run(&mut command, &serde_json::to_vec(&request).unwrap())
+}
+
+#[test]
+fn planner_operational_failures_preserve_strict_hook_policy_and_normal_controls() {
+    let fixture = Fixture::new();
+    for (name, body, diagnostic) in [
+        ("missing", None, "start isolated semantic planner"),
+        (
+            "failed",
+            Some("/bin/cat >/dev/null; printf 'owned planner failure' >&2; exit 19"),
+            "semantic planner exited",
+        ),
+        (
+            "malformed",
+            Some("/bin/cat >/dev/null; printf '{'"),
+            "invalid structural hook response",
+        ),
+        (
+            "excess-output",
+            Some("/bin/cat >/dev/null; exec /usr/bin/python3 -I -S -c 'print(\"x\" * 524289)'"),
+            "semantic planner stdout limit",
+        ),
+    ] {
+        let tools = planner_fixture(&fixture, name, body);
+        for (role, policy, allow_fallback, strict) in [
+            ("hybrid", Some("1"), true, true),
+            ("dispatcher", None, true, true),
+            ("hybrid", None, false, true),
+            ("hybrid", None, true, false),
+            ("dispatcher", Some("0"), true, false),
+        ] {
+            fixture.configure(role, allow_fallback);
+            for source in ["pytest -q", "pytest -q && cargo test"] {
+                let output = run_planner_hook(&fixture, &tools, source, policy);
+                assert!(
+                    output.status.success(),
+                    "the hook protocol must still return a valid decision"
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains(diagnostic),
+                    "{name}/{role}/{policy:?}: {stderr}"
+                );
+                if strict {
+                    let response: Value = serde_json::from_slice(&output.stdout)
+                        .unwrap_or_else(|error| panic!("strict planner failure must deny, not allow unchanged: {name}/{source}: {error}; {stderr}"));
+                    assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+                    let reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+                        .as_str()
+                        .unwrap();
+                    assert!(
+                        reason.contains("planner") && reason.contains("remote"),
+                        "{reason}"
+                    );
+                    assert!(
+                        response
+                            .pointer("/hookSpecificOutput/updatedInput")
+                            .is_none()
+                    );
+                } else {
+                    assert!(
+                        output.stdout.is_empty(),
+                        "non-strict miss policy remains unchanged"
+                    );
+                }
+                assert!(!fixture.root.join("state/job-leases").exists());
+            }
+        }
+        // A normal local command never needs this helper, even in strict mode.
+        let ordinary = run_planner_hook(&fixture, &tools, "git status", Some("1"));
+        assert!(ordinary.status.success());
+        assert!(ordinary.stdout.is_empty());
+        assert!(ordinary.stderr.is_empty());
+    }
+    // Positive control through exactly the same PATH-mediated helper launch.
+    let real = planner_fixture(&fixture, "real", Some("exec /usr/bin/python3 \"$@\""));
+    fixture.configure("hybrid", true);
+    let output = run_planner_hook(&fixture, &real, "pytest -q && cargo test", Some("1"));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["hookSpecificOutput"]["updatedInput"]["command"],
+        "rch exec --verification --require-remote -- pytest -q && rch exec --require-remote -- cargo test"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn planner_timeout_is_bounded_reaped_and_not_strict_local_permission() {
+    let fixture = Fixture::new();
+    let tools = planner_fixture(
+        &fixture,
+        "timeout",
+        Some("/bin/cat >/dev/null; printf '%s' $$ > \"$PLANNER_PID\"; exec /bin/sleep 10"),
+    );
+    for source in ["pytest -q", "pytest -q && cargo test"] {
+        let output = run_planner_hook(&fixture, &tools, source, Some("1"));
+        assert!(output.status.success());
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("semantic planner timed out"));
+        let pid = fs::read_to_string(fixture.root.join("planner.pid")).unwrap();
+        assert!(
+            !Path::new("/proc").join(pid.trim()).exists(),
+            "owned helper must be reaped before the hook answers"
+        );
+        assert!(
+            output.elapsed < Duration::from_secs(5),
+            "not a new parser budget; hung-child cleanup sentinel"
+        );
+        assert!(!fixture.root.join("state/job-leases").exists());
+    }
+}
+
+#[test]
+fn planner_timeout_reports_io_or_exit_progress_without_exposing_stream_contents() {
+    let fixture = Fixture::new();
+    for (name, body, phase, stdout_bytes, stderr_bytes, eof) in [
+        (
+            "no-output",
+            "/bin/cat >/dev/null; exec /bin/sleep 10",
+            "pipes",
+            0,
+            0,
+            false,
+        ),
+        (
+            "partial-output",
+            "/bin/cat >/dev/null; printf 'private-out'; printf 'private-err' >&2; exec /bin/sleep 10",
+            "pipes",
+            11,
+            11,
+            false,
+        ),
+        // A complete, valid plan still cannot authorize a rewrite until the
+        // owned helper exits in time. Closed pipes are not process completion.
+        (
+            "closed-output",
+            "/bin/cat >/dev/null; printf '{\"version\":1,\"insertions\":[]}'; exec 1>&- 2>&-; exec /bin/sleep 10",
+            "exit",
+            29,
+            0,
+            true,
+        ),
+    ] {
+        let tools = planner_fixture(&fixture, name, Some(body));
+        let output = run_planner_hook(&fixture, &tools, "pytest -q", Some("1"));
+        assert!(output.status.success());
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            response
+                .pointer("/hookSpecificOutput/updatedInput")
+                .is_none()
+        );
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        for expected in [
+            "semantic planner timed out".to_owned(),
+            format!("phase={phase}"),
+            "request_sent=true".to_owned(),
+            format!("stdout_bytes={stdout_bytes}"),
+            format!("stderr_bytes={stderr_bytes}"),
+            format!("stdout_eof={eof}"),
+            format!("stderr_eof={eof}"),
+            "child_after_deadline=Ok(None)".to_owned(),
+        ] {
+            assert!(
+                diagnostic.contains(&expected),
+                "{name}: missing {expected}: {diagnostic}"
+            );
+        }
+        assert!(!diagnostic.contains("private-out") && !diagnostic.contains("private-err"));
+        assert!(!fixture.root.join("state/job-leases").exists());
+        assert!(
+            output.elapsed < Duration::from_secs(5),
+            "hung fixture must be stopped, not awaited for ten seconds"
+        );
+    }
+}
+
 #[test]
 fn explicit_remote_opt_out_keeps_existing_dispatcher_override_semantics() {
     let fixture = Fixture::new();
@@ -1379,6 +1709,254 @@ fn interactive_duplex_output_does_not_deadlock_pending_input() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("RECEIVED={}", input.len())));
     fixture.assert_guard_reclaimed();
+}
+
+fn generic_tool_witness(fixture: &Fixture) -> PathBuf {
+    let tools = fixture.root.join("generic-tools");
+    fs::create_dir(&tools).unwrap();
+    let executable = tools.join("node");
+    // A shell sentinel verifies actual dispatch/guard/argv behavior; this is
+    // explicitly not a claim that Node or an SSH worker was executed.
+    let body = "#!/bin/sh\nprintf x >> \"$RUN_RECORD\"\nprintf '%s' \"${RCH_GUARDED_LOCAL:-0}\" > \"$GUARD_RECORD\"\nprintf '%s\\0' \"$@\"\nprintf owned-tool-error >&2\nexit 17\n";
+    let published = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "umask 077; set -C; printf '%s' \"$2\" > \"$1\" && /bin/chmod 700 \"$1\"",
+            "generic-tool-witness",
+        ])
+        .arg(&executable)
+        .arg(body)
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(published.status.success(), "{published:?}");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_rch"), tools.join("rch")).unwrap();
+    executable
+}
+
+#[test]
+fn generic_shim_planner_failures_preserve_remote_policy() {
+    let fixture = Fixture::new();
+    let executable = generic_tool_witness(&fixture);
+    let calls = fixture.root.join("generic-calls");
+    let guard = fixture.root.join("generic-guard");
+    for (name, body, diagnostic) in [
+        ("shim-missing", None, "start isolated semantic planner"),
+        (
+            "shim-failed",
+            Some("/bin/cat >/dev/null; exit 19"),
+            "semantic planner exited",
+        ),
+        (
+            "shim-malformed",
+            Some("/bin/cat >/dev/null; printf '{'"),
+            "invalid semantic planner response",
+        ),
+        (
+            "shim-oversized",
+            Some("/bin/cat >/dev/null; exec /usr/bin/python3 -I -S -c 'print(\"x\" * 524289)'"),
+            "semantic planner stdout limit",
+        ),
+        (
+            "shim-timeout",
+            Some("/bin/cat >/dev/null; printf '%s' $$ > \"$PLANNER_PID\"; exec /bin/sleep 10"),
+            "semantic planner timed out",
+        ),
+    ] {
+        let tools = planner_fixture(&fixture, name, body);
+        for (role, policy, allow_fallback, refuse) in [
+            ("hybrid", Some("1"), true, true),
+            ("dispatcher", None, true, true),
+            ("hybrid", None, false, true),
+            ("hybrid", None, true, false),
+            ("dispatcher", Some("0"), true, false),
+        ] {
+            fixture.configure(role, allow_fallback);
+            let before = fs::read(&calls).unwrap_or_default();
+            let mut command = fixture.command();
+            command
+                .args([
+                    "shim",
+                    "dispatch",
+                    "--tool",
+                    "node",
+                    "--",
+                    "--test",
+                    "two words; $HOME",
+                    "",
+                ])
+                .env("RCH_SHIM_REAL_TOOL", &executable)
+                .env("PATH", &tools)
+                .env("RUN_RECORD", &calls)
+                .env("GUARD_RECORD", &guard)
+                .env("PLANNER_PID", fixture.root.join("shim-planner.pid"));
+            if let Some(policy) = policy {
+                command.env("RCH_REQUIRE_REMOTE", policy);
+            }
+            let result = fixture.run(&mut command, b"");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains(diagnostic),
+                "{name}/{role}/{policy:?}: {stderr}"
+            );
+            if refuse {
+                assert_ne!(
+                    result.status.code(),
+                    Some(17),
+                    "strict shim planner failure must not launch the local tool: {name}/{role}/{policy:?}"
+                );
+                assert!(!result.status.success());
+                assert!(result.stdout.is_empty());
+                assert!(stderr.contains("refusing local execution"), "{stderr}");
+                assert_eq!(fs::read(&calls).unwrap_or_default(), before);
+            } else {
+                assert_eq!(result.status.code(), Some(17));
+                assert_eq!(result.stdout, b"--test\0two words; $HOME\0\0");
+                assert!(result.stderr.ends_with(b"owned-tool-error"));
+                assert_eq!(fs::read(&calls).unwrap().len(), before.len() + 1);
+            }
+            if name == "shim-timeout" {
+                let pid = fs::read_to_string(fixture.root.join("shim-planner.pid")).unwrap();
+                assert!(
+                    !Path::new("/proc").join(pid.trim()).exists(),
+                    "owned helper must be reaped before dispatch returns"
+                );
+            }
+            assert!(!fixture.root.join("state/job-leases").exists());
+        }
+    }
+    // Unknown policy is not permission to execute either. Keep the same
+    // real-tool witness and require its invocation counter to stay unchanged.
+    fs::write(fixture.root.join("config/config.toml"), "[general\ninvalid").unwrap();
+    let before = fs::read(&calls).unwrap();
+    let invalid = fixture.run(
+        fixture
+            .command()
+            .args(["shim", "dispatch", "--tool", "node", "--", "--test"])
+            .env("PATH", fixture.root.join("shim-missing"))
+            .env("RCH_SHIM_REAL_TOOL", &executable)
+            .env("RUN_RECORD", &calls)
+            .env("GUARD_RECORD", &guard),
+        b"",
+    );
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("refusing local execution"));
+    assert_eq!(fs::read(&calls).unwrap(), before);
+
+    // A successful negative classification remains an ordinary interpreter,
+    // even under strict policy; absence of a test workload is not a failure.
+    let real = planner_fixture(&fixture, "shim-real", Some("exec /usr/bin/python3 \"$@\""));
+    fixture.configure("hybrid", true);
+    let result = fixture.run(
+        fixture
+            .command()
+            .args([
+                "shim", "dispatch", "--tool", "node", "--", "app.js", "--test",
+            ])
+            .env("PATH", real)
+            .env("RCH_SHIM_REAL_TOOL", &executable)
+            .env("RCH_REQUIRE_REMOTE", "1")
+            .env("RUN_RECORD", &calls)
+            .env("GUARD_RECORD", &guard),
+        b"",
+    );
+    assert_eq!(result.status.code(), Some(17));
+    assert_eq!(result.stdout, b"app.js\0--test\0");
+    assert_eq!(fs::read(&guard).unwrap(), b"0");
+}
+
+#[test]
+fn generic_node_leading_options_are_guarded_without_changing_argv() {
+    let fixture = Fixture::new();
+    let executable = generic_tool_witness(&fixture);
+    let tools = executable.parent().unwrap();
+    let calls = fixture.project.join("node-calls");
+    let guard = fixture.project.join("node-guard");
+    let installed = fixture.run(
+        fixture
+            .command()
+            .args(["shim", "install", "--tools", "node"]),
+        b"",
+    );
+    assert!(installed.status.success(), "{:?}", installed.stderr);
+    let path = std::env::join_paths([tools, Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let variants: &[&[&str]] = &[
+        &[
+            "--import",
+            "setup with spaces.mjs",
+            "--test",
+            "literal ; $HOME",
+            "",
+        ],
+        &["-r", "setup.cjs", "--test"],
+        &["-rsetup.cjs", "--test"],
+        &["--require=setup.cjs", "--import=setup.mjs", "--test"],
+        &[
+            "--no-warnings",
+            "--test-name-pattern",
+            "literal ; $HOME",
+            "--test",
+        ],
+    ];
+    for args in variants {
+        for entry in ["dispatch", "ci"] {
+            let before = fs::read(&calls).unwrap_or_default().len();
+            let mut command = fixture.command();
+            if entry == "dispatch" {
+                command.args(["shim", "dispatch", "--tool", "node", "--"]);
+            } else {
+                command.args(["ci", "--", "node"]);
+            }
+            command
+                .args(*args)
+                .env("PATH", &path)
+                .env("RCH_SHIM_REAL_TOOL", &executable)
+                .env("RUN_RECORD", &calls)
+                .env("GUARD_RECORD", &guard);
+            let output = fixture.run(&mut command, b"");
+            assert_eq!(
+                output.status.code(),
+                Some(17),
+                "{entry}/{args:?}: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read(&guard).unwrap(),
+                b"1",
+                "Node test options must enter guarded verification: {entry}/{args:?}"
+            );
+            let expected: Vec<u8> = args
+                .iter()
+                .flat_map(|arg| arg.as_bytes().iter().copied().chain([0]))
+                .collect();
+            assert_eq!(output.stdout, expected);
+            assert!(output.stderr.ends_with(b"owned-tool-error"));
+            assert_eq!(fs::read(&calls).unwrap().len(), before + 1);
+            fixture.assert_guard_reclaimed();
+            // This fixture has no shared-workspace mapping, so strict mode
+            // must return the existing permanent pre-admission refusal (1),
+            // not the retryable worker-unavailable code (103) or a local launch.
+            let refused = fixture.run(command.env("RCH_REQUIRE_REMOTE", "1"), b"");
+            assert_eq!(
+                refused.status.code(),
+                Some(1),
+                "{entry}/{args:?}: {:?}",
+                String::from_utf8_lossy(&refused.stderr)
+            );
+            let reason = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                reason.contains("shared invocation refused before execution"),
+                "{reason}"
+            );
+            assert!(
+                reason.contains("guarded local fallback is not authorized"),
+                "{reason}"
+            );
+            assert!(refused.stdout.is_empty());
+            assert_eq!(fs::read(&calls).unwrap().len(), before + 1);
+        }
+    }
 }
 
 #[test]

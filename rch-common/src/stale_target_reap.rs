@@ -123,7 +123,10 @@ rch_claim_quarantine_pending() {
     fi;
     # Old in-flight dispatcher scripts do not know quarantine/. They DO
     # reject this incomplete cancelling record, so cannot revive the token.
-    sync -f "$1" || return 1;
+    # The registry's scoped fsync adapter does not implicitly persist file
+    # bytes when flushing a directory. Retain both record data and its names,
+    # including recovery of the hard-link-before-rename frontier.
+    sync -f "$2" && sync -f "$1" || return 1;
     rch_mv_T "$2" "$__rch_quarantined" || return 1;
     sync -f "$1/quarantine" && sync -f "$1" || return 1;
     printf 'RCH_SOURCE_CLAIM_QUARANTINED %s\n' "$__rch_quarantined" >&2;

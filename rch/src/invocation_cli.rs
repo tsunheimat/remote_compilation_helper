@@ -154,8 +154,19 @@ pub async fn dispatch_tool(tool: String, args: Vec<OsString>) -> Result<()> {
             match crate::hook::semantic_plan(&source).await {
                 Ok(plan) => plan.is_some(),
                 Err(error) => {
+                    // Failure to classify is not a successful ordinary-tool
+                    // decision. Resolve the same policy used by the agent hook
+                    // before allowing an unguarded interpreter/tool launch.
+                    let config = crate::config::load_config().context(
+                        "RCH shim cannot resolve fallback policy after planner failure; refusing local execution",
+                    )?;
+                    if crate::hook::planner_failure_requires_refusal(&config) {
+                        return Err(error).context(
+                            "RCH shim planner failed; refusing local execution under remote-only or no-local-fallback policy",
+                        );
+                    }
                     eprintln!(
-                        "[RCH] semantic planning unavailable; preserving local argv: {error}"
+                        "[RCH] semantic planning unavailable; preserving local argv under non-strict fallback policy: {error:#}"
                     );
                     false
                 }

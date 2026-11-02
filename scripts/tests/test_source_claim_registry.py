@@ -7,12 +7,14 @@ fixtures are retained; neither a passing test nor this suite claims fleet or
 native-Darwin qualification. Run directly or through the Rust integration test.
 """
 import hashlib
+import json
 import os
 from pathlib import Path
 import random
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -28,7 +30,7 @@ FLOCK_NO_FORK = ["--no-fork"] if FLOCK and b"util-linux" in subprocess.run(
     check=False).stdout else []
 AWK = shutil.which("awk")
 REALPATH = shutil.which("realpath")
-SYNC = shutil.which("sync")
+PYTHON = sys.executable
 
 
 def body(roots):
@@ -103,6 +105,120 @@ class SourceClaimRegistryTests(unittest.TestCase):
         tool.write_text("#!/bin/sh\n" + program + "\n")
         tool.chmod(0o700)
         return {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]}
+
+    def fsync_env(self, *, fail_path=None, fail_after=None, fail_kind=None, trace=None):
+        """Real open/fsync with explicit observation/faults at the actual boundary."""
+        directory = self.root / ("tools-" + str(len(list(self.root.glob("tools-*")))))
+        directory.mkdir()
+        # Any utility-wide fallback is a test failure, never a simulated success.
+        broad = directory / "sync"
+        broad.write_text("#!/bin/sh\necho unexpected-global-sync >&2\nexit 97\n")
+        broad.chmod(0o700)
+        tool = directory / "python3"
+        tool.write_text("#!" + PYTHON + "\n" + r'''
+import json, os, stat, sys
+args = sys.argv[1:]
+if len(args) < 4 or args[:3] != ['-I', '-S', '-c'] or 'os.fsync(' not in args[3]:
+    os.execv(os.environ['REAL_PYTHON'], [os.environ['REAL_PYTHON']] + args)
+real_open, real_fsync = os.open, os.fsync
+opened = {}
+def observe_open(path, flags, *rest, **keywords):
+    fd = real_open(path, flags, *rest, **keywords)
+    opened[fd] = os.fsdecode(path)
+    return fd
+def observe_fsync(fd):
+    path = opened[fd]
+    info = os.fstat(fd)
+    kind = 'file' if stat.S_ISREG(info.st_mode) else 'directory' if stat.S_ISDIR(info.st_mode) else 'other'
+    trace = os.environ.get('FSYNC_TRACE')
+    if trace:
+        with open(trace, 'a') as stream:
+            stream.write(json.dumps({'path': path, 'kind': kind, 'inode': info.st_ino}) + '\n')
+    if (path == os.environ.get('FSYNC_FAIL_PATH') or
+        kind == os.environ.get('FSYNC_FAIL_KIND') or
+        (os.environ.get('FSYNC_FAIL_AFTER') and os.path.exists(os.environ['FSYNC_FAIL_AFTER']))):
+        raise OSError('injected exact fsync failure')
+    return real_fsync(fd)
+os.open, os.fsync = observe_open, observe_fsync
+sys.argv = ['-c'] + args[4:]
+exec(compile(args[3], '<production-fsync>', 'exec'))
+''')
+        tool.chmod(0o700)
+        env = {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"],
+               "REAL_PYTHON": PYTHON}
+        for key, value in (("FSYNC_FAIL_PATH", fail_path), ("FSYNC_FAIL_AFTER", fail_after),
+                           ("FSYNC_FAIL_KIND", fail_kind), ("FSYNC_TRACE", trace)):
+            if value is not None:
+                env[key] = str(value)
+            else:
+                env.pop(key, None)
+        return env
+
+    def test_scoped_fsync_traces_records_and_each_terminal_directory(self):
+        trace = self.root / "fsync.jsonl"
+        env = self.fsync_env(trace=trace)
+        for operation in ("acquire", "recover", "cancel", "finish-cancel", "cancelled"):
+            self.assert_granted(self.transact("aa", [self.root / "cancel-source"], operation, env))
+        for operation in ("acquire", "release", "released"):
+            self.assert_granted(self.transact("bb", [self.root / "release-source"], operation, env))
+        observations = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertTrue(any(Path(row["path"]).name.startswith(".record-write.")
+                            and row["kind"] == "file" for row in observations))
+        paths = {Path(row["path"]) for row in observations}
+        for directory in (self.registry, self.registry / "cancelled", self.registry / "released"):
+            self.assertIn(directory, paths)
+        for token, roots, directory in (("aa", [self.root / "cancel-source"], "cancelled"),
+                                        ("bb", [self.root / "release-source"], "released")):
+            receipt = self.registry / directory / (token + "." + digest(roots) + ".claim")
+            self.assertTrue(any(Path(row["path"]) == receipt and row["kind"] == "file"
+                                for row in observations))
+        # Real failures cannot publish a grant or silently switch to utility sync.
+        for index, kind in enumerate(("file", "directory")):
+            result = self.transact("e" + str(index), [self.root / kind],
+                                   env=self.fsync_env(fail_kind=kind))
+            self.assert_unconfirmed(result)
+            self.assertNotIn(b"unexpected-global-sync", result.stderr)
+
+    def test_quarantine_persists_record_data_and_both_names_before_success(self):
+        roots = [self.root / "quarantined-source"]
+        pending = self.record("dd", roots, "pending")
+        pending.write_bytes(b"partial retained bytes")
+        inode = pending.stat().st_ino
+        trace = self.root / "quarantine-fsync.jsonl"
+        result = self.transact("ee", [self.root / "unrelated"], env=self.fsync_env(trace=trace))
+        self.assert_granted(result)
+        receipt = self.registry / "quarantine" / pending.name
+        fence = self.registry / pending.with_suffix(".cancelling").name
+        self.assertEqual(receipt.read_bytes(), b"partial retained bytes")
+        self.assertEqual(receipt.stat().st_ino, inode)
+        self.assertEqual(fence.stat().st_ino, inode)
+        rows = [json.loads(line) for line in trace.read_text().splitlines()]
+        file_barriers = [i for i, row in enumerate(rows) if row["kind"] == "file" and row["inode"] == inode]
+        self.assertTrue(file_barriers, "directory fsync does not persist retained pending bytes")
+        self.assertEqual(Path(rows[file_barriers[0]]["path"]), pending)
+        directory_barriers = [i for i, row in enumerate(rows) if row["kind"] == "directory"]
+        self.assertLess(file_barriers[0], directory_barriers[0])
+        for directory in (self.registry, self.registry / "quarantine"):
+            self.assertTrue(any(Path(row["path"]) == directory for row in rows))
+        self.assertIn(b"RCH_SOURCE_CLAIM_QUARANTINED", result.stderr)
+
+    def test_quarantine_failed_file_barrier_retains_evidence_and_never_grants(self):
+        roots = [self.root / "quarantine-failure"]
+        pending = self.record("dd", roots, "pending")
+        pending.write_bytes(b"partial retained bytes")
+        before = (pending.stat().st_ino, pending.read_bytes())
+        for barrier in (pending, self.registry, self.registry / "quarantine"):
+            result = self.transact("ee", [self.root / "unrelated"],
+                                   env=self.fsync_env(fail_path=barrier))
+            self.assert_unconfirmed(result)
+            self.assertNotIn(b"RCH_SOURCE_CLAIM_QUARANTINED", result.stderr)
+            self.assertFalse(list(self.registry.glob("ee.*.claim")))
+            retained = pending if pending.exists() else self.registry / "quarantine" / pending.name
+            self.assertEqual((retained.stat().st_ino, retained.read_bytes()), before)
+        # Recover the exact retained intent; unrelated admission may then proceed.
+        self.assert_granted(self.transact("dd", roots, "cancel"))
+        self.assert_granted(self.transact("ee", [self.root / "unrelated"]))
+        self.assert_refused(self.transact("dd", roots, "acquire"))
 
     def test_cartesian_reference_matches_component_index(self):
         rng = random.Random(67031)
@@ -314,12 +430,8 @@ class SourceClaimRegistryTests(unittest.TestCase):
                 process.communicate(timeout=5)
 
     def fail_sync_after_move(self, destination):
-        # Real writes and renames run. Only sync reports an injected failure
-        # after the destination appears: the lost-durability-ack frontier.
-        return self.tool_env("sync", 'if [ -e {} ]; then\n'
-                             '  printf "injected post-rename sync failure\\n" >&2\n'
-                             '  exit 91\nfi\nexec {} "$@"'.format(
-                                 shlex.quote(str(destination)), shlex.quote(SYNC)))
+        # Actual writes/renames execute; only their subsequent fsync fails.
+        return self.fsync_env(fail_after=destination)
 
     def assert_unconfirmed(self, result):
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -415,8 +527,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
             receipt = self.registry / state / (token + "." + digest(roots) + ".claim")
             before = (receipt.stat().st_ino, receipt.read_bytes())
             for path in (receipt, receipt.parent, self.registry):
-                env = self.tool_env("sync", 'if [ "$2" = {} ]; then exit 91; fi\n'
-                                    'exec {} "$@"'.format(shlex.quote(str(path)), shlex.quote(SYNC)))
+                env = self.fsync_env(fail_path=path)
                 for operation in operations:
                     with self.subTest(state=state, path=path, operation=operation):
                         self.assert_unconfirmed(self.transact(token, roots, operation, env))

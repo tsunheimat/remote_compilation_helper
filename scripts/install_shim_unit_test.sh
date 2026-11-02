@@ -6,6 +6,14 @@ set -euo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 rch_test_binary=${1:?pass an already-built RCH binary}
 [[ "$rch_test_binary" = /* && -x "$rch_test_binary" ]]
+# Resolve the real interpreter before constructing the fixture's PATH. The
+# embedded planner needs Python too; an argv-echoing fake python3 is not an
+# interpreter and must not masquerade as a successful ordinary classification.
+real_python=$(RCH_SHIM_BYPASS=1 python3 -I -S -c 'import os, sys; print(os.path.realpath(sys.executable))')
+[[ "$real_python" = /* && -x "$real_python" ]]
+# Exercise actual dispatch even when a development transport used bypass for
+# its own compiler process. Changes remain in this isolated test subprocess.
+unset RCH_SHIM_BYPASS RCH_CARGO_WRAPPER_BYPASS
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/rch-install-shim.XXXXXXXX")
 printf 'Retained installer fixture: %s\n' "$fixture"
 export HOME="$fixture/home" RUSTUP_HOME="$fixture/rustup"
@@ -209,16 +217,58 @@ fi
 grep -Fx 'USER OWNED' "$collision_home/.rch/shims/python"
 printf 'PASS: collisions refuse before any generic shim is written\n'
 
-# Query the actual CLI dispatcher for ordinary interpreter launchers. No real
-# language runtime executes: these record the exact argv and never compile.
+# Run the actual dispatcher and embedded planner through the installed shims.
+# Python/python3 resolve to a real interpreter; only Node is an explicit argv
+# sentinel. No compiler, SSH worker or installed service is exercised here.
 mkdir -p "$fixture/generic-real" "$fixture/generic-rch"
 ln -s "$rch_test_binary" "$fixture/generic-rch/rch"
+ln -s "$real_python" "$fixture/generic-real/python"
+ln -s "$real_python" "$fixture/generic-real/python3"
+ordinary_script="$fixture/ordinary script.py"
+cat > "$ordinary_script" <<'PY'
+import os
+import sys
+
+with open(os.environ["RCH_FIXTURE_EXECUTIONS"], "ab") as calls:
+    calls.write(b"x")
+os.write(1, b"\0".join(os.fsencode(arg) for arg in sys.argv) + b"\0")
+PY
+cat > "$fixture/generic-real/node" <<'NODE'
+#!/bin/sh
+printf x >> "$RCH_FIXTURE_EXECUTIONS"
+printf '%s\0' "$@"
+NODE
+chmod +x "$fixture/generic-real/node"
+runtime_path="$generic_home/.rch/shims:$fixture/generic-rch:$fixture/generic-real:/usr/bin:/bin"
 for tool in python python3 node; do
-    printf '#!/bin/sh\nprintf "%%s\\0" "$@"\n' > "$fixture/generic-real/$tool"
-    chmod +x "$fixture/generic-real/$tool"
-    HOME="$generic_home" PATH="$generic_home/.rch/shims:$fixture/generic-rch:$fixture/generic-real:/usr/bin:/bin" \
-        "$generic_home/.rch/shims/$tool" ordinary-script 'two words' '' '$(false)' > "$fixture/$tool-argv"
-    printf '%s\0' ordinary-script 'two words' '' '$(false)' > "$fixture/$tool-expected"
+    HOME="$generic_home" PATH="$runtime_path" RCH_FIXTURE_EXECUTIONS="$fixture/generic-calls" \
+        "$generic_home/.rch/shims/$tool" "$ordinary_script" 'two words' '' '$(false)' > "$fixture/$tool-argv"
+    printf '%s\0' "$ordinary_script" 'two words' '' '$(false)' > "$fixture/$tool-expected"
     cmp "$fixture/$tool-expected" "$fixture/$tool-argv"
 done
-printf 'PASS: ordinary Python and Node launches preserve exact argv through real dispatch\n'
+[[ "$(cat "$fixture/generic-calls")" == xxx ]]
+printf 'PASS: real Python planning preserves ordinary interpreter argv and exactly-once execution\n'
+
+# Negative control: a genuinely broken interpreter is not an ordinary-tool
+# classification under the dispatcher's strict policy. Do not disable the
+# policy just to let a malformed planner fixture pass.
+mkdir -p "$fixture/broken-python"
+printf '#!/bin/sh\n/bin/cat >/dev/null\nexit 19\n' > "$fixture/broken-python/python3"
+chmod +x "$fixture/broken-python/python3"
+before_calls=$(sha256sum "$fixture/generic-calls")
+failed_status=0
+HOME="$generic_home" RCH_FIXTURE_EXECUTIONS="$fixture/generic-calls" \
+    PATH="$generic_home/.rch/shims:$fixture/generic-rch:$fixture/broken-python:$fixture/generic-real:/usr/bin:/bin" \
+    "$generic_home/.rch/shims/node" "$ordinary_script" 'two words' '' '$(false)' \
+    > "$fixture/planner-failure.stdout" 2> "$fixture/planner-failure.stderr" || failed_status=$?
+[[ "$failed_status" -ne 0 && ! -s "$fixture/planner-failure.stdout" ]]
+grep -F 'refusing local execution' "$fixture/planner-failure.stderr"
+grep -F 'semantic planner exited' "$fixture/planner-failure.stderr"
+[[ "$(sha256sum "$fixture/generic-calls")" == "$before_calls" ]]
+# Restoring the real interpreter must restore the exact ordinary-tool result,
+# not leave a bypass or refusal cached from the previous failed request.
+HOME="$generic_home" PATH="$runtime_path" RCH_FIXTURE_EXECUTIONS="$fixture/generic-calls" \
+    "$generic_home/.rch/shims/node" "$ordinary_script" 'two words' '' '$(false)' > "$fixture/planner-recovered.stdout"
+cmp "$fixture/node-expected" "$fixture/planner-recovered.stdout"
+[[ "$(cat "$fixture/generic-calls")" == xxxx ]]
+printf 'PASS: failed planner refuses without execution; valid parser restores ordinary dispatch\n'

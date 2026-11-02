@@ -159,6 +159,27 @@ that replace PATH. Ordinary interpreter launches remain local while their nested
 verification commands can still resolve through shims. Missing `rch` makes a
 generic shim refuse rather than run an unclassified, unguarded workload.
 
+A generic dispatch whose planner fails now resolves the same refusal policy as
+the agent hook. Explicit remote-only policy, dispatcher default strictness, or
+disabled local fallback refuses before the real tool starts; an unreadable
+policy also refuses. A successful classification that finds an ordinary
+interpreter command is different and still allows it locally. Non-strict
+planner failure retains the existing literal local launch with a diagnostic.
+This change does not broaden unsupported grammar or change non-UTF-8 argv
+handling, so it is not a universal remote-only shell sandbox.
+
+The Node frontend recognizes bounded literal options before `--test`, including
+`--import`, `--require`/`-r`, loader and test-selection options. Thus
+`node --import setup.mjs --test` reaches the same shared-verification path as
+`node --test`, through direct generic dispatch, installed PATH shims and `rch ci`.
+Option values are consumed before identifying test mode: `node --require --test
+app.js`, ordinary scripts with a later `--test`, `--`, eval/print and unknown or
+dynamic prefixes are not newly classified. Arguments and preloads are forwarded
+unchanged; they are not evaluated by the planner. Nested literal RTK/shell
+wrappers share that recognition without double dispatch. Native compiler
+allowlist/confidence checks and the distinction between native stream-only and
+shared-workspace contracts remain in effect.
+
 `--tools all` installs only these generic frontends: `go`, `swift`, `npm`, `pnpm`,
 `bun`, `pytest`, `python`, `python3`, `node`, `make`, `npx`, `bunx`, `vitest`, `jest`,
 `tsc`, `eslint`, `prettier`, `playwright`, `vite`, and `rtk`. It does **not** include Cargo
@@ -306,6 +327,18 @@ policy. This is propagation of a recognized delegation's policy, not a claim tha
 every shell command has been intercepted. Mixed compounds retain permission
 checking and exact authored command bytes.
 
+Once a candidate request and its policy have been loaded, a planner startup,
+process, protocol, output-limit or timeout failure cannot silently remove a
+remote-only requirement. Strict policy or disabled local fallback returns a
+structured hook denial with no rewritten command. Under non-strict policy the
+original command remains unchanged, with a visible diagnostic. Use
+`RCH_LOG_TARGETS=rch::hook::planner_failure=debug` to distinguish operational
+failure from a supported analysis that found nothing to delegate. Successful
+hooks remain silent on stderr. The 750ms parser budget and output bounds are
+unchanged, and the owned parser child is stopped/reaped on timeout. Ordinary
+local commands, explicit project opt-outs, and unsupported grammar keep their
+existing classification policy; this is not broader command interception.
+
 ### Worker selection inventory
 
 `rch --json diagnose --dry-run 'cargo test'` includes a `worker_selection.inventory`
@@ -329,6 +362,29 @@ probe slots or append dispatch-audit entries. Real selection audit records remai
 intact, and actual selections still record their normal audit entries. Inventory
 explains the existing native diagnose request; it does not replace the hook's
 per-component planner or qualify a shared mapping for execution.
+
+### Recovery uses durable owner identity, not PID existence alone
+
+Restart admission and the background recovery scan compare a stale lease's
+recorded boot and native process birth identity with the current process. A
+reused PID or a verified previous boot proves the recorded wrapper is absent;
+a fresh heartbeat, matching live owner, missing birth evidence for a live PID,
+or genuinely unavailable/foreign process view remains blocking. Previous-boot
+proof comes from the observer's own verified native identity, not an unchecked
+boot-id file. The existing fifteen-minute stale-heartbeat requirement remains.
+
+Absence authorizes the existing recovery path; it does not authorize killing the
+current occupant of a recycled PID, replaying a command, or declaring artifacts
+delivered. Journals that still own worker source remain retained. Recovery
+reloads and locks that same journal and still requires its normal completion
+and source-retirement evidence. Existing source-root/shared-workspace paths and
+worker-selection diagnostic reasons are unchanged.
+
+This identity backport does not introduce automatic recipe-less settlement,
+zero-byte journal cleanup, maintenance-owner restart fencing, or new disk
+budgets. A lease without the required recovery/delivery recipe is not newly
+made recoverable merely by aging past 24 hours. Do not delete such evidence or
+assume this change makes an active-fleet restart safe by itself.
 
 ### RTK logs and local fallback limits
 
@@ -528,6 +584,26 @@ only, not acceptance for shared scratch. Do not change NFS mount settings or
 weaken cancellation deadlines to make a test pass. Direct group signaling avoids
 spawning `kill(1)` during cancellation, but cannot force blocked filesystem I/O
 to finish or make a D-state process immediately reapable.
+
+Source admission, namespace setup, reusable source-pair ownership and durable
+execution completion now flush the named records/directories with isolated
+Python `os.fsync`, not utility-dependent filesystem-wide `sync`. Python must be
+available on the worker. Missing Python, unsupported objects or any failed
+barrier refuses confirmation; there is no broader-flush fallback. Private record
+bytes, quarantine evidence, rename source/destination directories and newly
+created ancestors remain explicitly covered. No-follow opens reject record
+symlinks, while validated topology aliases and ordinary ancestor aliases retain
+their existing meaning.
+
+A streamed completion also confirms its retained stdout/stderr bytes before
+publishing and before trusting a receipt after reconnect. Interactive execution
+keeps real stdin/PTY semantics and creates no invented log files; a failed
+receipt barrier returns an unconfirmed outcome rather than the workload's
+apparently successful status. Existing workload exit codes, output bytes,
+source custody, no-replay rules and timeouts remain unchanged. These barriers
+reduce the scope of requested writes, not the amount of required evidence.
+They do not claim power-loss testing, guaranteed bounded filesystem latency or
+that every historical contention/termination failure has the same cause.
 
 The optional RABS worker toolchain pool publishes a synced tree with an
 exclusive `.complete` marker, rather than relying on `RENAME_NOREPLACE`, which

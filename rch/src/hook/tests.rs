@@ -8385,6 +8385,40 @@ edition = "2024"
     );
 }
 
+fn preflight_snapshot_matches(detail: Option<&str>, counter: Option<u64>) -> bool {
+    // The immediate tick may observe start() before update_phase(). Accept the
+    // two exact states, not independent sets that also admit invented progress.
+    matches!(
+        (detail, counter),
+        (Some("build_started"), Some(0)) | (Some("source_validation"), Some(1))
+    )
+}
+
+#[test]
+fn preflight_snapshot_contract_rejects_missing_or_mismatched_progress() {
+    assert!(preflight_snapshot_matches(Some("build_started"), Some(0)));
+    assert!(preflight_snapshot_matches(
+        Some("source_validation"),
+        Some(1)
+    ));
+    for (detail, counter) in [
+        (None, None),
+        (None, Some(0)),
+        (None, Some(1)),
+        (Some("build_started"), None),
+        (Some("build_started"), Some(1)),
+        (Some("source_validation"), None),
+        (Some("source_validation"), Some(0)),
+        (Some("source_validation"), Some(2)),
+        (Some("execute"), Some(1)),
+    ] {
+        assert!(
+            !preflight_snapshot_matches(detail, counter),
+            "invalid detail/counter pair accepted: {detail:?}/{counter:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial(mock_global)]
 async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
@@ -8513,9 +8547,9 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         );
         assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncUp);
         assert!(heartbeat.remote_pgid_file.is_none());
-        assert!(matches!(heartbeat.progress_counter, Some(0 | 1)));
         assert!(
-            heartbeat.detail.is_none() || heartbeat.detail.as_deref() == Some("source_validation")
+            preflight_snapshot_matches(heartbeat.detail.as_deref(), heartbeat.progress_counter),
+            "invalid preflight snapshot: {heartbeat:?}"
         );
     }
 
@@ -8528,22 +8562,31 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         Some("preflight-wrapper"),
         None,
     );
-    heartbeat_loop.update_phase(
-        BuildHeartbeatPhase::SyncUp,
-        Some("source_validation".to_string()),
-    );
+    // Force the startup tick to arrive before the update instead of relying
+    // on relative thread scheduling (the hosted ARM failure's valid ordering).
     let first = tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
         .await
         .expect("initial interval heartbeat")
         .unwrap();
+    assert!(
+        preflight_snapshot_matches(first.detail.as_deref(), first.progress_counter),
+        "startup-before-update must be a valid preflight snapshot: {first:?}"
+    );
+    heartbeat_loop.update_phase(
+        BuildHeartbeatPhase::SyncUp,
+        Some("source_validation".to_string()),
+    );
     let next = tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
         .await
         .expect("periodic preflight heartbeat")
         .unwrap();
     assert_eq!(first.build_id, 72);
     assert_eq!(next.build_id, first.build_id);
-    // The first immediate tick can precede update_phase on the independent
-    // executor. Only compare periodic snapshots after that transition.
+    assert_eq!(first.detail.as_deref(), Some("build_started"));
+    assert_eq!(first.progress_counter, Some(0));
+    assert_eq!(next.progress_counter, Some(1));
+    // The startup tick has already arrived before update_phase. Every later
+    // periodic snapshot must retain that one transition without inventing work.
     let periodic = tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
         .await
         .expect("second periodic preflight heartbeat")

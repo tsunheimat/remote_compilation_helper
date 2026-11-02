@@ -371,25 +371,176 @@ fn daemon_dead_fails_open_fast_and_breaker_opens_per_model() {
     );
 }
 
+/// A bound socket is not a service-readiness acknowledgment. Spend the
+/// fixture's existing startup budget on one real hello/status exchange before
+/// asserting the wrapper's unchanged 25ms/50ms steady-state breaker policy.
+fn confirm_daemon_ready(
+    stream: std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::io::{self, BufRead, BufReader, Write};
+
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "daemon startup deadline"))
+    };
+    let mut stream = BufReader::new(stream);
+    for (request, expected) in [
+        (
+            "{\"kind\":\"hello\",\"transport\":{\"minimum_compatible\":1,\"current\":1},\"application\":{\"minimum_compatible\":1,\"current\":1}}\n",
+            "hello-ok",
+        ),
+        ("{\"kind\":\"status\"}\n", "coord-status"),
+    ] {
+        stream.get_mut().set_write_timeout(Some(remaining()?))?;
+        stream.get_mut().write_all(request.as_bytes())?;
+        let mut frame = Vec::new();
+        // Each read spends the remaining original deadline. Neither trickled
+        // bytes nor coalesced hello/status replies renew the startup budget.
+        loop {
+            stream.get_mut().set_read_timeout(Some(remaining()?))?;
+            let bytes = stream.fill_buf()?;
+            if bytes.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete daemon startup frame",
+                ));
+            }
+            let newline = bytes.iter().position(|byte| *byte == b'\n');
+            let count = newline.map_or(bytes.len(), |offset| offset + 1);
+            if frame.len() + count > 16 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "oversized daemon startup frame",
+                ));
+            }
+            frame.extend_from_slice(&bytes[..count]);
+            stream.consume(count);
+            if newline.is_some() {
+                break;
+            }
+        }
+        let value: serde_json::Value = serde_json::from_slice(&frame)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if value["kind"] != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected daemon startup response",
+            ));
+        }
+        remaining()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn bound_socket_without_protocol_readiness_is_not_a_healthy_daemon() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    // This real bound endpoint satisfies the former exists() check, but must
+    // not satisfy readiness with a malformed, partial, or missing response.
+    for response in [
+        b"".as_slice(),
+        b"{}\n",
+        b"{\"kind\":\"hello-ok\"}",
+        b"{\"kind\":\"hello-ok\"}\n{\"kind\":\"wrong-status\"}\n",
+        b"{\"kind\":\"hello-ok\"}\n{\"kind\":\"coord-status\"}\n",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("not-ready.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(
+            path.exists(),
+            "old socket-existence readiness would succeed"
+        );
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut server = BufReader::new(server);
+            let mut hello = String::new();
+            server.read_line(&mut hello).unwrap();
+            assert!(hello.contains("\"kind\":\"hello\""));
+            server.get_mut().write_all(response).unwrap();
+            // The complete two-frame controls wait for the actual status query.
+            if response.contains(&b'\n') && response.starts_with(b"{\"kind\":\"hello-ok\"}\n") {
+                let mut status = String::new();
+                server.read_line(&mut status).unwrap();
+                assert_eq!(status, "{\"kind\":\"status\"}\n");
+            }
+        });
+        let result = confirm_daemon_ready(client, Instant::now() + Duration::from_secs(5));
+        peer.join().unwrap();
+        assert_eq!(
+            result.is_ok(),
+            response.ends_with(b"{\"kind\":\"coord-status\"}\n")
+        );
+    }
+    let (client, _unresponsive) = UnixStream::pair().unwrap();
+    let result = confirm_daemon_ready(client, Instant::now() + Duration::from_millis(20));
+    assert!(matches!(
+        result.unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ));
+}
+
 #[test]
 fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("rabsd.sock");
     let marker = dir.path().join("rabsd.boot");
-    let mut daemon = Command::new(rabsd_bin())
+    struct OwnedDaemon {
+        child: Child,
+        log: std::path::PathBuf,
+    }
+    impl Drop for OwnedDaemon {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+            if std::thread::panicking() {
+                eprintln!(
+                    "live-daemon evidence: {:?}",
+                    std::fs::read_to_string(&self.log)
+                );
+            }
+        }
+    }
+    let log = dir.path().join("daemon.log");
+    let child = Command::new(rabsd_bin())
         .env("RABS_SOCKET_PATH", &socket)
         .env("RABS_BOOT_MARKER", &marker)
         .env("RABS_STATE_DIR", dir.path().join("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
         .fixture_spawn()
         .expect("spawn rabsd");
+    let mut daemon = OwnedDaemon { child, log };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "socket never appeared");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let connected = loop {
+        assert!(
+            daemon.child.try_wait().unwrap().is_none(),
+            "daemon exited before readiness"
+        );
+        assert!(Instant::now() < deadline, "daemon startup deadline expired");
+        match std::os::unix::net::UnixStream::connect(&socket) {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(error) => panic!("daemon startup connect: {error}"),
+        }
+    };
+    confirm_daemon_ready(connected, deadline).expect("daemon must actually answer hello/status");
 
     let fake = write_script(
         dir.path(),
@@ -398,7 +549,8 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
     );
     let breaker = dir.path().join("breaker");
     let raw_value = b"binary-\xff\xfe";
-    for _ in 0..5 {
+    let mut observations = Vec::new();
+    for iteration in 0..5 {
         let mut command = Command::new(wrap());
         command.arg(&fake).args(["--crate-name", "fx"]);
         command.env("RABS_BREAKER_FILE", &breaker);
@@ -415,7 +567,14 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
             OsString::from_vec(raw_value.to_vec()),
         );
         command.env(OsString::from_vec(b"RABS_TEST_\xff".to_vec()), "untouched");
+        let started = Instant::now();
         let output = command.fixture_output().unwrap();
+        let state = std::fs::read(&breaker).unwrap();
+        observations.push((
+            iteration,
+            started.elapsed(),
+            rabs_protocol::wrapper_breaker::decode_state(&state),
+        ));
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout.as_slice(), raw_value);
     }
@@ -424,14 +583,21 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
     assert_eq!(
         decoded,
         rabs_protocol::wrapper_breaker::BreakerState::fresh(),
-        "successful consults keep the breaker closed-fresh"
+        "successful consults keep the breaker closed-fresh; observations={observations:?}"
+    );
+    let receipts =
+        std::fs::read_to_string(dir.path().join("state/shadow-receipts.ndjson")).unwrap();
+    assert_eq!(
+        receipts.lines().count(),
+        5,
+        "every tested invocation must reach the real daemon"
     );
 
     Command::new("kill")
-        .args(["-TERM", &daemon.id().to_string()])
+        .args(["-TERM", &daemon.child.id().to_string()])
         .fixture_status()
         .unwrap();
-    assert_eq!(daemon.wait().unwrap().code(), Some(0));
+    assert_eq!(daemon.child.wait().unwrap().code(), Some(0));
 }
 
 #[test]

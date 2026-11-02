@@ -570,8 +570,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launcher_status_distinguishes_live_successful_and_failed_owned_children() {
+        assert!(launcher_status(&mut None).unwrap().is_none());
+        // Wait for actual exit before testing its classification. A readiness
+        // deadline is not a guarantee that the OS has scheduled a new process.
+        for code in [0, 17] {
+            let mut child = tokio::process::Command::from(start_command(&format!("exit {code}")))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let observed = timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.code(), Some(code));
+            let mut child = Some(child);
+            if code == 0 {
+                assert!(launcher_status(&mut child).unwrap().unwrap().success());
+            } else {
+                assert!(
+                    launcher_status(&mut child)
+                        .unwrap_err()
+                        .contains("launcher exited")
+                );
+            }
+        }
+        // An owned stdin pipe, rather than a sleep, keeps this child live.
+        let child = tokio::process::Command::from(start_command("IFS= read -r line; exit 0"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut child = Some(child);
+        assert!(launcher_status(&mut child).unwrap().is_none());
+        drop(child.as_mut().unwrap().stdin.take());
+        assert!(
+            timeout(Duration::from_secs(5), child.as_mut().unwrap().wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[tokio::test]
     async fn update_start_refuses_failed_launcher_and_zero_exit_without_ready_api() {
-        for script in ["exit 17", "exit 0"] {
+        for script in [
+            "exit 17",
+            "exit 0",
+            "/bin/sleep 0.2; exit 17",
+            "/bin/sleep 0.2; exit 0",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
             let result = start_with_timing(
@@ -583,11 +637,16 @@ mod tests {
             )
             .await
             .unwrap_err();
-            if script == "exit 17" {
-                assert!(result.contains("launcher exited"), "{result}");
-            } else {
-                assert!(result.contains("readiness timed out"), "{result}");
-            }
+            // Neither a known failed launcher nor one still unobserved at the
+            // unchanged deadline is readiness. A zero exit alone is not either.
+            // The exact status branch is exercised above, and a failed launcher
+            // with a responding delegated child is rejected below as well.
+            let expired = result.starts_with("daemon readiness timed out after 100ms:")
+                && result.ends_with("installed files and any running daemon retained");
+            let failed = script.ends_with("exit 17")
+                && result.starts_with("installed daemon launcher exited ")
+                && result.ends_with("restart failed");
+            assert!(expired || failed, "{script}: {result}");
             assert!(!socket.exists());
         }
     }
@@ -703,8 +762,8 @@ null = os.stat(os.devnull)
 for descriptor in (0, 1, 2):
     metadata = os.fstat(descriptor)
     assert stat.S_ISCHR(metadata.st_mode) and metadata.st_rdev == null.st_rdev
-if mode == 'delegated' and os.fork() != 0:
-    sys.exit(0)
+if mode in ('delegated', 'delegated-failed') and os.fork() != 0:
+    sys.exit(17 if mode == 'delegated-failed' else 0)
 if mode == 'delayed':
     time.sleep(0.05)
 server = socket.socket(socket.AF_UNIX)
@@ -744,7 +803,7 @@ os.rename(pending, done)
 
     #[tokio::test]
     async fn update_start_waits_for_real_child_and_detaches_output_pipes() {
-        for mode in ["immediate", "delayed", "delegated"] {
+        for mode in ["immediate", "delayed", "delegated", "delegated-failed"] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("custom : daemon.sock");
             let fixture = directory.path().join("child.py");
@@ -768,15 +827,19 @@ os.rename(pending, done)
             command
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            start_with_timing(
+            let readiness = start_with_timing(
                 command,
                 &socket,
                 Some("9.1.2"),
                 Duration::from_secs(2),
                 timing(),
             )
-            .await
-            .unwrap();
+            .await;
+            if mode == "delegated-failed" {
+                assert!(readiness.unwrap_err().contains("launcher exited"));
+            } else {
+                readiness.unwrap();
+            }
             timeout(Duration::from_secs(3), async {
                 while !done.exists() {
                     sleep(Duration::from_millis(10)).await;

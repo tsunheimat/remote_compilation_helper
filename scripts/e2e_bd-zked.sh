@@ -167,8 +167,23 @@ test_unit_tests() {
 test_no_negative_savings() {
     log_json "test" "Verifying time_saved_ms cannot be negative"
 
-    grep -q 'test history::tests::test_saved_time_stats_no_negative_savings .* ok' "$tmp_root/saved-time-tests.log" \
-        || die "Non-negative savings behavior test did not pass"
+    # The concurrent --nocapture group can interleave tracing between the
+    # harness's test name and its trailing `ok`. That cosmetic line is not a
+    # per-case verdict. Execute the exact assertion, require a successful exit
+    # and exactly one non-ignored pass, and keep its diagnostics separately.
+    local test_name="history::tests::test_saved_time_stats_no_negative_savings"
+    local result_log="$tmp_root/no-negative-savings.log"
+    local diagnostics="$tmp_root/no-negative-savings.stderr"
+    local status=0
+    (cd "$PROJECT_ROOT" && RUST_TEST_NOCAPTURE=0 cargo test --locked -p rchd --bin rchd -- "$test_name" --exact) \
+        >"$result_log" 2>"$diagnostics" || status=$?
+    # Retain the actual test outputs in the uploaded scenario artifact directory.
+    cp "$result_log" "${LOG_FILE%.jsonl}.no-negative-savings.log"
+    cp "$diagnostics" "${LOG_FILE%.jsonl}.no-negative-savings.stderr"
+    cat "$diagnostics" >&2
+    [[ "$status" -eq 0 ]] || die "Non-negative savings test exited $status; see $result_log"
+    grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$result_log" \
+        || die "Exact non-negative savings selection did not run one passing test; see $result_log"
     log_json "verify" "Non-negative savings behavior test passed" '{"result":"pass"}'
 }
 
@@ -248,4 +263,7 @@ main() {
     echo "E2E test log: $LOG_FILE"
 }
 
-main "$@"
+# Permit focused tests of these assertions without starting a daemon.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
