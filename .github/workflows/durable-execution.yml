@@ -4,6 +4,16 @@ name: Durable execution recovery
 # grant a CI process permission to publish a repair directly to main.
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - 'rch/src/transfer.rs'
+      - 'rch/src/hook/source_claim_registry.sh'
+      - 'rch-common/src/stale_target_reap.rs'
+      - 'scripts/tests/test_durable_execution.py'
+      - 'scripts/test_source_claim_registry.py'
+      - 'scripts/tests/test_source_claim_registry.py'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/durable-execution.yml'
   push:
     branches: [main]
     paths:

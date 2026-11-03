@@ -2,6 +2,8 @@
 """Run the exact embedded rch-build supervisor, not the legacy watchdog tail.
 
 SupervisedPlatform uses native Linux/macOS identities without platform mocks.
+Complete-witness helper controls use a stable, owned native group; the other
+cases retain the real supervisor/watchdog, including incomplete-census refusal.
 DarwinPrimitives selects Darwin's portable syscall adapters explicitly, also
 on Linux; those tests are not native libproc or macOS qualification. Darwin
 needs the candidate rch-wkr and Python 3.7+ (the harness needs Python 3.9+).
@@ -45,12 +47,22 @@ class SupervisedPlatform(unittest.TestCase):
     def setUp(self):
         # Retain failure receipts for diagnosis. Only our direct supervisor
         # children are signalled during cleanup; their own watchdog owns work.
-        self.root = Path(tempfile.mkdtemp(prefix="rch-supervised-platform-"))
+        evidence = os.environ.get("RCH_TEST_EVIDENCE_ROOT")
+        if evidence:
+            self.assertTrue(Path(evidence).is_absolute(), "evidence root must be absolute")
+            Path(evidence).mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="rch-supervised-platform-", dir=evidence))
         self.receipt = self.root / "receipt"
         self.ready = self.root / "ready"
         self.release = self.root / "release"
         self.children = []
         self.env = dict(os.environ, HOME=str(self.root), TMPDIR=str(self.root))
+        if evidence:
+            self.env['RCH_TEST_OBSERVATION_TRACE'] = str(self.root / 'observations.log')
+            (self.root / 'case.json').write_text(json.dumps({
+                'case': self.id(), 'shell': SHELL,
+                'no_gnu_timeout': os.environ.get('RCH_TEST_NO_TIMEOUT') == '1',
+            }))
         if os.environ.get("RCH_TEST_NO_TIMEOUT") == "1":
             binaries = self.root / "bin"
             binaries.mkdir()
@@ -74,8 +86,47 @@ class SupervisedPlatform(unittest.TestCase):
             # An exact fresh-channel recovery, never a blind killpg(record).
             self.cancel("kill")
 
+    def diagnostic_protocol(self, protocol):
+        # Test-only observation, not replacement evidence: call the unchanged
+        # native functions once and preserve their exit/stdout/stderr. Capture
+        # failed exchanges and unavailable census snapshots out-of-band, so a
+        # hosted failure is diagnosable instead of discarding its /tmp tree.
+        if not self.env.get('RCH_TEST_OBSERVATION_TRACE'):
+            return protocol
+        for name in ('rch_group_state', 'rch_control_capture'):
+            declaration = name + '() {'
+            self.assertEqual(protocol.count(declaration), 1)
+            protocol = protocol.replace(declaration, name + '_diagnostic_original() {', 1)
+        boundary = '\nRCH_SCOPED_LAUNCH_SOURCE_104\n'
+        self.assertEqual(protocol.count(boundary), 1)
+        wrappers = r'''
+rch_group_state() {
+    rch_group_state_diagnostic_original
+    rch_fixture_diagnostic_state=$?
+    if [ "$rch_fixture_diagnostic_state" = 2 ]; then
+        {
+            printf 'CENSUS_UNAVAILABLE observer=%s group=%s identified=%s\n' "$$" "${rch_pgid-}" "${rch_identified-}"
+            printf 'LAST_SNAPSHOT_MAY_BE_STALE\n%s\nEND_SNAPSHOT\n' "${rch_snapshot-}"
+        } >> "$RCH_TEST_OBSERVATION_TRACE" 2>/dev/null || :
+    fi
+    return "$rch_fixture_diagnostic_state"
+}
+rch_control_capture() {
+    rch_control_capture_diagnostic_original "$@"
+    rch_fixture_diagnostic_capture=$?
+    if [ "$rch_fixture_diagnostic_capture" != 0 ]; then
+        printf 'CAPTURE_FAILED observer=%s status=%s budget=%s executable=%s\n' \
+            "$$" "$rch_fixture_diagnostic_capture" "${1-}" "${2-}" \
+            >> "$RCH_TEST_OBSERVATION_TRACE" 2>/dev/null || :
+    fi
+    return "$rch_fixture_diagnostic_capture"
+}
+'''
+        return protocol.replace(boundary, '\n' + wrappers + boundary, 1)
+
     def start(self, payload, seconds=0, prefix="", stdin=subprocess.DEVNULL,
               protocol=PROTOCOL, diagnostic=None):
+        protocol = self.diagnostic_protocol(protocol)
         out = open(self.root / f"out-{len(self.children)}", "w+b")
         err = open(self.root / f"err-{len(self.children)}", "w+b")
         self.addCleanup(out.close)
@@ -104,7 +155,14 @@ class SupervisedPlatform(unittest.TestCase):
     def wait_ready(self, child):
         until = time.monotonic() + 15
         while not self.ready.exists():
-            self.assertIsNone(child.poll(), f"setup failed; fixtures: {self.root}")
+            status = child.poll()
+            if status is not None:
+                error = self.root / f"err-{self.children.index(child)}"
+                with error.open('rb') as stream:
+                    stream.seek(0, os.SEEK_END)
+                    stream.seek(max(0, stream.tell() - 4096))
+                    diagnostic = stream.read().decode(errors='replace')
+                self.fail(f"setup failed ({status}); fixtures: {self.root}; stderr: {diagnostic}")
             self.assertLess(time.monotonic(), until, f"setup stalled: {self.root}")
             time.sleep(.02)
         self.assertTrue(self.receipt.exists())
@@ -114,9 +172,96 @@ class SupervisedPlatform(unittest.TestCase):
         return (f"printf ready > {shlex.quote(str(self.ready))}; "
                 f"while [ ! -f {shlex.quote(str(self.release))} ]; do sleep .1; done")
 
-    def observe(self, body):
-        return subprocess.run([SHELL, "-c", PROTOCOL + "\n" + body], env=self.env,
-                              capture_output=True, timeout=30)
+    def observe(self, body, protocol=PROTOCOL, timeout=30):
+        protocol = self.diagnostic_protocol(protocol)
+        return subprocess.run([SHELL, "-c", protocol + "\n" + body], env=self.env,
+                              capture_output=True, timeout=timeout)
+
+    def start_stable_witness(self):
+        # Complete collection needs a stable census. The real supervisor's
+        # watchdog repeatedly starts short-lived helpers; their disappearance
+        # correctly refuses partial witnesses and selects immediate KILL. That
+        # is not a valid positive fixture for an assertion requiring TERM.
+        # This one-process native group has a genuine production identity
+        # record and no changing descendants. Other tests still exercise the
+        # entire supervisor/watchdog, deadlines and incomplete-census behavior.
+        out = open(self.root / f"out-{len(self.children)}", "w+b")
+        err = open(self.root / f"err-{len(self.children)}", "w+b")
+        self.addCleanup(out.close)
+        self.addCleanup(err.close)
+        payload = ("import pathlib, signal, sys; "
+                   "pathlib.Path(sys.argv[1]).write_text('ready'); signal.pause()")
+        child = subprocess.Popen(
+            [SHELL, "-c", self.diagnostic_protocol(PROTOCOL) + '\nrch_remote_record "$1" 115 || exit $?; '
+             'exec "$2" -I -S -c "$3" "$4"',
+             "rch-stable-witness", str(self.receipt), sys.executable, payload, str(self.ready)],
+            env=self.env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+            start_new_session=True,
+        )
+        self.children.append(child)
+        until = time.monotonic() + 15
+        while not self.ready.exists():
+            self.assertIsNone(child.poll(), self.contents(err).decode(errors="replace"))
+            self.assertLess(time.monotonic(), until, f"native group setup stalled: {self.root}")
+            time.sleep(.02)
+        self.assertTrue(self.receipt.exists())
+        return child, out, err
+
+    def observe_capture_fault(self, body, timeout=30):
+        # Restrict exchange faults to the bounded witness helper. Darwin also
+        # uses rch_control_capture for native leader identity; corrupting that
+        # unrelated 1s call tests missing authority (43), not invalid witnesses.
+        marker = "rch_control_capture() {"
+        self.assertEqual(CORE.count(marker), 1)
+        core = CORE.replace(marker, "rch_fixture_real_capture() {", 1)
+        trace = shlex.quote(str(self.root / "capture-exchanges"))
+        core += '''
+rch_control_capture() {
+    if [ "${rch_fixture_capture_status+x}" = x ] &&
+        [ "${1-}:${2-}:${3-}:${5-}" = '5s:/bin/sh:-c:rch-witnesses' ]; then
+        printf '%s\\n' "$rch_fixture_capture_status" >> ''' + trace + '''
+        printf '%s\\n' "$rch_fixture_capture_output"
+        return "$rch_fixture_capture_status"
+    fi
+    rch_fixture_real_capture "$@"
+}
+'''
+        return self.observe(body, protocol=PROTOCOL.replace(CORE, core, 1), timeout=timeout)
+
+    def observe_live_capture_fault(self, body, budget=5):
+        # Malformed-reply tests need an authenticated LIVE census as setup.
+        # Darwin can legitimately report unknown for a global ps snapshot; do
+        # not confuse an unavailable prerequisite with the injected reply's
+        # verdict. Only that pre-fault unknown is retried, within a SINGLE
+        # five-second bound (stricter than observe's former 30-second limit).
+        # A disappeared/invalid owner or any result AFTER injection is returned
+        # once, never retried into a green test. All six fault deliveries are
+        # still counted independently by capture-exchanges.
+        prefix = f'''
+rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
+rch_group_state
+case "$?" in
+    1) ;;
+    2) printf 'RCH_FIXTURE_CENSUS_UNAVAILABLE\\n' >&2; exit 79 ;;
+    *) exit 81 ;;
+esac
+'''
+        until = time.monotonic() + budget
+        unavailable = 0
+        while True:
+            remaining = until - time.monotonic()
+            self.assertGreater(remaining, 0,
+                               f"live witness setup not confirmed; unknown={unavailable}; fixture={self.root}")
+            try:
+                result = self.observe_capture_fault(prefix + body, timeout=remaining)
+            except subprocess.TimeoutExpired:
+                self.fail(f"live witness setup/exchange exceeded its total bound; fixture={self.root}")
+            self.assertLess(time.monotonic(), until, "late witness fixture evidence")
+            if (result.returncode != 79 or result.stdout or
+                    result.stderr != b'RCH_FIXTURE_CENSUS_UNAVAILABLE\n'):
+                return result
+            unavailable += 1
+            time.sleep(min(.05, max(0, until - time.monotonic())))
 
     def cancel(self, mode="term"):
         return self.observe(f"rch_remote_cancel {shlex.quote(str(self.receipt))} 115 {mode}")
@@ -125,6 +270,90 @@ class SupervisedPlatform(unittest.TestCase):
         result = self.observe(
             f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; rch_group_state")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def assert_crash_cleanup(self, until):
+        # A killed leader does not produce a terminal-success acknowledgement.
+        # Its surviving watchdog cleans asynchronously. Within the caller's
+        # ORIGINAL crash budget, require a fresh affirmative empty census;
+        # neither a live group nor unavailable evidence is success. Normal
+        # successful-completion tests still use immediate assert_empty().
+        states = []
+        diagnostic = b''
+        while True:
+            remaining = until - time.monotonic()
+            self.assertGreater(remaining, 0,
+                               f"crash cleanup not confirmed; states={states}; "
+                               f"stderr={diagnostic!r}; fixture={self.root}")
+            try:
+                result = self.observe(
+                    f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; rch_group_state",
+                    timeout=remaining,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail(f"crash cleanup observer exceeded its total deadline; states={states}; "
+                          f"fixture={self.root}")
+            states.append(result.returncode)
+            diagnostic = result.stderr[-4096:]
+            self.assertLess(time.monotonic(), until, f"late cleanup evidence: {states}")
+            self.assertIn(result.returncode, (0, 1, 2), diagnostic)
+            if result.returncode == 0:
+                return states
+            time.sleep(min(.05, max(0, until - time.monotonic())))
+
+    def test_crash_cleanup_requires_positive_census_and_preserves_total_deadline(self):
+        from unittest.mock import patch
+
+        run = self.start_stable_witness()
+        # A real live group cannot pass merely by exhausting the wait budget.
+        with self.assertRaises(AssertionError):
+            self.assert_crash_cleanup(time.monotonic() + .2)
+        self.assertIsNone(run[0].poll())
+        self.assertEqual(self.cancel("kill").returncode, 0)
+        run[0].wait(timeout=5)
+        native_observe = self.observe
+        calls = []
+
+        def transient(body, **kwargs):
+            calls.append(body)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess([], 2, b'', b'explicit unavailable-census fault')
+            return native_observe(body, **kwargs)
+
+        # Exactly one injected unavailable observation followed by real native
+        # absence is a valid asynchronous cleanup, not an unknown-as-success.
+        with patch.object(self, 'observe', side_effect=transient):
+            states = self.assert_crash_cleanup(time.monotonic() + 8)
+        self.assertEqual(states[0], 2)
+        self.assertEqual(states[-1], 0)
+        self.assertGreaterEqual(len(calls), 2)
+        with patch.object(self, 'observe', return_value=subprocess.CompletedProcess([], 2, b'', b'unknown')):
+            with self.assertRaises(AssertionError):
+                self.assert_crash_cleanup(time.monotonic() + .1)
+        with patch.object(self, 'observe', return_value=subprocess.CompletedProcess([], 43, b'', b'wrong identity')):
+            with self.assertRaises(AssertionError):
+                self.assert_crash_cleanup(time.monotonic() + 8)
+        with patch.object(self, 'observe', side_effect=subprocess.TimeoutExpired('owned census', .1)):
+            with self.assertRaises(AssertionError):
+                self.assert_crash_cleanup(time.monotonic() + .1)
+
+    def test_observer_diagnostics_preserve_status_and_streams_without_authority(self):
+        trace = self.root / 'diagnostic-control.log'
+        for body in (
+            "rch_control_capture 1s /bin/sh -c 'printf native-success'",
+            "rch_control_capture 1s /bin/sh -c 'printf native-refusal; exit 7'",
+            "rch_check_procfs_namespace() { return 1; }; rch_group_state",
+        ):
+            self.env.pop('RCH_TEST_OBSERVATION_TRACE', None)
+            baseline = self.observe(body)
+            self.env['RCH_TEST_OBSERVATION_TRACE'] = str(trace)
+            diagnosed = self.observe(body)
+            self.assertEqual((diagnosed.returncode, diagnosed.stdout, diagnosed.stderr),
+                             (baseline.returncode, baseline.stdout, baseline.stderr))
+        text = trace.read_text()
+        self.assertIn('status=7 budget=1s executable=/bin/sh', text)
+        self.assertIn('CENSUS_UNAVAILABLE', text)
+        self.assertNotIn('native-refusal', text, "diagnostics do not copy captured command content")
+        self.assertFalse(self.receipt.exists(), "observability must not fabricate an execution record")
 
     def test_status_and_binary_stdin_survive_supervision(self):
         data = b"original\x00input\nlast\xff"
@@ -172,7 +401,7 @@ class SupervisedPlatform(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         started = time.monotonic()
         self.assertNotEqual(run[0].wait(timeout=8), 0)
-        self.assert_empty()
+        self.assert_crash_cleanup(started + 8)
         self.assertLess(time.monotonic() - started, 8)
 
     def test_deadline_stops_group_and_emits_marker(self):
@@ -198,7 +427,7 @@ class SupervisedPlatform(unittest.TestCase):
         self.assertNotEqual(run[0].wait(timeout=15), 0)
         self.assert_empty()
 
-    def cancel_with_probe(self, probe):
+    def cancel_with_probe(self, probe, unavailable_after_kill=False):
         # Fault injection is confined to the cancelling channel. Launch,
         # leader identity, actual signals and the final census remain native.
         # Put it in the literal shared source so a bounded collector sees the
@@ -206,16 +435,57 @@ class SupervisedPlatform(unittest.TestCase):
         core = CORE.replace("rch_read_process() {", "rch_real_read_process() {")
         core += "\n" + probe
         trace = self.root / "signals"
+        outcomes = shlex.quote(str(self.root / "signal-outcomes"))
         core = core.replace("rch_signal_group() {", "rch_real_signal_group() {")
-        core += ("\nrch_signal_group() { printf '%s\\n' \"$1\" >> "
-                 + shlex.quote(str(trace)) + '; rch_real_signal_group "$@"; }\n')
-        script = PROTOCOL.replace(CORE, core) + (
+        core += ("\nrch_fixture_killed=0\nrch_signal_group() { printf '%s\\n' \"$1\" >> "
+                 + shlex.quote(str(trace)) + '; rch_real_signal_group "$@"; '
+                 'rch_fixture_signal_status=$?; printf "%s:%s\\n" "$1" "$rch_fixture_signal_status" >> '
+                 + outcomes + '; [ "$1:$rch_fixture_signal_status" != KILL:0 ] || rch_fixture_killed=1; '
+                 'return "$rch_fixture_signal_status"; }\n')
+        if unavailable_after_kill:
+            # Only the cancelling channel's first post-KILL census is replaced.
+            # The real authorized signal and independent recovery observation
+            # below remain native. This must produce refusal44, never success.
+            core = core.replace("rch_group_state() {", "rch_fixture_group_state() {", 1)
+            core += '''
+rch_fixture_unknown=0
+rch_group_state() {
+    if [ "$rch_fixture_killed" = 1 ] && [ "$rch_fixture_unknown" = 0 ]; then
+        rch_fixture_unknown=1
+        printf 'RCH_FIXTURE_POST_KILL_UNKNOWN\\n' >&2
+        return 2
+    fi
+    rch_fixture_group_state
+}
+'''
+        script = self.diagnostic_protocol(PROTOCOL.replace(CORE, core)) + (
             f"\nrch_remote_cancel {shlex.quote(str(self.receipt))} 115 term")
         started = time.monotonic()
+        self.cancel_started = started
         result = subprocess.run([SHELL, "-c", script], env=self.env,
                                 capture_output=True, timeout=25)
         elapsed = time.monotonic() - started
         return result, elapsed, trace.read_text() if trace.exists() else ""
+
+    def assert_bounded_kill(self, run, result, elapsed, signals):
+        # The cancellation API must never claim success on unavailable census.
+        # A valid44 AFTER an authenticated KILL is unconfirmed, not a retry of
+        # the workload or permission to ignore liveness. Confirm actual native
+        # absence on a fresh observation within the ORIGINAL10s total budget.
+        self.assertIn(result.returncode, (0, 44), result.stderr)
+        self.assertLess(elapsed, 10, "member observation consumed the recovery budget")
+        self.assertEqual(signals, "KILL\n", "partial collection must not authorize TERM")
+        self.assertEqual((self.root / "signal-outcomes").read_text().splitlines(), ["KILL:0"],
+                         "an attempted or refused signal is not delivered cancellation")
+        until = self.cancel_started + 10
+        if result.returncode == 0:
+            self.assert_empty()
+        else:
+            self.assert_crash_cleanup(until)
+        remaining = until - time.monotonic()
+        self.assertGreater(remaining, 0, "cleanup exceeded original cancellation budget")
+        self.assertNotEqual(run[0].wait(timeout=remaining), 0)
+        self.assertLess(time.monotonic(), until)
 
     def test_stalled_member_probe_cannot_starve_cancellation(self):
         run = self.start(
@@ -229,11 +499,35 @@ rch_read_process() {{
     rch_real_read_process "$1"
 }}
 ''')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(elapsed, 10, "member observation consumed the recovery budget")
-        self.assertEqual(signals, "KILL\n", "partial collection must not authorize TERM")
+        self.assert_bounded_kill(run, result, elapsed, signals)
+
+    def test_post_kill_unknown_stays_refused_until_separate_native_confirmation(self):
+        from unittest.mock import patch
+
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        # Deliberately unavailable witnesses require the independently verified
+        # leader's immediate KILL. No fabricated process identities or signals.
+        result, elapsed, signals = self.cancel_with_probe('''
+rch_read_process() {
+    [ "$1" = "$rch_pgid" ] || return 1
+    rch_real_read_process "$1"
+}
+''', unavailable_after_kill=True)
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assertIn(b'RCH_FIXTURE_POST_KILL_UNKNOWN', result.stderr)
+        self.assert_bounded_kill(run, result, elapsed, signals)
+        # Refusal remains refusal even after separate cleanup confirmation.
+        self.assertEqual(result.returncode, 44)
+        with self.assertRaises(AssertionError):
+            self.assert_bounded_kill(run, result, elapsed, '')
+        with patch.object(self, 'assert_crash_cleanup', side_effect=AssertionError('still live/unknown')):
+            with self.assertRaises(AssertionError):
+                self.assert_bounded_kill(run, result, elapsed, signals)
+        with patch.object(self, 'cancel_started', time.monotonic() - 11):
+            with self.assertRaises(AssertionError):
+                self.assert_bounded_kill(run, result, elapsed, signals)
         self.assert_empty()
-        self.assertNotEqual(run[0].wait(timeout=10), 0)
 
     def test_large_group_has_one_collection_budget_not_one_per_member(self):
         run = self.start(
@@ -253,8 +547,7 @@ rch_read_process() {
         self.assertNotEqual(run[0].wait(timeout=10), 0)
 
     def test_complete_collection_retains_graceful_term(self):
-        run = self.start(self.blocking_payload())
-        self.wait_ready(run[0])
+        run = self.start_stable_witness()
         result, _, signals = self.cancel_with_probe('''
 rch_read_process() { rch_real_read_process "$1"; }
 ''')
@@ -290,22 +583,61 @@ rch_remote_witness_matches
         self.assertIsNone(run[0].poll(), "failed witness probe signalled the workload")
         self.assertEqual(self.cancel("kill").returncode, 0)
 
+    def test_witness_fixture_requires_live_setup_and_never_retries_fault_results(self):
+        from unittest.mock import patch
+
+        run = self.start_stable_witness()
+        native = self.observe_capture_fault
+        calls = []
+
+        def unavailable_once(body, **kwargs):
+            calls.append(body)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess([], 79, b'', b'RCH_FIXTURE_CENSUS_UNAVAILABLE\n')
+            return native(body, **kwargs)
+
+        fault = '''
+rch_fixture_capture_output=123
+rch_fixture_capture_status=0
+rch_capture_group_witnesses
+[ "$?" = 46 ] && [ -z "$rch_witnesses$rch_witness_identity" ] || exit 82
+'''
+        with patch.object(self, 'observe_capture_fault', side_effect=unavailable_once):
+            self.assertEqual(self.observe_live_capture_fault(fault).returncode, 0)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual((self.root / 'capture-exchanges').read_text().splitlines(), ['0'])
+        for code in (80, 81, 82):
+            with self.subTest(code=code):
+                result = subprocess.CompletedProcess([], code, b'', b'identity/absence/fault failure')
+                with patch.object(self, 'observe_capture_fault', return_value=result) as observer:
+                    self.assertEqual(self.observe_live_capture_fault(fault).returncode, code)
+                    self.assertEqual(observer.call_count, 1)
+        unavailable = subprocess.CompletedProcess([], 79, b'', b'RCH_FIXTURE_CENSUS_UNAVAILABLE\n')
+        with patch.object(self, 'observe_capture_fault', return_value=unavailable):
+            with self.assertRaises(AssertionError):
+                self.observe_live_capture_fault(fault, budget=.1)
+        with patch.object(self, 'observe_capture_fault', side_effect=subprocess.TimeoutExpired('census', .1)):
+            with self.assertRaises(AssertionError):
+                self.observe_live_capture_fault(fault, budget=.1)
+        self.assertIsNone(run[0].poll())
+        self.assertEqual(self.cancel('kill').returncode, 0)
+
     def test_partial_and_malformed_collection_never_leaks_witnesses(self):
-        run = self.start(self.blocking_payload())
-        self.wait_ready(run[0])
+        run = self.start_stable_witness()
         for output, code in (("123:456", 7), ("", 0), ("123", 0),
                              ("123:0", 0), ("1:456", 0), ("123:456:789", 0)):
             with self.subTest(output=output, status=code):
-                result = self.observe(f'''
-rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
-rch_group_state; [ "$?" = 1 ] || exit 81
-rch_control_capture() {{ printf '%s\\n' {shlex.quote(output)}; return {code}; }}
+                result = self.observe_live_capture_fault(f'''
+rch_fixture_capture_output={shlex.quote(output)}
+rch_fixture_capture_status={code}
 rch_witnesses=stale; rch_witness_identity=stale
 rch_capture_group_witnesses
 [ "$?" = 46 ] && [ -z "$rch_witnesses$rch_witness_identity" ] || exit 82
 ''')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIsNone(run[0].poll())
+        self.assertEqual((self.root / "capture-exchanges").read_text().splitlines(),
+                         ['7', '0', '0', '0', '0', '0'])
         self.assertEqual(self.cancel("kill").returncode, 0)
 
     def test_collection_failure_does_not_bypass_live_birth_check(self):
@@ -322,24 +654,26 @@ rch_remote_cancel {shlex.quote(str(self.receipt))} 115 term
         self.assertEqual(self.cancel("kill").returncode, 0)
 
     def test_bounded_witness_match_preserves_birth_and_exchange_fences(self):
-        run = self.start(self.blocking_payload())
-        self.wait_ready(run[0])
-        result = self.observe(f'''
+        run = self.start_stable_witness()
+        result = self.observe_capture_fault(f'''
 rch_read_record {shlex.quote(str(self.receipt))} 115 || exit 80
 rch_group_state; [ "$?" = 1 ] || exit 81
 rch_capture_group_witnesses || exit 82
 rch_remote_witness_matches || exit 83
 rch_witnesses="$rch_pgid:$((rch_start + 1))"
 if rch_remote_witness_matches; then exit 84; fi
-rch_control_capture() {{ printf 'RCH_WITNESS_MATCH_V1\\n'; return 7; }}
+rch_fixture_capture_output=RCH_WITNESS_MATCH_V1
+rch_fixture_capture_status=7
 if rch_remote_witness_matches; then exit 85; fi
-rch_control_capture() {{ printf 'RCH_WITNESS_MATCH_V1 contaminated\\n'; }}
+rch_fixture_capture_output='RCH_WITNESS_MATCH_V1 contaminated'
+rch_fixture_capture_status=0
 if rch_remote_witness_matches; then exit 86; fi
 rch_witness_identity=stale
-rch_control_capture() {{ exit 87; }}
+rch_fixture_capture_status=87
 if rch_remote_witness_matches; then exit 88; fi
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "capture-exchanges").read_text().splitlines(), ['7', '0'])
         self.assertIsNone(run[0].poll())
         self.assertEqual(self.cancel("kill").returncode, 0)
 
@@ -481,6 +815,48 @@ class DarwinPrimitives(unittest.TestCase):
                    + body)
         return subprocess.run([SHELL, "-c", source], input=data, env=env,
                               capture_output=True, start_new_session=True, timeout=10)
+
+    def test_native_darwin_unknown_state_is_scoped_to_the_target_group(self):
+        # macOS artifact13127873747 contained a valid unrelated `?<` row:
+        # pid28119/group965 invalidated live group27856 and aborted admission.
+        # Apple ps/tasks.c defines H and ? in mach_state_table. These are not
+        # malformed records. An unknown TARGET state must remain unknown;
+        # no parser result here grants signal authority or replays a workload.
+        cases = (
+            ('unrelated unknown, live target', '42 42 S<\n51 965 ?<', 1, True),
+            ('unrelated unknown, empty target', '51 965 ?<', 0, True),
+            ('unrelated unknown, zombie target', '42 42 Z\n51 965 ?<', 0, True),
+            ('halted target is not terminal', '42 42 H', 1, True),
+            ('unknown target cannot prove absence', '42 42 ?<', 2, True),
+            ('live member cannot hide unknown target', '42 42 S\n43 42 ?', 2, True),
+            ('zombie cannot hide unknown target', '42 42 Z\n43 42 ?', 2, True),
+            ('ordinary live target', '42 42 R+', 1, True),
+            ('ordinary empty target', '51 965 S', 0, True),
+            ('malformed unrelated state', '51 965 !', 2, True),
+            ('future unsupported state', '51 965 Q', 2, True),
+            ('unknown state with invalid suffix', '51 965 ?!', 2, True),
+            ('malformed pid', 'invalid 965 ?', 2, True),
+            ('malformed group', '51 invalid ?', 2, True),
+            ('missing field', '51 965', 2, True),
+            ('extra field', '51 965 ? extra', 2, True),
+            ('duplicate pid', '51 965 S\n51 965 ?', 2, True),
+            ('missing observer', '51 965 ?', 2, False),
+        )
+        for name, rows, expected, observer in cases:
+            with self.subTest(name=name):
+                observed = 'printf "%s 4241 S\\n" "$$"' if observer else ':'
+                result = self.run_adapter(f'''
+rch_pgid=42
+rch_scope_bound=0
+rch_control_capture() {{
+    [ "$#" = 4 ] && [ "$1:$2:$3:$4" = '1s:ps:-axo:pid=,pgid=,stat=' ] || return 125
+    {observed}
+    printf '%s\\n' {shlex.quote(rows)}
+}}
+rch_group_state
+''')
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(result.stdout, b'')
 
     def site_environment(self):
         # A real isolated venv, not a fake python executable. -I still loads
