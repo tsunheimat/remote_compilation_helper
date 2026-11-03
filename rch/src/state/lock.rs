@@ -301,11 +301,33 @@ impl ConfigLock {
         timeout: Duration,
         operation: &str,
     ) -> Result<Self> {
+        let start = Instant::now();
+        Self::acquire_in_dir_with_wait(
+            lock_dir,
+            lock_name,
+            timeout,
+            operation,
+            || start.elapsed(),
+            std::thread::sleep,
+        )
+    }
+
+    /// Real file/owner operations with observable test-clock and sleep edges.
+    /// Host descheduling is not evidence that this helper requested a longer
+    /// polling interval. This seam is test-only, not a new product clock.
+    #[cfg(test)]
+    fn acquire_in_dir_with_wait(
+        lock_dir: &Path,
+        lock_name: &str,
+        timeout: Duration,
+        operation: &str,
+        mut elapsed: impl FnMut() -> Duration,
+        mut wait: impl FnMut(Duration),
+    ) -> Result<Self> {
         fs::create_dir_all(lock_dir)
             .with_context(|| format!("Failed to create lock directory: {:?}", lock_dir))?;
 
         let path = lock_dir.join(format!("{}.lock", lock_name));
-        let start = Instant::now();
         let poll_interval = Duration::from_millis(10); // Faster polling for tests
 
         loop {
@@ -320,7 +342,7 @@ impl ConfigLock {
                     return Ok(ConfigLock { file, path, body });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if start.elapsed() >= timeout {
+                    if elapsed() >= timeout {
                         let holder = Self::read_lock_info(&path).ok();
                         return Err(anyhow!(
                             "Lock acquisition timeout after {:?}. Lock held by: {:?}",
@@ -328,7 +350,7 @@ impl ConfigLock {
                             holder
                         ));
                     }
-                    std::thread::sleep(poll_interval);
+                    wait(poll_interval);
                 }
                 Err(e) => {
                     return Err(anyhow!("Failed to create lock file: {}", e));
@@ -1007,41 +1029,107 @@ mod tests {
 
     #[test]
     fn test_backoff_polling_interval() {
-        log_test_start("test_backoff_polling_interval");
+        use std::cell::Cell;
 
         let tmp = TempDir::new().unwrap();
         let lock_dir = tmp.path().join("locks");
-
-        // Hold a lock
-        let _lock = ConfigLock::acquire_in_dir(&lock_dir, "backoff_test", "holder").unwrap();
-
-        // Try to acquire with short timeout
-        let start = std::time::Instant::now();
-        let _ = ConfigLock::acquire_in_dir_with_timeout(
+        let _holder = ConfigLock::acquire_in_dir(&lock_dir, "backoff_test", "holder").unwrap();
+        let path = lock_dir.join("backoff_test.lock");
+        let before = fs::read(&path).unwrap();
+        let elapsed = Cell::new(Duration::ZERO);
+        let probes = Cell::new(0);
+        let mut sleeps = Vec::new();
+        let result = ConfigLock::acquire_in_dir_with_wait(
             &lock_dir,
             "backoff_test",
             Duration::from_millis(50),
             "waiter",
+            || {
+                probes.set(probes.get() + 1);
+                assert!(probes.get() <= 6, "busy loop or missed timeout");
+                elapsed.get()
+            },
+            |interval| {
+                assert_eq!(
+                    interval,
+                    Duration::from_millis(10),
+                    "incorrect poll request"
+                );
+                sleeps.push(interval);
+                elapsed.set(elapsed.get() + interval);
+            },
         );
-        let elapsed = start.elapsed();
-
-        // With 10ms polling interval and 50ms timeout, we should have ~5 retries
-        // The elapsed time should be roughly 50ms (not much more due to busy waiting)
         assert!(
-            elapsed >= Duration::from_millis(45),
-            "Should wait at least close to timeout, got {:?}",
-            elapsed
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Lock acquisition timeout")
+        );
+        assert_eq!(sleeps, [Duration::from_millis(10); 5]);
+        assert_eq!(probes.get(), 6);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            before,
+            "waiter must not steal the holder"
+        );
+    }
+
+    #[test]
+    fn polling_timeout_uses_elapsed_deadline_without_sleeping_after_descheduling() {
+        let tmp = TempDir::new().unwrap();
+        let _holder = ConfigLock::acquire_in_dir(tmp.path(), "held", "holder").unwrap();
+        let path = tmp.path().join("held.lock");
+        let before = fs::read(&path).unwrap();
+        let result = ConfigLock::acquire_in_dir_with_wait(
+            tmp.path(),
+            "held",
+            Duration::from_millis(50),
+            "waiter",
+            // A descheduled process can resume after the old 150ms wall proxy.
+            || Duration::from_millis(200),
+            |_| panic!("expired deadline must not request another wait"),
         );
         assert!(
-            elapsed < Duration::from_millis(150),
-            "Should not wait excessively, got {:?}",
-            elapsed
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Lock acquisition timeout")
         );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
 
-        info!(
-            "TEST PASS: test_backoff_polling_interval - waited {:?} for 50ms timeout",
-            elapsed
+    #[test]
+    fn observed_polling_acquires_only_after_the_real_owner_releases() {
+        use std::cell::Cell;
+
+        let tmp = TempDir::new().unwrap();
+        let mut holder = Some(ConfigLock::acquire_in_dir(tmp.path(), "held", "holder").unwrap());
+        let path = tmp.path().join("held.lock");
+        let before = fs::read(&path).unwrap();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut waits = 0;
+        let acquired = ConfigLock::acquire_in_dir_with_wait(
+            tmp.path(),
+            "held",
+            Duration::from_millis(50),
+            "waiter",
+            || elapsed.get(),
+            |interval| {
+                assert_eq!(interval, Duration::from_millis(10));
+                assert_eq!(fs::read(&path).unwrap(), before);
+                waits += 1;
+                elapsed.set(elapsed.get() + interval);
+                drop(holder.take());
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, 1);
+        assert_ne!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            ConfigLock::read_lock_info(&path).unwrap().operation,
+            "waiter"
         );
+        drop(acquired);
     }
 
     #[test]

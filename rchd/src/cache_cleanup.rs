@@ -2000,9 +2000,22 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     fn cleanup_command_keeps_record_when_process_state_is_unknown() {
         let _guard = test_guard!();
         assert_process_record_sweep(
-            "printf '%s 1 S\\n2147482000 1 ?\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"",
-            "printf '%s %s 1 S 1\\n2147482000 2147482000 1 ? 1\\n' \"$RCH_CLEANUP_TEST_OBSERVER\" \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            // The uncertain row must belong to the recorded target group,
+            // not an unrelated group whose native state may be unavailable.
+            "printf '%s 1 S\\n2147482000 2147483000 ?\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            "printf '%s %s 1 S 1\\n2147482000 2147482000 2147483000 ? 1\\n' \"$RCH_CLEANUP_TEST_OBSERVER\" \"$RCH_CLEANUP_TEST_OBSERVER\"",
             true,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cleanup_command_darwin_unrelated_unknown_state_does_not_invent_a_target_member() {
+        let _guard = test_guard!();
+        assert_process_record_sweep(
+            "printf '%s 1 S\\n2147482000 1 ?<\\n' \"$RCH_CLEANUP_TEST_OBSERVER\"",
+            "exit 97",
+            false,
         );
     }
 
@@ -2056,11 +2069,11 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         let empty_new = runs.path().join("empty-new");
         std::fs::create_dir(&empty_new).expect("empty new");
 
-        // A native process snapshot can legitimately be incomplete: Darwin
-        // emits '?' for an unavailable task state, and the shared identity
-        // helper then refuses to declare any group absent. Exercise both
-        // outcomes explicitly instead of assuming every host observation
-        // succeeds. The live-group and cwd cases below still use native ps.
+        // A native target snapshot can legitimately be incomplete: an unknown
+        // target state forbids absence, while Darwin's unrelated '?' rows do
+        // not invent members of this group. Exercise both outcomes instead of
+        // assuming every host observation succeeds. Live-group/cwd cases below
+        // still use native ps; these ps replies are explicit protocol fixtures.
         let shim_dir = tempfile::tempdir().expect("process observation shim");
         // Match the actual platform census. Linux's five columns describe
         // individual threads; a process-only row cannot prove group absence.
