@@ -420,6 +420,42 @@ mod tests {
     }
 
     #[test]
+    fn nested_image_wikilinks_keep_only_the_innermost_image_target() {
+        // RUSTSEC-2026-0433: even a tiny nested input exposes the stale
+        // wikilink stack. Event counts alone missed its quadratic rescans.
+        // Production still uses Parser::new (wikilinks disabled); this also
+        // checks the patched dependency's explicit optional configuration.
+        for options in [
+            pulldown_cmark::Options::ENABLE_WIKILINKS,
+            pulldown_cmark::Options::all(),
+        ] {
+            for depth in [1, 2, 4, 32, 256] {
+                let input = format!(
+                    "{}dog.png{} unique-tail",
+                    "![[".repeat(depth),
+                    "]]".repeat(depth)
+                );
+                let events: Vec<_> = Parser::new_ext(&input, options)
+                    .take(8 * depth + 8)
+                    .collect();
+                let targets: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    targets,
+                    ["dog.png"],
+                    "nested depth {depth}: enclosing image openers must be retired"
+                );
+                assert_eq!(events.iter().filter(|event| matches!(event, Event::Text(text) if text.contains("unique-tail"))).count(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn test_render_heading() {
         log_test_start("test_render_heading");
         let md = "# Title";
