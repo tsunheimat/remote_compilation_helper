@@ -677,6 +677,124 @@ if rch_remote_witness_matches; then exit 88; fi
         self.assertIsNone(run[0].poll())
         self.assertEqual(self.cancel("kill").returncode, 0)
 
+    def pending_admission_protocol(self, unavailable=2):
+        # Only the pre-payload observation is faulted. Identity, private gate,
+        # actual payload and cleanup use the production implementation. The
+        # hosted Darwin case retained a live leader and a transient ?<E helper
+        # in its group; that uncertain census must not grant execution.
+        self.env["RCH_TEST_ADMISSION_TRACE"] = str(self.root / "admission-polls")
+        self.env["RCH_TEST_ADMISSION_AVAILABLE"] = str(self.root / "census-available")
+        self.env["RCH_TEST_ADMISSION_ELAPSED"] = str(self.root / "elapsed")
+        self.env["RCH_TEST_ADMISSION_STATE"] = str(unavailable)
+        needle = "rch_group_state() {\n"
+        self.assertEqual(PROTOCOL.count(needle), 1)
+        fault = PROTOCOL.replace(needle, needle + '''
+    if [ "${__sl_admitted-}" = 0 ] && [ "${__sl_reason-}" = setup ] &&
+        [ ! -f "$RCH_TEST_ADMISSION_AVAILABLE" ]; then
+        printf 'observed\\n' >> "$RCH_TEST_ADMISSION_TRACE" || return 2
+        return "$RCH_TEST_ADMISSION_STATE"
+    fi
+''', 1)
+        clock = "rch_scope_launch_clock() {"
+        self.assertEqual(fault.count(clock), 1)
+        fault = fault.replace(clock, "rch_fixture_admission_real_clock() {", 1)
+        boundary = "\nRCH_SCOPED_LAUNCH_SOURCE_104\n"
+        self.assertEqual(fault.count(boundary), 1)
+        return fault.replace(boundary, '''
+rch_scope_launch_clock() {
+    rch_fixture_admission_real_clock || return $?
+    if [ "${__sl_admitted-}" = 0 ] && [ "${__sl_reason-}" = setup ] &&
+        [ -n "${__sl_setup_started-}" ] && [ -f "$RCH_TEST_ADMISSION_ELAPSED" ]; then
+        rch_fixture_elapsed=$(cat "$RCH_TEST_ADMISSION_ELAPSED") || return 1
+        rch_launch_now=$((__sl_setup_started + rch_fixture_elapsed))
+    fi
+}
+''' + boundary, 1)
+
+    def wait_pending_admission(self, run):
+        trace = self.root / "admission-polls"
+        until = time.monotonic() + 15
+        while not trace.exists() or len(trace.read_text().splitlines()) < 2:
+            self.assertIsNone(run[0].poll(), self.contents(run[2]).decode(errors="replace"))
+            self.assertLess(time.monotonic(), until, "pending census did not reobserve")
+            time.sleep(.02)
+        self.assertTrue(self.receipt.exists())
+        self.assertFalse(self.ready.exists(), "payload ran without an affirmative census")
+        self.assertFalse(Path(str(self.receipt) + ".supervisor.v1/go").exists())
+        self.assertEqual(self.contents(run[1]), b"")
+
+    def test_transient_admission_uncertainty_waits_without_grant_or_workload_replay(self):
+        protocol = self.pending_admission_protocol()
+        calls = self.root / "calls"
+        payload = f"printf 'once\\n' >> {shlex.quote(str(calls))}; " + self.blocking_payload()
+        run = self.start(payload, protocol=protocol)
+        self.wait_pending_admission(run)
+        receipt = self.receipt.read_bytes()
+        self.assertFalse(calls.exists())
+        (self.root / "census-available").touch()
+        self.wait_ready(run[0])
+        self.assertEqual(self.receipt.read_bytes(), receipt)
+        self.assertEqual(calls.read_bytes(), b"once\n")
+        self.release.touch()
+        self.finish(run)
+        self.assertEqual(calls.read_bytes(), b"once\n")
+        self.assert_empty()
+
+    def test_persistent_admission_uncertainty_keeps_original_setup_deadline(self):
+        run = self.start(self.blocking_payload(), protocol=self.pending_admission_protocol())
+        self.wait_pending_admission(run)
+        # Advance only the observer's clock to the existing 6000-centisecond
+        # deadline. No sleep-budget increase or fake identity/death observation.
+        (self.root / "elapsed").write_text("6000")
+        out, err = self.finish(run, 255)
+        self.assertEqual(out, b"")
+        self.assertIn(b"RCH_SCOPED_COMPLETION_UNCONFIRMED", err)
+        self.assertFalse(self.ready.exists())
+        self.assertFalse(Path(str(self.receipt) + ".supervisor.v1/go").exists())
+        self.assert_empty()
+
+    def test_expired_pending_admission_cannot_grant_after_census_recovers(self):
+        run = self.start(self.blocking_payload(), protocol=self.pending_admission_protocol())
+        self.wait_pending_admission(run)
+        (self.root / "elapsed").write_text("6000")
+        (self.root / "census-available").touch()
+        out, err = self.finish(run, 255)
+        self.assertEqual(out, b"")
+        self.assertIn(b"RCH_SCOPED_COMPLETION_UNCONFIRMED", err)
+        self.assertFalse(self.ready.exists())
+        self.assertFalse(Path(str(self.receipt) + ".supervisor.v1/go").exists())
+        self.assert_empty()
+
+    def test_pending_admission_census_remains_cancellable_without_payload(self):
+        run = self.start(self.blocking_payload(), protocol=self.pending_admission_protocol())
+        self.wait_pending_admission(run)
+        run[0].send_signal(signal.SIGTERM)
+        out, _ = self.finish(run, 143)
+        self.assertEqual(out, b"")
+        self.assertFalse(self.ready.exists())
+        self.assertFalse(Path(str(self.receipt) + ".supervisor.v1/go").exists())
+        self.assert_empty()
+
+    def test_pre_admission_absent_or_invalid_census_is_not_a_retryable_wait(self):
+        # A verified live direct child cannot be reconciled with an empty group
+        # or an unknown result code. Only the defined unavailable status waits.
+        for status in (0, 7):
+            with self.subTest(status=status):
+                protocol = self.pending_admission_protocol(unavailable=status)
+                run = self.start(self.blocking_payload(), protocol=protocol)
+                out, err = self.finish(run, 255)
+                self.assertEqual(out, b"")
+                self.assertIn(b"RCH_SCOPED_COMPLETION_UNCONFIRMED", err)
+                self.assertFalse(self.ready.exists())
+                self.assertFalse(Path(str(self.receipt) + ".supervisor.v1/go").exists())
+                self.assert_empty()
+                # Preserve the refused record/control tree before the next
+                # independent attempt; do not pretend it is reusable admission.
+                self.receipt.rename(self.root / f"retained-refusal-{status}")
+                control = Path(str(self.receipt) + ".supervisor.v1")
+                if control.exists():
+                    control.rename(self.root / f"retained-control-{status}")
+
     def test_duplicate_admission_cannot_replace_live_receipt(self):
         first = self.start(self.blocking_payload())
         self.wait_ready(first[0])
