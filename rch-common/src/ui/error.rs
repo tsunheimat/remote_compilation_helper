@@ -151,11 +151,25 @@ pub struct ErrorPanel {
     pub stack_trace: Option<String>,
 
     /// Timestamp when the error occurred.
+    #[serde(serialize_with = "serialize_timestamp")]
     pub timestamp: DateTime<Utc>,
 
     /// Whether the message was truncated (show --verbose hint).
     #[serde(default)]
     pub truncated: bool,
+}
+
+// Chrono's default Serialize formats into Serializer::collect_str. For JSON,
+// every formatting fragment crosses the escaping adapter separately. Format
+// this small timestamp once, then let the serializer escape one complete str.
+// AutoSi and the UTC Z suffix match Chrono's default serialization, including
+// fractional seconds, leap seconds and expanded years. Nothing is cached:
+// ErrorPanel's public fields may be changed between serialization calls.
+fn serialize_timestamp<S>(timestamp: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&timestamp.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
 }
 
 impl ErrorPanel {
@@ -521,6 +535,154 @@ pub fn show_info(code: &str, title: &str, message: &str, ctx: OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Independent wire-format oracle: the original derived field layout with
+    // Chrono's unmodified Serialize implementation, not serialize_timestamp.
+    #[derive(Serialize)]
+    struct UnbufferedPanel {
+        code: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        severity: ErrorSeverity,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        context: Vec<ErrorContext>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        suggestions: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        caused_by: Vec<CausedBy>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stack_trace: Option<String>,
+        timestamp: DateTime<Utc>,
+        truncated: bool,
+    }
+
+    impl From<&ErrorPanel> for UnbufferedPanel {
+        fn from(panel: &ErrorPanel) -> Self {
+            Self {
+                code: panel.code.clone(),
+                title: panel.title.clone(),
+                message: panel.message.clone(),
+                severity: panel.severity,
+                context: panel.context.clone(),
+                suggestions: panel.suggestions.clone(),
+                caused_by: panel.caused_by.clone(),
+                stack_trace: panel.stack_trace.clone(),
+                timestamp: panel.timestamp,
+                truncated: panel.truncated,
+            }
+        }
+    }
+
+    fn assert_original_json(panel: &ErrorPanel) {
+        let original = UnbufferedPanel::from(panel);
+        let pretty = panel.to_json().unwrap();
+        let compact = panel.to_json_compact().unwrap();
+        assert_eq!(pretty, serde_json::to_string_pretty(&original).unwrap());
+        assert_eq!(compact, serde_json::to_string(&original).unwrap());
+        let decoded: ErrorPanel = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(decoded.timestamp, panel.timestamp);
+        assert_eq!(decoded.to_json_compact().unwrap(), compact);
+    }
+
+    #[test]
+    fn timestamp_buffering_preserves_original_json_and_mutable_fields() {
+        use chrono::NaiveDate;
+
+        let mut panel = ErrorPanel::error("RCH-E001", "Quotes \" and Unicode 雲 🦀")
+            .message("line one\nline two\t\u{0000}\\")
+            .context("Host", "host\"name")
+            .context("Empty", "")
+            .suggestion("check\nconnectivity")
+            .caused_by("cause\r\n", Some("ERR\\001".to_string()))
+            .caused_by("second", None)
+            .stack_trace("frame 1\nframe 2");
+        // Cover each fractional precision and both ends of Chrono's supported
+        // expanded-year range, rather than only the current clock's format.
+        for year in [
+            -262_143, -10_000, -1, 0, 1, 1970, 2026, 9999, 10_000, 262_142,
+        ] {
+            for nanos in [0, 1, 123_000_000, 123_456_000, 123_456_789, 999_999_999] {
+                panel.timestamp = NaiveDate::from_ymd_opt(year, 6, 15)
+                    .unwrap()
+                    .and_hms_nano_opt(12, 34, 56, nanos)
+                    .unwrap()
+                    .and_utc();
+                assert_original_json(&panel);
+            }
+        }
+        for timestamp in [
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MAX_UTC,
+            DateTime::parse_from_rfc3339("2016-12-31T23:59:60.123456789Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2026-11-04T01:02:03.000004+05:30")
+                .unwrap()
+                .with_timezone(&Utc),
+        ] {
+            panel.timestamp = timestamp;
+            assert_original_json(&panel);
+        }
+        panel.message = None;
+        panel.context.clear();
+        panel.suggestions.clear();
+        panel.caused_by.clear();
+        panel.stack_trace = None;
+        panel.truncated = true;
+        for severity in [
+            ErrorSeverity::Warning,
+            ErrorSeverity::Info,
+            ErrorSeverity::Error,
+        ] {
+            panel.severity = severity;
+            assert_original_json(&panel);
+        }
+        panel.timestamp = DateTime::from_timestamp(0, 0).unwrap();
+        panel.title = "changed after serialization".to_string();
+        assert_original_json(&panel);
+    }
+
+    #[test]
+    fn diagnostic_json_paired_serializers_report_equal_work() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let panel = ErrorPanel::error("RCH-E001", "Test Error")
+            .message("Test message with some content")
+            .context("Host", "192.168.1.10")
+            .context("Port", "22")
+            .suggestion("Check connectivity")
+            .suggestion("Verify credentials");
+        let original = UnbufferedPanel::from(&panel);
+        assert_original_json(&panel);
+        // The incumbent has the original owned field types; its clone above
+        // is outside the timers. Fixed paired work and alternating order are
+        // informational only. Timestamp buffering adds one small allocation
+        // per call; no allocation reduction or fleet speedup is claimed. The
+        // integration test still enforces its unchanged 1000-call/100ms gate.
+        let mut unbuffered = Vec::new();
+        let mut buffered = Vec::new();
+        for round in 0..9 {
+            for old in [round % 2 == 0, round % 2 != 0] {
+                let start = Instant::now();
+                for _ in 0..1000 {
+                    if old {
+                        black_box(serde_json::to_string_pretty(black_box(&original)).unwrap());
+                    } else {
+                        black_box(black_box(&panel).to_json().unwrap());
+                    }
+                }
+                if old {
+                    unbuffered.push(start.elapsed());
+                } else {
+                    buffered.push(start.elapsed());
+                }
+            }
+        }
+        eprintln!("diagnostic JSON paired 9x1000: original={unbuffered:?}; buffered={buffered:?}");
+        assert_original_json(&panel);
+    }
 
     #[test]
     fn test_error_panel_creation() {
