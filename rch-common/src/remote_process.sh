@@ -185,14 +185,19 @@ rch_group_state() {
     if [ "$(uname -s)" = Darwin ]; then
         # Darwin's process zombie state is terminal for the whole task. Linux
         # needs the separate LWP census below (a zombie leader can have LWPs).
+        # Native ps also emits H (halted) and ? (state unavailable), including
+        # priority suffixes like ?<; see Apple's adv_cmds/ps/tasks.c. An unknown
+        # state outside the target group does not obscure its known membership.
+        # Within the target it remains unavailable, never empty or stop authority.
         [ "${rch_scope_bound:-0}" != 1 ] || return 2
         rch_snapshot=$(LC_ALL=C rch_control_capture 1s ps -axo pid=,pgid=,stat=) || return 2
         printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
-            NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTIUZE][A-Za-z0-9+<>-]*$/ { bad=1; next }
+            NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTIUZEH?][A-Za-z0-9+<>-]*$/ { bad=1; next }
             seen_pid[$1]++ { bad=1 }
             $1 == observer { seen=1; if ($2 == group) bad=1 }
-            $2 == group && $3 !~ /^Z/ { live=1 }
-            END { if (bad || !seen) exit 2; exit live ? 1 : 0 }
+            $2 == group && $3 ~ /^[?]/ { uncertain=1 }
+            $2 == group && $3 !~ /^[Z?]/ { live=1 }
+            END { if (bad || !seen || uncertain) exit 2; exit live ? 1 : 0 }
         '
         return $?
     fi

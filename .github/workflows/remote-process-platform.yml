@@ -1,6 +1,18 @@
 name: Remote process platform identity
 
 on:
+  pull_request:
+    paths:
+      - 'rch-common/src/process_identity.rs'
+      - 'rch-common/src/remote_process.sh'
+      - 'rch-common/src/remote_scoped_launch.rs'
+      - 'rch-common/src/remote_scoped_launch.sh'
+      - 'rch-common/tests/remote_supervised_platform.py'
+      - 'rch-common/tests/remote_process_platform.py'
+      - 'rch-common/tests/remote_control_timeout.py'
+      - 'rch-wkr/src/main.rs'
+      - 'rch/src/transfer.rs'
+      - '.github/workflows/remote-process-platform.yml'
   push:
     branches: [main]
     paths:
@@ -57,6 +69,10 @@ jobs:
           python3 rch-common/tests/remote_control_timeout.py -v
           RCH_TEST_SHELL=/bin/bash python3 rch-common/tests/remote_control_timeout.py -v
       - name: Exercise the production owned-group supervisor on each platform
+        env:
+          # Preserve actual failed exchange status and process-only census data;
+          # observing a failure does not turn it into successful cleanup.
+          RCH_TEST_EVIDENCE_ROOT: ${{ runner.temp }}/rch-native-observations
         run: |
           export PATH="$PWD/target/debug:$PATH"
           for shell in /bin/sh /bin/bash; do
@@ -67,5 +83,21 @@ jobs:
         run: |
           cargo test --locked -p rch-common process_identity
           cargo test --locked -p rch-common --test remote_process_escalation
+      - name: Retain owned native-observer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-observations-${{ matrix.os }}
+          # Select data files only. Do not follow the fixture bin/ symlinks or
+          # collect unrelated host files, toolchains or environment secrets.
+          path: |
+            ${{ runner.temp }}/rch-native-observations/**/case.json
+            ${{ runner.temp }}/rch-native-observations/**/observations.log
+            ${{ runner.temp }}/rch-native-observations/**/err-*
+            ${{ runner.temp }}/rch-native-observations/**/receipt
+            ${{ runner.temp }}/rch-native-observations/**/signals
+            ${{ runner.temp }}/rch-native-observations/**/signal-outcomes
+          if-no-files-found: warn
+          retention-days: 7
       # Full-workspace compilation, Clippy and formatting belong to ci.yml;
       # this lane owns the distinct native shell/process identity checks.

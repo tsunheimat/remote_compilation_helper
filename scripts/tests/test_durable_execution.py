@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Exercise the durable-execution program embedded in transfer.rs.
 
---native compiles the actual Rust formatter in isolation with its production
-shell-escape dependency; CI always uses this mode. Without it the ordinary Rust
-strings are decoded for shell-only local checks. Neither mode qualifies the
-whole TransferPipeline, SSH transport, or recovery journal integration.
+Both the default invocation and --native compile the unchanged Rust formatter
+and its persistence helpers with the production shell-escape dependency and
+the selected toolchain. There is no independent Python rendering fallback.
+This qualifies the embedded supervisor, not the whole TransferPipeline, SSH
+transport, or recovery journal integration.
 """
 from __future__ import annotations
 
@@ -32,6 +33,21 @@ def build_native_renderer(directory: Path) -> Path:
     start = source.index('    fn durable_execution_command_with_stall(')
     end = source.index('\n    }\n', start) + len('\n    }\n')
     method = source[start:end]
+    # Keep each helper byte-for-byte from production. Copying just the method
+    # stopped compiling once it delegated persistence to these functions; a
+    # separately implemented Python formatter would not test the same program.
+    helpers = []
+    for declaration in (
+        'pub(crate) fn file_fsync_command(',
+        'fn directory_fsync_command(',
+        'fn completion_records_fsync_command(',
+    ):
+        marker = '\n' + declaration
+        if source.count(marker) != 1:
+            raise ValueError(f'expected exactly one production helper: {declaration}')
+        helper_start = source.index(marker) + 1
+        helper_end = source.index('\n}\n', helper_start) + len('\n}\n')
+        helpers.append(source[helper_start:helper_end])
     (directory / 'src').mkdir()
     (directory / 'Cargo.toml').write_text(
         '[package]\nname = "durable-renderer"\nversion = "0.0.0"\nedition = "2024"\n'
@@ -39,6 +55,7 @@ def build_native_renderer(directory: Path) -> Path:
     )
     (directory / 'src/main.rs').write_text(
         'use std::borrow::Cow;\nuse std::path::Path;\nuse shell_escape::escape;\n'
+        + '\n'.join(helpers) + '\n'
         'struct InvocationOptions { interactive: bool }\n'
         'struct TransferPipeline { recovery_completion: Option<(String, String)>, invocation_options: Option<InvocationOptions> }\n'
         'impl TransferPipeline {\n' + method + '\n}\n'
@@ -55,84 +72,24 @@ def build_native_renderer(directory: Path) -> Path:
         environment.pop(name, None)
     environment['RUSTFLAGS'] = '-D warnings'
     subprocess.run(
-        ['cargo', '+stable', 'build', '--manifest-path', str(directory / 'Cargo.toml'),
+        ['cargo', 'build', '--manifest-path', str(directory / 'Cargo.toml'),
          '--target-dir', str(directory / 'target')],
         check=True, env=environment, timeout=180,
     )
     return directory / 'target/debug/durable-renderer'
 
 
-def rust_string(source: str, at: int) -> str:
-    """Decode a Rust ordinary string, including whitespace line continuations."""
-    if source[at] != '"':
-        raise ValueError("expected a Rust string")
-    at += 1
-    result: list[str] = []
-    escapes = {'n': '\n', 'r': '\r', 't': '\t', '0': '\0', '"': '"', '\\': '\\'}
-    while at < len(source):
-        character = source[at]
-        at += 1
-        if character == '"':
-            return ''.join(result)
-        if character != '\\':
-            result.append(character)
-            continue
-        character = source[at]
-        at += 1
-        if character == '\n':
-            while at < len(source) and source[at] in ' \t\r\n':
-                at += 1
-        elif character in escapes:
-            result.append(escapes[character])
-        else:
-            raise ValueError(f"unsupported Rust escape: {character!r}")
-    raise ValueError("unterminated Rust string")
-
-
 def script(path: Path, command: str, stall_seconds: int = 1, mode: str | None = None) -> str:
-    if NATIVE_RENDERER is not None:
-        environment = os.environ.copy()
-        environment.pop('RCH_DURABLE_TEST_MODE', None)
-        if mode is not None:
-            environment['RCH_DURABLE_TEST_MODE'] = mode
-        return subprocess.check_output(
-            [str(NATIVE_RENDERER), str(path), 'abc123', str(stall_seconds), command],
-            timeout=5, text=True, env=environment,
-        )
-    source = SOURCE.read_text()
-    start = source.index('fn durable_execution_command_with_stall(')
-    end = source.index('\n    }\n', start) + len('\n    }\n')
-    source = source[start:end]
-    supervisor_at = source.index('let supervisor = format!(')
-    supervisor = rust_string(source, source.index('"', supervisor_at))
-    prefix = '"set -e; rch_umask='
-    outer = rust_string(source, source.index(prefix) if mode == 'interactive' else source.rindex(prefix))
-    # These bindings mirror the production formatter, not a substitute shell
-    # program. Changing its binding expressions requires updating this harness.
-    for binding in [
-        'supervisor = quote(&supervisor)', 'done = quote(path)',
-        'identity = quote(identity)', 'stall_ticks = stall_secs * 5',
-        'out_progress = quote(&format!("{path}.stdout.progress"))',
-        'err_progress = quote(&format!("{path}.stderr.progress"))',
-    ]:
-        if binding not in source:
-            raise ValueError(f"production formatter changed: {binding}")
-    bindings = {
-        'identity': shlex.quote('abc123'), 'done': shlex.quote(str(path)),
-        'directory': shlex.quote(str(path.parent)),
-        'pending': shlex.quote(str(path) + '.pending'),
-        'claim': shlex.quote(str(path) + '.started'),
-        'out': shlex.quote(str(path) + '.stdout'),
-        'err': shlex.quote(str(path) + '.stderr'),
-        'out_progress': shlex.quote(str(path) + '.stdout.progress'),
-        'err_progress': shlex.quote(str(path) + '.stderr.progress'),
-        'stall_ticks': stall_seconds * 5,
-        'stdin_setup': 'exec 4<&0; ' if mode is not None else '',
-        'stdin_redirection': '<&4 4<&-' if mode is not None else '</dev/null',
-        'stdin_close': 'exec 4<&-; ' if mode is not None else '',
-    }
-    bindings['supervisor'] = shlex.quote(supervisor.format(command=command, **bindings))
-    return outer.format(**bindings)
+    if NATIVE_RENDERER is None:
+        raise RuntimeError('the production Rust renderer must be built before executing a test')
+    environment = os.environ.copy()
+    environment.pop('RCH_DURABLE_TEST_MODE', None)
+    if mode is not None:
+        environment['RCH_DURABLE_TEST_MODE'] = mode
+    return subprocess.check_output(
+        [str(NATIVE_RENDERER), str(path), 'abc123', str(stall_seconds), command],
+        timeout=5, text=True, env=environment,
+    )
 
 
 class DurableExecution(unittest.TestCase):
@@ -415,8 +372,7 @@ class DurableExecution(unittest.TestCase):
 if __name__ == '__main__':
     if '--native' in sys.argv:
         sys.argv.remove('--native')
-        with tempfile.TemporaryDirectory(prefix='rch-durable-renderer-') as build:
-            NATIVE_RENDERER = build_native_renderer(Path(build))
-            result = unittest.main(verbosity=2, exit=False).result
-        sys.exit(not result.wasSuccessful())
-    unittest.main(verbosity=2)
+    with tempfile.TemporaryDirectory(prefix='rch-durable-renderer-') as build:
+        NATIVE_RENDERER = build_native_renderer(Path(build))
+        result = unittest.main(verbosity=2, exit=False).result
+    sys.exit(not result.wasSuccessful())

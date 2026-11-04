@@ -463,6 +463,7 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
 rch_scope_launch_finish() {
     rch_scope_launch_close_input
     __sl_child_start=; __sl_admitted=0; __sl_admission_record=; __sl_reason=setup
+    __sl_census_pending=0
     rch_scope_launch_clock || return 255
     __sl_setup_started=$rch_launch_now
     while :; do
@@ -479,13 +480,41 @@ rch_scope_launch_finish() {
         if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi
         rch_scope_launch_clock || { __sl_reason=unknown; break; }
         if [ "$__sl_admitted" = 0 ]; then
+            # Record publication and a conclusive group census share the
+            # original setup deadline. A late affirmative observation cannot
+            # turn an expired attempt into a new payload grant.
+            if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
+                if [ "$__sl_census_pending" = 1 ] ||
+                    [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
+                    __sl_reason=unknown
+                else
+                    __sl_reason=setup
+                fi
+                break
+            fi
             if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
                 if ! rch_scope_launch_read_owned_record; then
                     __sl_reason=unknown; break
                 fi
                 rch_group_state
-                [ "$?" = 1 ] || { __sl_reason=unknown; break; }
+                case $? in
+                    1) ;;
+                    2)
+                        # Short-lived setup helpers can make an otherwise live
+                        # group census temporarily unavailable. The private go
+                        # gate stays CLOSED. Reobserve only while the same direct
+                        # child/record is owned, within the unchanged setup cap.
+                        # This retries an observation, never an execution.
+                        __sl_census_pending=1
+                        sleep 0.1 || { __sl_reason=unknown; break; }
+                        continue;;
+                    *) __sl_reason=unknown; break;;
+                esac
                 rch_scope_launch_clock || { __sl_reason=unknown; break; }
+                if [ "$__sl_cancelled" = 1 ]; then __sl_reason=cancelled; break; fi
+                if [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
+                    __sl_reason=unknown; break
+                fi
                 __sl_started=$rch_launch_now
                 # Mark admitted before publication: an uncertain gate write
                 # cannot authorize the pre-payload group-only cleanup path.
@@ -497,8 +526,6 @@ rch_scope_launch_finish() {
                 (umask 077; set -C; printf '%s\n' go > "$__sl_control/go") || {
                     __sl_reason=unknown; break;
                 }
-            elif [ "$((rch_launch_now - __sl_setup_started))" -ge 6000 ]; then
-                __sl_reason=setup; break
             fi
         else
             if [ -e "$__sl_control/result" ] || [ -L "$__sl_control/result" ]; then

@@ -96,8 +96,45 @@ def process(pid):
     try:
         fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()
         return fields[0], int(fields[2]), int(fields[19])
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # The owned process can exit before open (ENOENT) or during the procfs
+        # read (ESRCH). Neither grants a new launch. Permission, I/O and malformed
+        # observations remain errors rather than fabricated cleanup evidence.
         return None
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux procfs observation")
+class ProcessObservation(unittest.TestCase):
+    def test_only_verified_disappearance_is_absence(self):
+        import errno
+        from unittest.mock import patch
+
+        for error in (FileNotFoundError(errno.ENOENT, "gone before open"),
+                      ProcessLookupError(errno.ESRCH, "gone during read")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(Path, "read_bytes", side_effect=error):
+                    self.assertIsNone(process(123))
+        for error in (PermissionError(errno.EACCES, "denied"),
+                      OSError(errno.EIO, "read failed")):
+            with patch.object(Path, "read_bytes", side_effect=error):
+                with self.assertRaises(type(error)):
+                    process(123)
+        with patch.object(Path, "read_bytes", return_value=b"malformed"):
+            with self.assertRaises(IndexError):
+                process(123)
+
+    def test_real_owned_process_is_observed_before_and_after_reap(self):
+        child = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            observed = process(child.pid)
+            self.assertIsNotNone(observed)
+            self.assertNotIn(observed[0], (b"Z", b"X", b"x"))
+            self.assertGreater(observed[2], 0)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+        self.assertIsNone(process(child.pid))
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux owned supervisor")
